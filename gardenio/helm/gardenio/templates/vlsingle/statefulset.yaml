@@ -1,0 +1,132 @@
+{{- if .Values.vlsingle.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "gardenio.vlsingle.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vlsingle.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "gardenio.vlsingle.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.vlsingle.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.vlsingle.selectorLabels" . | nindent 8 }}
+      {{- if .Values.vlsingle.metrics.scrape }}
+      # Self-scrape opt-in (ka-0000001302). VictoriaLogs exposes its own
+      # operational series on the SAME :9428 listener at /metrics — including
+      # vl_data_size_bytes{type=~"storage|indexdb"} (bytes on disk) and
+      # vl_max_disk_space_usage_bytes (the -retention.maxDiskSpaceUsageBytes cap
+      # reflected back as a metric). The in-chart vmagent discovers pods via
+      # these prometheus.io/* annotations (templates/vmagent/configmap.yaml,
+      # job kubernetes-pods), so annotating the pod is what lands vl_* in
+      # vmsingle and makes the VlsingleDiskUsageHigh rule fireable rather than a
+      # silent never-fire no-op (advice ka-0000002586). Default-off so the chart
+      # stays byte-identical until an env opts in; the vlsingle-ingress
+      # NetworkPolicy already carries a vmagent :9428 carve-out gated on the
+      # same toggle.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9428"
+        prometheus.io/path: "/metrics"
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: vlsingle
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.vlsingle.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.vlsingle.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            - "-retentionPeriod={{ .Values.vlsingle.retentionPeriod }}"
+            - "-storageDataPath=/victoria-logs-data"
+            - "-httpListenAddr=:9428"
+            {{- with .Values.vlsingle.retention.maxDiskSpaceUsageBytes }}
+            - "-retention.maxDiskSpaceUsageBytes={{ . }}"
+            {{- end }}
+            {{- range .Values.vlsingle.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 9428
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.vlsingle.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /victoria-logs-data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        {{- if not .Values.vlsingle.persistence.enabled }}
+        {{- /* Persistence disabled (throwaway ephemeral test namespaces,
+               ka-0000000711): back the logs data dir with an emptyDir instead
+               of a PVC. The volumeClaimTemplates block only renders when
+               persistence is enabled, so the `data` mount would otherwise
+               dangle. emptyDir avoids consuming an EBS attachment slot on the
+               POC node — mirrors the vmsingle/vtsingle statefulsets. */}}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.vlsingle.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.vlsingle.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.vlsingle.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+  {{- if .Values.vlsingle.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.vlsingle.persistence.storageClass }}
+        storageClassName: {{ .Values.vlsingle.persistence.storageClass }}
+        {{- else if .Values.global.storageClass }}
+        storageClassName: {{ .Values.global.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.vlsingle.persistence.size }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,349 @@
+{{- if .Values.nats.enabled }}
+{{- $replicas := .Values.nats.replicas | default 1 | int }}
+{{- $clusterEnabled := gt $replicas 1 }}
+{{- $fullname := include "gardenio.nats.fullname" . }}
+{{- $clusterPort := .Values.nats.cluster.port | default 6222 | int }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.nats.labels" . | nindent 4 }}
+data:
+  nats-server.conf: |
+    server_name: $SERVER_NAME
+    listen: 0.0.0.0:4222
+    http: 0.0.0.0:8222
+    {{- if .Values.nats.websocket.enabled }}
+    websocket {
+      listen: 0.0.0.0:8443
+      no_tls: true
+    }
+    {{- end }}
+    {{- if .Values.nats.auth.enabled }}
+    {{- if .Values.nats.auth.subjectIsolation.enabled }}
+    # Multi-user auth with subject isolation.
+    # Infrastructure: full pub/sub access to all subjects.
+    # Agent: restricted to publishing on agent-scoped subjects only.
+    # This prevents agents from subscribing to other agents' NATS events.
+    #
+    # NOTE: users entries support only user/password/nkey — a per-user
+    # `token` field is rejected at startup ("unknown field") and crashloops
+    # the server (ka-0000000002). The shared secrets are therefore wired as
+    # PASSWORDS; every client sends user+token-as-password (nats.UserInfo /
+    # with_user_and_password / nats --user --password).
+    authorization {
+      users: [
+        {
+          user: infra
+          password: $NATS_INFRA_TOKEN
+          permissions: {
+            publish: ">"
+            subscribe: ">"
+          }
+        }
+        {
+          user: agent
+          password: $NATS_AGENT_TOKEN
+          permissions: {
+            publish: {
+              allow: [
+                # Agent session events (state, prompt, hook, stop, start, usage, profile)
+                "coop.events.>"
+                # Outbound-only session registration relay (MicroVM satellites,
+                # ka-0000006995): announce/status/state/usage publishes coopmux
+                # discovers sessions by. K8s pods register over HTTP and never
+                # publish here; without this allow, an authenticated MicroVM
+                # agent could not register at all. Must cover the coopmux
+                # --nats-relay-prefix (default "coop.mux").
+                "coop.mux.session.>"
+                # gb hook relay fallback (cmd/gb/hook_relay.go): hook events
+                # publish hooks.<agent>.<event> directly to NATS when the
+                # daemon HTTP publish path fails. Publish-only — agents must
+                # never subscribe here. The sole non-test subscriber is
+                # bridge.HookStream, built only by cmd/slack-bridge, which is
+                # disabled on this cluster; the older beads3d/"doots" consumer
+                # was deleted in f1fd0c5f. So this subject space has no live
+                # reader today (gardenio/plans/claude-session-subagent-tracking.md).
+                "hooks.>"
+                # Request-reply inbox
+                "_INBOX.>"
+              ]
+            }
+            subscribe: {
+              allow: [
+                # Request-reply inbox only — agents should not subscribe to
+                # other agents' event subjects or JetStream consumer subjects.
+                "_INBOX.>"
+                # Relay command channel for outbound-only sessions: coopmux
+                # publishes input/nudge/respond on these subjects; the session's
+                # NATS relay subscriber is its ONLY inbound command path (no
+                # HTTP callback into a MicroVM). Scoped to the three command
+                # verbs so agents still cannot subscribe to sibling
+                # announce/status/state traffic.
+                "coop.mux.session.*.input"
+                "coop.mux.session.*.nudge"
+                "coop.mux.session.*.respond"
+              ]
+            }
+          }
+        }
+      ]
+      {{- if .Values.nats.auth.subjectIsolation.landCallout.enabled }}
+      # Every other user goes to the controller's land callout, which issues
+      # a tenant land its own user scoped to coop.events.land.<land>.>
+      # (internal/lands/natsland, gd-sS7bSXOdGs). infra (the callout's own
+      # connection) and agent bypass it.
+      auth_callout {
+        issuer: $NATS_LAND_CALLOUT_ISSUER
+        auth_users: [ infra, agent ]
+      }
+      {{- end }}
+    }
+    {{- else }}
+    authorization {
+      {{- if .Values.nats.auth.token }}
+      token: "{{ .Values.nats.auth.token }}"
+      {{- end }}
+    }
+    {{- end }}
+    {{- end }}
+    jetstream {
+      store_dir: /data/jetstream
+      max_memory_store: {{ .Values.nats.jetstream.maxMemory | default "256M" }}
+      max_file_store: {{ .Values.nats.persistence.size | default "2Gi" }}
+    }
+    {{- if $clusterEnabled }}
+    cluster {
+      name: {{ $fullname }}
+      listen: 0.0.0.0:{{ $clusterPort }}
+      routes: [
+        {{- range $i := until $replicas }}
+        nats-route://{{ $fullname }}-{{ $i }}.{{ $fullname }}-headless:{{ $clusterPort }}
+        {{- end }}
+      ]
+    }
+    {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.nats.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 4222
+      targetPort: client
+      protocol: TCP
+      name: client
+    - port: 8222
+      targetPort: monitoring
+      protocol: TCP
+      name: monitoring
+    {{- if .Values.nats.websocket.enabled }}
+    - port: 8443
+      targetPort: websocket
+      protocol: TCP
+      name: websocket
+    {{- end }}
+  selector:
+    {{- include "gardenio.nats.selectorLabels" . | nindent 4 }}
+{{- if $clusterEnabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.nats.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - port: 4222
+      targetPort: client
+      protocol: TCP
+      name: client
+    - port: {{ $clusterPort }}
+      targetPort: cluster
+      protocol: TCP
+      name: cluster
+    - port: 8222
+      targetPort: monitoring
+      protocol: TCP
+      name: monitoring
+  selector:
+    {{- include "gardenio.nats.selectorLabels" . | nindent 4 }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.nats.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ if $clusterEnabled }}{{ $fullname }}-headless{{ else }}{{ $fullname }}{{ end }}
+  replicas: {{ $replicas }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.nats.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.nats.selectorLabels" . | nindent 8 }}
+      {{- with include "gardenio.doNotDisrupt" . }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nats.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.nats.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.nats.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- if .Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ .Values.global.systemPriorityClass.name }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nats
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.nats.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.nats.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            - "--config"
+            - "/etc/nats/nats-server.conf"
+          env:
+            - name: SERVER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- if .Values.nats.auth.subjectIsolation.enabled }}
+            # Tokens are resolved at server startup via NATS config env-var
+            # substitution ($NATS_INFRA_TOKEN / $NATS_AGENT_TOKEN), so the
+            # source of truth is the K8s Secrets (raw or ExternalSecret-backed)
+            # rather than values.yaml.
+            - name: NATS_INFRA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.fullname" . }}-nats-infra-creds
+                  key: token
+            {{- if .Values.nats.auth.subjectIsolation.landCallout.enabled }}
+            - name: NATS_LAND_CALLOUT_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "nats.auth.subjectIsolation.landCallout.issuerSecret is required with landCallout.enabled" .Values.nats.auth.subjectIsolation.landCallout.issuerSecret }}
+                  key: public
+            {{- end }}
+            - name: NATS_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.fullname" . }}-nats-agent-creds
+                  key: token
+            {{- end }}
+          ports:
+            - name: client
+              containerPort: 4222
+              protocol: TCP
+            - name: monitoring
+              containerPort: 8222
+              protocol: TCP
+            {{- if .Values.nats.websocket.enabled }}
+            - name: websocket
+              containerPort: 8443
+              protocol: TCP
+            {{- end }}
+            {{- if $clusterEnabled }}
+            - name: cluster
+              containerPort: {{ $clusterPort }}
+              protocol: TCP
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: monitoring
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: monitoring
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: monitoring
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.nats.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nats
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}
+        {{- if not .Values.nats.persistence.enabled }}
+        {{- /* Persistence disabled (throwaway ephemeral test namespaces,
+               ka-0000000711): back JetStream's store_dir (/data/jetstream)
+               with an emptyDir instead of a PVC. The volumeClaimTemplates
+               block only renders when persistence is enabled. emptyDir avoids
+               consuming an EBS attachment slot on the POC node — see the
+               postgres statefulset note for the AttachmentLimitExceeded chain. */}}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.nats.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.nats.persistence.storageClass }}
+        storageClassName: {{ .Values.nats.persistence.storageClass }}
+        {{- else if .Values.global.storageClass }}
+        storageClassName: {{ .Values.global.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.nats.persistence.size | default "2Gi" }}
+  {{- end }}
+{{- /* The NATS PodDisruptionBudget lives in templates/pdb-singletons.yaml,
+       which covers every persistent gardenio-system spine singleton (nats,
+       postgres, keycloak-runtime, vmsingle, vtsingle) at ALL replica counts —
+       not just cluster mode — so a node roll never strands the single-replica
+       nats-0 (ka-0000001453). Toggle via platformPdb.enabled. */}}
+{{- end }}

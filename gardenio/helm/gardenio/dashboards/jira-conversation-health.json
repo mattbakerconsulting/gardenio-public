@@ -1,0 +1,2464 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "type": "dashboard",
+        "name": "Annotations & Alerts",
+        "enable": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        }
+      },
+      {
+        "name": "gardenio rollout",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "victoriametrics"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "semi-dark-orange",
+        "expr": "count(changes(process_start_time_seconds{namespace=\"gardenio-system\",component!=\"\"}[$__interval]) > 0) >= 3",
+        "step": "1m",
+        "titleFormat": "gardenio rollout",
+        "textFormat": "3+ gardenio-system components restarted at once - a release deploy or chart apply. Check this marker before hunting a code cause for a step change on this board."
+      },
+      {
+        "name": "component restart",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "victoriametrics"
+        },
+        "enable": false,
+        "hide": false,
+        "iconColor": "semi-dark-blue",
+        "expr": "changes(process_start_time_seconds{namespace=\"gardenio-system\",component!=\"\"}[$__interval]) > 0",
+        "step": "1m",
+        "tagKeys": "component",
+        "titleFormat": "{{component}} restarted",
+        "textFormat": "gardenio-system/{{component}} moved its process start time - deploy, OOM-kill or crash-loop. Off by default: ~22 single-component restarts/day fleet-wide would bury the rollout markers."
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "title": "All gardenio boards",
+      "type": "dashboards",
+      "tags": [
+        "gardenio"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Every gardenio board, with this board's time range carried over"
+    },
+    {
+      "title": "Jira — Metrics",
+      "type": "link",
+      "icon": "dashboard",
+      "url": "/grafana/d/jira-metrics",
+      "targetBlank": false,
+      "tooltip": "Ticket analytics — backlog / SLA-age / throughput (JQL-count exporter)",
+      "keepTime": true
+    },
+    {
+      "title": "Inbound Webhook Liveness",
+      "type": "link",
+      "icon": "dashboard",
+      "url": "/grafana/d/gardenio-webhook-liveness",
+      "targetBlank": false,
+      "tooltip": "The inbound webhook deadman in depth (non-AVA carve-out)",
+      "keepTime": true
+    },
+    {
+      "title": "Control-plane liveness",
+      "type": "link",
+      "url": "/grafana/d/gardenio-control-plane-liveness",
+      "icon": "external link",
+      "tooltip": "Controller reconcile / trigger-engine liveness and starvation - is the control plane even running",
+      "targetBlank": false,
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "type": "text",
+      "title": "Jira conversation-loop health",
+      "id": 1,
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Health of the **@gardenio Jira conversational bridge** — the `mention → spawn → 👋 ack → reply → follow-up` loop (epic **ka-0000007401**; design-doc F-B). These `gardenio_jira_*` conversation counters are emitted by the jira-bridge but were charted in **no** dashboard until this board — `jira-metrics.json` is the separate JQL-count *ticket-analytics* exporter (backlog / SLA-age / throughput), not the conversation loop. Read this board top-to-bottom as the loop flows: front-half spawn/ack, reply path, follow-up warm/cold delivery, wake durability, inbound comment-mirror durability + DLQ, and the webhook deadman. All outbound writes are **deny-by-default** and gated by one shared write policy; `blocked` is a policy refusal, `error` is Jira bouncing the post. Companion boards: **Jira — Metrics** (ticket analytics) and **Inbound Webhook Liveness** (the deadman in depth). Runbook: `gardenio/docs/runbooks/jira-conversational-bridge.md`.\n\n> ✅ **Loop counters are live.** All conversation-loop counters (`gardenio_jira_mention_spawn_total`, `_spawn_ack_total`, `_reply_total`, `_followup_delivery_total`, `_followup_wake_retries_total` / `_wake_failures_total`, `_inbound_comment_write_retries_total` / `_write_failures_total`, `_inbound_comment_dlq_{enqueued,replayed,dropped,depth}`) now emit live series from the jira-bridge. The stat tiles color on threshold, so a real error rate or DLQ backlog shows orange/red. A tile reading **0** over its window is an **honest zero** — `increase()` across an idle interval is genuinely 0, not “no data”; the series exist. (Emitter landed via tracking bead **ka-0000000731**; annotation re-grounded 2026-08-19 per **ka-0000000355**.)"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Front half — mention → spawn → 👋 ack",
+      "id": 2,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Mention spawns (1h)",
+      "description": "sum(increase(gardenio_jira_mention_spawn_total[1h])): fresh @gardenio-mention agent spawns (all outcomes) in the last hour — conversation starts.",
+      "id": 3,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_mention_spawn_total series — no @gardenio mention has spawned an agent since the jira-bridge booted, so the counter does not exist. Legitimate on a quiet hour; check “Webhook dark verdict” in the bottom row to rule out a dead inbound hook.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "text"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(increase(gardenio_jira_mention_spawn_total[1h]))",
+          "legendFormat": "spawns"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Mention-spawn error ratio (1h)",
+      "description": "error / (ok+error) of gardenio_jira_mention_spawn_total over 1h. Non-zero = @gardenio mentions arrive but the agent never boots — the conversation dies at the front half while the webhook already 200'd. Empty-branch liveness: every `or vector(0)` fallback is gated on `up{component=\"jira-bridge\"} == 1`, so a 0 appears only while the jira-bridge exporter is actually being scraped — a dark bridge leaves the panel empty instead of painting a reassuring zero.",
+      "id": 4,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "the ratio is UNDEFINED, not 0% error: gardenio_jira_mention_spawn_total returned nothing for the last hour, so the denominator is zero. This panel cannot tell an idle hour from a bridge that never ran — resolve with “Mention spawns (1h)” to the left and the webhook dark verdict below.",
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 0.01,
+                "color": "orange"
+              },
+              {
+                "value": 0.1,
+                "color": "red"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "(sum(increase(gardenio_jira_mention_spawn_total{outcome=\"error\"}[1h])) or (vector(0) and (max(up{component=\"jira-bridge\"}) == 1))) / clamp_min(sum(increase(gardenio_jira_mention_spawn_total[1h])), 1)",
+          "legendFormat": "spawn error ratio"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Spawn-ack posted (1h)",
+      "description": "gardenio_jira_spawn_ack_total{outcome=\"posted\"} increase over 1h: the \"👋 On it\" note landed on the ticket — the front half of the reaction lifecycle.",
+      "id": 5,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_spawn_ack_total{outcome=\"posted\"} series — no “👋 On it” note was posted since the bridge booted. Legitimate if no mention arrived; if “Mention spawns (1h)” is non-zero and this is empty, the ticket is going silent after a spawn.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "text"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(increase(gardenio_jira_spawn_ack_total{outcome=\"posted\"}[1h]))",
+          "legendFormat": "acks posted"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Spawn-ack blocked+error (1h)",
+      "description": "spawn-ack posts that were policy-blocked or errored over 1h. Non-zero = the ticket goes silent after a mention even though an agent booted.",
+      "id": 6,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "gardenio_jira_spawn_ack_total{outcome=~\"blocked|error\"} returned nothing. The counter is created only on the first blocked/error outcome, so empty is AMBIGUOUS and this panel cannot resolve it: either none occurred since the bridge booted, or the bridge never ran. Resolve against “Spawn-ack posted (1h)” to the left — if that renders, the bridge is live and this really is zero.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 1,
+                "color": "orange"
+              },
+              {
+                "value": 50,
+                "color": "red"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(increase(gardenio_jira_spawn_ack_total{outcome=~\"blocked|error\"}[1h]))",
+          "legendFormat": "ack blocked+error"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Mention spawns by outcome (rate/5m)",
+      "description": "rate() of gardenio_jira_mention_spawn_total split by outcome (ok/error). A rising error line is the front-half twin of the follow-up wake-failure signal below (which covers respawns only).",
+      "id": 7,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_mention_spawn_total series — no mention spawn has been attempted since the bridge booted, so there is no ok/error split to draw. Empty is not “zero errors”: it is “no data on either outcome”.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "error"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "blocked"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ok"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "posted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (outcome) (rate(gardenio_jira_mention_spawn_total[5m]))",
+          "legendFormat": "{{ outcome }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Spawn-ack posts by outcome (rate/5m)",
+      "description": "rate() of gardenio_jira_spawn_ack_total by outcome (posted/blocked/error).",
+      "id": 8,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_spawn_ack_total series — no spawn-ack has been attempted since the bridge booted. Empty means the front half of the lifecycle never ran, not that every ack succeeded.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "error"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "blocked"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ok"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "posted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (outcome) (rate(gardenio_jira_spawn_ack_total[5m]))",
+          "legendFormat": "{{ outcome }}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Reply path — agent → ticket (gb jira reply)",
+      "id": 9,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Replies posted (1h)",
+      "description": "gardenio_jira_reply_total{outcome=\"posted\"} increase over 1h: agent replies that landed on the bound ticket.",
+      "id": 10,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 21
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_reply_total{outcome=\"posted\"} series — no agent reply has landed on a bound ticket since the bridge booted. Legitimate on a quiet hour; if the blocked/error stats to the right are non-zero, replies are being attempted and rejected.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "text"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(increase(gardenio_jira_reply_total{outcome=\"posted\"}[1h]))",
+          "legendFormat": "replies posted"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Replies blocked (1h)",
+      "description": "gardenio_jira_reply_total{outcome=\"blocked\"} increase over 1h: write-policy / bound-ticket refusals. Rising = a misconfig or a non-replyable project.",
+      "id": 11,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 21
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "gardenio_jira_reply_total{outcome=\"blocked\"} returned nothing. Write-policy refusals create this counter on the first block, so empty is AMBIGUOUS and this panel cannot resolve it: either none were blocked since the bridge booted, or the bridge never ran. Resolve against “Replies posted (1h)” — if that renders, the bridge is live and this really is zero.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 1,
+                "color": "orange"
+              },
+              {
+                "value": 50,
+                "color": "red"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(increase(gardenio_jira_reply_total{outcome=\"blocked\"}[1h]))",
+          "legendFormat": "replies blocked"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Replies error (1h)",
+      "description": "gardenio_jira_reply_total{outcome=\"error\"} increase over 1h: Jira bounced the post. Rising = Jira-side rejection (auth / 4xx / 5xx).",
+      "id": 12,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 21
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "gardenio_jira_reply_total{outcome=\"error\"} returned nothing. Jira-side rejections create this counter on the first error, so empty is AMBIGUOUS and this panel cannot resolve it: either none occurred since the bridge booted, or the bridge never ran. Resolve against “Replies posted (1h)” — if that renders, the bridge is live and this really is zero.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 1,
+                "color": "orange"
+              },
+              {
+                "value": 50,
+                "color": "red"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(increase(gardenio_jira_reply_total{outcome=\"error\"}[1h]))",
+          "legendFormat": "replies error"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Public replies posted (1h)",
+      "description": "gardenio_jira_reply_total{outcome=\"posted\",visibility=\"public\"}: customer-facing reply volume. Public replies are role-gated and granted to no role by default (deny-by-default) — a non-zero value here is a deliberately-granted customer-facing reply.",
+      "id": 13,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 21
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no public replies since the bridge booted — the expected state: public visibility is role-gated and granted to no role by default, so empty is the designed configuration, not a failure.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "text"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(increase(gardenio_jira_reply_total{outcome=\"posted\",visibility=\"public\"}[1h]))",
+          "legendFormat": "public replies"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Reply posts by outcome (rate/5m)",
+      "description": "rate() of gardenio_jira_reply_total by outcome (posted/blocked/error).",
+      "id": 14,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_reply_total series — no reply has been attempted since the bridge booted, so there is no posted/blocked/error split. Empty is “no attempts”, not “all clean”.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "error"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "blocked"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ok"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "posted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (outcome) (rate(gardenio_jira_reply_total[5m]))",
+          "legendFormat": "{{ outcome }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Reply posts by visibility (rate/5m)",
+      "description": "rate() of gardenio_jira_reply_total by visibility (internal/public/none). internal = staff-only note (the default); public = customer-facing.",
+      "id": 15,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_reply_total series — no reply has been attempted since the bridge booted, so neither the internal nor the public line exists. Empty is “no attempts”, not “no public leakage”.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "public"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "internal"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (visibility) (rate(gardenio_jira_reply_total[5m]))",
+          "legendFormat": "{{ visibility }}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Follow-up delivery — warm nudge vs cold respawn",
+      "id": 16,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Follow-up warm-hit ratio (30m)",
+      "description": "warm / (warm+cold) of gardenio_jira_followup_delivery_total over 30m — the Jira twin of the Slack warm-graft hit rate (epic ka-0000006987). warm = a live agent was nudged in place; cold = a stopped agent was respawned. Higher is better (the conversation stayed warm). Empty-branch liveness: every `or vector(0)` fallback is gated on `up{component=\"jira-bridge\"} == 1`, so a 0 appears only while the jira-bridge exporter is actually being scraped — a dark bridge leaves the panel empty instead of painting a reassuring zero.",
+      "id": 17,
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 0,
+        "y": 35
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no warm or cold follow-up deliveries in the last 30m — the ratio is UNDEFINED, not 0% warm. No follow-up comment reached a bound ticket in the window; check the delivery-by-path panel to the right.",
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "red"
+              },
+              {
+                "value": 0.5,
+                "color": "orange"
+              },
+              {
+                "value": 0.8,
+                "color": "green"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "(sum(increase(gardenio_jira_followup_delivery_total{path=\"warm\"}[30m])) or (vector(0) and (max(up{component=\"jira-bridge\"}) == 1))) / clamp_min(sum(increase(gardenio_jira_followup_delivery_total{path=~\"warm|cold\"}[30m])), 1)",
+          "legendFormat": "warm-hit ratio"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Follow-up delivery by path (rate/5m)",
+      "description": "rate() of gardenio_jira_followup_delivery_total by path (warm=live nudge / cold=same-name respawn / skipped=recent-spawn dedup).",
+      "id": 18,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 35
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_followup_delivery_total series — no follow-up comment has been delivered since the bridge booted, so there is no warm/cold/skipped split. Corroborate with “Authenticated deliveries (1h)” in the bottom row: empty there too means inbound is dark.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "warm"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cold"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "skipped"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (path) (rate(gardenio_jira_followup_delivery_total[5m]))",
+          "legendFormat": "{{ path }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Warm-hit ratio over time (30m window)",
+      "description": "warm / (warm+cold) over a 30m rolling window. A sustained dip means follow-ups keep landing on already-stopped agents (cold respawns), i.e. agents are despawning before the human replies. Empty-branch liveness: every `or vector(0)` fallback is gated on `up{component=\"jira-bridge\"} == 1`, so a 0 appears only while the jira-bridge exporter is actually being scraped — a dark bridge leaves the panel empty instead of painting a reassuring zero.",
+      "id": 19,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 35
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no warm or cold follow-up deliveries in the range — the rolling ratio is UNDEFINED, not a 0% warm-hit rate. A sustained empty line means no follow-ups are arriving at all, which is an inbound problem, not a warm-graft problem.",
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "(sum(increase(gardenio_jira_followup_delivery_total{path=\"warm\"}[30m])) or (vector(0) and (max(up{component=\"jira-bridge\"}) == 1))) / clamp_min(sum(increase(gardenio_jira_followup_delivery_total{path=~\"warm|cold\"}[30m])), 1)",
+          "legendFormat": "warm-hit ratio"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Wake durability — follow-up nudge / respawn retries",
+      "id": 20,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Follow-up wake retries by stage (rate/5m)",
+      "description": "rate() of gardenio_jira_followup_wake_retries_total by stage (nudge/spawn): transient-error retry attempts of a follow-up wake. Some retries are normal during a daemon rollout; a sustained high rate means the daemon is flaky on the wake path.",
+      "id": 21,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_followup_wake_retries_total series — no wake has needed a retry since the bridge booted. Healthy; retries are created on first transient error.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "nudge"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "spawn"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (stage) (rate(gardenio_jira_followup_wake_retries_total[5m]))",
+          "legendFormat": "{{ stage }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Follow-up wake failures by stage (rate/5m)",
+      "description": "rate() of gardenio_jira_followup_wake_failures_total by stage (nudge/spawn): TERMINAL wake failures. Non-flat = follow-up comments are reaching the bead but never waking the agent (the reply is lost to the conversation even though it's mirrored).",
+      "id": 22,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_followup_wake_failures_total series — no TERMINAL wake failure since the bridge booted. This is the good state, but it only means something if follow-ups are actually arriving: check “Follow-up delivery by path” above.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "nudge"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "spawn"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (stage) (rate(gardenio_jira_followup_wake_failures_total[5m]))",
+          "legendFormat": "{{ stage }}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Inbound comment-mirror durability + DLQ",
+      "id": 23,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "DLQ depth (current)",
+      "description": "gardenio_jira_inbound_comment_dlq_depth: inbound comment mirrors currently queued in the durable replay DLQ after exhausting the inline retry. Steady growth = the daemon is down longer than the replay loop can drain.",
+      "id": 24,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 53
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_inbound_comment_dlq_depth series — the gauge is published by the jira-bridge on every replay tick, so empty means the bridge is not reporting, NOT that the DLQ is empty. Check “Webhook dark verdict” below and up{component=\"jira-bridge\"} on Gardenio — System Health.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 1,
+                "color": "orange"
+              },
+              {
+                "value": 50,
+                "color": "red"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "max(gardenio_jira_inbound_comment_dlq_depth)",
+          "legendFormat": "dlq depth"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Inbound write retries by stage (rate/5m)",
+      "description": "rate() of gardenio_jira_inbound_comment_write_retries_total by stage (add_comment/set_fields): transient retries mirroring a human follow-up comment onto the task bead.",
+      "id": 25,
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 6,
+        "y": 53
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_inbound_comment_write_retries_total series — no comment-mirror write has needed a retry since the bridge booted. Healthy.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "add_comment"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "set_fields"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (stage) (rate(gardenio_jira_inbound_comment_write_retries_total[5m]))",
+          "legendFormat": "{{ stage }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Inbound write failures by stage (rate/5m)",
+      "description": "rate() of gardenio_jira_inbound_comment_write_failures_total by stage: TERMINAL failures of the comment-mirror write. Non-flat = follow-up comments dropped from the bead conversation (they survive in Jira). A transient-class terminal failure is what enqueues to the DLQ below.",
+      "id": 26,
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 15,
+        "y": 53
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_inbound_comment_write_failures_total series — no TERMINAL comment-mirror failure since the bridge booted. Good state; meaningful only while inbound deliveries are non-zero (bottom row).",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "add_comment"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "set_fields"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (stage) (rate(gardenio_jira_inbound_comment_write_failures_total[5m]))",
+          "legendFormat": "{{ stage }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "DLQ flow — enqueued / replayed / dropped (rate/5m)",
+      "description": "rate() of the three DLQ lifecycle counters. enqueued = a transient terminal failure parked a mirror; replayed = the replay loop drained one (recovery); dropped = permanently lost. Healthy steady state: enqueued ≈ replayed, dropped flat at 0.",
+      "id": 27,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "none of the three DLQ lifecycle counters exist — nothing has been enqueued, replayed or dropped since the bridge booted. Healthy; the panel lights up on the first durable-replay event.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "enqueued"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "replayed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dropped"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(rate(gardenio_jira_inbound_comment_dlq_enqueued_total[5m]))",
+          "legendFormat": "enqueued"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(rate(gardenio_jira_inbound_comment_dlq_replayed_total[5m]))",
+          "legendFormat": "replayed"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(rate(gardenio_jira_inbound_comment_dlq_dropped_total[5m]))",
+          "legendFormat": "dropped"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "DLQ drops by reason (rate/5m)",
+      "description": "rate() of gardenio_jira_inbound_comment_dlq_dropped_total by reason (overflow/exhausted/nontransient/no_state). Any non-zero series is a permanently-lost follow-up comment — the exact failure the DLQ exists to prevent — annotated by why it could not be saved.",
+      "id": 28,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_inbound_comment_dlq_dropped_total series — no follow-up comment has been permanently lost since the bridge booted. This is the one panel where empty is unambiguously good.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (reason) (rate(gardenio_jira_inbound_comment_dlq_dropped_total[5m]))",
+          "legendFormat": "{{ reason }}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Webhook liveness — inbound deadman",
+      "id": 29,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Webhook dark verdict",
+      "description": "gardenio_jira_webhook_dark{component=\"jira-bridge\"}: 0 = a recent authenticated delivery kept the hook alive; 1 = no authenticated delivery within the deadman window while Jira upstream still shows activity (the hook is silently DARK — the whole inbound half is dead). Pinned to the owning component so the other bridges' always-zero series can't mask it at max().",
+      "id": 30,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 70
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_webhook_dark series — the deadman monitor itself is not reporting, which is WORSE than a dark verdict of 1: nothing is watching the inbound hook. Check up{component=\"jira-bridge\"} on Gardenio — System Health.",
+          "unit": "none",
+          "decimals": 0,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ALIVE",
+                  "color": "green"
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "DARK",
+                  "color": "red"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 1,
+                "color": "red"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "max(gardenio_jira_webhook_dark{component=\"jira-bridge\"})",
+          "legendFormat": "jira dark"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Authenticated deliveries (1h)",
+      "description": "gardenio_jira_webhook_deliveries_total{outcome=~\"processed|ignored\"} increase over 1h: authenticated inbound deliveries — the receive-path liveness counter. Zero for a sustained period while upstream is active is what trips the dark verdict.",
+      "id": 31,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 70
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_webhook_deliveries_total series — no authenticated inbound delivery since the bridge booted, so the receive-path counter does not exist. Combined with a dark verdict of 1 this is the confirmed “hook is dead” state.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "text"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum(increase(gardenio_jira_webhook_deliveries_total{outcome=~\"processed|ignored\"}[1h]))",
+          "legendFormat": "auth deliveries"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Webhook deliveries by outcome (rate/5m)",
+      "description": "rate() of gardenio_jira_webhook_deliveries_total by terminal outcome. processed/ignored = authenticated; hmac_failed = fail-closed 403; bad_request = malformed. A rejected-but-arriving stream shows here instead of silence. Deep-dive board: Inbound Webhook Liveness.",
+      "id": 32,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_webhook_deliveries_total series — no inbound delivery of any outcome (processed / ignored / hmac_failed / bad_request) since the bridge booted. Empty is “nothing arrived”, not “nothing was rejected”.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "processed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ignored"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "hmac_failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "bad_request"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (outcome) (rate(gardenio_jira_webhook_deliveries_total[5m]))",
+          "legendFormat": "{{ outcome }}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "End-to-end mention latency & failure inventory",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 78
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Mention cold-respawn latency — p50 / p90 / p99 (SLO 30s p95)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 79
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "no cold-respawn samples in the window — either every mention hit a warm agent, or the counter is not reporting",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(gardenio_mention_cold_respawn_seconds_bucket[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "histogram_quantile(0.90, sum by (le) (rate(gardenio_mention_cold_respawn_seconds_bucket[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "p90"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gardenio_mention_cold_respawn_seconds_bucket[$__rate_interval])))",
+          "refId": "C",
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "Wall-clock from an inbound Jira/Slack mention to a live agent for the cold path. This is the number a human actually experiences when they @-mention the bot; the dashed line is the 30s p95 SLO."
+    },
+    {
+      "type": "table",
+      "title": "Follow-up wake failures by stage (window)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 79
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no wake-failure samples in the window — either none failed, or the counter is not reporting"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "show": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (stage) (increase(gardenio_jira_followup_wake_failures_total[$__range])) > 0",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "description": "Failure inventory for the follow-up wake path, by stage — the sortable form of the rate chart above, so a stage that fails once an hour is still visible."
+    },
+    {
+      "type": "bargauge",
+      "title": "DLQ depth & drop reasons (window)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 79
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
+          "noValue": "no DLQ or drop samples in the window — either nothing was dropped, or the counters are not reporting"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "max(gardenio_jira_inbound_comment_dlq_depth)",
+          "refId": "A",
+          "legendFormat": "dlq depth (now)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "expr": "sum by (reason) (increase(gardenio_jira_inbound_comment_dlq_dropped_total[$__range]))",
+          "refId": "B",
+          "legendFormat": "dropped: {{reason}}"
+        }
+      ],
+      "description": "Current dead-letter depth next to the drop reasons accumulated over the window: depth is recoverable backlog, drops are lost inbound comments."
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 39,
+  "tags": [
+    "gardenio",
+    "jira-bridge",
+    "conversation",
+    "observability",
+    "mention",
+    "reply"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Jira — Conversation-Loop Health",
+  "uid": "gardenio-jira-conversation-health",
+  "version": 1,
+  "weekStart": "",
+  "description": "Health of the Jira conversation loop: mention→spawn, spawn-ack, reply and follow-up delivery outcomes, warm-hit ratio, wake retries and failures, DLQ depth and drops, plus inbound webhook delivery. Open this when a Jira mention got no answer — the panels localise the break to spawn, reply, follow-up or webhook."
+}

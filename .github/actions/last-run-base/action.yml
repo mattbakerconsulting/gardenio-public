@@ -1,0 +1,160 @@
+# What should a main push's path gate diff against? (gd-RZopn9lf5I)
+#
+# SINCE 2026-11-03 NO BRANCH PUSH RUNS ci.yml OR checks.yml (owner: test the
+# release tag, not main head). On the tag push they do run on, this answers
+# empty (a tag is not a branch) and every caller opens every path gate. The
+# action and the notes below are kept for when a branch push comes back.
+#
+# ci.yml and checks.yml now hold ONE concurrency group per workflow for main
+# pushes: one run builds, one waits, and a newer push replaces the waiting
+# one (GitHub cancels it). That is the batching Task 2.3 wants, and it is
+# sound for every job that runs on every push, because the newest run builds
+# the whole tree and the newest run always completes.
+#
+# It is NOT sound for a job that is path-gated per push (checks.yml's
+# lint-go, helm and cargo-security; ci.yml's rust, gardenhub-browser and
+# lands-conformance), as long as each run diffs only its own push, `before`
+# against `after`. Push A edits the chart and waits; push B edits only docs
+# and evicts A; B diffs B^..B, its `helm` gate says no, and nothing ever lints
+# A's chart change while main looks green. The fix is the base, not the
+# group: diff against the newest EARLIER run that actually ran. Then B diffs
+# from that run's commit, which takes in A's chart change, and the union of
+# the diffs the surviving runs make is every commit on main.
+#
+# "Actually ran" means: a push run of this workflow on this branch, older by
+# run_number, that completed `success`, or is `in_progress`.
+# That is an ACCEPT-list (RAN / RUNNING below; gd-5VoRbArSS8), because the
+# conclusions that mean "no job ran" keep growing: `startup_failure` (the
+# workflow file was invalid, so not one job started) slipped through the old
+# deny-list and became a base, and its push then sat outside every path gate
+# until the nightly. Every run off the list is stepped over, so its push
+# lands inside the next diff; stepping over only ever WIDENS a diff, so a
+# conclusion this file has not heard of costs extra gated jobs, never a hole.
+#   success            the jobs ran and passed: this is the only base.
+#   failure            stepped over (gd-NkRBUlh9Ar). Red on main is not
+#                      enough: release-cut.sh tagged (until 2026-11-03) the
+#                      newest commit whose ci + checks push runs were green, so if push A fails
+#                      `helm` and is a base, docs-only push B diffs A..B,
+#                      skips `helm`, goes green and gets tagged with A's
+#                      broken chart. The same goes for a run whose gate job
+#                      failed (a spot runner lost in it): every path-gated
+#                      job skipped. Stepped over, A's commits stay inside
+#                      every later diff and its gated jobs re-run on each
+#                      push until main is green again. Main reds are mostly
+#                      isolated (Oct 28-30: ~11 ci.yml and ~3 checks.yml a
+#                      day, each followed by a green run), so that costs one
+#                      wider diff per red, not a run of full ones.
+#   cancelled          stepped over. An evicted waiting run completes
+#                      `cancelled` without starting a job, and one cancelled
+#                      by hand may stop before its path-gated jobs; the API
+#                      tells neither apart, so both widen the next diff.
+#   in_progress        counts: it will run its own gates. That only happens
+#                      across the change-over from per-sha groups; the main
+#                      group otherwise starts a run only once the one before
+#                      it has completed, so the base is a finished green run.
+#   anything else      stepped over: startup_failure, skipped, stale,
+#                      action_required, timed_out, neutral, and a queued,
+#                      waiting or pending run (one held by the concurrency
+#                      group can still be evicted).
+# scripts/check-main-concurrency.py guards the two lists, and its _test.py
+# runs this script against those cases when node is available.
+#
+# ── FAILING OPEN ────────────────────────────────────────────────────────────
+# `base` is a sha only when it is proven safe: such a run was found among the
+# newest 50, and `compare` says this push strictly descends from its commit.
+# Every other path -- any event but push, a non-branch ref, an API error, own
+# run not listed, no earlier run that ran, a force-push -- leaves `base` EMPTY.
+# Callers must treat an empty `base` on a push as "every path changed": ci.yml
+# forces its path outputs to 'true', and checks.yml hands it to the `gate`
+# step as BASE_SHA, which fails open to scope=ALL. Callers also run this step
+# with continue-on-error, so the step failing outright reads the same.
+# scripts/check-main-concurrency.py guards that wiring.
+name: last-run-base
+description: For a push, the commit of the newest earlier push run of this workflow that actually ran; empty means fail open
+
+inputs:
+  workflow:
+    description: 'Workflow file whose push runs are read, e.g. ci.yml or checks.yml. Must be the CALLING workflow.'
+    required: true
+
+outputs:
+  base:
+    description: 'Sha to diff this push against, or empty: on a push, empty means treat every path as changed.'
+    value: ${{ steps.base.outputs.base }}
+
+runs:
+  using: composite
+  steps:
+    - id: base
+      uses: actions/github-script@v7
+      env:
+        WORKFLOW: ${{ inputs.workflow }}
+      with:
+        script: |
+          const workflow = process.env.WORKFLOW;
+          // An accept-list, never a deny-list: see "Actually ran" above.
+          const RAN = ['success'];
+          const RUNNING = ['in_progress'];
+          // Every return goes through here, so the output is always set.
+          const answer = (sha, why) => {
+            core.setOutput('base', sha);
+            core.info(`base=${sha || '(empty)'} -- ${why}`);
+          };
+
+          if (context.eventName !== 'push') {
+            return answer('', `event is ${context.eventName}; only a push diffs against a previous run`);
+          }
+          if (!context.ref.startsWith('refs/heads/')) {
+            return answer('', `FAIL OPEN: ref ${context.ref} is not a branch`);
+          }
+          const branch = context.ref.slice('refs/heads/'.length);
+          const { owner, repo } = context.repo;
+
+          let mine, earlier;
+          try {
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: workflow, branch, event: 'push', per_page: 50,
+            });
+            mine = data.workflow_runs.find((r) => r.id === context.runId);
+            if (!mine) {
+              return answer('', `FAIL OPEN: own run ${context.runId} not in the newest 50 ` +
+                `push runs for ${branch}, so "earlier" cannot be established`);
+            }
+            // run_number is monotonic per workflow; created_at is not, under reruns.
+            earlier = data.workflow_runs
+              .filter((r) => r.run_number < mine.run_number)
+              .sort((a, b) => b.run_number - a.run_number);
+          } catch (e) {
+            return answer('', `FAIL OPEN: could not list runs (${e.message})`);
+          }
+
+          for (const cand of earlier) {
+            const ran = cand.status === 'completed'
+              ? RAN.includes(cand.conclusion) : RUNNING.includes(cand.status);
+            if (!ran) {
+              core.info(`  #${cand.run_number} ${cand.head_sha.slice(0, 9)}: ` +
+                `${cand.status}/${cand.conclusion}, not a run that ran; its push stays inside this diff`);
+              continue;
+            }
+            // Same commit pushed again: diffing against it would gate out
+            // everything, so look further back instead.
+            if (cand.head_sha === context.sha) continue;
+            let cmp;
+            try {
+              cmp = await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `${cand.head_sha}...${context.sha}`,
+              });
+            } catch (e) {
+              return answer('', `FAIL OPEN: compare with #${cand.run_number} failed (${e.message})`);
+            }
+            // 'ahead': this push strictly descends from cand, so cand..us is
+            // exactly the commits no earlier run has diffed.
+            if (cmp.data.status !== 'ahead') {
+              return answer('', `FAIL OPEN: #${cand.run_number} (${cand.head_sha.slice(0, 9)}) is ` +
+                `${cmp.data.status}, not an ancestor (force-push?)`);
+            }
+            return answer(cand.head_sha, `#${cand.run_number} is the newest earlier ${workflow} ` +
+              `push run that ran; ${cmp.data.total_commits} commit(s) since`);
+          }
+          return answer('', `FAIL OPEN: no earlier ${workflow} push run on ${branch} that ran, ` +
+            `among the newest 50`);

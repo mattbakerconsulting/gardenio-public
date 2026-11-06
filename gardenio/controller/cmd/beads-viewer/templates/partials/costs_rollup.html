@@ -1,0 +1,279 @@
+{{/* costs_rollup — the interactive, native multi-axis cost rollup on /costs
+     (operator decision ka-0000000742 option "costs-page"). Filter by
+     Project/Role/Model/Account, roll up by any of agent/role/project/model/
+     account over a selectable window, and read the ranked-cost table — the
+     "view all <X> costs" list, server-side from the same PromQL the Grafana
+     rollup dashboard runs (costs_rollup.go). The controls re-request the
+     table-only fragment (costs_rollup_table) on change via htmx, so changing a
+     dropdown re-queries inline without a full reload.
+
+     Two define blocks:
+       costs_rollup        — the full section (controls + table), lazy-loaded.
+       costs_rollup_table  — the table only, the htmx swap target. */}}
+
+{{define "costs_rollup"}}
+{{with .Rollup}}
+<section class="costs-rollup-interactive" aria-label="Interactive cost rollup">
+  <h2>Cost explorer
+    <span class="meta">per-agent spend · filter &amp; roll up · click a row to open it</span>
+  </h2>
+  {{if .Unavailable}}
+  {{/* No vmsingle upstream wired (local dev / unconfigured) — degrade to an
+       honest note + the Grafana pop-out, mirroring the rate headline's "—". */}}
+  <p class="meta costs-rollup-note">
+    Live rollup unavailable — no metrics upstream is configured for this viewer.
+    {{if .GrafanaBaseURL}}<a href="{{.GrafanaBaseURL}}/d/gb-cost-per-bead-rollup-preview" target="_blank" rel="noopener">Open the rollup dashboard in Grafana ↗</a>.{{end}}
+  </p>
+  {{else}}
+  {{/* hx-get points at the table-only fragment; hx-include pulls every control
+       in this form so a change to any one re-queries with the full selection.
+       change+keyup(debounced) covers <select> changes and the free-text filter
+       inputs. The <select>s/inputs live OUTSIDE the swap target so they keep
+       their browser state across swaps (no flicker, no lost focus). */}}
+  <form class="costs-rollup-controls"
+        hx-get="{{$.BasePath}}/costs/rollup?part=table"
+        hx-target="#costs-rollup-table"
+        hx-swap="innerHTML"
+        hx-trigger="change, keyup changed delay:400ms from:input"
+        onsubmit="return false">
+    <div class="costs-rollup-control">
+      <label for="rollup-by">Roll up by</label>
+      <select id="rollup-by" name="rollup">
+        {{$by := .RollupBy}}
+        {{range .Dims}}<option value="{{.}}"{{if eq . $by}} selected{{end}}>{{.}}</option>{{end}}
+      </select>
+    </div>
+    <div class="costs-rollup-control">
+      <label for="rollup-range">Range</label>
+      <select id="rollup-range" name="range">
+        {{$rk := .RangeKey}}
+        {{range .Ranges}}<option value="{{.Key}}"{{if eq .Key $rk}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    {{/* Filter dropdowns. Each is a single-select with an "All" sentinel
+         (empty value). Populated from the metric's distinct label values; when
+         the live label list is empty (metric not yet present) the input
+         degrades to a free-text box so an operator can still type a known
+         value. */}}
+    <div class="costs-rollup-control">
+      <label for="filter-project">Project</label>
+      {{if .Projects}}
+      <select id="filter-project" name="project">
+        <option value="">All</option>
+        {{$v := .FilterProject}}
+        {{range .Projects}}<option value="{{.}}"{{if eq . $v}} selected{{end}}>{{.}}</option>{{end}}
+      </select>
+      {{else}}
+      <input id="filter-project" name="project" type="text" placeholder="All" value="{{.FilterProject}}" autocomplete="off">
+      {{end}}
+    </div>
+    <div class="costs-rollup-control">
+      <label for="filter-role">Role</label>
+      {{if .Roles}}
+      <select id="filter-role" name="role">
+        <option value="">All</option>
+        {{$v := .FilterRole}}
+        {{range .Roles}}<option value="{{.}}"{{if eq . $v}} selected{{end}}>{{.}}</option>{{end}}
+      </select>
+      {{else}}
+      <input id="filter-role" name="role" type="text" placeholder="All" value="{{.FilterRole}}" autocomplete="off">
+      {{end}}
+    </div>
+    <div class="costs-rollup-control">
+      <label for="filter-model">Model</label>
+      {{if .Models}}
+      <select id="filter-model" name="model">
+        <option value="">All</option>
+        {{$v := .FilterModel}}
+        {{range .Models}}<option value="{{.}}"{{if eq . $v}} selected{{end}}>{{.}}</option>{{end}}
+      </select>
+      {{else}}
+      <input id="filter-model" name="model" type="text" placeholder="All" value="{{.FilterModel}}" autocomplete="off">
+      {{end}}
+    </div>
+    <div class="costs-rollup-control">
+      <label for="filter-account">Account</label>
+      {{if .Accounts}}
+      <select id="filter-account" name="account">
+        <option value="">All</option>
+        {{$v := .FilterAccount}}
+        {{range .Accounts}}<option value="{{.}}"{{if eq . $v}} selected{{end}}>{{.}}</option>{{end}}
+      </select>
+      {{else}}
+      <input id="filter-account" name="account" type="text" placeholder="All" value="{{.FilterAccount}}" autocomplete="off">
+      {{end}}
+    </div>
+  </form>
+
+  <div id="costs-rollup-table" class="costs-rollup-table-host" aria-live="polite">
+    {{template "costs_rollup_table" $}}
+  </div>
+
+  {{if .GrafanaBaseURL}}
+  <p class="meta costs-rollup-note">
+    The table ranks total spend per group over the window; for the same data as
+    a stacked bar chart over time,
+    <a href="{{.GrafanaBaseURL}}/d/gb-cost-per-bead-rollup-preview" target="_blank" rel="noopener">open the rollup dashboard in Grafana ↗</a>.
+  </p>
+  {{end}}
+  {{end}}
+</section>
+
+<style>
+  .costs-rollup-interactive { margin: 0.5rem 0 1.25rem; }
+  .costs-rollup-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem 1rem;
+    align-items: flex-end;
+    padding: 0.6rem 0.85rem;
+    margin: 0.4rem 0 0.75rem;
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    border-radius: 6px;
+    background: rgba(128, 128, 128, 0.05);
+  }
+  .costs-rollup-control { display: flex; flex-direction: column; gap: 0.2rem; }
+  .costs-rollup-control label { font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.03em; opacity: 0.75; }
+  .costs-rollup-control select,
+  .costs-rollup-control input {
+    font: inherit;
+    padding: 0.2rem 0.4rem;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    border-radius: 4px;
+    background: inherit;
+    color: inherit;
+    min-width: 9rem;
+  }
+  .costs-rollup-total { margin: 0 0 0.5rem; font-size: 0.85em; }
+  .costs-rollup-total strong { font-size: 1.05em; }
+  .costs-rollup-rank { width: 1.5rem; text-align: right; opacity: 0.6; font-variant-numeric: tabular-nums; }
+  /* Top-3 ranks get an accent so the costliest groups read at a glance. */
+  .costs-rollup-rank-1, .costs-rollup-rank-2, .costs-rollup-rank-3 { opacity: 1; font-weight: 700; }
+  .costs-rollup-rank-1 { color: #b8860b; }
+  .costs-rollup-rank-2 { color: #8a8a8a; }
+  .costs-rollup-rank-3 { color: #a0651a; }
+  .costs-rollup-row .cost-bar { flex: 1; }
+  /* Top-3 rows get a faintly stronger bar fill so the leaders pop in the list. */
+  .costs-rollup-row-top .cost-bar-fill { background: rgba(76,175,80,0.75); }
+  /* Clickable key chip — looks like the existing chip-type but signals it
+     navigates (agent→bead, role→hub, project→page). Long agent names stay on
+     one line and ellipsize rather than wrapping the row. */
+  .costs-rollup-key { text-decoration: none; color: inherit; max-width: 24rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  a.costs-rollup-key:hover, a.costs-rollup-key:focus { border-color: rgb(25,118,210); }
+  html[data-skin="dark-terminal"] a.costs-rollup-key:hover,
+  html[data-skin="dark-terminal"] a.costs-rollup-key:focus { border-color: rgb(56,178,255); }
+  .costs-rollup-share { font-variant-numeric: tabular-nums; }
+  /* A by-project row's budget, the figures the /garden header shows (gd-GmJYMnSKGJ).
+     The level is ok (<75% spent), warn (75-99%) or over (>=100%); display only. */
+  .costs-rollup-budget { font-size: 0.8em; margin-top: 0.2rem; font-variant-numeric: tabular-nums; }
+  .costs-rollup-budget-flag { font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.03em; font-weight: 700; }
+  .costs-rollup-budget-warn .costs-rollup-budget-flag { color: #8a5a00; }
+  .costs-rollup-budget-over .costs-rollup-budget-flag { color: #b3261e; }
+  html[data-skin^="dark"] .costs-rollup-budget-warn .costs-rollup-budget-flag { color: #e0b25a; }
+  html[data-skin^="dark"] .costs-rollup-budget-over .costs-rollup-budget-flag { color: #ee7e7e; }
+  /* "Biggest <dim>" lead callout — the headline answer to "who spent the most". */
+  .costs-rollup-lead {
+    display: flex; align-items: baseline; gap: 0.5rem;
+    padding: 0.5rem 0.75rem; margin: 0 0 0.6rem;
+    border: 1px solid rgba(184,134,11,0.35);
+    border-left: 3px solid rgba(184,134,11,0.7);
+    border-radius: 6px;
+    background: rgba(184,134,11,0.06);
+  }
+  .costs-rollup-lead-tag { font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.75; }
+  .costs-rollup-lead-spend { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; font-weight: 700; font-size: 1.1em; }
+  .costs-rollup-note { margin: 0.4rem 0 0; font-size: 0.78em; }
+  /* Source-provenance caption under the total (ka-0000006213). The settled
+     variant (at-close counter dims) reads as a warning so its low total is not
+     mistaken for current burn; the real-bill variant (by-account gauge) is a
+     neutral note. */
+  .costs-rollup-caption {
+    margin: 0 0 0.6rem; font-size: 0.78em; line-height: 1.35;
+    padding: 0.4rem 0.6rem; border-radius: 6px;
+    border: 1px solid rgba(128,128,128,0.25);
+    border-left: 3px solid rgba(128,128,128,0.5);
+    background: rgba(128,128,128,0.05);
+  }
+  .costs-rollup-caption-settled {
+    border-color: rgba(184,134,11,0.35);
+    border-left-color: rgba(184,134,11,0.7);
+    background: rgba(184,134,11,0.07);
+  }
+  .costs-rollup-caption-tag {
+    font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.04em;
+    font-weight: 700; opacity: 0.8; margin-right: 0.35rem;
+  }
+  .costs-rollup-caption-settled .costs-rollup-caption-tag { color: #b8860b; opacity: 1; }
+  .costs-rollup-empty { margin: 0.5rem 0; }
+  /* htmx in-flight cue on the table host (ka-style: dim while the swap loads). */
+  .costs-rollup-table-host.htmx-request { opacity: 0.5; transition: opacity 0.1s; }
+</style>
+{{end}}
+{{end}}
+
+{{/* costs_rollup_table — the table-only htmx swap target. Reads the same
+     .Rollup view-model; rendered both inline (initial paint) and standalone
+     (every dropdown change). */}}
+{{define "costs_rollup_table"}}
+{{with .Rollup}}
+{{if not .Available}}
+<p class="meta costs-rollup-empty">Metrics temporarily unavailable — try refresh.</p>
+{{else}}
+<p class="costs-rollup-total">
+  {{if .FilterEcho}}<span class="meta">{{.FilterEcho}} · </span>{{end}}
+  by <strong>{{.RollupBy}}</strong> · {{.RangeLabel}} ·
+  total <strong>{{.TotalLabel}}</strong>
+  <span class="meta">({{len .Rows}} group{{if ne (len .Rows) 1}}s{{end}})</span>
+</p>
+{{/* Source-provenance caption (ka-0000006213). by-account is the real LiteLLM
+     bill (gauge) — a neutral note. Every other dim is the at-close counter,
+     which lags ~1d and undercounts in-flight burn — a warning, so the (low)
+     total is never misread as the current spend rate. */}}
+{{if .Caption}}
+<p class="costs-rollup-caption{{if not .SourceIsRealBill}} costs-rollup-caption-settled{{end}}">
+  {{if .SourceIsRealBill}}<span class="costs-rollup-caption-tag">real bill</span>{{else}}<span class="costs-rollup-caption-tag">settled</span>{{end}}
+  {{.Caption}}
+  {{if and .SourceIsRealBill .IgnoredFilters}}<span class="meta">(ignored on the account gauge: {{.IgnoredFilters}})</span>{{end}}
+</p>
+{{end}}
+{{if .Rows}}
+{{/* Rank 1 leads as a "biggest spender" callout so the costliest group reads at
+     a glance; ranks 1+ list below it. Rows carry a server-computed .Href when
+     the key is navigable (agent→bead, role→/role, project→/p); non-linkable
+     keys (model/account, "(none)", unresolved agents) render as a plain chip. */}}
+{{$top := index .Rows 0}}
+<div class="costs-rollup-lead">
+  <span class="costs-rollup-lead-tag">biggest {{.RollupBy}}</span>
+  {{if $top.Href}}<a class="chip chip-type costs-rollup-key" href="{{$top.Href}}">{{$top.Key}}</a>{{else}}<span class="chip chip-type costs-rollup-key">{{$top.Key}}</span>{{end}}
+  <span class="bead-row-spacer"></span>
+  <span class="costs-rollup-lead-spend">{{$top.USDLabel}}</span>
+  {{if $top.SharePct}}<span class="meta">{{$top.SharePct}}% of shown</span>{{end}}
+</div>
+<ul class="bead-list costs-rollup-list">
+  {{range .Rows}}
+  <li class="bead-row costs-rollup-row{{if le .Rank 3}} costs-rollup-row-top{{end}}">
+    <div class="cost-row-head">
+      <span class="costs-rollup-rank costs-rollup-rank-{{.Rank}}">{{.Rank}}</span>
+      {{if .Href}}<a class="chip chip-type costs-rollup-key" href="{{.Href}}">{{.Key}}</a>{{else}}<span class="chip chip-type costs-rollup-key">{{.Key}}</span>{{end}}
+      <span class="bead-row-spacer"></span>
+      <span class="cost-row-spend">{{.USDLabel}}</span>
+      {{if .SharePct}}<span class="meta costs-rollup-share">{{.SharePct}}%</span>{{end}}
+    </div>
+    <div class="cost-bar-row cost-bar-compact">
+      <div class="cost-bar"><div class="cost-bar-fill" style="width: {{.BarPct}}%"></div></div>
+    </div>
+    {{with .Budget}}
+    <div class="meta costs-rollup-budget{{if .Level}} costs-rollup-budget-{{.Level}}{{end}}">
+      budget {{.BudgetLabel}} · {{.RemainingLabel}} left
+      {{if eq .Level "over"}}<span class="costs-rollup-budget-flag">over budget</span>{{else if eq .Level "warn"}}<span class="costs-rollup-budget-flag">75%+ spent</span>{{end}}
+    </div>
+    {{end}}
+  </li>
+  {{end}}
+</ul>
+{{else}}
+<p class="empty costs-rollup-empty">No spend recorded for this selection in the {{.RangeLabel}} window.</p>
+{{end}}
+{{end}}
+{{end}}
+{{end}}

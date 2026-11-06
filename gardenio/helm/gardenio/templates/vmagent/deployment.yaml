@@ -1,0 +1,98 @@
+{{- if .Values.vmagent.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.vmagent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmagent.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.vmagent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.vmagent.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "gardenio.contentChecksum" (include (print .Template.BasePath "/vmagent/configmap.yaml") .) }}
+    spec:
+      serviceAccountName: {{ include "gardenio.vmagent.fullname" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: vmagent
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.vmagent.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.vmagent.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            - "-promscrape.config=/config/scrape.yaml"
+            - "-remoteWrite.url={{ .Values.vmagent.remoteWriteURL | default (include "gardenio.vmsingle.writeURL" .) }}"
+            # readOnlyRootFilesystem=true makes the working dir unwritable, so the
+            # remote-write persistent queue (default ./vmagent-remotewrite-data) must
+            # live under the writable /tmp emptyDir or vmagent crashloops on startup.
+            - "-remoteWrite.tmpDataPath=/tmp/vmagent-remotewrite-data"
+            - "-httpListenAddr=:8429"
+          ports:
+            - name: http
+              containerPort: 8429
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.vmagent.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.vmagent.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "gardenio.vmagent.fullname" . }}-config
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.vmagent.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.vmagent.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.vmagent.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.vmagent.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

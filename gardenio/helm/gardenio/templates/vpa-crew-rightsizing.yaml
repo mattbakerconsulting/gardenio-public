@@ -1,0 +1,208 @@
+{{- /*
+Per-project / per-workload-class VPA scoping objects for crew right-sizing.
+
+Parent epic ka-0000005189; scoping model ka-0000001210; spike ka-0000006358;
+operator-settled targeting fork ka-0000007947 (RECO-ONLY-STAMP).
+
+WHAT THIS RENDERS (per enabled (project,role) class, in the gardenio namespace):
+  1. A replicas:0 placeholder Deployment whose .spec.selector.matchLabels are the
+     class crew labels (gardenio.io/project + gardenio.io/role). It runs ZERO pods.
+     Its ONLY purpose is to give the VPA recommender a label selector to aggregate
+     the real, bare, ownerRef-less crew pods by — the recommender reads the target's
+     selector and lists matching pods regardless of ownership.
+  2. A recommendation-only VerticalPodAutoscaler (updateMode: Off) targeting that
+     Deployment, controlledResources: memory, controlledValues: RequestsOnly, with
+     per-class minAllowed/maxAllowed bounds.
+
+WHY THE PLACEHOLDER DEPLOYMENT CANNOT HARM LIVE CREW PODS (verified on
+america-e2e-eks v1.33.12-eks, ka-0000001210 session): a Deployment's ReplicaSet
+selector always carries an injected `pod-template-hash` label. Bare crew pods
+never carry that label, so the RS selector never matches them — adoption (and
+therefore eviction/deletion) is STRUCTURALLY impossible, not merely timing-safe.
+replicas:0 means the RS also never creates pods of its own. Confirmed: an orphan
+pod with the class labels survived 90s next to a replicas:0 placeholder, never
+adopted, never deleted.
+
+ENFORCEMENT: gated behind `updateMode` (DEFAULT "Off"). updateMode:Off means VPA
+only WRITES .status.recommendation — nothing evicts or resizes a live pod, and
+the sole actor that changes a crew pod's request is the agent-controller at spawn
+(podspec.go, ka-0000004606), which reads .status.recommendation and stamps a
+right-sized memory REQUEST. Limits are never touched.
+
+TURNING ON ENFORCE (ka-0000003138): set .Values.vpaRightSizing.updateMode to
+"InPlaceOrRecreate" — a VALUES FLIP, no code change. That lets the VPA *updater*
+right-size LONG-LIVED pods (gardeners/threads) in place mid-run. It only has an
+effect if the updater is actually deployed (the wrapper chart's `vpa` subchart
+updater.enabled) — that staged live rollout + the OOM-guardrail gate is a SEPARATE
+operator-signed-off step (ka-0000008205). The bulk request SHRINK (8Gi -> ~1.5Gi)
+still happens at SPAWN via the stamp, NOT via mid-run resize.
+
+MID-RUN EVICTION GUARDS (rendered only when updateMode != "Off"): crew pods are
+BARE pods (no controller), so a VPA "Recreate" eviction is an unrecoverable
+mid-task KILL — there is nothing to recreate the pod. Three layers prevent that:
+  1. evictionRequirements changeRequirement=TargetHigherThanRequests (grow-only):
+     the updater only acts when the recommendation is HIGHER than the current
+     request, so it can only ever RELIEVE memory pressure on a live run, never
+     shrink a running pod's request (which would raise node-pressure-eviction
+     risk). Shrinking is done at spawn, not on live pods.
+  2. minReplicas on the updatePolicy bounds how aggressively the updater acts.
+  3. A maxUnavailable:0 PodDisruptionBudget per class (below) makes the eviction
+     API REFUSE to delete a live crew pod. InPlaceOrRecreate prefers in-place
+     (KEP-1287, proven on runc + gVisor, ka-0000005298); if in-place is infeasible
+     the updater would normally fall back to eviction — the PDB blocks that, so an
+     infeasible resize is simply SKIPPED (pod keeps running, re-stamped at next
+     spawn). VPA has no native "agent is mid-task" hook; this eviction-API block
+     is the structural substitute, layered on the existing
+     karpenter.sh/do-not-disrupt=true annotation (blocks Karpenter consolidation).
+
+ROLLOUT: DEFAULT SAFE. Nothing renders unless .Values.vpaRightSizing.enabled; and
+with the default updateMode "Off" the rendered VPAs are recommendation-only and NO
+disruption-blocking objects (PDBs) are created — byte-identical posture to reco-only.
+This only creates VPA *objects*; the VPA *recommender controller* itself lives in
+the wrapper chart's `vpa` subchart (recommendation-only, --vpa-object-namespace=gardenio).
+ROLLBACK: revert updateMode back to "Off" (re-sync) — see docs/vpa-guardrails.md#rollback.
+*/ -}}
+{{- if .Values.vpaRightSizing.enabled }}
+{{- $top := . }}
+{{- $rs := .Values.vpaRightSizing }}
+{{- $ns := .Release.Namespace }}
+{{- $container := $rs.containerName | default "agent" }}
+{{- $mode := $rs.updateMode | default "Off" }}
+{{- $enforcing := ne $mode "Off" }}
+{{- $guards := $rs.guards | default dict }}
+{{- $pdb := $rs.pdb | default dict }}
+{{- range $class := $rs.classes }}
+{{- /* Build the selector: project-specific classes match {project,role}; role-default classes match {role} only. */ -}}
+{{- $name := "" }}
+{{- $selector := dict "gardenio.io/role" $class.role }}
+{{- if $class.project }}
+{{-   $name = printf "gardenio-crew-%s-%s" $class.project $class.role }}
+{{-   $_ := set $selector "gardenio.io/project" $class.project }}
+{{- else }}
+{{-   $name = printf "gardenio-crew-default-%s" $class.role }}
+{{- end }}
+---
+# Placeholder Deployment (0 replicas) — selector anchor for the VPA recommender.
+# Adoption-proof: its ReplicaSet selector gains a pod-template-hash that bare crew
+# pods never carry. See file header.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vpa-ph-{{ $class.project | default "default" }}-{{ $class.role }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" $top | nindent 4 }}
+    gardenio.io/vpa-rightsizing: placeholder
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      {{- toYaml $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- toYaml $selector | nindent 8 }}
+    spec:
+      # Never scheduled (replicas:0); kept minimal + restricted-PSA-clean so a
+      # server-side validation never warns even though no pod is ever admitted.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: {{ $container }}
+          image: registry.k8s.io/pause:3.9
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" $top | nindent 4 }}
+    gardenio.io/vpa-rightsizing: "true"
+    gardenio.io/role: {{ $class.role }}
+    {{- with $class.project }}
+    gardenio.io/project: {{ . }}
+    {{- end }}
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vpa-ph-{{ $class.project | default "default" }}-{{ $class.role }}
+  updatePolicy:
+    # updateMode DEFAULTS to "Off" (recommendation-only): the recommender writes
+    # .status.recommendation; nothing evicts or resizes, and the agent-controller
+    # stamps requests at spawn (ka-0000004606). Flipping it to "InPlaceOrRecreate"
+    # (a values change, ka-0000003138) lets the updater right-size live long-lived
+    # pods in place. Enforce only takes effect if the updater is also deployed
+    # (separate operator-gated rollout, ka-0000008205).
+    updateMode: {{ $mode | quote }}
+    {{- if $enforcing }}
+    # minReplicas: the smallest pod count the updater will leave running while it
+    # acts. For these bare-pod placeholder targets it bounds updater aggressiveness
+    # (defense-in-depth alongside the PDB below). Default 1.
+    minReplicas: {{ $guards.minReplicas | default 1 }}
+    {{- /* growOnly defaults true; Helm `default` treats false as empty, so test
+           explicitly: render evictionRequirements unless growOnly is set false. */ -}}
+    {{- if or (not (hasKey $guards "growOnly")) $guards.growOnly }}
+    # GROW-ONLY guard: the updater may act ONLY when the recommendation is HIGHER
+    # than the current request — so it can relieve memory pressure on a live run
+    # but can NEVER shrink a running pod's request (shrinking happens at spawn).
+    # This removes the most dangerous mid-run action (shrink -> node-pressure
+    # eviction / OOM) entirely. Disable with vpaRightSizing.guards.growOnly=false.
+    evictionRequirements:
+      - resources: ["memory"]
+        changeRequirement: TargetHigherThanRequests
+    {{- end }}
+    {{- end }}
+  resourcePolicy:
+    containerPolicies:
+      - containerName: {{ $container }}
+        controlledResources: ["memory"]
+        controlledValues: RequestsOnly
+        minAllowed:
+          memory: {{ $class.minAllowed | quote }}
+        maxAllowed:
+          memory: {{ $class.maxAllowed | quote }}
+{{- /* pdb.enabled defaults true; test explicitly (Helm `default` treats false as empty). */ -}}
+{{- if and $enforcing (or (not (hasKey $pdb "enabled")) $pdb.enabled) }}
+---
+# Per-class PodDisruptionBudget — the mid-run KILL guard.
+# maxUnavailable:0 means the eviction API REFUSES every voluntary eviction of a
+# pod matching this class's crew labels. The VPA updater evicts via that same
+# eviction API, so under InPlaceOrRecreate it can only ever resize in place; if a
+# resize is infeasible in place it is SKIPPED (the pod keeps running and is
+# re-stamped at its next spawn) instead of the Recreate fallback deleting a live,
+# ownerless agent pod mid-task. The selector matches the REAL bare crew pods
+# (same labels the placeholder Deployment selects), not the 0-replica placeholder.
+# Layers on karpenter.sh/do-not-disrupt=true (already on every agent pod), which
+# blocks the OTHER involuntary-disruption source (Karpenter consolidation).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vpa-norecreate-{{ $class.project | default "default" }}-{{ $class.role }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" $top | nindent 4 }}
+    gardenio.io/vpa-rightsizing: pdb
+    gardenio.io/role: {{ $class.role }}
+    {{- with $class.project }}
+    gardenio.io/project: {{ . }}
+    {{- end }}
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- toYaml $selector | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}

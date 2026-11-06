@@ -1,0 +1,159 @@
+{{- if and .Values.backup.postgres.enabled .Values.postgres.enabled }}
+# Gardenio-in-a-Box whole-cluster logical backup (ka-0000008198).
+#
+# Runs `pg_dumpall` against the in-cluster postgres StatefulSet and writes a
+# timestamped, gzip-compressed plaintext dump to a dedicated PVC, pruning dumps
+# older than `backup.postgres.retentionDays`. Unlike the prod-oriented per-DB
+# `postgres.backup.*` job (pg_dump -Fc of a single DB), pg_dumpall captures
+# EVERY database (beads, controller, AND keycloak) PLUS global roles in one
+# portable, app-consistent stream — the artifact a fresh box is rehydrated
+# from. Reuses the postgres image (pg_dumpall already present) — no extra
+# image, fully in-cluster (no AWS API, no EBS snapshots). Restore: see
+# gardenio/docs/gardenio-in-a-box-restore.md.
+#
+# Mirrors the token-rotator CronJob pattern.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "gardenio.postgres.fullname" . }}-dumpall
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.postgres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-dumpall-backup
+spec:
+  accessModes:
+    {{- toYaml .Values.backup.postgres.storage.accessModes | nindent 4 }}
+  {{- if .Values.backup.postgres.storage.storageClass }}
+  storageClassName: {{ .Values.backup.postgres.storage.storageClass }}
+  {{- else if .Values.global.storageClass }}
+  storageClassName: {{ .Values.global.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.postgres.storage.size }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "gardenio.postgres.fullname" . }}-dumpall
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.postgres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-dumpall-backup
+spec:
+  schedule: {{ .Values.backup.postgres.schedule | quote }}
+  # Forbid: never run two dumps against the same DB at once. A still-running
+  # prior dump means this slot is skipped — the next tick covers it.
+  concurrencyPolicy: Forbid
+  # After an outage, don't backfill missed slots; if a run can't start within
+  # 5 min of its slot, skip it.
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      activeDeadlineSeconds: {{ .Values.backup.postgres.activeDeadlineSeconds }}
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "gardenio.postgres.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: postgres-dumpall-backup
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: OnFailure
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+          {{- if $.Values.global.systemPriorityClass.create }}
+          priorityClassName: {{ $.Values.global.systemPriorityClass.name }}
+          {{- end }}
+          containers:
+            - name: dumpall
+              image: {{ include "gardenio.mirroredImage" (dict "image" .Values.postgres.image "global" .Values.global) | quote }}
+              imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              env:
+                # application_name (gd-rXqkv4rSmG): libpq and lib/pq read PGAPPNAME, so
+                # pg_stat_activity and the postgres exporter attribute this client's load.
+                - name: PGAPPNAME
+                  value: "gardenio-backup"
+                - name: PGHOST
+                  value: {{ include "gardenio.postgres.fullname" . | quote }}
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  value: "postgres"
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .) }}
+                      key: password
+                - name: BACKUP_DIR
+                  value: /backups
+                - name: RETENTION_DAYS
+                  value: {{ .Values.backup.postgres.retentionDays | quote }}
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+                  OUT="${BACKUP_DIR}/pg_dumpall-${STAMP}.sql.gz"
+                  TMP="${OUT}.partial"
+
+                  echo "=== pg_dumpall start: host=${PGHOST} -> ${OUT} (retentionDays=${RETENTION_DAYS}) ==="
+                  echo "[backup] waiting for postgres to accept connections"
+                  for i in $(seq 1 30); do
+                    if pg_isready -q; then break; fi
+                    echo "[backup]   not ready yet (${i}/30)"; sleep 5
+                  done
+
+                  # pg_dumpall captures ALL databases + global roles in one
+                  # plaintext stream (gzipped). Write to .partial then atomic
+                  # rename so a killed run never leaves a truncated dump that
+                  # retention or a restore would mistake for a good one.
+                  # pipefail makes a pg_dumpall failure fail the whole pipe.
+                  pg_dumpall | gzip -c > "${TMP}"
+                  mv "${TMP}" "${OUT}"
+                  SIZE=$(stat -c %s "${OUT}" 2>/dev/null || echo "?")
+                  echo "[backup] wrote ${OUT} (${SIZE} bytes)"
+
+                  # Retention: delete dumps older than RETENTION_DAYS days, and
+                  # clean up any stale .partial files from killed runs.
+                  rm -f "${BACKUP_DIR}"/*.partial 2>/dev/null || true
+                  find "${BACKUP_DIR}" -maxdepth 1 -name 'pg_dumpall-*.sql.gz' \
+                    -type f -mtime +"${RETENTION_DAYS}" -print -delete || true
+                  REMAINING=$(ls -1 "${BACKUP_DIR}"/pg_dumpall-*.sql.gz 2>/dev/null | wc -l | tr -d ' ')
+                  echo "[backup] ${REMAINING} dump(s) retained"
+                  echo "=== pg_dumpall complete ==="
+              resources:
+                {{- toYaml .Values.backup.postgres.resources | nindent 16 }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+          {{- include "gardenio.nodeSelector" (dict "local" .Values.postgres.nodeSelector "global" .Values.global.nodeSelector) | nindent 10 }}
+          {{- include "gardenio.tolerations" (dict "local" .Values.postgres.tolerations "global" .Values.global.tolerations) | nindent 10 }}
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ include "gardenio.postgres.fullname" . }}-dumpall
+            - name: tmp
+              emptyDir: {}
+{{- end }}

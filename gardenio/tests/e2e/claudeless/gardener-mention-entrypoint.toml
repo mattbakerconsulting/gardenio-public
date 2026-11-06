@@ -1,0 +1,160 @@
+# gardener-mention-entrypoint.toml
+#
+# Claudeless scenario: @gardenio <epic-id> round-trips to the same schedule
+# shape as `gb gardener start`.
+#
+# Plan §T9: "gardener-mention-entrypoint: @gardenio <epic-id> round-trips to
+# same schedule shape as gb gardener start."
+#
+# The Slack mention path (gardenio/controller/internal/bridge/bot_mentions.go,
+# tryHandleEpicGardenerStart) is a thin wrapper that shells out to
+# `gb gardener start <bead-id>` when the leading mention token is an epic.
+# We can't fire a real Slack event from claudeless, so we exercise the same
+# code path the bridge would take and assert the resulting schedule shape
+# matches the §5.1 worked example exactly. If the shape ever drifts the
+# Slack entrypoint and the CLI would diverge — this asserts they don't.
+#
+# Test outline:
+#   1. Create a fresh epic.
+#   2. Invoke `gb gardener start <epic>` (the single backing call).
+#   3. Resolve the schedule id via `gb gardener status --json`.
+#   4. Assert schedule fields contain the §5.1 trigger / stop / progress
+#      shape expected by the plan's appendix.
+#   5. Cleanup.
+
+[claude]
+session_id = "e2e00000-0009-4000-a000-000000000002"
+username = "e2e-gardener-mention"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 30000
+
+[[responses]]
+on = "*"
+say = "Running gardener-mention-entrypoint: assert mention path produces the §5.1 schedule shape."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight ─────────────────────────────────────────────────────
+if ! gb gardener --help >/dev/null 2>&1; then
+  echo "SKIP: gb gardener not present (pre-T6)"
+  exit 0
+fi
+
+# ── Setup ──────────────────────────────────────────────────────────
+EPIC_ID=$(kd create "e2e-gardener-mention-$$-$(date +%s)" --type=epic --json 2>/dev/null | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then
+  fail "create epic"; exit 1
+fi
+echo "epic: $EPIC_ID"
+
+cleanup() {
+  gb gardener stop "$EPIC_ID" --reason "e2e cleanup" >/dev/null 2>&1 || true
+  kd close "$EPIC_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ── Trigger the mention-path's backing call ────────────────────────
+# This is exactly what bridge/bot_mentions.go::tryHandleEpicGardenerStart
+# shells out to. Asserting the resulting schedule shape pins the contract
+# the Slack entrypoint depends on.
+gb gardener start "$EPIC_ID" --i-read-the-gardener-instructions >/dev/null 2>&1
+RC=$?
+if [ $RC -ne 0 ]; then
+  fail "gb gardener start" "rc=$RC"
+  exit 1
+fi
+pass "gb gardener start exited 0"
+
+STATUS_JSON=$(gb gardener status "$EPIC_ID" --json 2>&1)
+if [ -z "$STATUS_JSON" ]; then
+  fail "gb gardener status returned empty"; exit 1
+fi
+
+# Extract the JSON-blob fields. status --json renders triggers/stop/progress
+# as parsed JSON, so descend through them directly.
+TRIGGERS=$(echo "$STATUS_JSON" | jq -c '.triggers // empty')
+STOP=$(echo "$STATUS_JSON" | jq -c '.stop // empty')
+PROGRESS=$(echo "$STATUS_JSON" | jq -c '.progress // empty')
+
+# ── Trigger shape assertions (§5.1) ─────────────────────────────────
+echo "--- triggers ---"
+KINDS=$(echo "$TRIGGERS" | jq -r '[ .[].kind ] | sort | join(",")' 2>/dev/null || echo "")
+EXPECTED="bead_event,cron,decision_resolved,manual"
+if [ "$KINDS" = "$EXPECTED" ]; then
+  pass "triggers contain {cron,bead_event,decision_resolved,manual}"
+else
+  fail "triggers kinds" "got=[$KINDS] want=[$EXPECTED]"
+fi
+
+# ── Stop shape assertions (§5.1) ────────────────────────────────────
+echo "--- stop ---"
+LOOP_KINDS=$(echo "$STOP" | jq -r '[ .loop_end.any[].kind ] | sort | join(",")' 2>/dev/null || echo "")
+for k in bead_query specific_bead_closed max_runs no_progress_for wall_clock; do
+  if echo ",$LOOP_KINDS," | grep -q ",$k,"; then
+    pass "loop_end contains kind=$k"
+  else
+    fail "loop_end contains kind=$k" "got=[$LOOP_KINDS]"
+  fi
+done
+RUN_KINDS=$(echo "$STOP" | jq -r '[ .run_end.any[].kind ] | sort | join(",")' 2>/dev/null || echo "")
+for k in yielded_then_woken_then_idle no_actionable_state wall_clock; do
+  if echo ",$RUN_KINDS," | grep -q ",$k,"; then
+    pass "run_end contains kind=$k"
+  else
+    fail "run_end contains kind=$k" "got=[$RUN_KINDS]"
+  fi
+done
+HARD_KINDS=$(echo "$STOP" | jq -r '[ .hard_stop.any[].kind ] | sort | join(",")' 2>/dev/null || echo "")
+for k in consecutive_failures manual_force; do
+  if echo ",$HARD_KINDS," | grep -q ",$k,"; then
+    pass "hard_stop contains kind=$k"
+  else
+    fail "hard_stop contains kind=$k" "got=[$HARD_KINDS]"
+  fi
+done
+
+# ── Progress shape assertions (§5.1) ────────────────────────────────
+echo "--- progress ---"
+EVT_KINDS=$(echo "$PROGRESS" | jq -r '[ .events[].kind ] | sort | join(",")' 2>/dev/null || echo "")
+for k in child_closed decision_resolved mr_merged crew_dispatched; do
+  if echo ",$EVT_KINDS," | grep -q ",$k,"; then
+    pass "progress.events contains kind=$k"
+  else
+    fail "progress.events contains kind=$k" "got=[$EVT_KINDS]"
+  fi
+done
+IN_PRIME=$(echo "$PROGRESS" | jq -r '.surface.in_prime // false')
+if [ "$IN_PRIME" = "true" ]; then
+  pass "progress.surface.in_prime=true"
+else
+  fail "progress.surface.in_prime=true" "got=$IN_PRIME"
+fi
+
+# ── Summary ────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "gardener-mention-entrypoint: schedule shape matches §5.1."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-mention-entrypoint scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

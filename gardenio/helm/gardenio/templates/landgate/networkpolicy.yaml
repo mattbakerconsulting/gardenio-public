@@ -1,0 +1,172 @@
+{{- /* landgate's own fence (gd-ParwLpmgID). Independent of networkPolicies.enabled,
+       like edgeBackends: the edge namespace is the only caller, so no crew,
+       agent or tenant pod can address a landgate, whatever else is on, except
+       through landgate.verifier (below). The
+       crew -> edge half of the deny lives on the policies that select agent
+       pods (imds-deny.yaml, networkpolicies.yaml, the land namespaces). */ -}}
+{{- if .Values.landgate.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- $edgeNS := .Values.landgate.edgeNamespace | default .Values.edgeBackends.edgeNamespace | default "public-edge" -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-landgate-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: landgate
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $edgeNS | quote }}
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Egress: kube-dns, the daemon, and the OIDC issuer (discovery and JWKS). The
+# issuer is usually the public auth host, so 443 to the internet minus private,
+# metadata and CGNAT ranges; an in-cluster Keycloak runtime is named too.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-landgate-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: landgate
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.beads.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ include "gardenio.beads.httpPort" . }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if and .Values.keycloak.enabled .Values.keycloak.runtime.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- /* Land-door verifier (gd-Hq1PnUVOUC): the one exception to "only the edge
+       reaches a landgate". Agent pods of the listed roles, in this namespace,
+       reach the landgate of each listed land and no other. The egress half is
+       rendered only with networkPolicies.enabled, where agent-egress already
+       isolates agent pods: alone, it would isolate them to the landgate. */ -}}
+{{- if and .Values.landgate.enabled .Values.landgate.verifier.lands }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- $roles := .Values.landgate.verifier.roles | default list -}}
+{{- if not $roles }}
+{{- fail "landgate.verifier.lands needs landgate.verifier.roles: the agent roles that may reach those landgates" }}
+{{- end }}
+{{- range $land := .Values.landgate.verifier.lands }}
+{{- if not (has $land $.Values.landgate.lands) }}
+{{- fail (printf "landgate.verifier.lands: %q is not in landgate.lands" $land) }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ printf "%s-landgate-verifier-%s" $fullname $land | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: landgate
+      gardenio.io/land: {{ $land | quote }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: gardenio.io/agent
+                operator: Exists
+              - key: gardenio.io/role
+                operator: In
+                values:
+                  {{- toYaml $roles | nindent 18 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+{{- end }}
+{{- if .Values.networkPolicies.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-landgate-verifier-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: gardenio.io/agent
+        operator: Exists
+      - key: gardenio.io/role
+        operator: In
+        values:
+          {{- toYaml $roles | nindent 10 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: landgate
+            matchExpressions:
+              - key: gardenio.io/land
+                operator: In
+                values:
+                  {{- toYaml .Values.landgate.verifier.lands | nindent 18 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+{{- end }}
+{{- end }}

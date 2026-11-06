@@ -1,0 +1,128 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.coopmux.enabled .Values.coopmux.ingress.enabled }}
+{{- $fullname := include "gardenio.coopmux.fullname" . -}}
+{{- $host := .Values.coopmux.ingress.host -}}
+{{- $servicePort := .Values.coopmux.service.port -}}
+# Coopmux Ingress — exposes mux dashboard, WebSocket, sessions API, and
+# credential API. ForwardAuth (Keycloak SSO) protects browser-facing routes;
+# oauth2-proxy sets the Authorization header with the OIDC access token, and
+# coopmux's OIDC verifier (COOP_MUX_OIDC_*) validates it. Internal M2M callers
+# (controller, bridges) hit the ClusterIP service directly with the static
+# bearer from the kd-beads-token Secret, bypassing Traefik entirely.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coopmux.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    # Root → /mux redirect
+    - match: Host(`{{ $host }}`) && Path(`/`)
+      kind: Rule
+      priority: 200
+      services:
+        - name: {{ $fullname }}
+          port: {{ $servicePort }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if .Values.coopmux.ingress.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ipwhitelist
+        {{- end }}
+        - name: {{ $fullname }}-root-redirect
+    # Dashboard HTML
+    - match: Host(`{{ $host }}`) && PathPrefix(`/mux`)
+      kind: Rule
+      priority: 100
+      services:
+        - name: {{ $fullname }}
+          port: {{ $servicePort }}
+      middlewares:
+        {{- include "gardenio.coopmux.ingressMiddlewares" (dict "Values" .Values "fullname" $fullname "releaseName" (include "gardenio.fullname" .)) | nindent 8 }}
+    # WebSocket feeds (bearer injected via header; mux accepts both query param and header)
+    - match: Host(`{{ $host }}`) && PathPrefix(`/ws/`)
+      kind: Rule
+      priority: 100
+      services:
+        - name: {{ $fullname }}
+          port: {{ $servicePort }}
+      middlewares:
+        {{- include "gardenio.coopmux.ingressMiddlewares" (dict "Values" .Values "fullname" $fullname "releaseName" (include "gardenio.fullname" .)) | nindent 8 }}
+    # Sessions API
+    - match: Host(`{{ $host }}`) && PathPrefix(`/api/v1/sessions`)
+      kind: Rule
+      priority: 100
+      services:
+        - name: {{ $fullname }}
+          port: {{ $servicePort }}
+      middlewares:
+        {{- include "gardenio.coopmux.ingressMiddlewares" (dict "Values" .Values "fullname" $fullname "releaseName" (include "gardenio.fullname" .)) | nindent 8 }}
+    {{- if .Values.coopmux.ingress.exposeAPI }}
+    # Full API (optional — usually internal-only)
+    - match: Host(`{{ $host }}`)
+      kind: Rule
+      services:
+        - name: {{ $fullname }}
+          port: {{ $servicePort }}
+      middlewares:
+        {{- include "gardenio.coopmux.ingressMiddlewares" (dict "Values" .Values "fullname" $fullname "releaseName" (include "gardenio.fullname" .)) | nindent 8 }}
+    {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if .Values.coopmux.ingress.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coopmux.labels" . | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.coopmux.ingress.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.coopmux.ingress.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if .Values.coopmux.ingress.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coopmux.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ .Values.coopmux.ingress.rateLimit.average }}
+    burst: {{ .Values.coopmux.ingress.rateLimit.burst }}
+{{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-root-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coopmux.labels" . | nindent 4 }}
+spec:
+  redirectRegex:
+    regex: "^https?://[^/]+/$"
+    replacement: "/mux"
+    permanent: false
+{{- end }}

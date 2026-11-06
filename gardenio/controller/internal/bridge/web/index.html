@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Decisions</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5; }
+  .container { max-width: 960px; margin: 0 auto; padding: 16px; }
+  header { display: flex; align-items: center; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  header h1 { font-size: 20px; font-weight: 600; }
+  .badge { background: var(--accent); color: var(--bg); font-size: 12px; font-weight: 600;
+    padding: 2px 8px; border-radius: 10px; }
+  .badge.live { background: var(--green); }
+  .badge.disconnected { background: var(--red); }
+  .empty { text-align: center; padding: 48px 16px; color: var(--muted); }
+
+  /* Decision cards */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    margin-bottom: 8px; overflow: hidden; }
+  .card-header { display: flex; align-items: center; gap: 8px; padding: 12px 16px;
+    cursor: pointer; user-select: none; }
+  .card-header:hover { background: rgba(88,166,255,0.04); }
+  .priority { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .priority.p0 { background: var(--red); }
+  .priority.p1 { background: var(--yellow); }
+  .priority.p2 { background: var(--muted); }
+  .priority.p3, .priority.p4 { background: var(--border); }
+  .card-id { font-family: monospace; font-size: 12px; color: var(--muted); flex-shrink: 0; }
+  .card-agent { font-size: 13px; color: var(--accent); flex-shrink: 0; }
+  .card-question { font-size: 14px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-age { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+  .escalated { border-left: 3px solid var(--red); }
+
+  /* Detail panel */
+  .card-detail { display: none; padding: 0 16px 16px; border-top: 1px solid var(--border); }
+  .card.open .card-detail { display: block; }
+  .detail-section { margin-top: 12px; }
+  .detail-section h3 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .prompt-text { font-size: 14px; white-space: pre-wrap; }
+  .context-text { font-size: 13px; color: var(--muted); white-space: pre-wrap; }
+
+  /* Options */
+  .option { display: flex; align-items: flex-start; gap: 8px; padding: 8px 12px;
+    border: 1px solid var(--border); border-radius: 4px; margin-bottom: 4px; cursor: pointer; }
+  .option:hover { border-color: var(--accent); }
+  .option.selected { border-color: var(--accent); background: rgba(88,166,255,0.08); }
+  .option-radio { margin-top: 3px; }
+  .option-label { font-size: 14px; font-weight: 500; }
+  .option-desc { font-size: 13px; color: var(--muted); }
+  .option-artifact { font-size: 11px; color: var(--yellow); margin-top: 2px; }
+
+  /* Other input */
+  .other-input { width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; color: var(--text); font-size: 14px; margin-top: 4px; }
+  .other-input:focus { outline: none; border-color: var(--accent); }
+
+  /* Rationale + actions */
+  .rationale { width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; color: var(--text); font-size: 13px; margin-top: 8px; resize: vertical; min-height: 40px; }
+  .rationale:focus { outline: none; border-color: var(--accent); }
+  .actions { display: flex; gap: 8px; margin-top: 12px; }
+  .btn { padding: 6px 16px; border: none; border-radius: 4px; font-size: 13px; font-weight: 500;
+    cursor: pointer; transition: opacity 0.15s; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: var(--bg); }
+  .btn-danger { background: transparent; color: var(--red); border: 1px solid var(--red); }
+  .btn-danger:hover { background: rgba(248,81,73,0.1); }
+  .btn-warn { background: transparent; color: var(--yellow); border: 1px solid var(--yellow); }
+  .btn-warn:hover { background: rgba(210,153,34,0.1); }
+  .status-msg { font-size: 13px; margin-top: 8px; }
+  .status-msg.error { color: var(--red); }
+  .status-msg.success { color: var(--green); }
+
+  /* Keyboard focus */
+  .card.focused { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .card.focused > .card-header { background: rgba(88,166,255,0.06); }
+  .option.opt-focused { border-color: var(--accent); background: rgba(88,166,255,0.04); }
+  .kbd-help { position: fixed; bottom: 16px; right: 16px; font-size: 11px; color: var(--muted);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 8px 12px; }
+  .kbd-help kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
+    padding: 1px 5px; font-family: monospace; font-size: 11px; }
+  .kbd-help-full { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 20px 28px;
+    z-index: 100; min-width: 280px; }
+  .kbd-help-full.visible { display: block; }
+  .kbd-help-full h3 { margin-bottom: 8px; font-size: 14px; }
+  .kbd-help-full dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 16px; font-size: 13px; }
+  .kbd-help-full dt { color: var(--muted); text-align: right; }
+  .kbd-help-full dd { color: var(--text); }
+  .kbd-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 99; }
+  .kbd-overlay.visible { display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Decisions</h1>
+    <span id="count" class="badge">0</span>
+    <span id="sse-status" class="badge disconnected">disconnected</span>
+  </header>
+  <div id="list"></div>
+</div>
+<div class="kbd-help"><kbd>j</kbd>/<kbd>k</kbd> navigate &middot; <kbd>Enter</kbd> open &middot; <kbd>1-9</kbd> pick &middot; <kbd>r</kbd> resolve &middot; <kbd>?</kbd> help</div>
+<div id="kbd-overlay" class="kbd-overlay"></div>
+<div id="kbd-help-full" class="kbd-help-full">
+  <h3>Keyboard Shortcuts</h3>
+  <dl>
+    <dt><kbd>j</kbd> / <kbd>Down</kbd></dt><dd>Next decision</dd>
+    <dt><kbd>k</kbd> / <kbd>Up</kbd></dt><dd>Previous decision</dd>
+    <dt><kbd>Enter</kbd> / <kbd>o</kbd></dt><dd>Open / close detail</dd>
+    <dt><kbd>1</kbd>-<kbd>9</kbd></dt><dd>Select option</dd>
+    <dt><kbd>r</kbd></dt><dd>Resolve decision</dd>
+    <dt><kbd>d</kbd></dt><dd>Dismiss decision</dd>
+    <dt><kbd>p</kbd></dt><dd>Promote to escalation</dd>
+    <dt><kbd>Esc</kbd></dt><dd>Close detail / help</dd>
+    <dt><kbd>?</kbd></dt><dd>Toggle this help</dd>
+  </dl>
+</div>
+
+<script>
+const API = '/api/decisions';
+const SSE_URL = '/api/decisions/events';
+let decisions = {};
+let selectedOptions = {};
+
+// --- Rendering ---
+
+function renderList() {
+  const list = document.getElementById('list');
+  const sorted = Object.values(decisions).sort((a, b) => {
+    const ae = a.labels?.includes('escalated') ? 0 : 1;
+    const be = b.labels?.includes('escalated') ? 0 : 1;
+    if (ae !== be) return ae - be;
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    return (a.id || '').localeCompare(b.id || '');
+  });
+
+  document.getElementById('count').textContent = sorted.length;
+
+  if (sorted.length === 0) {
+    list.innerHTML = '<div class="empty">No pending decisions</div>';
+    return;
+  }
+
+  // Preserve open state.
+  const openIds = new Set();
+  list.querySelectorAll('.card.open').forEach(c => openIds.add(c.dataset.id));
+
+  list.innerHTML = sorted.map(d => renderCard(d, openIds.has(d.id))).join('');
+
+  // Attach event handlers.
+  list.querySelectorAll('.card-header').forEach(h => {
+    h.addEventListener('click', () => {
+      h.closest('.card').classList.toggle('open');
+    });
+  });
+  list.querySelectorAll('.option').forEach(el => {
+    el.addEventListener('click', () => selectOption(el));
+  });
+  list.querySelectorAll('.btn-primary').forEach(btn => {
+    btn.addEventListener('click', () => resolveDecision(btn.dataset.id));
+  });
+  list.querySelectorAll('.btn-danger').forEach(btn => {
+    btn.addEventListener('click', () => dismissDecision(btn.dataset.id));
+  });
+  list.querySelectorAll('.btn-promote').forEach(btn => {
+    btn.addEventListener('click', () => promoteDecision(btn.dataset.id));
+  });
+}
+
+function renderCard(d, isOpen) {
+  const escalated = d.labels?.includes('escalated');
+  const question = d.fields?.prompt || d.fields?.question || d.title || d.id;
+  const agent = d.assignee || d.created_by || '';
+  const options = parseOptions(d.fields?.options);
+  const sel = selectedOptions[d.id] || '';
+
+  return `
+    <div class="card ${isOpen ? 'open' : ''} ${escalated ? 'escalated' : ''}" data-id="${d.id}">
+      <div class="card-header">
+        <span class="priority p${d.priority}"></span>
+        <span class="card-id">${d.id}</span>
+        <span class="card-agent">${escHtml(agent)}</span>
+        <span class="card-question">${escHtml(truncate(question, 80))}</span>
+      </div>
+      <div class="card-detail">
+        <div class="detail-section">
+          <h3>Question</h3>
+          <div class="prompt-text">${escHtml(question)}</div>
+        </div>
+        ${d.fields?.context ? `<div class="detail-section"><h3>Context</h3><div class="context-text">${escHtml(d.fields.context)}</div></div>` : ''}
+        ${options.length > 0 ? `
+          <div class="detail-section">
+            <h3>Options</h3>
+            ${options.map(o => `
+              <div class="option ${sel === o.id ? 'selected' : ''}" data-decision="${d.id}" data-option="${o.id}">
+                <input type="radio" class="option-radio" name="opt-${d.id}" ${sel === o.id ? 'checked' : ''}>
+                <div>
+                  <div class="option-label">${escHtml(o.short || o.id)}: ${escHtml(o.label || '')}</div>
+                  ${o.description ? `<div class="option-desc">${escHtml(o.description)}</div>` : ''}
+                  ${o.artifact_type ? `<div class="option-artifact">Requires: ${escHtml(o.artifact_type)}</div>` : ''}
+                </div>
+              </div>
+            `).join('')}
+            <div class="option ${sel === '_other' ? 'selected' : ''}" data-decision="${d.id}" data-option="_other">
+              <input type="radio" class="option-radio" name="opt-${d.id}" ${sel === '_other' ? 'checked' : ''}>
+              <div style="flex:1">
+                <div class="option-label">Other...</div>
+                <input type="text" class="other-input" id="other-${d.id}" placeholder="Type a custom response...">
+              </div>
+            </div>
+          </div>
+        ` : ''}
+        <textarea class="rationale" id="rationale-${d.id}" placeholder="Rationale (optional)..."></textarea>
+        <div class="actions">
+          <button class="btn btn-primary" data-id="${d.id}">Resolve</button>
+          <button class="btn btn-danger" data-id="${d.id}">Dismiss</button>
+          <button class="btn btn-warn btn-promote" data-id="${d.id}">Promote to Escalation</button>
+        </div>
+        <div class="status-msg" id="status-${d.id}"></div>
+      </div>
+    </div>`;
+}
+
+function parseOptions(raw) {
+  if (!raw) return [];
+  try { return JSON.parse(raw); } catch { return []; }
+}
+
+function selectOption(el) {
+  const decId = el.dataset.decision;
+  const optId = el.dataset.option;
+  selectedOptions[decId] = optId;
+  el.closest('.detail-section').querySelectorAll('.option').forEach(o => {
+    o.classList.toggle('selected', o.dataset.option === optId);
+    o.querySelector('input[type=radio]').checked = o.dataset.option === optId;
+  });
+}
+
+// --- Actions ---
+
+async function resolveDecision(id) {
+  const sel = selectedOptions[id];
+  let chosen = sel;
+  if (sel === '_other') {
+    const otherEl = document.getElementById('other-' + id);
+    chosen = otherEl ? otherEl.value.trim() : '';
+  }
+  if (!chosen) {
+    setStatus(id, 'Select an option first', true);
+    return;
+  }
+  const rationale = (document.getElementById('rationale-' + id)?.value || '').trim();
+  setStatus(id, 'Resolving...', false);
+  try {
+    const resp = await fetch(API + '/' + id + '/resolve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({chosen, rationale}),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    setStatus(id, 'Resolved!', false, true);
+    delete decisions[id];
+    setTimeout(renderList, 500);
+  } catch (e) {
+    setStatus(id, 'Error: ' + e.message, true);
+  }
+}
+
+async function dismissDecision(id) {
+  const rationale = (document.getElementById('rationale-' + id)?.value || '').trim();
+  setStatus(id, 'Dismissing...', false);
+  try {
+    const resp = await fetch(API + '/' + id + '/dismiss', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({reason: rationale || 'Dismissed via web UI'}),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    setStatus(id, 'Dismissed', false, true);
+    delete decisions[id];
+    setTimeout(renderList, 500);
+  } catch (e) {
+    setStatus(id, 'Error: ' + e.message, true);
+  }
+}
+
+async function promoteDecision(id) {
+  if (!confirm('Promote this decision to an escalation?\n\nThis will create an escalation bead requiring authenticated approval and close the decision.')) {
+    return;
+  }
+  setStatus(id, 'Promoting to escalation...', false);
+  try {
+    const resp = await fetch(API + '/' + id + '/promote', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    const data = await resp.json();
+    setStatus(id, 'Promoted to escalation ' + (data.escalationId || ''), false, true);
+    delete decisions[id];
+    setTimeout(renderList, 500);
+  } catch (e) {
+    setStatus(id, 'Error: ' + e.message, true);
+  }
+}
+
+function setStatus(id, msg, isError, isSuccess) {
+  const el = document.getElementById('status-' + id);
+  if (!el) return;
+  el.textContent = msg;
+  el.className = 'status-msg' + (isError ? ' error' : '') + (isSuccess ? ' success' : '');
+}
+
+// --- Data loading ---
+
+async function loadDecisions() {
+  try {
+    const resp = await fetch(API);
+    const data = await resp.json();
+    decisions = {};
+    (data.decisions || []).forEach(d => {
+      // The daemon returns the full bead in "issue"; "decision" only has
+      // metadata (prompt, options) without bead identity fields (id, status).
+      const dec = d.issue || d.decision || d;
+      decisions[dec.id] = dec;
+    });
+    renderList();
+  } catch (e) {
+    console.error('Failed to load decisions:', e);
+  }
+}
+
+// --- SSE ---
+
+function connectSSE() {
+  const statusEl = document.getElementById('sse-status');
+  const src = new EventSource(SSE_URL, { withCredentials: true });
+
+  src.onopen = () => {
+    statusEl.textContent = 'live';
+    statusEl.className = 'badge live';
+  };
+
+  src.addEventListener('decision', (e) => {
+    try {
+      const evt = JSON.parse(e.data);
+      if (evt.type === 'closed') {
+        delete decisions[evt.bead.id];
+      } else {
+        decisions[evt.bead.id] = evt.bead;
+      }
+      renderList();
+    } catch (err) {
+      console.error('SSE parse error:', err);
+    }
+  });
+
+  src.onerror = () => {
+    statusEl.textContent = 'reconnecting';
+    statusEl.className = 'badge disconnected';
+  };
+}
+
+// --- Helpers ---
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+
+function truncate(s, n) {
+  return s && s.length > n ? s.slice(0, n - 3) + '...' : (s || '');
+}
+
+// --- Keyboard navigation ---
+
+let focusedIdx = -1;
+
+function getCards() {
+  return Array.from(document.querySelectorAll('#list .card'));
+}
+
+function setFocus(idx) {
+  const cards = getCards();
+  if (cards.length === 0) return;
+  // Remove old focus.
+  cards.forEach(c => c.classList.remove('focused'));
+  // Clamp.
+  focusedIdx = Math.max(0, Math.min(idx, cards.length - 1));
+  const card = cards[focusedIdx];
+  card.classList.add('focused');
+  card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function focusedCard() {
+  const cards = getCards();
+  return focusedIdx >= 0 && focusedIdx < cards.length ? cards[focusedIdx] : null;
+}
+
+function toggleHelp(show) {
+  const overlay = document.getElementById('kbd-overlay');
+  const help = document.getElementById('kbd-help-full');
+  const vis = show !== undefined ? show : !help.classList.contains('visible');
+  overlay.classList.toggle('visible', vis);
+  help.classList.toggle('visible', vis);
+}
+
+document.getElementById('kbd-overlay').addEventListener('click', () => toggleHelp(false));
+
+document.addEventListener('keydown', (e) => {
+  // Ignore when typing in inputs.
+  const tag = e.target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+    if (e.key === 'Escape') e.target.blur();
+    return;
+  }
+
+  const cards = getCards();
+  if (e.key === '?') { toggleHelp(); return; }
+  if (e.key === 'Escape') {
+    const help = document.getElementById('kbd-help-full');
+    if (help.classList.contains('visible')) { toggleHelp(false); return; }
+    // Close open card.
+    const card = focusedCard();
+    if (card && card.classList.contains('open')) { card.classList.remove('open'); return; }
+    return;
+  }
+  if (cards.length === 0) return;
+
+  // Navigation.
+  if (e.key === 'j' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    setFocus(focusedIdx + 1);
+    return;
+  }
+  if (e.key === 'k' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    setFocus(focusedIdx < 0 ? 0 : focusedIdx - 1);
+    return;
+  }
+
+  // Open/close detail.
+  if (e.key === 'Enter' || e.key === 'o') {
+    const card = focusedCard();
+    if (card) { card.classList.toggle('open'); e.preventDefault(); }
+    return;
+  }
+
+  // Select option by number (1-9).
+  if (e.key >= '1' && e.key <= '9') {
+    const card = focusedCard();
+    if (!card || !card.classList.contains('open')) return;
+    const options = card.querySelectorAll('.option');
+    const idx = parseInt(e.key) - 1;
+    if (idx < options.length) { selectOption(options[idx]); }
+    return;
+  }
+
+  // Resolve.
+  if (e.key === 'r') {
+    const card = focusedCard();
+    if (!card || !card.classList.contains('open')) return;
+    const id = card.dataset.id;
+    resolveDecision(id);
+    return;
+  }
+
+  // Dismiss.
+  if (e.key === 'd') {
+    const card = focusedCard();
+    if (!card || !card.classList.contains('open')) return;
+    const id = card.dataset.id;
+    dismissDecision(id);
+    return;
+  }
+
+  // Promote to escalation.
+  if (e.key === 'p') {
+    const card = focusedCard();
+    if (!card || !card.classList.contains('open')) return;
+    const id = card.dataset.id;
+    promoteDecision(id);
+    return;
+  }
+});
+
+// Auto-focus first card on render if nothing focused.
+const _origRenderList = renderList;
+renderList = function() {
+  _origRenderList();
+  const cards = getCards();
+  if (cards.length > 0 && focusedIdx < 0) setFocus(0);
+  else if (focusedIdx >= cards.length) setFocus(cards.length - 1);
+  else if (focusedIdx >= 0) setFocus(focusedIdx);
+};
+
+// --- Init ---
+
+loadDecisions();
+connectSSE();
+</script>
+</body>
+</html>

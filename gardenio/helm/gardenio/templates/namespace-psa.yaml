@@ -1,0 +1,137 @@
+{{- /*
+Pod Security Admission (PSA) labels on the gardenio namespace.
+
+Stamps `pod-security.kubernetes.io/{enforce,audit,warn}` (and matching
+`*-version`) labels on .Release.Namespace via a pre-install/pre-upgrade
+Job. The Job is robust to:
+  - `helm install --create-namespace` (helm creates ns first, then Job
+    re-labels)
+  - pre-existing namespaces created by an operator
+  - chart-managed namespaces
+
+Default profile is "restricted"; soften via `.Values.podSecurityAdmission`.
+*/ -}}
+{{- if .Values.podSecurityAdmission.enabled -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gardenio.fullname" . }}-psa-labels
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-20"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "gardenio.fullname" . }}-psa-labels
+      restartPolicy: OnFailure
+      {{- /* Global tolerations only — lets this pre-install canary tolerate an
+             autoscaling-pool taint (e.g. gardenio.agent on POC) so it can use
+             that headroom instead of being pinned to exhausted static nodes
+             (ka-0000005127). Inert (byte-identical) when global.tolerations is empty. */}}
+      {{- if .Values.global.tolerations }}
+      {{- include "gardenio.tolerations" (dict "global" .Values.global.tolerations) | nindent 6 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with include "gardenio.hookPriorityClassName" $ }}
+      {{ . }}
+      {{- end }}
+      containers:
+        - name: stamp
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.kubectlImage "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.kubectlImage.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              NS="{{ .Release.Namespace }}"
+              ENFORCE_PROFILE="{{ .Values.podSecurityAdmission.enforceProfile | default .Values.podSecurityAdmission.profile }}"
+              AUDIT_WARN_PROFILE="{{ .Values.podSecurityAdmission.profile }}"
+              VERSION="{{ .Values.podSecurityAdmission.version }}"
+              echo "Stamping PSA labels on namespace $NS (enforce=$ENFORCE_PROFILE, audit/warn=$AUDIT_WARN_PROFILE, version=$VERSION)..."
+              kubectl label namespace "$NS" \
+                "pod-security.kubernetes.io/enforce=$ENFORCE_PROFILE" \
+                "pod-security.kubernetes.io/audit=$AUDIT_WARN_PROFILE" \
+                "pod-security.kubernetes.io/warn=$AUDIT_WARN_PROFILE" \
+                "pod-security.kubernetes.io/enforce-version=$VERSION" \
+                "pod-security.kubernetes.io/audit-version=$VERSION" \
+                "pod-security.kubernetes.io/warn-version=$VERSION" \
+                --overwrite
+              echo "Done."
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "gardenio.fullname" . }}-psa-labels
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-20"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.fullname" . }}-psa-labels
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-20"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["{{ .Release.Namespace }}"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.fullname" . }}-psa-labels
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-20"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.fullname" . }}-psa-labels
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.fullname" . }}-psa-labels
+    namespace: {{ .Release.Namespace }}
+{{- end }}

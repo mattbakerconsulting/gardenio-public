@@ -1,0 +1,132 @@
+{{- if .Values.coreLogShipper.enabled }}
+{{- /*
+core-log-shipper Deployment (general gardenio-pod slog transport, design
+ka-0000005579 option A step 3, task ka-0000005209).
+
+A purpose-built Go streamer (gardenio/controller/cmd/core-log-shipper) that opens
+FOLLOW streams of the enabled core components' pods (controller / slack-bridge /
+trigger-engine / grafana-bridge) via the Kubernetes pod-log API, stamps each
+record with its logical component name, SECRET-REDACTS it (claudemore.RedactBytes),
+and POSTs it to the in-chart VictoriaLogs /insert/jsonline. This is the WRITE
+side of the `gb logs <component>` surface: the read verb is only as useful as the
+components this shipper covers.
+
+It is the sibling of bridge-log-shipper — same sanctioned stream->filter->sink
+shape (the same pod-log follow streamer and VictoriaLogs sink) — with two
+differences: (1) a broader, per-component-gated source set, and (2) a ship-time
+redaction gate, because these are broad behavior logs (not a pre-scrubbed
+webhook audit slice) and can echo a credential. All source components run in THIS
+release's namespace, so RBAC is same-namespace (rbac.yaml).
+
+OFF BY DEFAULT and off PER COMPONENT: only components with
+coreLogShipper.components.<name>.enabled=true are streamed. With the top-level
+flag on but every component off, the binary fails fast rather than running dark;
+this template refuses that config up front with a clear message.
+*/}}
+{{- $ship := .Values.coreLogShipper }}
+{{- $c := $ship.components }}
+{{- if not (or $c.controller.enabled $c.slackBridge.enabled $c.triggerEngine.enabled $c.grafanaBridge.enabled) }}
+{{- fail "coreLogShipper.enabled=true requires at least one of coreLogShipper.components.{controller,slackBridge,triggerEngine,grafanaBridge}.enabled=true — the shipper streams those components' stdout, so with none enabled it would have no source to follow. Enable the component(s) whose logs you want agent-readable via `gb logs`, or disable coreLogShipper. See ka-0000005209." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.coreLogShipper.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coreLogShipper.labels" . | nindent 4 }}
+spec:
+  # Exactly one replica: the shipper follows each component's pod-log stream and
+  # de-dup is not attempted, so two replicas would double-ship every record. A
+  # brief gap across a restart is acceptable — streamSinceSeconds re-reads a
+  # bounded window on reconnect so the disconnect window is covered
+  # (at-least-once), matching bridge-log-shipper.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.coreLogShipper.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.coreLogShipper.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "gardenio.coreLogShipper.fullname" . }}
+      # The shipper authenticates to the API server as its ServiceAccount to read
+      # pods/log, so the projected SA token must be mounted.
+      automountServiceAccountToken: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: core-log-shipper
+          image: {{ include "gardenio.imageRef" (dict "image" $ship.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ $ship.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: CORE_VICTORIALOGS_ENDPOINT
+              value: {{ include "gardenio.coreLogShipper.victoriaLogsEndpoint" . | quote }}
+            - name: CORE_POD_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            {{- if $c.controller.enabled }}
+            # controller: stream the controller pod, ship every JSON record
+            # (secret-redacted). Selector mirrors the controller Deployment's
+            # component label.
+            - name: CORE_CONTROLLER_POD_SELECTOR
+              value: {{ $c.controller.selector | quote }}
+            {{- end }}
+            {{- if $c.slackBridge.enabled }}
+            # slack-bridge: stream the slack-bridge pod.
+            - name: CORE_SLACK_BRIDGE_POD_SELECTOR
+              value: {{ $c.slackBridge.selector | quote }}
+            {{- end }}
+            {{- if $c.triggerEngine.enabled }}
+            # trigger-engine: stream the trigger-engine pod.
+            - name: CORE_TRIGGER_ENGINE_POD_SELECTOR
+              value: {{ $c.triggerEngine.selector | quote }}
+            {{- end }}
+            {{- if $c.grafanaBridge.enabled }}
+            # grafana-bridge: stream the grafana-bridge pod.
+            - name: CORE_GRAFANA_BRIDGE_POD_SELECTOR
+              value: {{ $c.grafanaBridge.selector | quote }}
+            {{- end }}
+            - name: CORE_RECONNECT_BACKOFF
+              value: {{ $ship.reconnectBackoff | quote }}
+            - name: CORE_STREAM_SINCE_SECONDS
+              value: {{ $ship.streamSinceSeconds | quote }}
+            - name: CORE_FLUSH_INTERVAL
+              value: {{ $ship.flushInterval | quote }}
+            - name: CORE_MAX_BATCH_LINES
+              value: {{ $ship.maxBatchLines | quote }}
+          # No containerPort: the shipper dials OUT (API server + VictoriaLogs) and
+          # opens no in-cluster listener. kubelet restarts the pod on process exit.
+          resources:
+            {{- toYaml $ship.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" $ship.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with $ship.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" $ship.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

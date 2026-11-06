@@ -1,0 +1,52 @@
+# local-runner-escalation.toml
+#
+# Claudeless scenario: a local runner agent executes a cloud-to-local
+# escalation its owner approved (local-agents spec §8.2, §11 c; plan
+# gd-fwFefkDP4H Task 18, gd-jW7KJ7ZdNy).
+#
+# Driven by gardenio/tests/e2e/scripts/test-local-runner-escalation.sh through
+# `gb runner join --command "claudeless --scenario <this>"`. On approval the
+# daemon mails the agent joined on the runner control:escalation-approved; that
+# mail never reaches the model. gb's escalation executor (HandleControl) checks
+# it and nudges coop with "ESCALATION APPROVED: <title> (ID: <id>)", which is
+# what this scenario answers: it reports the outcome with
+# `gb escalation close`, as a real agent would.
+#
+# The script writes the escalation id to $GARDENIO_HOME/e2e-escalation-id
+# (the session inherits GARDENIO_HOME from `gb runner join`), so the report
+# does not depend on parsing the nudge text.
+
+[claude]
+session_id = "e2e00000-0007-4000-a000-000000000002"
+username = "e2e-local-runner-escalation"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+[[responses]]
+on = { contains = "ESCALATION APPROVED" }
+say = "An approved escalation for this machine. Executing and reporting."
+tools = [
+  { call = "Bash", input = { command = """set -u
+ESC_ID="$(cat "$GARDENIO_HOME/e2e-escalation-id" 2>/dev/null || true)"
+if [ -z "$ESC_ID" ]; then
+  echo "ESCALATION-NO-ID" >&2
+  exit 1
+fi
+echo e2e
+gb escalation close "$ESC_ID" --status success --result '{"ok":true,"ran":"echo e2e"}' && echo "ESCALATION-DONE $ESC_ID"
+""" } }
+]
+
+# Startup prompt, prime output and anything else: wait for the nudge.
+[default]
+say = "Local runner escalation scenario idle. Waiting for an approved escalation."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

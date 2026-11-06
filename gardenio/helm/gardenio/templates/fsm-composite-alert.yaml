@@ -1,0 +1,123 @@
+{{- if .Values.fsmCompositeAlert.enabled }}
+{{- $cfg := .Values.fsmCompositeAlert }}
+{{- /*
+  Composite FSM alert (ka-0000006124, plan §5.7 / FSM_CORRELATION_CONTRACT §5a):
+  the operational signal epic ka-0000000741 exists to produce.
+
+  Fires when a gardenio agent is OOM-killed AND an ECS task restart is observed
+  in the SAME (time, cluster, service) window. The two estates share no natural
+  label, so the join is carried by the gardenio-owned `gardenio_resource_mapping`
+  pivot (project -> {cluster, service}) and `env`, exactly as the cross-estate
+  join contract mandates:
+
+    1. OOM count per (env, project) from the gardenio estate.
+    2. Pivot project -> {cluster, service} via gardenio_resource_mapping (the
+       primary fine-grained join key; group_left() so one OOM (env,project)
+       row fans out across the mapping rows for that project, never a
+       many-to-many).
+    3. `and on(env, cluster, service)` against ECS task restarts from the site
+       estate, whose native cluster_name/service_name labels are renamed to
+       cluster/service so the join keys line up.
+
+  The `[$window]` range on both sides plus `for:` is the same-window predicate.
+  Window default 5m absorbs the T±30s estate skew the contract documents while
+  keeping distinct incidents from smearing together.
+
+  IMPORTANT: this rule routes via the EXISTING site kube-prometheus-stack
+  Alertmanager — it is a plain PrometheusRule CR picked up by the cluster's
+  prometheus-operator ruleSelector. It does NOT stand up a second Alertmanager.
+
+  Annotations carry deep links to BOTH dashboards (the gardenio agent/fleet view
+  and the site infra/correlation view, pre-filtered by env/cluster/service +
+  the alert time window) and the session-recording S3 key for the OOM'd
+  session, resolved at notification time from the OOM series.
+*/}}
+{{- $window := $cfg.window | default "5m" }}
+{{- $base := $cfg.grafanaBaseURL | trimSuffix "/" }}
+{{- $agentDash := $cfg.dashboards.agentUID | default "gardenio-cost-overview" }}
+{{- $acmeDash := $cfg.dashboards.acmeUID | default "fsm-correlation" }}
+{{- $s3Bucket := $cfg.s3.bucket | default .Values.agents.s3.bucket }}
+{{- $s3Prefix := $cfg.s3.prefix | default .Values.agents.s3.prefix | default "coop/sessions" | trimSuffix "/" }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-fsm-composite
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.fsm.composite
+      interval: 30s
+      rules:
+        - alert: FSMAgentOOMWithECSRestart
+          # OOM ∧ ECS task restart in the same (env, cluster, service) window.
+          # group_left() (not group_right) keeps the multiply many-to-one:
+          # the mapping (many rows per project) is the left/"many" side, the
+          # per-(env,project) OOM count is the right/"one" side. `and on(...)`
+          # then intersects with renamed ECS restarts on env+cluster+service.
+          expr: |
+            (
+              gardenio_resource_mapping
+              * on (env, project) group_left ()
+              (
+                sum by (env, project) (
+                  increase(gardenio_agent_lifecycle_events_total{event="oom_killed"}[{{ $window }}])
+                ) > 0
+              )
+            )
+            and on (env, cluster, service)
+            (
+              label_replace(
+                label_replace(
+                  sum by (env, cluster_name, service_name) (
+                    increase(aws_ecs_task_restart_total[{{ $window }}])
+                  ) > 0,
+                  "cluster", "$1", "cluster_name", "(.+)"
+                ),
+                "service", "$1", "service_name", "(.+)"
+              )
+            )
+          for: {{ $cfg.for | default "0m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gardenio-fsm
+            subsystem: composite-correlation
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Agent OOM correlated with ECS task restart ({{`{{ $labels.env }}`}}/{{`{{ $labels.cluster }}`}}/{{`{{ $labels.service }}`}})"
+            description: |
+              A gardenio agent in project {{`{{ $labels.project }}`}} (env
+              {{`{{ $labels.env }}`}}) was OOM-killed AND ECS service
+              {{`{{ $labels.service }}`}} on cluster {{`{{ $labels.cluster }}`}}
+              restarted at least one task within the same {{ $window }} window.
+              This is the FSM composite signal (epic ka-0000000741, plan §5.7):
+              an agent memory failure that coincides with infra churn on the
+              site resource that project exercises. Pivot from the agent
+              incident to the site infra panels using the links below.
+            # --- Deep links to BOTH dashboards (gardenio agent side + site infra side) ---
+            {{- if $base }}
+            dashboard_agent_url: "{{ $base }}/d/{{ $agentDash }}?{{`var-env={{ $labels.env }}&var-project={{ $labels.project }}&from=now-1h&to=now`}}"
+            dashboard_acme_url: "{{ $base }}/d/{{ $acmeDash }}?{{`var-env={{ $labels.env }}&var-cluster={{ $labels.cluster }}&var-service={{ $labels.service }}&from=now-1h&to=now`}}"
+            {{- else }}
+            # grafanaBaseURL unset — deep links omitted; set fsmCompositeAlert.grafanaBaseURL to enable.
+            dashboard_agent_uid: {{ $agentDash | quote }}
+            dashboard_acme_uid: {{ $acmeDash | quote }}
+            {{- end }}
+            # --- Session-recording S3 key for the OOM'd session ---
+            # Resolved at notification time from the OOM series for this
+            # (env, project): topk(1) picks the most recent OOM'd session.
+            # session_id is a drill-down identifier (contract §6 — never a join
+            # key), surfaced here as an annotation only.
+            session_recording_s3: |-
+              {{`{{ with printf "topk(1, gardenio_agent_lifecycle_events_total{event=\"oom_killed\", env=\"%s\", project=\"%s\"})" $labels.env $labels.project | query }}{{ range . }}`}}s3://{{ $s3Bucket | default "<COOP_S3_BUCKET>" }}/{{ $s3Prefix }}/{{`{{ .Labels.session_id }}{{ end }}{{ else }}`}}s3://{{ $s3Bucket | default "<COOP_S3_BUCKET>" }}/{{ $s3Prefix }}/{{`{{ end }}`}}
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/FSM_CORRELATION_CONTRACT.md#5-supported-metric-pairs-v1"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

@@ -1,0 +1,75 @@
+# aws-node-termination-handler (IMDS mode) for the gardenio k3s CI node pool.
+# Chart: oci://public.ecr.aws/aws-ec2/helm/aws-node-termination-handler
+# Namespace: kube-system. DaemonSet, one pod per ci node.
+#
+# ── WHY ─────────────────────────────────────────────────────────────────────
+# The ci pool is 100% spot. A reclaim gives the instance a two-minute
+# interruption notice on IMDS that nothing in this cluster was listening
+# for: the kubelet simply vanished, the node went Ready=Unknown ~40s later,
+# and the runner pod on it hung Terminating until something deleted the
+# Node object (now aws-ccm-values.yaml's lifecycle controller; before
+# 2026-09-21, nothing). This is the other half: on the notice, cordon+taint
+# the node so no new runner lands on a doomed instance, and evict the runner
+# pod so it exits cleanly inside the window -- ARC sees a finished pod and
+# frees the scale-set slot immediately rather than after the instance is
+# confirmed dead. The job on GitHub fails either way (a reclaimed runner is
+# a lost job; no retry exists yet, gd-IoVkE0k8ot); what this buys is the
+# slot back in seconds, not minutes, plus a Kubernetes event that says WHY
+# the node went away instead of a silent disappearance.
+#
+# ── SCOPE: ci nodes only, on purpose ────────────────────────────────────────
+# The platform (agent) pool is spot too and would benefit from the same
+# early warning, but draining a crew/gardener pod mid-task changes its
+# failure mode from "node died" to "evicted with SIGTERM + grace period",
+# and how the coordinator treats that has not been checked (known harness
+# gap: unschedulable crews leave in_progress ghosts). Extending this is one
+# line -- daemonsetNodeSelector below -- once that is understood; it belongs
+# to the gardenio namespace/chart lane, not this one. The Node-object GC in
+# aws-ccm-values.yaml already covers the platform pool's ghost nodes, which
+# is the part that actually leaks capacity.
+#
+# ── MODE ────────────────────────────────────────────────────────────────────
+# IMDS mode (enableSqsTerminationDraining=false): no SQS queue, no
+# EventBridge rules, no extra IAM -- nothing in terraform. Each pod polls its
+# own node's IMDS for spot ITNs and scheduled events. Rebalance
+# recommendations are monitored-off deliberately: they arrive well before
+# (and sometimes without) a reclaim, and draining a 5-40 minute build on a
+# recommendation would kill more jobs than spot itself does. ASG lifecycle
+# draining is left at the chart default (on) but is inert until the ASG has
+# a termination lifecycle hook (terraform lane); it costs nothing meanwhile.
+
+enableSqsTerminationDraining: false
+enableSpotInterruptionDraining: true
+enableScheduledEventDraining: true
+enableRebalanceMonitoring: false
+enableRebalanceDraining: false
+
+# Cordon, taint AND drain. taintNode keeps the scheduler from placing a new
+# runner on the node during the two-minute window; the runner's own
+# terminationGracePeriod is honoured (podTerminationGracePeriod -1) inside
+# the 120s node budget, which is the length of the ITN itself.
+cordonOnly: false
+taintNode: true
+deleteLocalData: true
+ignoreDaemonSets: true
+podTerminationGracePeriod: -1
+nodeTerminationGracePeriod: 120
+
+# Events on the Node object ("SpotInterruption", "Cordon", "Drain") so that
+# `kubectl describe node` / `kubectl get events` explains a lost runner.
+emitKubernetesEvents: true
+
+daemonsetNodeSelector:
+  gardenio.io/role: ci
+# Chart default daemonsetTolerations is [operator: Exists] -- tolerates the
+# ci=true:NoSchedule taint and whatever the autoscaler adds while draining.
+
+# hostNetwork (chart default) -> IMDS at hop 1, independent of the pod-side
+# IMDS exposure decision (gd-adirNxx3Qo / gd-fTCYDqMYeH).
+useHostNetwork: true
+
+# The pod is an IMDS poller; it needs almost nothing. Bounded so it can never
+# compete with the 3-CPU/12Gi runner on the same 4-vCPU node.
+resources:
+  requests: { cpu: 10m, memory: 32Mi }
+  limits: { memory: 128Mi }

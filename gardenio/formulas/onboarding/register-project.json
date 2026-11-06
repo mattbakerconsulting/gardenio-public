@@ -1,0 +1,128 @@
+{
+  "description": "Register a repo as a gardenio project: sign in, pick the type:account bead, then gb project create with --dry-run and for real. The manual form is the Onboard section of .claude/skills/gardenio/SKILL.md (step 6).",
+  "phase": "liquid",
+  "vars": [
+    {
+      "name": "project",
+      "required": true,
+      "description": "Project name; becomes the type:project bead and the project:<name> label"
+    },
+    {
+      "name": "git_url",
+      "required": true,
+      "description": "Git remote URL of the repo, e.g. the output of `git remote get-url origin`"
+    },
+    {
+      "name": "account",
+      "required": true,
+      "description": "type:account bead that holds the LLM credentials; confirmed at the pick-account gate"
+    },
+    {
+      "name": "default_branch",
+      "default": "main",
+      "description": "Branch agents clone and branch from"
+    }
+  ],
+  "steps": [
+    {
+      "id": "sign-in",
+      "title": "Sign in to the gardenio daemon as a gardenio-admin",
+      "short_title": "sign in with gb login",
+      "type": "task",
+      "gate": {
+        "type": "manual",
+        "timeout": "24h"
+      },
+      "description": "Human step: only the person can do this.\n\n1. Export the daemon and the person the writes are attributed to:\n   ```sh\n   export BEADS_HTTP_URL=<daemon URL>\n   export BEADS_OPERATED_BY=oidc:<your email>\n   ```\n2. Run `gb login` (or `kd login`; it is the same Keycloak device code). Open the printed link in your own browser and sign in. kd and gb then send your token and refresh it themselves. A deployment that uses a static bearer instead takes `GARDENIO_TOKEN`; never paste it into a bead.\n\nCreating a project needs an OIDC token with the `gardenio-admin` role. The daemon refuses it on the shared static token and on fleet tokens (403, \"requires gardenio-admin\").\n\nClose this step once `gb prime` names you, not a service identity."
+    },
+    {
+      "id": "check-setup",
+      "title": "Check the daemon, identity and git remote for {{project}}",
+      "short_title": "check daemon, identity and remote",
+      "type": "task",
+      "needs": [
+        "sign-in"
+      ],
+      "description": "Run from the repo root:\n\n```sh\nkd --version; gb --version     # both present, same calver\ngb ping                       # nonzero exit = daemon unreachable\ngb prime                      # must name the signed-in person\ngit remote get-url origin     # must match {{git_url}}\n```\n\nIf anything fails, use the Doctor section of the gardenio skill. Close this step when every line is ok."
+    },
+    {
+      "id": "list-accounts",
+      "title": "List the type:account beads that could hold {{project}}'s LLM credentials",
+      "short_title": "list account beads",
+      "type": "task",
+      "needs": [
+        "sign-in"
+      ],
+      "description": "```sh\nkd list --type account\n```\n\nComment the candidates on the pick-account step so the person can choose. The formula was poured with account `{{account}}`; say whether it is in the list."
+    },
+    {
+      "id": "pick-account",
+      "title": "Pick the account bead for {{project}}",
+      "short_title": "pick the account bead",
+      "gate": {
+        "type": "decision",
+        "prompt": "Which type:account bead should this project use for its LLM credentials?",
+        "options": [
+          {
+            "id": "as-poured",
+            "label": "The account given when the formula was poured"
+          },
+          {
+            "id": "other",
+            "label": "A different account (name it in the answer)"
+          }
+        ],
+        "timeout": "72h"
+      },
+      "needs": [
+        "list-accounts"
+      ],
+      "description": "Decision for the person. The formula was poured with `--var account={{account}}`; the candidates are on this step's comments. If the answer is `other`, use the account it names in place of `{{account}}` in the next two steps."
+    },
+    {
+      "id": "dry-run",
+      "title": "Dry-run gb project create {{project}}",
+      "short_title": "dry-run gb project create",
+      "type": "task",
+      "needs": [
+        "check-setup",
+        "pick-account"
+      ],
+      "description": "Validate without writing. From the repo root:\n\n```sh\ngb project create {{project}} --git-url {{git_url}} --account {{account}} --default-branch {{default_branch}} --dry-run\n```\n\nUse the account chosen at pick-account. Fix any validation error (a malformed URL, a dangling account) before closing this step."
+    },
+    {
+      "id": "create",
+      "title": "Create the {{project}} project bead",
+      "short_title": "create the project bead",
+      "type": "task",
+      "needs": [
+        "dry-run"
+      ],
+      "description": "```sh\ngb project create {{project}} --git-url {{git_url}} --account {{account}} --default-branch {{default_branch}}\n```\n\nIt writes the type:project bead only. Comment the new bead id and the list of remaining wiring that the command prints (repo push credentials and any custom roles) on this step."
+    },
+    {
+      "id": "wire-credentials",
+      "title": "Wire the repo push credentials that gb project create reported for {{project}}",
+      "short_title": "wire repo push credentials",
+      "type": "task",
+      "gate": {
+        "type": "manual",
+        "timeout": "72h"
+      },
+      "needs": [
+        "create"
+      ],
+      "description": "Human or operator step. Repo push credentials are secrets, so an agent does not create them. Do what the create step's output listed, following gardenio/docs/onboarding-new-project-and-role.md.\n\nIf you cannot do it yourself, file `gb escalation create --requesting-task <this step's id>` with the exact change, and close this step when the escalation is done."
+    },
+    {
+      "id": "verify",
+      "title": "Verify the {{project}} project bead",
+      "short_title": "verify the project bead",
+      "type": "task",
+      "needs": [
+        "wire-credentials"
+      ],
+      "description": "```sh\nkd list --type project       # {{project}} is listed\nkd show <project-bead-id>    # git_url={{git_url}}, account and default_branch={{default_branch}} as chosen\n```\n\nNext: pour add-local-agent.json and then first-task.json from this directory."
+    }
+  ]
+}

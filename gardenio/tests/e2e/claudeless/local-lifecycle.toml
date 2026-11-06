@@ -1,0 +1,99 @@
+# local-lifecycle.toml
+#
+# Claudeless scenario: Local-mode full lifecycle — startup → work → shutdown
+#
+# Exercises the laptop/runner lifecycle for `gb agent start --local`. Unlike
+# agent-crew-lifecycle.toml (which exercises the K8s path), this scenario runs
+# inside a local coop session spawned by the host `gb` binary and verifies the
+# end-to-end loop an operator would see on their laptop:
+#
+#   1. Runner launches coop + claudeless with this scenario
+#   2. SessionStart hooks fire (prime, check-mail) against the local beads daemon
+#   3. Agent discovers work via `gb ready`
+#   4. Agent claims a pre-assigned task
+#   5. Agent simulates work
+#   6. Agent closes the task with `kd close`
+#   7. Agent calls `gb stop` — runner deregisters the agent bead
+#
+# The pre-assigned task ID is passed in via BOAT_TASK_ID (set by the
+# runner via `gb agent start --local --task=<id>`). The runner
+# (test-local-mode.sh, lands in A4) is responsible for provisioning the
+# task and asserting registration/deregistration from the outside.
+#
+# Run via:
+#   gb agent start --local --test-scenario=local-lifecycle
+
+# Local-mode startup prompt for `gb agent start --local` lives in the
+# sidecar local-lifecycle.startup-prompt.txt next to this file
+# (claudeless rejects unknown TOML keys). Follow-up nudges that drive the
+# remaining phases (claim → work → close → stop) live in the sidecar
+# local-lifecycle.nudges.txt — see decision ka-0000006129 (multi-nudge).
+
+[claude]
+session_id = "e2e00000-0004-4000-a000-000000000001"
+username = "e2e-local-lifecycle"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+# ── Phase 1: Startup — prime + ready ────────────────────────────────
+[[responses]]
+on = { contains = "gb ready" }
+say = "Local agent online. Checking for work."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = "gb ready 2>&1 || true"
+
+# ── Phase 2: Claim ──────────────────────────────────────────────────
+[[responses]]
+on = { contains = "claim" }
+say = "Claiming assigned task."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = "if [ -n \"$BOAT_TASK_ID\" ]; then kd claim \"$BOAT_TASK_ID\" 2>&1 || true; else echo 'no BOAT_TASK_ID set'; fi"
+
+# ── Phase 3: Do work ────────────────────────────────────────────────
+[[responses]]
+on = { contains = "work" }
+say = "Running the work step."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = "echo 'local-lifecycle: simulated work complete'"
+
+# ── Phase 4: Close ──────────────────────────────────────────────────
+[[responses]]
+on = { contains = "close" }
+say = "Work finished. Closing the task."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = "if [ -n \"$BOAT_TASK_ID\" ]; then kd close \"$BOAT_TASK_ID\" 2>&1 || true; else echo 'no BOAT_TASK_ID set'; fi"
+
+# ── Phase 5: Stop ───────────────────────────────────────────────────
+# Signals pass to gb-agent (ka-0000006600) before despawning. The runner
+# treats a missing/empty GB_SCENARIO_RESULT_FILE as a scenario failure, so
+# every successful phase chain must terminate with a positive verdict.
+[[responses]]
+on = { contains = "stop" }
+say = "Signaling despawn."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = "if [ -n \"${GB_SCENARIO_RESULT_FILE:-}\" ]; then echo pass > \"$GB_SCENARIO_RESULT_FILE\"; fi; gb stop 2>&1 || true"
+
+# ── Fallback ────────────────────────────────────────────────────────
+[default]
+say = "Local lifecycle scenario idle. Ready for the next step."
+
+# ── Tool config ─────────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

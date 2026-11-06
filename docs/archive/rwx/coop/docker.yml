@@ -1,0 +1,171 @@
+# OCI image build for coop (claude, coopmux)
+# Single workflow with config: none for clean OCI output.
+# Build tasks install toolchain manually; image tasks start from clean
+# base (no use:) for proper layer isolation. Push via rwx image push.
+
+on:
+  gitlab:
+    push:
+      if: ${{ event.git.branch == 'main' }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: ${{ event.git.ref }}
+      status-checks:
+        name: Docker
+    tag-push:
+      if: ${{ starts-with(event.git.ref, 'refs/tags/20') }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: ${{ event.git.ref }}
+      status-checks:
+        name: Docker
+    merge-request:
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: pr
+      status-checks:
+        - tasks: [build-coop]
+          name: Docker
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      ref-name: cli
+
+base:
+  image: ubuntu:24.04
+  config: none
+
+tasks:
+  # ═══════════════════════════════════════════════════════════════════════
+  # Build — native Rust compile, outputs binary artifact
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── System deps (protobuf compiler for tonic) ──────────────────────────
+  - key: build-deps
+    filter:
+      - .rwx/docker.yml
+    run: |
+      apt-get update
+      apt-get install -y git protobuf-compiler curl build-essential pkg-config libssl-dev
+
+  # ── Clone (parallel with build-deps) ──────────────────────────────────
+  - key: code
+    use: build-deps
+    run: |
+      git init
+      git remote add origin https://gitlab.com/Acme/Platform/gardenio.git
+      git fetch --depth 1 origin "$COMMIT_SHA"
+      git checkout FETCH_HEAD
+    env:
+      COMMIT_SHA: ${{ init.commit-sha }}
+
+  # ── Rust toolchain ─────────────────────────────────────────────────────
+  - key: rust
+    use: build-deps
+    filter:
+      - .rwx/docker.yml
+    run: |
+      curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain 1.93.0
+      echo "$HOME/.cargo/bin" | tee -a $RWX_ENV/PATH
+      echo "" | tee $RWX_ENV/RUSTC_WRAPPER
+
+  # ── Cargo fetch ────────────────────────────────────────────────────────
+  - key: cargo-deps
+    use: [code, rust]
+    filter:
+      - Cargo.lock
+      - Cargo.toml
+    run: cargo fetch
+
+  # ── Build coop + coopmux binaries → artifacts ────────────────────────
+  - key: build-coop
+    use: cargo-deps
+    agent:
+      cpus: 8
+    filter:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - "deploy/k8s-launch.sh"
+    run: |
+      cargo build --release -p coop --features s3 -p coopmux
+      cp target/release/coop coop-bin
+      cp target/release/coopmux coopmux-bin
+      cp deploy/k8s-launch.sh k8s-launch.sh
+    outputs:
+      artifacts:
+        - key: coop-binary
+          path: coop-bin
+        - key: coopmux-binary
+          path: coopmux-bin
+        - key: k8s-launch
+          path: k8s-launch.sh
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Image assembly — no use: = clean filesystem (multi-stage equivalent)
+  # Each task starts fresh from base image and installs only runtime deps.
+  # Artifact references work within the same run regardless of use: chain.
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── image-claude: coop + Claude CLI ──────────────────────────────────
+  - key: image-claude
+    after: build-coop
+    filter:
+      - .rwx/docker.yml
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - Cargo.lock
+    run: |
+      apt-get update && apt-get install -y --no-install-recommends \
+        git python3 build-essential openssh-client \
+        jq ripgrep fd-find tree \
+        ca-certificates curl \
+        && rm -rf /var/lib/apt/lists/*
+      curl -fsSL https://claude.ai/install.sh | bash
+      cp ${{ tasks.build-coop.artifacts.coop-binary }} /usr/local/bin/coop
+      chmod +x /usr/local/bin/coop
+      jq -n '["coop"]' > $RWX_IMAGE/entrypoint.json
+    env:
+      PATH: /root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+  # ── image-coopmux: coopmux + kubectl + k8s-launch.sh ──────────────────
+  - key: image-coopmux
+    after: build-coop
+    filter:
+      - .rwx/docker.yml
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - "deploy/k8s-launch.sh"
+    run: |
+      apt-get update && apt-get install -y --no-install-recommends \
+        git python3 build-essential openssh-client \
+        jq ripgrep fd-find tree \
+        ca-certificates curl \
+        && rm -rf /var/lib/apt/lists/*
+
+      curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+        -o /usr/local/bin/kubectl
+      chmod +x /usr/local/bin/kubectl
+
+      cp ${{ tasks.build-coop.artifacts.coopmux-binary }} /usr/local/bin/coopmux
+      chmod +x /usr/local/bin/coopmux
+
+      cp ${{ tasks.build-coop.artifacts.k8s-launch }} /usr/local/bin/coop-launch
+      chmod +x /usr/local/bin/coop-launch
+
+      jq -n '["coopmux"]' > $RWX_IMAGE/entrypoint.json
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Push — embedded run with rwx/base for CLI + package access
+  # ═══════════════════════════════════════════════════════════════════════
+  - key: push
+    if: ${{ init.ref-name != 'pr' }}
+    call: ${{ run.dir }}/push.yml
+    after: [image-claude, image-coopmux]
+    init:
+      commit-sha: ${{ init.commit-sha }}
+      ref-name: ${{ init.ref-name }}
+      image-claude-task-id: ${{ tasks.image-claude.id }}
+      image-coopmux-task-id: ${{ tasks.image-coopmux.id }}

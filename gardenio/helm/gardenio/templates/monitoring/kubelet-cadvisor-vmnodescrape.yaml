@@ -1,0 +1,66 @@
+{{- if .Values.monitoring.clusterMetrics.kubeletCadvisor.enabled }}
+{{- $cfg := .Values.monitoring.clusterMetrics.kubeletCadvisor }}
+{{- $name := printf "%s-kubelet-cadvisor" (include "gardenio.fullname" .) }}
+# Cluster-wide kubelet /metrics/cadvisor scrape for the vm-operator monitoring
+# stack (ka-0000006163 — "Instrument the cluster").
+#
+# A VMNodeScrape (node-role SD) so the monitoring vm-agent scrapes EVERY
+# kubelet's cadvisor endpoint directly and vmsingle-vm-single carries
+# container_cpu_usage_seconds_total + container_memory_working_set_bytes — the
+# per-container CPU/memory usage the EKS capacity/autoscaling analysis needs as
+# percentiles over time, absent from that store today.
+#
+# WHY VMNodeScrape (not the in-chart static-vmagent kubeletScrape): the static
+# vmagent's kubelet job feeds the SEPARATE in-chart gardenio-vmsingle and is
+# scoped to the release namespace (/metrics/resource only). This CR feeds the
+# CLUSTER observability store instead, via the vm-operator: that vm-agent runs
+# selectAllByDefault:true and its ServiceAccount already carries
+# nodes/nodes/metrics get/list/watch (verified live), so no operator or RBAC
+# change is needed — the CR is discovered and scraped as-is.
+#
+# TLS/auth: the kubelet serves :10250 with a self-signed cert (no cluster-CA SAN
+# for node addresses on EKS) and authorizes via the Webhook authorizer against
+# the nodes/metrics subresource — hence insecureSkipVerify + the SA bearer
+# token. The metricRelabelConfigs keep pins the copied series to the two
+# capacity families and drop cadvisor's high-cardinality id/image/name labels so
+# the shared store's retention stays bounded.
+#
+# OPERATOR PREREQ: the monitoring vm-agent must be able to reach node :10250.
+# Verified 2026-09-01: the `monitoring` namespace has NO NetworkPolicy, so
+# egress is open; if a default-deny policy is later added there, allow
+# vm-agent -> nodes:10250.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMNodeScrape
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kubelet-cadvisor
+spec:
+  scheme: https
+  honorLabels: true
+  interval: {{ $cfg.interval | default .Values.monitoring.victoriaMetrics.interval | default "30s" }}
+  scrapeTimeout: {{ $cfg.scrapeTimeout | default "10s" }}
+  path: /metrics/cadvisor
+  bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+  tlsConfig:
+    insecureSkipVerify: true
+  relabelConfigs:
+    # Stamp the node identity onto every series (cadvisor's own labels carry
+    # namespace/pod/container).
+    - action: replace
+      sourceLabels: [__meta_kubernetes_node_name]
+      targetLabel: node
+    - targetLabel: job
+      replacement: kubelet-cadvisor
+  metricRelabelConfigs:
+    # Keep only the capacity-signal families (bounds shared-store cardinality).
+    - action: keep
+      sourceLabels: [__name__]
+      regex: "({{ join "|" $cfg.keepMetrics }})"
+    # Drop cadvisor's high-cardinality per-container labels; pod/namespace/
+    # container are enough to attribute usage.
+    - action: labeldrop
+      regex: "id|image|name"
+{{- end }}

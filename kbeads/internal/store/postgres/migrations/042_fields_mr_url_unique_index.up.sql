@@ -1,0 +1,68 @@
+-- Task ka-0000005686 (HALF-2): promote the type=merge-request mr_url index to
+-- UNIQUE. Follows migration 041 (ka-0000002762 HALF-1), which added the
+-- NON-UNIQUE partial index idx_beads_fields_mr_url as a deliberate placeholder.
+--
+-- WHY THIS IS A SEPARATE MIGRATION FROM 041.
+-- A partial UNIQUE index cannot be built while duplicate sets live: a full
+-- census (2026-08-18) measured 396 mr_urls carrying >1 canonical MR bead (up to
+-- 7 each), 282 disagreeing on mr_state. CREATE UNIQUE INDEX over that population
+-- raises 23505 (unique_violation) and hard-fails the prod `kd migrate` Job. So
+-- 041 shipped a non-unique index (useful on its own — it makes the daemon dedup
+-- lookup indexed), and promotion to UNIQUE was gated behind reconciling those
+-- 396 sets first.
+--
+-- DEPLOY-ORDER PRECONDITION (operator/release note).
+-- The reconciliation sweep `kd admin migrate mr-bead-dedup --apply` MUST have
+-- run and reported 0 mr_urls with >1 open+closed merge-request bead BEFORE this
+-- migration runs on an environment that still carries duplicates. On a fresh /
+-- already-clean store this migration is a no-op-safe build. If duplicates
+-- remain, the CREATE UNIQUE INDEX below fails loudly with 23505 (naming the
+-- conflicting mr_url in the Postgres detail) rather than silently — that is the
+-- intended guard: it refuses to promote over a dirty population instead of
+-- masking it.
+--
+-- TYPE-SCOPED (as 041): to 'merge-request' because task beads ALSO carry a
+-- legacy fields->>'mr_url' (the pre-epic dual-write); a producing task bead
+-- mirroring the same URL must stay OUT of the uniqueness set. `fields ?
+-- 'mr_url'` keeps rows without the key out of the index.
+--
+-- DELETED-SCOPED (added ka-0000003154): the predicate ALSO requires
+-- `deleted_at IS NULL`. This is a HARD requirement, not a nicety — without it a
+-- SOFT-DELETED merge-request tombstone that still carries fields.mr_url
+-- collides on the unique build with the live bead for the same URL and raises
+-- 23505, hard-failing the prod `kd migrate` Job. Prod hit exactly this
+-- (2026-08-19 → 2026-08-20): MR !3656 had one soft-deleted opened bead
+-- (ka-0000008228, deleted_at set) + one live closed bead (ka-0000000654); the
+-- mr-bead-dedup precondition sweep (which goes through ListBeads, and so is
+-- deleted-blind by the store's default `deleted_at IS NULL` filter) reported 0
+-- duplicates, while this status-blind, deleted-blind CREATE UNIQUE INDEX saw 1
+-- collision and dirtied schema_migrations at 42 — freezing every prod deploy
+-- for ~30h (13+ consecutive failed release pipelines, 2026.231.7 → 2026.232.1,
+-- all at this hook).
+--
+-- Scoping the index to `deleted_at IS NULL` makes the on-disk uniqueness
+-- constraint match the invariant the daemon ACTUALLY enforces: every daemon
+-- read/lookup (including server/beads_mr_dedup.go's lookupMergeRequestByURL,
+-- via store.ListBeads) appends `deleted_at IS NULL`, so a tombstone is already
+-- invisible to createBead's dedup. A tombstone that duplicates a live URL is
+-- therefore NOT a violation of the daemon's invariant, and the index must not
+-- treat it as one. The daemon lookup still hits this partial index because that
+-- query carries the same `deleted_at IS NULL` clause.
+--
+-- Migration policy (kbeads/CLAUDE.md): idempotent DDL only. DROP … IF EXISTS
+-- before CREATE … IF NOT EXISTS so a partially-applied migration recovers on
+-- retry without manual intervention. Built inline (not CONCURRENTLY) because
+-- golang-migrate wraps each migration in a transaction; over the small partial
+-- set (~7800 merge-request rows) this is a sub-second build with no
+-- daemon-startup deadline (runs via `kd migrate`).
+--
+-- The name changes (idx_beads_fields_mr_url → idx_beads_fields_mr_url_unique)
+-- so a re-run after a partial apply cannot leave the old non-unique index
+-- shadowing the new unique one: the DROP removes 041's index by its old name,
+-- and the CREATE builds the unique index under the new name.
+
+DROP INDEX IF EXISTS idx_beads_fields_mr_url;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_beads_fields_mr_url_unique
+    ON beads ((fields->>'mr_url'))
+    WHERE type = 'merge-request' AND fields ? 'mr_url' AND deleted_at IS NULL;

@@ -1,0 +1,123 @@
+# edge-auth-forwardauth-identity-write.toml
+#
+# Claudeless scenario for ka-0000007461 (epic ka-0000006278): the
+# write-through-forwardauth-identity lifecycle — a WRITE that carries ONLY an
+# injected human identity (no agent self-attribution) must land
+# operated_by=oidc:<email> on the bead's event log.
+#
+# This is the claudeless companion to edge-auth Gate Q. In prod the AVA
+# forwardauth verifies a browser session (the gb-login cookie) and the
+# unified-host → kbeads hop carries the resolved human identity, which kbeads
+# maps to operated_by=oidc:<email>. Here we exercise the SAME kbeads
+# resolution contract directly via BEADS_HTTP_URL with the X-Operated-By
+# attribution header (the static-token human-identity channel; see kbeads
+# resolveOperatedByPure case "static"/"none"). Driving it through claudeless
+# proves the lifecycle end-to-end (create → comment → query attribution) the
+# way a session-driven write would, and is GREEN in the ephemeral e2e ns
+# where edge-auth/unified-host are not deployed.
+#
+# Engine/server code covered:
+#   - kbeads/internal/server/interceptors.go AuthMiddleware (X-Operated-By)
+#   - kbeads/internal/server/audit.go resolveOperatedByPure / sanitizeOperatedByHeader
+#   - kbeads/internal/server/http_relations.go handleGetEvents (operated_by surface)
+#   - kbeads/internal/store/postgres/queries.go queryGetEvents (operators JOIN)
+#
+# Fast by construction: no scheduler reconcile, no cron boundary — three curl
+# round-trips. Safe to keep in the auto-discovered `claudeless` module shard.
+
+[claude]
+session_id = "e2e00000-00ea-4000-a000-000000000001"
+username = "e2e-edge-auth-fwdidentity-write"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 60000
+
+[[responses]]
+on = "*"
+say = "Running edge-auth-forwardauth-identity-write: WRITE via injected identity → operated_by=oidc:<email>."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+  echo "SKIP: curl/jq not present"; exit 0
+fi
+if [ -z "${BEADS_HTTP_URL:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL unset"; exit 0
+fi
+
+TAG="e2e-eafiw-$$-$(date +%s)"
+# Injected human identity — distinct from run-shard.sh's ambient
+# BEADS_OPERATED_BY so the assertion proves the per-request identity wins, not
+# the shard default. Must be oidc:<local>@<domain> so kbeads' sanitizer accepts it.
+OP="oidc:gb-login-claudeless-${TAG}@gardenio.dev"
+BASE="${BEADS_HTTP_URL%/}"
+
+hdr() {
+  set -- -H "Content-Type: application/json" -H "X-Operated-By: ${OP}"
+  if [ -n "${BEADS_TOKEN:-}" ]; then set -- "$@" -H "Authorization: Bearer ${BEADS_TOKEN}"; fi
+  printf '%s\\n' "$@"
+}
+mapfile -t H < <(hdr)
+
+cleanup() {
+  if [ -n "${BEAD_ID:-}" ]; then
+    curl -sf -X POST "${H[@]}" "$BASE/v1/beads/$BEAD_ID/close" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+# ── Create a bead carrying the injected identity ────────────────────
+CREATE=$(curl -sS -X POST "${H[@]}" \
+  -d "{\\"title\\":\\"edge-auth fwdauth-identity write $TAG\\",\\"type\\":\\"task\\",\\"labels\\":[\\"e2e:claudeless\\",\\"e2e-tag:$TAG\\"],\\"description\\":\\"forwardauth-identity WRITE attribution probe — safe to delete\\"}" \
+  "$BASE/v1/beads" 2>&1)
+BEAD_ID=$(printf '%s' "$CREATE" | jq -r '.id // empty' 2>/dev/null)
+if [ -z "$BEAD_ID" ]; then fail "create bead via injected identity" "$(printf '%s' "$CREATE" | head -c 200)"; exit 1; fi
+pass "created bead $BEAD_ID via injected identity"
+
+# ── Add a comment carrying the same injected identity ───────────────
+COMMENT=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${H[@]}" \
+  -d '{"text":"forwardauth-identity comment"}' \
+  "$BASE/v1/beads/$BEAD_ID/comments" 2>&1)
+case "$COMMENT" in
+  200|201) pass "added comment via injected identity ($COMMENT)" ;;
+  *) fail "add comment → 2xx" "got $COMMENT" ;;
+esac
+
+# ── Assert operated_by attribution on the event log ─────────────────
+EVENTS=$(curl -sS "${H[@]}" "$BASE/v1/beads/$BEAD_ID/events" 2>&1)
+OPS=$(printf '%s' "$EVENTS" | jq -r \
+  '[.events[]? | select((.topic // "") | test("created|updated|comment")) | .operated_by // ""] | unique | .[]' 2>/dev/null)
+if [ -z "$OPS" ]; then
+  fail "events carry operated_by" "$(printf '%s' "$EVENTS" | head -c 300)"
+else
+  MISMATCH=$(printf '%s\\n' "$OPS" | grep -v -x "$OP" || true)
+  if [ -z "$MISMATCH" ]; then
+    pass "all write events attribute to injected identity ($OP)"
+  else
+    fail "events attribute to $OP" "found other operator(s): $(printf '%s' "$MISMATCH" | tr '\\n' ' ')"
+  fi
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "edge-auth-forwardauth-identity-write OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "edge-auth-forwardauth-identity-write scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

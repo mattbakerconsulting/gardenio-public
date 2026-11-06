@@ -1,0 +1,127 @@
+{{- if .Values.objectStore.enabled }}
+{{- /*
+In-box object store (MinIO) server — ka-0000004955.
+
+Single-node single-drive Deployment (MINIO_VOLUMES=/data) backed by one
+`local-path` PVC. Recreate strategy: the RWO PVC can attach to only one pod, so
+a rolling update would deadlock on the volume. PSA-restricted (non-root, no
+privileged, no hostPath, drop ALL caps, RuntimeDefault seccomp) so it admits
+cleanly into the workload namespace. Reachable only in-cluster over ClusterIP
+HTTP — never edge-exposed (the public-exposure axis governs the edge; MinIO is
+not part of it). Credentials come from the in-box-seeded Secret.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.minio.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.minio.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.minio.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.minio.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: minio
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.objectStore.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.objectStore.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.secretName" . }}
+                  key: accesskey
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.secretName" . }}
+                  key: secretkey
+            # Browser console off: MinIO is an internal data plane, not a UI.
+            - name: MINIO_BROWSER
+              value: "off"
+            {{- with .Values.objectStore.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: s3
+              containerPort: 9000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.objectStore.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.minio.fullname" . }}-data
+        - name: tmp
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.objectStore.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.objectStore.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.objectStore.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- /* A stateful store like postgres: the prod overlay pins it to the
+      scarce on-demand pair, where at priority 0 it cannot displace anything
+      and sat Pending behind gardeners (2026-09-23 rollout). */}}
+      {{- if .Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ .Values.global.systemPriorityClass.name }}
+      {{- end }}
+{{- end }}

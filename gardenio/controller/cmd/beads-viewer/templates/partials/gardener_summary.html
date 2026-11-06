@@ -1,0 +1,201 @@
+{{define "gardener_summary"}}
+{{- /* Shared gardener-summary component (task ka-0000006542): the goal + cadence
+       + counters + config + trajectory block that summarizes a gardener at a
+       glance. Rendered in TWO places so the gardener page rail and the gardener
+       bead view (/beads/<gardener-id>) converge on one design:
+
+         1. gardener_detail.html  — the sticky right-hand rail.
+         2. type_gardener.html    — the per-type detail block on the bead page.
+
+       Dot context: { Gardener gardenerView, BasePath string }. Wrapped in a dict
+       because both callers rebind `$`, so the component takes its gardenerView
+       explicitly rather than reaching for a page-level field. */ -}}
+{{- $cap := .Gardener -}}
+<div class="gardener-header">
+  <div class="gardener-header-meta">
+    <span class="bead-row-id">{{$cap.ID}}</span>
+    {{if $cap.OwnerDisplay}}<span class="meta" title="owner">owner {{userLink $cap.OwnerDisplay $cap.OwnerSlug}}</span>{{end}}
+    {{if $cap.Ago}}<span class="meta" title="last updated {{$cap.UpdatedAtRFC}}">updated {{$cap.Ago}}</span>{{end}}
+  </div>
+
+  {{- /* Schedule / cadence strip: surface next-fire + cron cadence so an
+         operator can read the gardener's tempo at a glance. Suppressed entirely
+         for bead-trigger gardeners with no cron. */ -}}
+  {{if $cap.Cron}}
+  <div class="gardener-schedule" aria-label="Schedule">
+    {{if $cap.NextFireRelative}}<span class="cap-next cap-next-soon" title="next fire {{$cap.NextFire}}">fires {{$cap.NextFireRelative}}</span>
+    {{else if $cap.NextFireError}}<span class="cap-next cap-next-err" title="cron parse error: {{$cap.NextFireError}}">cron error</span>
+    {{else if $cap.IsClosed}}<span class="cap-next meta" title="closed gardeners do not fire">not scheduled (closed)</span>
+    {{else if not $cap.Enabled}}<span class="cap-next meta" title="disabled gardeners do not fire">not scheduled (disabled)</span>{{end}}
+    <span class="chip chip-type gardener-cadence" title="cron schedule{{if $cap.Timezone}} ({{$cap.Timezone}}){{end}}">cadence: <code>{{$cap.Cron}}</code>{{if $cap.Timezone}} <span class="meta">{{$cap.Timezone}}</span>{{end}}</span>
+    {{- /* Overdue counter-signal beside the projected next-fire (bug
+           ka-0000006095 / A1): next-fire is projected from the cron and does not
+           confirm firing, so flag when the gardener is actually late. */ -}}
+    {{if $cap.Liveness.Overdue}}<span class="cap-next cap-next-err" title="This gardener should have fired again but has not — {{$cap.Liveness.OverdueDetail}}. Next-fire is a cron projection, not a firing guarantee.">⚠ overdue · {{$cap.Liveness.OverdueDetail}}</span>{{end}}
+  </div>
+  {{else if $cap.Liveness.Overdue}}
+  {{- /* Non-cron gardener flagged overdue (budget exhausted / progress frozen). */ -}}
+  <div class="gardener-schedule" aria-label="Schedule">
+    <span class="cap-next cap-next-err" title="This gardener looks overdue — {{$cap.Liveness.OverdueDetail}}.">⚠ overdue · {{$cap.Liveness.OverdueDetail}}</span>
+  </div>
+  {{end}}
+
+  {{if $cap.TerminalGoal}}
+  <p class="gardener-goal"><span class="gardener-goal-label">Terminal goal</span> {{$cap.TerminalGoal}}</p>
+  {{end}}
+
+  {{- /* Run prompt (bug ka-0000003596): the per-run `prompt` field IS the
+         operative instruction sent verbatim to every run the gardener spawns —
+         the single most behavior-defining knob. It was invisible on every
+         modern gardener surface. Surface it in a collapsible block (an escape
+         hatch like type_schedule.html's <pre>) so an operator can read exactly
+         what the gardener instructs each run to do without reading raw bead
+         JSON. Default-open when there is NO terminal goal, so a prompt-only
+         gardener — the sanctioned shape — is not silent about what it does. */ -}}
+  {{if $cap.Prompt}}
+  <details class="gardener-prompt"{{if not $cap.TerminalGoal}} open{{end}}>
+    <summary class="gardener-prompt-summary">Run prompt <span class="meta">— sent to every run</span></summary>
+    <pre class="gardener-prompt-body">{{$cap.Prompt}}</pre>
+  </details>
+  {{end}}
+
+  {{- /* Legible at-a-glance config (task ka-0000005782 / I2.4, design D1.2):
+         wakes-when / chasing / stops-when decoded into prose, replacing the raw
+         JSON dump. Health is the Trajectory verdict below. The raw stop/progress
+         JSON stays reachable behind the collapsed <details> audit hatch. */ -}}
+  <dl class="gardener-legible" aria-label="Gardener behavior at a glance">
+    <div class="cap-leg-row cap-leg-wakes">
+      <dt>Wakes</dt>
+      <dd>
+        {{if $cap.Legible.HasWakes}}
+          <ul class="cap-leg-list">
+            {{range $cap.Legible.Wakes}}<li class="cap-leg-item cap-leg-{{.Kind}}"{{if .Detail}} title="{{.Detail}}"{{end}}>{{.Summary}}</li>{{end}}
+          </ul>
+        {{else}}<span class="cap-leg-muted">fired manually</span>{{end}}
+      </dd>
+    </div>
+    <div class="cap-leg-row cap-leg-chasing">
+      <dt>Chasing</dt>
+      <dd>{{$cap.ChasingSummary}}</dd>
+    </div>
+    <div class="cap-leg-row cap-leg-stops">
+      <dt>Stops</dt>
+      <dd>
+        {{if $cap.Legible.HasStops}}
+          <ul class="cap-leg-list">
+            {{range $cap.Legible.Stops}}<li class="cap-leg-item cap-leg-stop-{{.Slot}}"><span class="cap-leg-slot" title="{{.Slot}}">{{.SlotLabel}}</span> {{.Summary}}</li>{{end}}
+          </ul>
+          {{if $cap.Legible.OnLoopEnd}}<div class="cap-leg-onend meta">then: {{$cap.Legible.OnLoopEnd}}</div>{{end}}
+        {{else if $cap.ExitCondition}}<span>exit: {{$cap.ExitCondition}}</span>
+        {{else}}<span class="cap-leg-muted">runs until stopped by hand</span>{{end}}
+      </dd>
+    </div>
+  </dl>
+
+  {{- /* Budget burn (task ka-0000007105): the operator's #1 question is "how
+         close is this gardener to stopping?" — surface run-budget burn as a
+         first-class progress meter, not a pair of plain numbers buried in the
+         stats dl. Suppressed (HasData=false) for a gardener with no run_budget
+         ceiling (unlimited) AND for a standing gardener, whose run_budget is
+         non-enforced accounting — a burn bar there is a false "about to stop /
+         runaway" signal (bug ka-0000006238). A "standing (unbounded)" chip renders
+         in its place below. The parsed stop conditions ("Stops when …") render
+         below; together they answer when/why-does-it-stop above the collapsed
+         raw-JSON audit hatch. */ -}}
+  {{- if $cap.IsStanding}}
+  <div class="gardener-budget gardener-budget-standing" aria-label="Run bound">
+    <div class="gardener-budget-head">
+      <span class="gardener-budget-label">Run bound</span>
+      <span class="gardener-budget-count" title="This is a STANDING (perpetual) gardener: its run_budget / max_runs are non-enforced accounting the engine exempts it from. The only real ceilings are the hard_stop brakes (consecutive_failures, wall_clock). RunsSpawned climbing past run_budget / max_runs is by design, not a runaway (bug ka-0000006238).">standing &middot; unbounded by design</span>
+    </div>
+  </div>
+  {{end}}
+  {{- with $cap.BudgetBurn}}{{if .HasData}}
+  <div class="gardener-budget gardener-budget-{{.Level}}" aria-label="Run-budget burn">
+    <div class="gardener-budget-head">
+      <span class="gardener-budget-label">Budget burn</span>
+      <span class="gardener-budget-count" title="Runs spawned vs. the run-budget ceiling the engine gates spawns on ({{.Spawned}} of {{.Budget}}).">{{.Spawned}} / {{.Budget}}{{if .Over}} <span class="gardener-budget-flag">at budget</span>{{else}} <span class="meta">({{.Remaining}} left)</span>{{end}}</span>
+    </div>
+    <div class="gardener-budget-track" role="progressbar" aria-valuenow="{{.Pct}}" aria-valuemin="0" aria-valuemax="100" aria-label="{{.Pct}}% of run budget spent">
+      <div class="gardener-budget-fill" style="width: {{.Pct}}%"></div>
+    </div>
+  </div>
+  {{end}}{{end}}
+
+  {{- /* Iterations is the PRIMARY, AUTHORITATIVE run count: it is the live
+         daemon count. The engine's GardenerSpec lifetime tally (RunsSpawned /
+         RunsCompleted) is a monotonic count that keeps climbing after older
+         iteration beads are pruned — it is demoted to an always-shown, clearly
+         framed SECONDARY line (design doc §1.3, ka-0000003322). */ -}}
+  <dl class="gardener-stats">
+    <div><dt>Iterations</dt><dd>{{$cap.IterationCount}}{{if $cap.LiveCount}} <span class="meta">({{$cap.LiveCount}} live)</span>{{end}}{{if $cap.DidNotRunCount}} <span class="meta gardener-stat-didnotrun" title="Spawns the reconciler expired in the coop queue before they ever claimed a pod (agent_state=expired). They show in the thread as &quot;did not run&quot; but are NOT counted as runs.">(+{{$cap.DidNotRunCount}} never ran)</span>{{end}}</dd></div>
+    {{if $cap.EngineCount}}{{if $cap.EngineDerived}}<div><dt>Engine count <span class="meta gardener-stat-source">from life-thread</span></dt><dd class="gardener-stat-secondary" title="This gardener is a legacy spawn_agent / bare-trigger loop with no engine spec, so it carries no monotonic lifetime tally. This count is DERIVED from the rendered life-thread: spawned = the iterations shown, completed = the closed ones.">{{$cap.EngineCount}}</dd></div>{{else}}<div><dt>Engine count <span class="meta gardener-stat-source">lifetime tally</span></dt><dd class="gardener-stat-secondary{{if $cap.EnginePruned}} gardener-stat-pruned{{end}}" title="The engine's monotonic lifetime spawn tally. Older iteration beads are pruned, so this count exceeds the renderable Iterations above; the cards are the authoritative, findable runs.">{{$cap.EngineCount}}</dd></div>{{end}}{{end}}
+    {{if $cap.MaxRuns}}<div><dt>Max runs</dt><dd>{{$cap.MaxRuns}}</dd></div>{{end}}
+    {{if $cap.RunBudget}}<div><dt>Run budget</dt><dd>{{$cap.RunBudget}}</dd></div>{{end}}
+    {{if $cap.ConsecutiveFailures}}<div><dt>Consecutive failures</dt><dd class="gardener-stat-warn">{{$cap.ConsecutiveFailures}}</dd></div>{{end}}
+    {{if or $cap.ResumesWithoutProgress $cap.LastResumeReason}}<div><dt>Resumes <span class="meta gardener-stat-source">fruitless / budget</span></dt><dd{{if ge $cap.ResumesWithoutProgress $cap.ResumeBudget}} class="gardener-stat-warn"{{end}} title="Consecutive resumes with no progress vs. resume budget. At the budget the gardener escalates to the operator. Last re-arm reason: {{$cap.LastResumeReason}} (bead ka-0000005353).">{{$cap.ResumesWithoutProgress}} / {{$cap.ResumeBudget}}{{if $cap.LastResumeReason}} <span class="meta">({{$cap.LastResumeReason}})</span>{{end}}</dd></div>{{end}}
+  </dl>
+
+  <div class="gardener-config">
+    {{if $cap.ExitCondition}}<span class="chip chip-type" title="exit_condition">exit: {{$cap.ExitCondition}}</span>{{end}}
+    {{if $cap.OnExit}}<span class="chip chip-type" title="on_exit">on exit: {{$cap.OnExit}}</span>{{end}}
+    {{if $cap.RetryOnFailure}}<span class="chip chip-type" title="retry_on_failure">retry{{if $cap.MaxRetries}} &times;{{$cap.MaxRetries}}{{end}}</span>{{end}}
+    {{if $cap.OneSpawnAtATime}}<span class="chip chip-type">one spawn at a time</span>{{end}}
+    {{if $cap.RunTimeout}}<span class="chip chip-type" title="run_timeout">run timeout: {{$cap.RunTimeout}}</span>{{end}}
+    {{if $cap.Timeout}}<span class="chip chip-type" title="timeout">timeout: {{$cap.Timeout}}</span>{{end}}
+  </div>
+
+  {{- /* Legible stop-condition summary (task ka-0000000897 / I2.3): human
+         "stops when …" lines, read first; the raw JSON stays as an escape
+         hatch below. */ -}}
+  {{if $cap.StopSummary}}
+  <div class="gardener-stop-summary">
+    <span class="gardener-stop-summary-label">Stops when</span>
+    <ul class="gardener-stop-summary-list">
+      {{range $cap.StopSummary}}<li>{{.}}</li>{{end}}
+    </ul>
+  </div>
+  {{end}}
+  {{if $cap.StopJSON}}
+  <details class="gardener-spec-details">
+    <summary>Stop spec{{if $cap.StopSummary}} (raw){{end}}</summary>
+    <pre class="gardener-spec-json">{{$cap.StopJSON}}</pre>
+  </details>
+  {{end}}
+  {{if $cap.ProgressJSON}}
+  <details class="gardener-spec-details">
+    <summary>Progress state</summary>
+    <pre class="gardener-spec-json">{{$cap.ProgressJSON}}</pre>
+  </details>
+  {{end}}
+</div>
+
+{{- /* Cross-run progress narrative (task ka-0000003359): a compact trajectory
+       strip — per-run outcome sparkline + aggregate outcome signals — so the
+       operator can read direction (winning / stalling / stuck) at a glance.
+       Suppressed when there is nothing to narrate (HasData=false). */ -}}
+{{- with $cap.Trajectory}}{{if .HasData}}
+<section class="gardener-trajectory" aria-label="Cross-run progress trajectory">
+  <div class="gardener-trajectory-head">
+    <h2 class="gardener-trajectory-heading">Trajectory</h2>
+    <span class="gardener-verdict gardener-verdict-{{.VerdictKind}}">{{.Verdict}}{{if .VerdictDetail}} <span class="gardener-verdict-detail">· {{.VerdictDetail}}</span>{{end}}</span>
+  </div>
+
+  {{if .Runs}}
+  <div class="gardener-spark" aria-label="Per-run progress, oldest to newest">
+    {{if .SparkOmitted}}<span class="gardener-spark-omitted meta" title="{{.SparkOmitted}} older run{{if ne .SparkOmitted 1}}s{{end}} not shown">+{{.SparkOmitted}}</span>{{end}}
+    {{range .Runs}}<span class="gardener-spark-bar gardener-spark-{{.Outcome}}" style="height: {{.Height}}%" title="{{.Title}}"></span>{{end}}
+  </div>
+  {{end}}
+
+  <dl class="gardener-trajectory-stats">
+    {{if .TotalRuns}}<div><dt>Recorded runs</dt><dd>{{.TotalRuns}}</dd></div>{{end}}
+    {{if .TotalRuns}}<div><dt>Outcome rate</dt><dd>{{.OutcomeRate}}% <span class="meta">({{.OutcomeRuns}}/{{.TotalRuns}})</span></dd></div>{{end}}
+    {{if .MRsMerged}}<div><dt>MRs merged</dt><dd>{{.MRsMerged}}</dd></div>{{end}}
+    {{if .BeadsClosed}}<div><dt>Beads closed</dt><dd>{{.BeadsClosed}}</dd></div>{{end}}
+    {{if .DecisionsResolved}}<div><dt>Decisions resolved</dt><dd>{{.DecisionsResolved}}</dd></div>{{end}}
+    {{if .ConsecutiveFailures}}<div><dt>Consecutive failures</dt><dd class="gardener-stat-warn">{{.ConsecutiveFailures}}</dd></div>{{end}}
+  </dl>
+</section>
+{{end}}{{end}}
+{{end}}

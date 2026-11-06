@@ -1,0 +1,152 @@
+{{- if and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-forwardauth-templates
+  namespace: {{ .Release.Namespace }}
+  # This object must render byte-identically across chart versions: its labels
+  # omit the chart-version label (templateLabels) because the Deployment hashes this
+  # manifest into checksum/error-template. A calver release that edits no
+  # template therefore leaves the ConfigMap and the oauth2-proxy pod alone, and
+  # oauth2-proxy keeps its JWKS cache across Keycloak restarts (gd-NrzwHXUxV0).
+  labels:
+    {{- include "gardenio.forwardAuth.templateLabels" . | nindent 4 }}
+data:
+  # Custom oauth2-proxy templates. v7 loads any of {sign_in.html, error.html,
+  # robots.txt} from --custom-templates-dir and overrides the matching named
+  # template; missing files fall back to the built-in defaults.
+  #
+  # Why both files: the CSRF / "no cookies" failure path on /oauth2/callback
+  # actually renders error.html (with .Message flash), NOT sign_in.html. We
+  # ship error.html for the self-heal redirect, and ship a styled sign_in.html
+  # too so the post-recovery sign-in (when --skip-provider-button=false in
+  # other deployments, or in the rare case it does render) matches the same
+  # minimal style instead of the upstream bulma-heavy default.
+  #
+  # The error template's data shape is:
+  #   { Title string; Message string; ProxyPrefix string; StatusCode int;
+  #     Redirect string; RequestID string; Footer template.HTML; Version string }
+  # (verified against oauth2-proxy v7.8.1 — note Message is SINGULAR; the
+  # default upstream template uses .Message, not .Messages.)
+  #
+  # Self-heal logic (error.html): if the rendered .Message mentions CSRF /
+  # cookie / "Login Failed" AND we're on /oauth2/callback with a state= param,
+  # parse the original target out of `state` and chain sign_out -> start to
+  # fire a fresh OAuth flow. Everything else falls through to a visible card
+  # -- never auto-redirect on a legitimate denial, that loops.
+  #
+  # Detection reads message text from the rendered DOM (a hidden #msgs div)
+  # rather than from `{{ .Message }}` inside the script literal so we don't
+  # have to fight Go html/template's context-aware JS escaping. See
+  # ka-0000001516 for the originating bug.
+  error.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>{{`{{.StatusCode}}`}} {{`{{.Title}}`}}</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+               background: #fafafa; color: #222; margin: 0;
+               display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .card { background: #fff; padding: 2rem 2.5rem; border-radius: 8px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.08); max-width: 30rem; }
+        h1 { margin: 0 0 0.5rem; font-size: 1.4rem; }
+        p { margin: 0.5rem 0; }
+        a { color: #2563eb; }
+        .req { color: #888; font-size: 0.8rem; margin-top: 1rem; }
+      </style>
+    </head>
+    <body>
+      <div id="msgs" hidden>{{`{{ .Message }}`}}</div>
+      <div id="err" class="card" style="display:none">
+        <h1>{{`{{.Title}}`}}</h1>
+        {{`{{ if .Message }}`}}<p>{{`{{ .Message }}`}}</p>{{`{{ end }}`}}
+        <p><a href="{{`{{.Redirect}}`}}">Try again</a></p>
+        {{`{{ if .RequestID }}`}}<p class="req">Request ID: {{`{{.RequestID}}`}}</p>{{`{{ end }}`}}
+      </div>
+      <script>
+        (function () {
+          var status = {{`{{.StatusCode}}`}};
+          var prefix = {{`{{.ProxyPrefix}}`}};
+          var msgEl = document.getElementById("msgs");
+          var msg = msgEl ? (msgEl.textContent || "") : "";
+          var path = window.location.pathname;
+          var qs = window.location.search;
+          var looksLikeCsrfFail = status === 403
+            && /csrf|cookie|login failed/i.test(msg)
+            && path.indexOf(prefix + "/callback") !== -1
+            && qs.indexOf("state=") !== -1;
+          if (looksLikeCsrfFail) {
+            // Self-heal at most once per session. iOS WebKit ITP partitioning
+            // drops the per-request CSRF cookie on the cross-subdomain redirect,
+            // so retrying forever just burns CPU. After one attempt fall through
+            // to the visible error card so the user can retry manually.
+            var KEY = "oauth2_self_heal_attempted";
+            var canPersist = false;
+            try {
+              if (!sessionStorage.getItem(KEY)) {
+                sessionStorage.setItem(KEY, "1");
+                canPersist = true;
+              }
+            } catch (e) {
+              // Safari Private Browsing throws QuotaExceededError on setItem.
+              // Without a working circuit breaker, redirecting again would loop,
+              // so fall through to the visible error card.
+            }
+            if (canPersist) {
+              var params = new URLSearchParams(qs);
+              var state = params.get("state") || "";
+              var colon = state.indexOf(":");
+              var rd = colon > -1 ? state.slice(colon + 1) : "/";
+              var startURL = prefix + "/start?rd=" + encodeURIComponent(rd);
+              var target = prefix + "/sign_out?rd=" + encodeURIComponent(startURL);
+              window.location.replace(target);
+              return;
+            }
+          }
+          document.getElementById("err").style.display = "block";
+        })();
+      </script>
+      <noscript>
+        <div class="card">
+          <h1>{{`{{.Title}}`}}</h1>
+          {{`{{ if .Message }}`}}<p>{{`{{ .Message }}`}}</p>{{`{{ end }}`}}
+          <p><a href="{{`{{.Redirect}}`}}">Try again</a></p>
+        </div>
+      </noscript>
+    </body>
+    </html>
+  sign_in.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Sign in</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+               background: #fafafa; color: #222; margin: 0;
+               display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .card { background: #fff; padding: 2rem 2.5rem; border-radius: 8px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.08); max-width: 30rem; }
+        h1 { margin: 0 0 0.75rem; font-size: 1.3rem; }
+        button { background: #2563eb; color: #fff; border: 0; padding: 0.55rem 1rem;
+                 border-radius: 6px; font-size: 1rem; cursor: pointer; }
+        button:hover { background: #1d4ed8; }
+        a { color: #2563eb; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Sign in</h1>
+        <form method="GET" action="{{`{{.ProxyPrefix}}`}}/start">
+          <input type="hidden" name="rd" value="{{`{{.Redirect}}`}}">
+          <button type="submit">Sign in with {{`{{.ProviderName}}`}}</button>
+        </form>
+      </div>
+    </body>
+    </html>
+{{- end }}

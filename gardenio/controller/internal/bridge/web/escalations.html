@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Escalations</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    --orange: #d18616;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5; }
+  .container { max-width: 960px; margin: 0 auto; padding: 16px; }
+  header { display: flex; align-items: center; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  header h1 { font-size: 20px; font-weight: 600; }
+  .badge { background: var(--accent); color: var(--bg); font-size: 12px; font-weight: 600;
+    padding: 2px 8px; border-radius: 10px; }
+  .badge.live { background: var(--green); }
+  .badge.disconnected { background: var(--red); }
+  .empty { text-align: center; padding: 48px 16px; color: var(--muted); }
+
+  /* User identity bar */
+  .user-bar { display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    margin-bottom: 16px; font-size: 13px; }
+  .user-bar .name { font-weight: 600; }
+  .user-bar .email { color: var(--muted); }
+  .user-bar .caps { color: var(--green); font-size: 11px; }
+  .user-bar .no-auth { color: var(--red); }
+
+  /* Status filter tabs */
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; }
+  .tab { padding: 4px 12px; border-radius: 4px; font-size: 13px; cursor: pointer;
+    background: transparent; border: 1px solid var(--border); color: var(--muted); }
+  .tab:hover { border-color: var(--accent); color: var(--text); }
+  .tab.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+
+  /* Escalation cards */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    margin-bottom: 8px; overflow: hidden; }
+  .card-header { display: flex; align-items: center; gap: 8px; padding: 12px 16px;
+    cursor: pointer; user-select: none; }
+  .card-header:hover { background: rgba(88,166,255,0.04); }
+  .priority { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .priority.p0 { background: var(--red); }
+  .priority.p1 { background: var(--yellow); }
+  .priority.p2 { background: var(--muted); }
+  .priority.p3, .priority.p4 { background: var(--border); }
+  .card-id { font-family: monospace; font-size: 12px; color: var(--muted); flex-shrink: 0; }
+  .card-op { font-size: 13px; color: var(--orange); flex-shrink: 0; font-weight: 500; }
+  .card-title { font-size: 14px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-status { font-size: 11px; padding: 2px 6px; border-radius: 3px; flex-shrink: 0; font-weight: 500; }
+  .card-status.open { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .card-status.in_progress { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .card-status.closed { background: rgba(139,148,158,0.15); color: var(--muted); }
+
+  /* Detail panel */
+  .card-detail { display: none; padding: 0 16px 16px; border-top: 1px solid var(--border); }
+  .card.open .card-detail { display: block; }
+  .detail-section { margin-top: 12px; }
+  .detail-section h3 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .detail-text { font-size: 14px; white-space: pre-wrap; }
+  .detail-meta { font-size: 13px; color: var(--muted); }
+  .spec-block { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 8px 12px; font-family: monospace; font-size: 12px; white-space: pre-wrap;
+    max-height: 300px; overflow-y: auto; }
+
+  /* Script viewer */
+  .script-block { background: #1a1e24; border: 1px solid var(--border); border-radius: 4px;
+    overflow: hidden; max-height: 400px; overflow-y: auto; }
+  .script-block .line { display: flex; font-family: monospace; font-size: 12px; line-height: 1.6; }
+  .script-block .line-num { color: var(--muted); text-align: right; padding: 0 12px 0 8px;
+    min-width: 40px; user-select: none; background: rgba(0,0,0,0.2); flex-shrink: 0; }
+  .script-block .line-code { padding: 0 12px; white-space: pre-wrap; word-break: break-all; flex: 1; }
+
+  /* Sensitivity badges */
+  .sensitivity-badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px;
+    border-radius: 10px; text-transform: uppercase; letter-spacing: 0.3px; }
+  .sensitivity-badge.public { background: rgba(63,185,80,0.15); color: var(--green); }
+  .sensitivity-badge.internal { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .sensitivity-badge.sensitive { background: rgba(209,134,22,0.15); color: var(--orange); }
+  .sensitivity-badge.secret { background: rgba(248,81,73,0.15); color: var(--red); }
+
+  /* Credential checklist */
+  .cred-list { list-style: none; padding: 0; }
+  .cred-list li { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
+  .cred-list input[type="checkbox"] { accent-color: var(--green); }
+  .cred-list .cred-type { font-family: monospace; color: var(--accent); font-size: 12px; }
+  .cred-list .cred-id { color: var(--text); }
+  .cred-list .cred-purpose { color: var(--muted); font-size: 12px; }
+
+  /* Output items */
+  .output-list { list-style: none; padding: 0; }
+  .output-list li { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
+
+  /* Execution target selector */
+  .target-select { margin-top: 8px; }
+  .target-select label { font-size: 13px; color: var(--muted); margin-right: 8px; }
+  .target-select select { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); padding: 4px 8px; font-size: 13px; }
+
+  /* Reason input */
+  .reason-input { width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; color: var(--text); font-size: 13px; margin-top: 8px; resize: vertical; min-height: 40px; }
+  .reason-input:focus { outline: none; border-color: var(--accent); }
+
+  /* Actions */
+  .actions { display: flex; gap: 8px; margin-top: 12px; }
+  .btn { padding: 6px 16px; border: none; border-radius: 4px; font-size: 13px; font-weight: 500;
+    cursor: pointer; transition: opacity 0.15s; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-approve { background: var(--green); color: var(--bg); }
+  .btn-approve:hover:not(:disabled) { opacity: 0.9; }
+  .btn-reject { background: transparent; color: var(--red); border: 1px solid var(--red); }
+  .btn-reject:hover:not(:disabled) { background: rgba(248,81,73,0.1); }
+  .status-msg { font-size: 13px; margin-top: 8px; }
+  .status-msg.error { color: var(--red); }
+  .status-msg.success { color: var(--green); }
+
+  /* Approved/rejected detail */
+  .approval-info { margin-top: 8px; padding: 8px 12px; border-radius: 4px;
+    background: rgba(63,185,80,0.08); border: 1px solid rgba(63,185,80,0.2); font-size: 13px; }
+  .approval-info.rejected { background: rgba(248,81,73,0.08); border-color: rgba(248,81,73,0.2); }
+
+  /* Keyboard focus */
+  .card.focused { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .kbd-help { position: fixed; bottom: 16px; right: 16px; font-size: 11px; color: var(--muted);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 8px 12px; }
+  .kbd-help kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
+    padding: 1px 5px; font-family: monospace; font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Escalations</h1>
+    <span id="count" class="badge">0</span>
+    <span id="sse-status" class="badge disconnected">disconnected</span>
+  </header>
+  <div id="user-bar" class="user-bar">
+    <span class="no-auth">Loading identity...</span>
+  </div>
+  <div class="tabs">
+    <span class="tab active" data-filter="pending" onclick="setFilter('pending')">Pending</span>
+    <span class="tab" data-filter="all" onclick="setFilter('all')">All</span>
+  </div>
+  <div id="list"></div>
+</div>
+<div class="kbd-help"><kbd>j</kbd>/<kbd>k</kbd> navigate &middot; <kbd>Enter</kbd> open &middot; <kbd>a</kbd> approve &middot; <kbd>x</kbd> reject</div>
+
+<script>
+const API = '/api/escalations';
+const SSE_URL = '/api/escalations/events';
+let escalations = {};
+let currentUser = null;
+let activeFilter = 'pending';
+
+// --- User identity ---
+
+async function loadUser() {
+  const bar = document.getElementById('user-bar');
+  try {
+    const resp = await fetch(API + '/me');
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      bar.innerHTML = `<span class="no-auth">${escHtml(data.error || 'Not authenticated')}</span>`;
+      return;
+    }
+    currentUser = await resp.json();
+    const hasCap = (currentUser.capabilities || []).some(c =>
+      c === 'approve:escalation' || c === 'approve:*' || c.endsWith(':*') && 'approve:escalation'.startsWith(c.slice(0, -1))
+    );
+    bar.innerHTML = `
+      <span class="name">${escHtml(currentUser.display_name || currentUser.email)}</span>
+      <span class="email">${escHtml(currentUser.email)}</span>
+      <span class="caps">${hasCap ? 'Can approve escalations' : 'View only (no approve:escalation capability)'}</span>
+    `;
+  } catch (e) {
+    bar.innerHTML = `<span class="no-auth">Auth error: ${escHtml(e.message)}</span>`;
+  }
+}
+
+// --- Filtering ---
+
+function setFilter(f) {
+  activeFilter = f;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.filter === f));
+  renderList();
+}
+
+// --- Rendering ---
+
+function renderList() {
+  const list = document.getElementById('list');
+  let sorted = Object.values(escalations).sort((a, b) => {
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    return (a.id || '').localeCompare(b.id || '');
+  });
+
+  if (activeFilter === 'pending') {
+    sorted = sorted.filter(e => e.status === 'open' || e.status === 'in_progress');
+  }
+
+  document.getElementById('count').textContent = sorted.length;
+
+  if (sorted.length === 0) {
+    list.innerHTML = '<div class="empty">No escalations</div>';
+    return;
+  }
+
+  const openIds = new Set();
+  list.querySelectorAll('.card.open').forEach(c => openIds.add(c.dataset.id));
+
+  list.innerHTML = sorted.map(e => renderCard(e, openIds.has(e.id))).join('');
+
+  list.querySelectorAll('.card-header').forEach(h => {
+    h.addEventListener('click', () => h.closest('.card').classList.toggle('open'));
+  });
+  list.querySelectorAll('.btn-approve').forEach(btn => {
+    btn.addEventListener('click', () => approveEscalation(btn.dataset.id));
+  });
+  list.querySelectorAll('.btn-reject').forEach(btn => {
+    btn.addEventListener('click', () => rejectEscalation(btn.dataset.id));
+  });
+
+  // Restore focus.
+  if (focusedIdx >= 0) setFocus(focusedIdx);
+}
+
+function renderCard(e, isOpen) {
+  const opType = e.fields?.operation_type || 'unknown';
+  const context = e.fields?.context || '';
+  const spec = e.fields?.operation_spec || '';
+  const script = e.fields?.execution_script || '';
+  const sensitivity = e.fields?.sensitivity || '';
+  const creds = e.fields?.credential_requirements || '';
+  const dataReqs = e.fields?.data_requirements || '';
+  const outputs = e.fields?.expected_outputs || '';
+  const agent = e.fields?.requesting_agent || e.created_by || '';
+  const approvedBy = e.fields?.approved_by || '';
+  const approvedAt = e.fields?.approved_at || '';
+  const resultStatus = e.fields?.result_status || '';
+  const redactedSummary = e.fields?.redacted_summary || '';
+  const isPending = e.status === 'open' || (e.status === 'in_progress' && !approvedBy);
+  const canApprove = currentUser && isPending;
+
+  let specFormatted = '';
+  try { specFormatted = JSON.stringify(JSON.parse(spec), null, 2); } catch { specFormatted = spec; }
+
+  return `
+    <div class="card ${isOpen ? 'open' : ''}" data-id="${e.id}">
+      <div class="card-header">
+        <span class="priority p${e.priority}"></span>
+        <span class="card-id">${e.id}</span>
+        <span class="card-op">${escHtml(opType)}</span>
+        ${sensitivity ? `<span class="sensitivity-badge ${sensitivity}">${sensitivity}</span>` : ''}
+        <span class="card-title">${escHtml(e.title || e.id)}</span>
+        <span class="card-status ${e.status}">${escHtml(e.status)}</span>
+      </div>
+      <div class="card-detail">
+        ${e.description ? `<div class="detail-section"><h3>Description</h3><div class="detail-text">${escHtml(e.description)}</div></div>` : ''}
+        ${context ? `<div class="detail-section"><h3>Context</h3><div class="detail-text">${escHtml(context)}</div></div>` : ''}
+        ${script ? `
+          <div class="detail-section">
+            <h3>Execution Script</h3>
+            <div class="script-block">${renderScript(script)}</div>
+          </div>
+        ` : ''}
+        ${specFormatted ? `
+          <div class="detail-section">
+            <h3>Operation Spec</h3>
+            <div class="spec-block">${escHtml(specFormatted)}</div>
+          </div>
+        ` : ''}
+        ${creds ? `
+          <div class="detail-section">
+            <h3>Credential Requirements</h3>
+            ${renderCredentials(creds, canApprove)}
+          </div>
+        ` : ''}
+        ${dataReqs ? `
+          <div class="detail-section">
+            <h3>Data Requirements</h3>
+            <div class="spec-block">${escHtml(formatJSON(dataReqs))}</div>
+          </div>
+        ` : ''}
+        ${outputs ? `
+          <div class="detail-section">
+            <h3>Expected Outputs</h3>
+            ${renderOutputs(outputs)}
+          </div>
+        ` : ''}
+        <div class="detail-section">
+          <h3>Details</h3>
+          <div class="detail-meta">
+            Requesting agent: ${escHtml(agent)}<br>
+            ${e.fields?.requesting_task ? 'Task: ' + escHtml(e.fields.requesting_task) + '<br>' : ''}
+            ${e.fields?.execution_target ? 'Execution target: ' + escHtml(e.fields.execution_target) + '<br>' : ''}
+            ${sensitivity ? 'Sensitivity: <span class="sensitivity-badge ' + sensitivity + '">' + sensitivity + '</span><br>' : ''}
+          </div>
+        </div>
+        ${approvedBy ? `
+          <div class="approval-info">
+            Approved by: ${escHtml(approvedBy)} at ${escHtml(approvedAt)} (${escHtml(e.fields?.approval_method || '')})
+            ${resultStatus ? '<br>Result: ' + escHtml(resultStatus) : ''}
+            ${redactedSummary ? '<br>Summary: ' + escHtml(redactedSummary) : ''}
+          </div>
+        ` : ''}
+        ${e.status === 'closed' && !approvedBy && e.notes ? `
+          <div class="approval-info rejected">
+            Rejected: ${escHtml(e.notes)}
+          </div>
+        ` : ''}
+        ${canApprove ? `
+          <div class="target-select">
+            <label for="target-${e.id}">Execution target:</label>
+            <select id="target-${e.id}">
+              <option value="">Default</option>
+              <option value="local">Local Agent</option>
+              <option value="service_account">Service Account</option>
+            </select>
+          </div>
+          <textarea class="reason-input" id="reason-${e.id}" placeholder="Reason (for rejection)..."></textarea>
+          <div class="actions">
+            <button class="btn btn-approve" data-id="${e.id}">Approve</button>
+            <button class="btn btn-reject" data-id="${e.id}">Reject</button>
+          </div>
+          <div class="status-msg" id="status-${e.id}"></div>
+        ` : ''}
+      </div>
+    </div>`;
+}
+
+// --- Actions ---
+
+async function approveEscalation(id) {
+  const targetEl = document.getElementById('target-' + id);
+  const target = targetEl ? targetEl.value : '';
+  setStatus(id, 'Approving...', false);
+  try {
+    const body = {};
+    if (target) body.execution_target = target;
+    const resp = await fetch(API + '/' + id + '/approve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      throw new Error(data.error || resp.statusText);
+    }
+    setStatus(id, 'Approved!', false, true);
+    setTimeout(loadEscalations, 500);
+  } catch (e) {
+    setStatus(id, 'Error: ' + e.message, true);
+  }
+}
+
+async function rejectEscalation(id) {
+  const reason = (document.getElementById('reason-' + id)?.value || '').trim();
+  setStatus(id, 'Rejecting...', false);
+  try {
+    const resp = await fetch(API + '/' + id + '/reject', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({reason: reason || 'Rejected via web UI'}),
+    });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      throw new Error(data.error || resp.statusText);
+    }
+    setStatus(id, 'Rejected', false, true);
+    setTimeout(loadEscalations, 500);
+  } catch (e) {
+    setStatus(id, 'Error: ' + e.message, true);
+  }
+}
+
+function setStatus(id, msg, isError, isSuccess) {
+  const el = document.getElementById('status-' + id);
+  if (!el) return;
+  el.textContent = msg;
+  el.className = 'status-msg' + (isError ? ' error' : '') + (isSuccess ? ' success' : '');
+}
+
+// --- Data loading ---
+
+async function loadEscalations() {
+  try {
+    const params = activeFilter === 'all' ? '?status=open,in_progress,closed' : '';
+    const resp = await fetch(API + params);
+    const data = await resp.json();
+    escalations = {};
+    (data.escalations || []).forEach(e => { escalations[e.id] = e; });
+    renderList();
+  } catch (e) {
+    console.error('Failed to load escalations:', e);
+  }
+}
+
+// --- SSE ---
+
+function connectSSE() {
+  const statusEl = document.getElementById('sse-status');
+  const src = new EventSource(SSE_URL, { withCredentials: true });
+
+  src.onopen = () => {
+    statusEl.textContent = 'live';
+    statusEl.className = 'badge live';
+  };
+
+  src.addEventListener('escalation', (e) => {
+    try {
+      const evt = JSON.parse(e.data);
+      if (evt.type === 'closed') {
+        if (activeFilter === 'pending') {
+          delete escalations[evt.bead.id];
+        } else {
+          escalations[evt.bead.id] = evt.bead;
+        }
+      } else {
+        escalations[evt.bead.id] = evt.bead;
+      }
+      renderList();
+    } catch (err) {
+      console.error('SSE parse error:', err);
+    }
+  });
+
+  src.onerror = () => {
+    statusEl.textContent = 'reconnecting';
+    statusEl.className = 'badge disconnected';
+  };
+}
+
+// --- Helpers ---
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+
+function formatJSON(s) {
+  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
+}
+
+function renderScript(script) {
+  const lines = script.split('\n');
+  return lines.map((line, i) =>
+    `<div class="line"><span class="line-num">${i + 1}</span><span class="line-code">${escHtml(line)}</span></div>`
+  ).join('');
+}
+
+function renderCredentials(credsJSON, interactive) {
+  try {
+    const creds = JSON.parse(credsJSON);
+    if (!Array.isArray(creds) || creds.length === 0) return `<div class="spec-block">${escHtml(credsJSON)}</div>`;
+    return `<ul class="cred-list">${creds.map((c, i) => `
+      <li>
+        ${interactive ? `<input type="checkbox" id="cred-check-${i}">` : ''}
+        <span class="cred-type">${escHtml(c.type || 'unknown')}</span>
+        <span class="cred-id">${escHtml(c.identifier || '')}</span>
+        ${c.purpose ? `<span class="cred-purpose">— ${escHtml(c.purpose)}</span>` : ''}
+      </li>`).join('')}</ul>`;
+  } catch {
+    return `<div class="spec-block">${escHtml(credsJSON)}</div>`;
+  }
+}
+
+function renderOutputs(outputsJSON) {
+  try {
+    const outputs = JSON.parse(outputsJSON);
+    if (!Array.isArray(outputs) || outputs.length === 0) return `<div class="spec-block">${escHtml(outputsJSON)}</div>`;
+    return `<ul class="output-list">${outputs.map(o => `
+      <li>
+        <span>${escHtml(o.name || 'output')}</span>
+        ${o.sensitivity ? `<span class="sensitivity-badge ${o.sensitivity}">${o.sensitivity}</span>` : ''}
+        ${o.description ? `<span style="color:var(--muted);font-size:12px">— ${escHtml(o.description)}</span>` : ''}
+      </li>`).join('')}</ul>`;
+  } catch {
+    return `<div class="spec-block">${escHtml(outputsJSON)}</div>`;
+  }
+}
+
+// --- Keyboard navigation ---
+
+let focusedIdx = -1;
+
+function getCards() { return Array.from(document.querySelectorAll('#list .card')); }
+
+function setFocus(idx) {
+  const cards = getCards();
+  if (cards.length === 0) return;
+  cards.forEach(c => c.classList.remove('focused'));
+  focusedIdx = Math.max(0, Math.min(idx, cards.length - 1));
+  const card = cards[focusedIdx];
+  card.classList.add('focused');
+  card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function focusedCard() {
+  const cards = getCards();
+  return focusedIdx >= 0 && focusedIdx < cards.length ? cards[focusedIdx] : null;
+}
+
+document.addEventListener('keydown', (e) => {
+  const tag = e.target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+    if (e.key === 'Escape') e.target.blur();
+    return;
+  }
+  const cards = getCards();
+  if (cards.length === 0) return;
+
+  if (e.key === 'j' || e.key === 'ArrowDown') { e.preventDefault(); setFocus(focusedIdx + 1); return; }
+  if (e.key === 'k' || e.key === 'ArrowUp') { e.preventDefault(); setFocus(focusedIdx < 0 ? 0 : focusedIdx - 1); return; }
+  if (e.key === 'Enter' || e.key === 'o') {
+    const card = focusedCard();
+    if (card) { card.classList.toggle('open'); e.preventDefault(); }
+    return;
+  }
+  if (e.key === 'Escape') {
+    const card = focusedCard();
+    if (card && card.classList.contains('open')) { card.classList.remove('open'); return; }
+    return;
+  }
+  if (e.key === 'a') {
+    const card = focusedCard();
+    if (card && card.classList.contains('open')) { approveEscalation(card.dataset.id); return; }
+  }
+  if (e.key === 'x') {
+    const card = focusedCard();
+    if (card && card.classList.contains('open')) { rejectEscalation(card.dataset.id); return; }
+  }
+});
+
+// Auto-focus first card on render.
+const _origRender = renderList;
+renderList = function() {
+  _origRender();
+  const cards = getCards();
+  if (cards.length > 0 && focusedIdx < 0) setFocus(0);
+  else if (focusedIdx >= cards.length) setFocus(cards.length - 1);
+  else if (focusedIdx >= 0) setFocus(focusedIdx);
+};
+
+// --- Init ---
+
+loadUser();
+loadEscalations();
+connectSSE();
+</script>
+</body>
+</html>

@@ -1,0 +1,221 @@
+{{- if .Values.traefikLogShipper.enabled }}
+{{- /*
+traefik-log-shipper Deployment (edge-IDP L0 transport, task ka-0000001563, epic
+ka-0000008216).
+
+A purpose-built Go streamer (gardenio/controller/cmd/traefik-log-shipper) that
+opens a FOLLOW stream of the single Traefik edge pod's stdout via the Kubernetes
+pod-log API, keeps only the JSON access records (dropping Traefik's own runtime
+chatter), and POSTs them to the in-chart VictoriaLogs /insert/jsonline. See
+internal/traefikshipper for why this is a small stdout streamer and not a Traefik
+sidecar (terraform-managed addon, no regcred in that namespace), a node
+log-collector DaemonSet (none exists), or a CloudWatch hop (the source is already
+in-cluster).
+
+SAMPLING POLICY (non-negotiable, ka-0000007287#c3): the shipper filters ONLY on
+"is this a JSON access record?", never on status code — non-2xx (probes, scans,
+auth failures) are the signal and are shipped in full.
+*/}}
+{{- $ship := .Values.traefikLogShipper }}
+{{- /*
+$geoImageEnabled is true when the FULL geo table is carried by a data-only
+carrier image (ka-0000005851) rather than an inline ConfigMap. A copy-only
+initContainer then seeds it into the emptyDir the shipper reads — the only way to
+carry the ~26 MiB global table past the 1 MiB ConfigMap/Secret etcd cap.
+*/}}
+{{- $geoImageEnabled := and $ship.geoTable.image $ship.geoTable.image.repository }}
+{{- if not $ship.pod.namespace }}
+{{- fail "traefikLogShipper.enabled=true requires traefikLogShipper.pod.namespace — the namespace the Traefik edge pod runs in (the terraform addon installs it in `traefik`). The shipper reads pods/log there via the cross-namespace Role in rbac.yaml. See ka-0000001563." }}
+{{- end }}
+{{- if not $ship.pod.selector }}
+{{- fail "traefikLogShipper.enabled=true requires traefikLogShipper.pod.selector — the label selector that resolves the Traefik pod (e.g. app.kubernetes.io/name=traefik). See ka-0000001563." }}
+{{- end }}
+{{- if and $ship.asnTable.data $ship.geoTable.data }}
+{{- fail "traefikLogShipper: set only ONE of asnTable.data / geoTable.data — a geo table already emits sourceASN (it is a superset), so the shipper treats both-set as a configuration error and fails fast rather than picking one silently. See ka-0000001136." }}
+{{- end }}
+{{- if and $geoImageEnabled $ship.geoTable.data }}
+{{- fail "traefikLogShipper: set only ONE of geoTable.data / geoTable.image — `data` mounts a small inline table as a ConfigMap, `image` seeds the full off-etcd table via a copy-only initContainer; both-set is a configuration error. See ka-0000005851." }}
+{{- end }}
+{{- if and $geoImageEnabled $ship.asnTable.data }}
+{{- fail "traefikLogShipper: set only ONE of asnTable.data / geoTable.image — a geo table already emits sourceASN (it is a superset). See ka-0000005851." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.traefikLogShipper.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.traefikLogShipper.labels" . | nindent 4 }}
+spec:
+  # Exactly one replica: the shipper follows one pod-log stream and de-dup is not
+  # attempted, so two replicas would double-ship every access record. A brief gap
+  # across a restart is acceptable — StreamSinceSeconds re-reads a bounded window
+  # on reconnect so the disconnect window is covered (at-least-once).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.traefikLogShipper.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.traefikLogShipper.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "gardenio.traefikLogShipper.fullname" . }}
+      # The shipper authenticates to the API server as its ServiceAccount to read
+      # pods/log, so the projected SA token must be mounted.
+      automountServiceAccountToken: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $geoImageEnabled }}
+      initContainers:
+        # Seed the FULL CIDR->{ASN,country} geo table into a writable emptyDir the
+        # main shipper container reads via TRAEFIK_GEO_TABLE_PATH (edge IDP L1b,
+        # ka-0000005851). The table (~1M CIDRs / ~26 MiB) is BUILT in CI from the
+        # upstream iptoasn dump and shipped at /geo-table in a tiny data-only
+        # artifact image (gardenio/images/geo-table; no workflow builds it today)
+        # — so this step is a pure `cp` with ZERO off-cluster egress, keeping the
+        # shipper default-deny-egress friendly. This is the ONLY way to carry the
+        # global table: a ConfigMap AND a Secret hard-cap at 1 MiB (the etcd object
+        # limit), so the inline geoTable.data mount cannot hold it. EXACTLY mirrors
+        # the grafana seed-llm-plugin / seed-vl-datasource-plugin prebake seam.
+        # `cp -r /geo-table/.` (not `-a`) drops source ownership so the copy
+        # inherits this 65534 process's uid, making the emptyDir readable by the
+        # main container without a root chown.
+        - name: seed-geo-table
+          image: {{ include "gardenio.imageRef" (dict "image" $ship.geoTable.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" $ship.geoTable.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              # Fail loudly if the carrier image is missing the built table — an
+              # empty/absent table means a broken image, not a skippable state.
+              # Exit non-zero so kubelet restarts the init and the main container
+              # never boots enrichment-blind while APPEARING enriched.
+              test -s /geo-table/geo-table.txt
+              cp -r /geo-table/. /mnt/geo-table/
+          volumeMounts:
+            - name: geo-table
+              mountPath: /mnt/geo-table
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      {{- end }}
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: traefik-log-shipper
+          image: {{ include "gardenio.imageRef" (dict "image" $ship.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ $ship.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: TRAEFIK_VICTORIALOGS_ENDPOINT
+              value: {{ include "gardenio.traefikLogShipper.victoriaLogsEndpoint" . | quote }}
+            - name: TRAEFIK_POD_NAMESPACE
+              value: {{ $ship.pod.namespace | quote }}
+            - name: TRAEFIK_POD_SELECTOR
+              value: {{ $ship.pod.selector | quote }}
+            {{- with $ship.pod.containerName }}
+            - name: TRAEFIK_CONTAINER_NAME
+              value: {{ . | quote }}
+            {{- end }}
+            - name: TRAEFIK_RECONNECT_BACKOFF
+              value: {{ $ship.reconnectBackoff | quote }}
+            - name: TRAEFIK_STREAM_SINCE_SECONDS
+              value: {{ $ship.streamSinceSeconds | quote }}
+            - name: TRAEFIK_FLUSH_INTERVAL
+              value: {{ $ship.flushInterval | quote }}
+            - name: TRAEFIK_MAX_BATCH_LINES
+              value: {{ $ship.maxBatchLines | quote }}
+            {{- if $ship.asnTable.data }}
+            # OPTIONAL ASN table (edge IDP L1, ka-0000001136): points the shipper
+            # at the mounted CIDR->ASN file so each row's X-Forwarded-For client IP
+            # resolves to a scalar sourceASN. Rendered ONLY when asnTable.data is
+            # set — unset = no env var = byte-identical RAW shipping.
+            - name: TRAEFIK_ASN_TABLE_PATH
+              value: /etc/traefik-log-shipper/asn/asn-table.txt
+            {{- end }}
+            {{- if or $ship.geoTable.data $geoImageEnabled }}
+            # OPTIONAL geo table (a superset of the ASN table): resolves each row's
+            # X-Forwarded-For client IP to scalar sourceASN + sourceCountry so the
+            # edge geomap console and the novel-geo detections have a country
+            # dimension. Mutually exclusive with asnTable.data (guarded above).
+            # The table lands at the same path whether it came from the inline
+            # ConfigMap (geoTable.data) or the seed-geo-table initContainer's
+            # emptyDir (geoTable.image, the full off-etcd table). Unset both =
+            # byte-identical RAW.
+            - name: TRAEFIK_GEO_TABLE_PATH
+              value: /etc/traefik-log-shipper/geo/geo-table.txt
+            {{- end }}
+          # No containerPort: the shipper dials OUT (API server + VictoriaLogs) and
+          # opens no in-cluster listener. kubelet restarts the pod on process exit.
+          resources:
+            {{- toYaml $ship.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if $ship.asnTable.data }}
+            - name: asn-table
+              mountPath: /etc/traefik-log-shipper/asn
+              readOnly: true
+            {{- end }}
+            {{- if or $ship.geoTable.data $geoImageEnabled }}
+            - name: geo-table
+              mountPath: /etc/traefik-log-shipper/geo
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if $ship.asnTable.data }}
+        - name: asn-table
+          configMap:
+            name: {{ include "gardenio.traefikLogShipper.fullname" . }}-asn-table
+        {{- end }}
+        {{- if $ship.geoTable.data }}
+        # Inline (small) table: mounted straight from the ConfigMap.
+        - name: geo-table
+          configMap:
+            name: {{ include "gardenio.traefikLogShipper.fullname" . }}-geo-table
+        {{- end }}
+        {{- if $geoImageEnabled }}
+        # Full (off-etcd) table: an emptyDir the seed-geo-table initContainer
+        # populates by copying from the carrier image, mounted read-only into the
+        # main container above. No ConfigMap involved (the table exceeds 1 MiB).
+        - name: geo-table
+          emptyDir: {}
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" $ship.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with $ship.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" $ship.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

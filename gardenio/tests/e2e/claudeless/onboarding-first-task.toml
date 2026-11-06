@@ -1,0 +1,94 @@
+# onboarding-first-task.toml
+#
+# Claudeless scenario: a local agent works a poured first-task molecule
+# (gardenio/formulas/onboarding/first-task.json) up to its first gate.
+#
+#   1. gb ready --plan shows `suggest` as the only ready step
+#   2. claim suggest, run the command it names, close it
+#   3. stop at the pick-task decision gate without touching it
+#
+# Driven by test-onboarding-formulas.sh, which pours the molecule, exports
+# ONBOARD_MOLECULE / ONBOARD_STATE_DIR / ONBOARD_AGENT_STEP, runs
+# `gb agent start --local --test-scenario=onboarding-first-task`, and then
+# checks from the outside that suggest is closed by this agent and pick-task
+# is the molecule's whole ready frontier. Each tool call goes through
+# scripts/onboarding-agent-step.sh, which refuses to claim a gate or a step
+# outside the ready set and records the scenario verdict.
+#
+# The startup prompt and follow-up nudges live in the sidecars
+# onboarding-first-task.startup-prompt.txt and .nudges.txt. claudeless picks
+# the first [[responses]] whose `contains` matches, so every nudge carries
+# exactly one phase keyword.
+
+[claude]
+session_id = "e2e00000-0005-4000-a000-000000000003"
+username = "e2e-onboarding-first-task"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+# ── Startup: find the molecule's ready steps ────────────────────────
+[[responses]]
+on = { contains = "gb ready" }
+say = "Checking the onboarding molecule for ready steps."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" ready'
+
+# ── suggest: claim, run, close ──────────────────────────────────────
+[[responses]]
+on = { contains = "Claim suggest" }
+say = "Claiming the suggest step."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" claim suggest'
+
+[[responses]]
+on = { contains = "Run suggest" }
+say = "Reading the repo for small first tasks."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '''"$ONBOARD_AGENT_STEP" run suggest "git ls-files -- '*.md' | head -n 5"'''
+
+[[responses]]
+on = { contains = "Close suggest" }
+say = "Closing the suggest step."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" close suggest'
+
+# ── Gate: pick-task is the person's decision ────────────────────────
+[[responses]]
+on = { contains = "the gate" }
+say = "Only the pick-task decision is left; that is the person's call."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" gate'
+
+# ── Stop ────────────────────────────────────────────────────────────
+[[responses]]
+on = { contains = "stop" }
+say = "Stopping at the gate."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" verdict; gb stop 2>&1 || true'
+
+# ── Fallback ────────────────────────────────────────────────────────
+[default]
+say = "Onboarding first-task scenario idle. Ready for the next step."
+
+# ── Tool config ─────────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

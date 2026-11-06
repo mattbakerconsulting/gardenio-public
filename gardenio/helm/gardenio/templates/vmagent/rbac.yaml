@@ -1,0 +1,113 @@
+{{- if .Values.vmagent.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "gardenio.vmagent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmagent.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "gardenio.vmagent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmagent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "endpoints", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "gardenio.vmagent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmagent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "gardenio.vmagent.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.vmagent.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.vmagent.karpenterScrape.enabled }}
+---
+# Cross-namespace discovery for the Karpenter scrape (GAP-2 prereq
+# ka-0000006900). The namespace-scoped Role above cannot see the `karpenter`
+# namespace, so the `karpenter` job's endpoints kubernetes_sd_config would get
+# an RBAC-forbidden watch and never discover a target. A ClusterRole (cluster
+# resources cannot be granted by a namespaced Role) grants the SAME minimal
+# read verbs cluster-wide — get/list/watch on pods/endpoints/services, exactly
+# what promscrape's endpoints role lists. No writes, no secrets, no exec.
+# Mirrors the read-only precedent in controller/agent-cluster-readonly-rbac.yaml.
+# Gated on karpenterScrape.enabled so no extra cluster-scoped grant exists in
+# any env that has not opted into the scrape.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.vmagent.fullname" . }}-karpenter-scrape
+  labels:
+    {{- include "gardenio.vmagent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "endpoints", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.vmagent.fullname" . }}-karpenter-scrape
+  labels:
+    {{- include "gardenio.vmagent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.vmagent.fullname" . }}-karpenter-scrape
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.vmagent.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.vmagent.kubeletScrape.enabled }}
+---
+# Kubelet resource-metrics scrape (vpa-right-sizing board ka-0000000341).
+# The node SD role lists/watches Node objects (cluster-scoped — a namespaced
+# Role cannot grant them), and the kubelet's Webhook authorizer maps
+# /metrics/* requests to a `get` on the nodes/metrics subresource. Both are
+# read-only; no pods/secrets/exec, mirroring the karpenter-scrape posture
+# above. Gated on kubeletScrape.enabled so no cluster-scoped grant exists in
+# any env that has not opted into the scrape.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.vmagent.fullname" . }}-kubelet-scrape
+  labels:
+    {{- include "gardenio.vmagent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.vmagent.fullname" . }}-kubelet-scrape
+  labels:
+    {{- include "gardenio.vmagent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.vmagent.fullname" . }}-kubelet-scrape
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.vmagent.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

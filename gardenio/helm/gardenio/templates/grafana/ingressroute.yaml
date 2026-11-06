@@ -1,0 +1,110 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.grafana.enabled .Values.grafana.ingress.enabled }}
+{{- $fullname := include "gardenio.grafana.fullname" . -}}
+{{- $host := .Values.grafana.ingress.host -}}
+{{- $port := .Values.grafana.service.port | default 3000 -}}
+{{- $pathPrefix := .Values.grafana.ingress.pathPrefix | default "" -}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.grafana.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $host }}`){{ if $pathPrefix }} && PathPrefix(`{{ $pathPrefix }}`){{ end }}
+      kind: Rule
+      priority: 100
+      services:
+        - name: {{ $fullname }}
+          port: {{ $port }}
+      {{- if or $pathPrefix .Values.grafana.ingress.ipWhitelist.enabled .Values.grafana.ingress.rateLimit.enabled (and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled) .Values.global.securityHeaders.enabled }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        {{- /* When allow_embedding is on, Grafana is meant to be framed by the
+               same-origin beads-viewer dashboard-bead iframe — so use the
+               iframe-variant security-headers middleware (X-Frame-Options:
+               SAMEORIGIN + CSP frame-ancestors 'self') instead of the strict
+               one, whose frameDeny:true would re-add X-Frame-Options: DENY at
+               the Traefik edge and refuse the frame ("refused to connect",
+               ka-0000003638). */}}
+        {{- if .Values.grafana.allowEmbedding }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers-iframe
+        {{- else }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- end }}
+        {{- if $pathPrefix }}
+        - name: {{ $fullname }}-stripprefix
+        {{- end }}
+        {{- if .Values.grafana.ingress.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ipwhitelist
+        {{- end }}
+        {{- if and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-forwardauth
+        {{- if .Values.keycloak.forwardAuth.forceLogoutOn403.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-forwardauth-errors
+        {{- end }}
+        {{- end }}
+        {{- if .Values.grafana.ingress.rateLimit.enabled }}
+        - name: {{ $fullname }}-ratelimit
+        {{- end }}
+      {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if $pathPrefix }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.grafana.labels" . | nindent 4 }}
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $pathPrefix }}
+{{- end }}
+{{- if .Values.grafana.ingress.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.grafana.labels" . | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.grafana.ingress.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.grafana.ingress.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if .Values.grafana.ingress.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.grafana.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ .Values.grafana.ingress.rateLimit.average }}
+    burst: {{ .Values.grafana.ingress.rateLimit.burst }}
+{{- end }}
+{{- end }}

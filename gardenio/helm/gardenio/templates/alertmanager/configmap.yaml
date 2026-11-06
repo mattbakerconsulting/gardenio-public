@@ -1,0 +1,240 @@
+{{- if .Values.alertmanager.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.alertmanager.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.alertmanager.labels" . | nindent 4 }}
+data:
+  # Prometheus Alertmanager config (epic ka-0000000770, decision ka-0000006149
+  # option (a)). vmalert POSTs firing alerts here (-notifier.url); Alertmanager
+  # groups + routes them to Slack via an incoming webhook.
+  #
+  # The Slack webhook URL is NOT in this ConfigMap — global.slack_api_url_file
+  # points at a file mounted from the ESO-synced Secret
+  # (alertmanager.slack.secretName). This is the ONLY place the credential
+  # exists at runtime; the rendered config is safe to store as a ConfigMap.
+  #
+  # Escaping note: Alertmanager's own notification-template actions are wrapped
+  # in Helm backtick-escapes so Helm emits them verbatim. Helm-interpolated
+  # values (channel, mention, intervals) sit OUTSIDE those escapes.
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+      # Slack incoming-webhook URL, read from the mounted Secret file. Applies
+      # to every slack_config that does not override api_url/api_url_file.
+      slack_api_url_file: /etc/alertmanager/slack/{{ .Values.alertmanager.slack.secretKey | default "url" }}
+
+    route:
+      # Default receiver: severity=warn / ticket / anything unmatched routes
+      # here and posts quietly (no @-mention).
+      receiver: slack-warn
+      group_by: {{ .Values.alertmanager.route.groupBy | toJson }}
+      # Anti-storm buffering so a flapping alert does not machine-gun Slack.
+      group_wait: {{ .Values.alertmanager.route.groupWait | quote }}
+      group_interval: {{ .Values.alertmanager.route.groupInterval | quote }}
+      repeat_interval: {{ .Values.alertmanager.route.repeatInterval | quote }}
+      routes:
+        {{- if .Values.alertmanager.securityRoute.enabled }}
+        # subsystem="intrusion-detection" → dedicated SECURITY channel
+        # (ka-0000002447, epic ka-0000004743). Every EKS intrusion detection —
+        # #1/#2/#4, the #3 measure-two-ways cross-check, the Phase-2 LogsQL
+        # detections, and the dead-man's-switch pair — carries this label, so the
+        # whole pack lands in the security owner's channel isolated from the
+        # #gardenio-alerts ops firehose. Placed FIRST and terminal (no continue) so
+        # a page-severity intrusion alert (sensitive-verb / dead-man's-switch)
+        # routes HERE, not into the general severity=page route below; a nested
+        # severity=page child keeps the @-mention for those crown-jewel signals
+        # while ticket-severity detections post quietly to the same channel.
+        - matchers:
+            - subsystem="intrusion-detection"
+          receiver: slack-security-warn
+          routes:
+            - matchers:
+                - severity="page"
+              receiver: slack-security-page
+              repeat_interval: {{ .Values.alertmanager.securityRoute.pageRepeatInterval | default .Values.alertmanager.route.pageRepeatInterval | quote }}
+        {{- end }}
+        # severity=page → loud receiver, re-notified faster.
+        - matchers:
+            - severity="page"
+          receiver: slack-page
+          repeat_interval: {{ .Values.alertmanager.route.pageRepeatInterval | quote }}
+        {{- if .Values.alertmanager.costRoute.enabled }}
+        # subsystem="cost" → dedicated COST channel (#aws-cost-management,
+        # ka-0000003023). The P1b fleet-size + node-utilization cost alerts carry
+        # this label so they land with the finops owner, isolated from the
+        # #gardenio-alerts ops firehose. Placed AFTER the security + page routes
+        # and terminal (no continue): a cost alert is warn-severity by design, so
+        # it would otherwise fall through to slack-warn. Same channel-lock caveat
+        # as securityRoute — a genuinely separate channel needs its own webhook
+        # (costRoute.slack.secretName); without it the receiver falls back to the
+        # global webhook + a best-effort channel override, never dropping alerts.
+        - matchers:
+            - subsystem="cost"
+          receiver: slack-cost
+        {{- end }}
+        {{- if .Values.alertmanager.watchdog.enabled }}
+        # severity=watchdog → dead-man's-switch heartbeat receiver, isolated
+        # from oncall (ka-0000001461, GAP-6). vmalert's always-firing Watchdog
+        # alert lands here; a long repeat_interval keeps it a quiet liveness
+        # pulse. The real signal is its ABSENCE, watched by an external monitor.
+        - matchers:
+            - severity="watchdog"
+          receiver: slack-watchdog
+          repeat_interval: {{ .Values.alertmanager.watchdog.repeatInterval | quote }}
+        {{- end }}
+        {{- with .Values.alertmanager.extraRoutes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+
+    receivers:
+      - name: slack-warn
+        slack_configs:
+          # send_resolved carries the `- ` list marker so `channel` can be
+          # conditionally omitted (empty channel → no channel field, rather than
+          # falling back to a default). Incoming webhooks are channel-locked, so
+          # the channel field is best-effort anyway.
+          - send_resolved: true
+            {{- if .Values.alertmanager.channel }}
+            channel: {{ .Values.alertmanager.channel | quote }}
+            {{- end }}
+            title: {{`'[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})'`}}
+            text: |-
+              {{`{{ range .Alerts -}}
+              *{{ .Labels.alertname }}* [{{ .Labels.severity }}]
+              {{ if .Annotations.summary }}{{ .Annotations.summary }}
+              {{ end }}{{ if .Annotations.description }}{{ .Annotations.description }}
+              {{ end }}{{ if .Annotations.dashboard }}📊 <{{ .Annotations.dashboard }}|Graph>
+              {{ end }}{{ if .Annotations.runbook_url }}Runbook: {{ .Annotations.runbook_url }}
+              {{ end }}{{ if .Annotations.bead }}Bead: {{ .Annotations.bead }}
+              {{ end }}{{ if .Labels.namespace }}namespace={{ .Labels.namespace }} {{ end }}{{ if .Labels.pod }}pod={{ .Labels.pod }}{{ end }}
+              {{ end -}}`}}
+      - name: slack-page
+        slack_configs:
+          - send_resolved: true
+            {{- if .Values.alertmanager.channel }}
+            channel: {{ .Values.alertmanager.channel | quote }}
+            {{- end }}
+            title: {{`'[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})'`}}
+            text: |-
+              {{ if .Values.alertmanager.pageMention }}{{ .Values.alertmanager.pageMention }} {{ end }}{{`{{ range .Alerts -}}
+              *{{ .Labels.alertname }}* [{{ .Labels.severity }}]
+              {{ if .Annotations.summary }}{{ .Annotations.summary }}
+              {{ end }}{{ if .Annotations.description }}{{ .Annotations.description }}
+              {{ end }}{{ if .Annotations.dashboard }}📊 <{{ .Annotations.dashboard }}|Graph>
+              {{ end }}{{ if .Annotations.runbook_url }}Runbook: {{ .Annotations.runbook_url }}
+              {{ end }}{{ if .Annotations.bead }}Bead: {{ .Annotations.bead }}
+              {{ end }}{{ if .Labels.namespace }}namespace={{ .Labels.namespace }} {{ end }}{{ if .Labels.pod }}pod={{ .Labels.pod }}{{ end }}
+              {{ end -}}`}}
+      {{- if .Values.alertmanager.costRoute.enabled }}
+      {{- $cost := .Values.alertmanager.costRoute }}
+      {{- $costChannel := $cost.channel | default .Values.alertmanager.channel }}
+      # COST receiver (ka-0000003023) — delivers the P1b fleet-size /
+      # node-utilization cost alerts (subsystem="cost") to #aws-cost-management,
+      # isolated from the ops firehose so the finops owner sees fleet-growth
+      # signals without noise. Same channel-lock fail-safe as slack-security-warn:
+      # if costRoute.slack.secretName points at a webhook minted against the cost
+      # channel, deliver there via api_url_file; otherwise fall back to the global
+      # webhook + a best-effort channel override (alerts still deliver, isolation
+      # is cosmetic until the dedicated webhook is wired). Quiet (no @-mention):
+      # cost alerts are investigate-not-page by design.
+      - name: slack-cost
+        slack_configs:
+          - send_resolved: true
+            {{- if $cost.slack.secretName }}
+            api_url_file: /etc/alertmanager/slack-cost/{{ $cost.slack.secretKey | default "url" }}
+            {{- end }}
+            {{- if $costChannel }}
+            channel: {{ $costChannel | quote }}
+            {{- end }}
+            title: {{`'[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})'`}}
+            text: |-
+              {{`{{ range .Alerts -}}
+              *{{ .Labels.alertname }}* [{{ .Labels.severity }}]
+              {{ if .Annotations.summary }}{{ .Annotations.summary }}
+              {{ end }}{{ if .Annotations.description }}{{ .Annotations.description }}
+              {{ end }}{{ if .Annotations.dashboard }}📊 <{{ .Annotations.dashboard }}|Graph>
+              {{ end }}{{ if .Annotations.runbook_url }}Runbook: {{ .Annotations.runbook_url }}
+              {{ end }}{{ if .Annotations.bead }}Bead: {{ .Annotations.bead }}
+              {{ end }}{{ if .Labels.namespace }}namespace={{ .Labels.namespace }} {{ end }}{{ if .Labels.pod }}pod={{ .Labels.pod }}{{ end }}
+              {{ end -}}`}}
+      {{- end }}
+      {{- if .Values.alertmanager.securityRoute.enabled }}
+      {{- $sec := .Values.alertmanager.securityRoute }}
+      {{- $secChannel := $sec.channel | default .Values.alertmanager.channel }}
+      # SECURITY receivers (ka-0000002447) — deliver the EKS intrusion-detection
+      # pack (subsystem="intrusion-detection") to a dedicated security channel,
+      # isolated from the #gardenio-alerts ops firehose so the security owner sees
+      # the F1 detective-control signal without noise. A Slack incoming webhook is
+      # CHANNEL-LOCKED to the channel it was minted against, so a genuinely
+      # separate channel needs its OWN webhook: point securityRoute.slack.secretName
+      # at a Secret carrying that webhook and both receivers deliver there via
+      # api_url_file. If it is unset the receivers FALL BACK to the global webhook
+      # + a best-effort `channel:` override (same fail-safe shape as the watchdog
+      # receiver) — the alerts still deliver, just to the global webhook's locked
+      # channel, never lost. slack-security-warn is the quiet default; the nested
+      # severity=page route (above) sends crown-jewel intrusion pages to
+      # slack-security-page, which prepends the mention.
+      - name: slack-security-warn
+        slack_configs:
+          - send_resolved: true
+            {{- if $sec.slack.secretName }}
+            api_url_file: /etc/alertmanager/slack-security/{{ $sec.slack.secretKey | default "url" }}
+            {{- end }}
+            {{- if $secChannel }}
+            channel: {{ $secChannel | quote }}
+            {{- end }}
+            title: {{`'[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})'`}}
+            text: |-
+              {{`{{ range .Alerts -}}
+              *{{ .Labels.alertname }}* [{{ .Labels.severity }}]{{ if .Labels.detection }} · {{ .Labels.detection }}{{ end }}
+              {{ if .Annotations.summary }}{{ .Annotations.summary }}
+              {{ end }}{{ if .Annotations.description }}{{ .Annotations.description }}
+              {{ end }}{{ if .Annotations.dashboard }}📊 <{{ .Annotations.dashboard }}|Graph>
+              {{ end }}{{ if .Annotations.runbook_url }}Runbook: {{ .Annotations.runbook_url }}
+              {{ end }}{{ if .Annotations.bead }}Bead: {{ .Annotations.bead }}
+              {{ end }}{{ if .Labels.namespace }}namespace={{ .Labels.namespace }} {{ end }}{{ if .Labels.pod }}pod={{ .Labels.pod }}{{ end }}
+              {{ end -}}`}}
+      - name: slack-security-page
+        slack_configs:
+          - send_resolved: true
+            {{- if $sec.slack.secretName }}
+            api_url_file: /etc/alertmanager/slack-security/{{ $sec.slack.secretKey | default "url" }}
+            {{- end }}
+            {{- if $secChannel }}
+            channel: {{ $secChannel | quote }}
+            {{- end }}
+            title: {{`'[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})'`}}
+            text: |-
+              {{ if $sec.pageMention }}{{ $sec.pageMention }} {{ else if .Values.alertmanager.pageMention }}{{ .Values.alertmanager.pageMention }} {{ end }}{{`{{ range .Alerts -}}
+              *{{ .Labels.alertname }}* [{{ .Labels.severity }}]{{ if .Labels.detection }} · {{ .Labels.detection }}{{ end }}
+              {{ if .Annotations.summary }}{{ .Annotations.summary }}
+              {{ end }}{{ if .Annotations.description }}{{ .Annotations.description }}
+              {{ end }}{{ if .Annotations.dashboard }}📊 <{{ .Annotations.dashboard }}|Graph>
+              {{ end }}{{ if .Annotations.runbook_url }}Runbook: {{ .Annotations.runbook_url }}
+              {{ end }}{{ if .Annotations.bead }}Bead: {{ .Annotations.bead }}
+              {{ end }}{{ if .Labels.namespace }}namespace={{ .Labels.namespace }} {{ end }}{{ if .Labels.pod }}pod={{ .Labels.pod }}{{ end }}
+              {{ end -}}`}}
+      {{- end }}
+      {{- if .Values.alertmanager.watchdog.enabled }}
+      # Dead-man's-switch heartbeat receiver (ka-0000001461, GAP-6). Posts the
+      # always-firing Watchdog to a quiet channel; send_resolved off (a
+      # heartbeat has no "resolved" state). An external monitor watching for the
+      # ABSENCE of these posts is what actually closes the dead-man's-switch.
+      - name: slack-watchdog
+        slack_configs:
+          - send_resolved: false
+            {{- $wdChannel := .Values.alertmanager.watchdog.channel | default .Values.alertmanager.channel }}
+            {{- if $wdChannel }}
+            channel: {{ $wdChannel | quote }}
+            {{- end }}
+            title: {{`'[{{ .Status | toUpper }}] gardenio alert-pipeline heartbeat (Watchdog)'`}}
+            text: |-
+              {{`Alert pipeline is alive: vmalert → Alertmanager → Slack all reachable. If these heartbeats STOP, the pipeline is broken.`}}
+      {{- end }}
+      {{- with .Values.alertmanager.extraReceivers }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+{{- end }}

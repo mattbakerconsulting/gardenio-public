@@ -1,0 +1,41 @@
+{{/*
+Node-drain nudge ClusterRole + ClusterRoleBinding (WS1, ka-0000007969).
+
+Grants the controller SA read-only access to Nodes so the reconciler's
+node-drain detector can see whether the node hosting an agent pod is being
+force-reclaimed (Karpenter disruption taint / node DeletionTimestamp) and
+gracefully drain the agent before the kubelet SIGTERMs it.
+
+Nodes are cluster-scoped, so a ClusterRole is required. Read-only (get/list/
+watch) — the controller never mutates nodes. Gated on agents.nodeDrainNudge so
+the feature ships zero cluster-scoped footprint until an operator opts in; the
+COOP_NODE_DRAIN_NUDGE env (deployment.yaml) is gated on the same value, so the
+detector is a no-op whenever this RBAC is absent.
+*/}}
+{{- if and .Values.agents.enabled .Values.agents.nodeDrainNudge }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-node-drain
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-node-drain
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.agents.fullname" . }}-node-drain
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.agents.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

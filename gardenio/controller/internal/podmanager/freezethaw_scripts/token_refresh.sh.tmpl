@@ -1,0 +1,86 @@
+set -uo pipefail
+BUNDLE='{{.BundlePath}}'
+HMNT() { nsenter -t 1 -m -- "$@"; }
+log() { echo "    $*" >&2; }
+HMNT python3 - "$BUNDLE" '{{.SADest}}' '{{.IRSADest}}' '{{.SATokenB64}}' '{{.IRSATokenB64}}' <<'PYTOKREFRESH'
+import base64,json,os,sys,tempfile
+bundle,sa_dest,irsa_dest,sa_b64,irsa_b64=sys.argv[1:6]
+# Fixed, dot-free sentinel slugs so the Go parser keys off stable names
+# (FT_TOKREFRESH_SA / FT_TOKREFRESH_IRSA) rather than a path-derived string with
+# dots.
+SA_SLUG,IRSA_SLUG="SA","IRSA"
+def log(msg):
+    # python-side logger to stderr (the bash log() is not in scope inside the
+    # heredoc); diagnostics ride stderr, sentinels ride stdout.
+    sys.stderr.write("    "+str(msg)+"\n")
+
+def _atomic_overlay(path,data):
+    # ATOMIC byte-overlay identical to the thaw PYAGENT _atomic_overlay: follow the
+    # atomic-writer symlink chain to the REAL backing file, write a temp file in the
+    # SAME dir (so os.rename is atomic on one fs), fsync durable, rename over target.
+    # A write interrupted mid-flush leaves the temp file, never a truncated JWT.
+    rp=os.path.realpath(path)
+    d=os.path.dirname(rp)
+    fd,tmp=tempfile.mkstemp(dir=d,prefix=".tok.")
+    try:
+        os.write(fd,data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp,rp)
+
+def _chown_readable(path):
+    # Mirror the thaw TOKEN-OWNERSHIP RESTORE (bug ka-0000000189): chown the REAL
+    # backing file (realpath follows token -> ..data/token -> ..<ts>/token) to
+    # 1000:1000 and OR-in the 0640 read bits, so the restored UID/GID-1000 agent
+    # keeps owner+group read. Best-effort: a chown miss must not fail the refresh.
+    try:
+        rp=os.path.realpath(path)
+        if os.path.isfile(rp):
+            os.chown(rp,1000,1000)
+            os.chmod(rp,os.stat(rp).st_mode|0o640)
+    except OSError:
+        pass
+
+# Load the .gofer manifest and key BOTH /run and /var/run forms, exactly as the
+# thaw PYAGENT does, so the destination lookup hits regardless of which form the
+# freeze-side manifest recorded (ka-0000007745).
+gofer={}
+try:
+    _raw=json.load(open(os.path.join(bundle,".gofer","manifest.json")))
+    for _k,_v in _raw.items():
+        gofer[_k]=_v
+        if _k.startswith("/var/run/"): gofer["/run/"+_k[len("/var/run/"):]]=_v
+        elif _k.startswith("/run/"):   gofer["/var/run/"+_k[len("/run/"):]]=_v
+except Exception:
+    gofer={}
+
+def refresh(slug,dest,b64):
+    if not dest or not b64:
+        print("FT_TOKREFRESH_%s=skip"%slug); return
+    if dest not in gofer:
+        # No stable controller-owned warm copy for this destination — nothing to
+        # refresh (the agent keeps its current token). Not a failure.
+        print("FT_TOKREFRESH_%s=skip"%slug)
+        log("token-refresh: %s absent from .gofer manifest; skipped"%dest)
+        return
+    warm=os.path.join(bundle,".gofer",str(gofer[dest]))
+    try:
+        tok=base64.b64decode(b64)
+        if not tok:
+            print("FT_TOKREFRESH_%s=skip"%slug); return
+        _atomic_overlay(os.path.join(warm,"token"),tok)
+        dd=os.path.join(warm,"..data","token")
+        if os.path.isfile(dd): _atomic_overlay(dd,tok)
+        for wt in (os.path.join(warm,"token"),dd):
+            _chown_readable(wt)
+        print("FT_TOKREFRESH_%s=ok"%slug)
+        log("token-refresh: re-overlaid fresh token into %s (warm %s)"%(dest,warm))
+    except Exception as e:
+        print("FT_TOKREFRESH_%s=fail"%slug)
+        log("WARN token-refresh: %s failed: %s (agent keeps prior token until next cycle)"%(dest,e))
+
+refresh(SA_SLUG,sa_dest,sa_b64)
+refresh(IRSA_SLUG,irsa_dest,irsa_b64)
+print("FT_TOKREFRESH_DONE=yes")
+PYTOKREFRESH

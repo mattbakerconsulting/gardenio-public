@@ -1,0 +1,113 @@
+{{- if and (not .Values.fleet.enabled) .Values.beads.embedding.enabled .Values.beads.embedding.backfill.enabled }}
+# Scheduled embedding backfill (bug ka-0000008129).
+#
+# Coverage (gardenio_beads_embedding_coverage_ratio) drifts down as new and
+# edited beads outpace the write-path embedder, and stale_count
+# (gardenio_beads_embedding_stale_count) climbs. This CronJob drives a
+# resumable server-side backfill on a schedule so coverage recovers toward
+# the SLO and stale_count drains toward 0 without an operator running
+# `kd embed sync` by hand.
+#
+# It runs the SAME kbeads image the daemon runs (kd is the entrypoint), so no
+# new image is built. Each tick execs `kd embed sync --only-missing`: the CLI
+# calls POST /v1/embeddings/sync-batch on the daemon, which SQL-filters to
+# beads with no/stale embedding, embeds them with its configured backend, and
+# upserts the vectors. --only-missing makes every page idempotent and the loop
+# naturally resumable — a killed or Forbid-skipped run just resumes next tick.
+#
+# KNOWN GAP: the endpoint is ADMIN-ONLY and the shared static admin token this
+# Job used to authenticate with is retired (gd-ke6PC7bRto). The daemon now
+# admits only an OIDC admin on this route and a CronJob holds no such
+# credential, so every tick 401s until the route gets a machine capability
+# (follow-up bead). OFF by default (beads.embedding.backfill.enabled) and off on
+# the k3s overlay; backfill by hand with `kd embed sync` as a logged-in admin.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}-embedding-backfill
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beads-embedding-backfill
+spec:
+  schedule: {{ .Values.beads.embedding.backfill.schedule | quote }}
+  # Forbid: never run two backfills against the same DB at once. A slow run
+  # that overruns its slot is skipped, not stacked — the next tick resumes the
+  # remaining work because --only-missing is idempotent.
+  concurrencyPolicy: Forbid
+  # After an outage don't backfill missed slots; if a run can't start within
+  # this window of its slot, skip it (the next tick still drains the backlog).
+  startingDeadlineSeconds: {{ .Values.beads.embedding.backfill.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 600
+      activeDeadlineSeconds: {{ .Values.beads.embedding.backfill.activeDeadlineSeconds }}
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "gardenio.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: beads-embedding-backfill
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: OnFailure
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          {{- if $.Values.global.systemPriorityClass.create }}
+          priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+          {{- end }}
+          containers:
+            - name: embedding-backfill
+              image: {{ include "gardenio.imageRef" (dict "image" .Values.beads.image "global" .Values.global "Chart" .Chart) | quote }}
+              imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.beads.image.pullPolicy "global" .Values.global) }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              env:
+                # Target the in-cluster daemon over HTTP (the CLI never opens a
+                # DB connection — embedding happens server-side).
+                - name: BEADS_HTTP_URL
+                  value: {{ printf "http://%s:%v" (include "gardenio.beads.fullname" .) (.Values.beads.service.httpPort | default 8080) | quote }}
+                {{- $allowed := .Values.beads.embedding.backfill.allowedTypes | default .Values.beads.embedding.allowedTypes }}
+                {{- if $allowed }}
+                - name: BEADS_EMBED_TYPES
+                  value: {{ join "," $allowed | quote }}
+                {{- end }}
+                {{- $excluded := .Values.beads.embedding.backfill.excludeTypes | default .Values.beads.embedding.excludeTypes }}
+                {{- if $excluded }}
+                - name: BEADS_EMBED_EXCLUDE_TYPES
+                  value: {{ join "," $excluded | quote }}
+                {{- end }}
+              command:
+                - kd
+                - embed
+                - sync
+                - --only-missing
+                - --batch-size
+                - {{ .Values.beads.embedding.backfill.batchSize | quote }}
+                {{- if gt (int .Values.beads.embedding.backfill.limit) 0 }}
+                - --limit
+                - {{ .Values.beads.embedding.backfill.limit | quote }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.beads.embedding.backfill.resources | nindent 16 }}
+          {{- include "gardenio.nodeSelector" (dict "local" .Values.beads.embedding.backfill.nodeSelector "global" .Values.global.nodeSelector) | nindent 10 }}
+          {{- with .Values.beads.embedding.backfill.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- include "gardenio.tolerations" (dict "local" .Values.beads.embedding.backfill.tolerations "global" .Values.global.tolerations) | nindent 10 }}
+{{- end }}

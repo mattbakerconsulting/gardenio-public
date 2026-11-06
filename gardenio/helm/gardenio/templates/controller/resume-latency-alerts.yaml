@@ -1,0 +1,106 @@
+{{- if .Values.agents.metrics.prometheusRule.resumeLatency.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.resumeLatency }}
+# PrometheusRule for the resume-latency / sub-second-resume gate
+# (epic ka-0000002590, task ka-0000002906).
+#
+# Source metric: gardenio_resume_latency_seconds (HistogramVec, labels
+# {regime,role,runtime,path,env}) emitted from the controller wake path
+# (RecordResumeLatency, gardenio/controller/internal/metrics/resume_latency.go).
+# Served on the controller :9092 /metrics endpoint, scraped via VMServiceScrape.
+#
+# Two alerts:
+#   - ResumeP95High: R4 (thaw-warm) p95 resume latency exceeds the gate
+#     threshold (default 1.5s, the Phase 5 success criterion) → the warm-graft
+#     resume path regressed.
+#   - ResumeWarmHitRateLow: the warm-graft hit rate (thaw-warm / total thaw)
+#     dropped below threshold while thaws are still happening → the warm pool
+#     is being exhausted and resumes are falling back to fresh Pod B (slower).
+#
+# Severity is configurable per env via .Values...resumeLatency.severity
+# (page in prod, ticket in e2e, none in dev). Off by default; per-env
+# overlays opt in. Requires the monitoring.coreos.com/v1 PrometheusRule CRD.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-resume-latency
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.resume_latency
+      interval: 30s
+      rules:
+        - alert: ResumeP95High
+          # R4 thaw-warm p95 resume latency above the gate. The
+          # `..._count{path="thaw-warm"} > 0` guard gates this on the path
+          # actually serving wakes — an env with no thaw-warm traffic
+          # (histogram_quantile over an all-zero rate) must NOT page on NaN.
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (rate(gardenio_resume_latency_seconds_bucket{path="thaw-warm"}[10m]))
+            ) > {{ $cfg.p95ThresholdSeconds }}
+            and
+            sum(increase(gardenio_resume_latency_seconds_count{path="thaw-warm"}[10m])) > 0
+          for: {{ $cfg.for | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: controller
+            subsystem: resume_latency
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "resume (thaw-warm) p95 above {{ $cfg.p95ThresholdSeconds }}s"
+            description: |
+              The R4 thaw-onto-warm-placeholder p95 resume latency exceeded
+              {{ $cfg.p95ThresholdSeconds }}s for {{ $cfg.for }} — the Phase 5
+              sub-second-resume gate is p50 < 1s / p95 < 1.5s (epic
+              ka-0000002590). Per-regime p95 breakdown:
+              {{`{{ with printf "histogram_quantile(0.95, sum by (le, regime) (rate(gardenio_resume_latency_seconds_bucket{path=\"thaw-warm\"}[10m])))" | query }}{{ range . }}  - {{ .Labels.regime }}: {{ .Value | printf "%.3f" }}s
+              {{ end }}{{ end }}`}}
+              Check warm-node Ready count and warm-pod pool depth (WS1) and the
+              freezethaw rehydrate path (freezethaw_rehydrate.go).
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/plans/sub-second-resume-integration.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: ResumeWarmHitRateLow
+          # Warm-graft hit rate = thaw-warm / (thaw-warm + thaw-fresh) over a
+          # 30m window. Fires when it drops below threshold AND there is real
+          # thaw volume — the `> 0` guard keeps an idle env (all-zero series)
+          # from paging on a 0/1 clamped ratio.
+          expr: |
+            (
+              sum(increase(gardenio_resume_latency_seconds_count{path="thaw-warm"}[30m]))
+              /
+              clamp_min(sum(increase(gardenio_resume_latency_seconds_count{path=~"thaw-warm|thaw-fresh"}[30m])), 1)
+            ) < {{ $cfg.warmHitRateThreshold }}
+            and
+            sum(increase(gardenio_resume_latency_seconds_count{path=~"thaw-warm|thaw-fresh"}[30m])) > {{ $cfg.warmHitRateMinThaws }}
+          for: {{ $cfg.for | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: controller
+            subsystem: resume_latency
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "warm-graft hit rate below {{ $cfg.warmHitRateThreshold }}"
+            description: |
+              The warm-graft hit rate (thaw-warm / total thaw) dropped below
+              {{ $cfg.warmHitRateThreshold }} over 30m while {{ $cfg.warmHitRateMinThaws }}+
+              thaws occurred — resumes are falling back to freshly-created Pod B
+              (thaw-fresh, R3) because no warm placeholder was available. This
+              is the warm-pool-exhaustion signal: each fallback is a slower
+              resume. Raise warm-pod pool depth / warm-node count (WS1).
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/plans/sub-second-resume-integration.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

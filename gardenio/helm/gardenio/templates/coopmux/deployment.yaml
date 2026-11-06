@@ -1,0 +1,553 @@
+{{- if .Values.coopmux.enabled }}
+{{- /* claudemore R4-SEC-6: assert COOP_ALLOW_PLAINTEXT_BOOTSTRAP is never set in
+       a production/CI namespace. The plaintext escape hatch is a migration-only
+       affordance; a real credential-encryption key must be wired instead. Two
+       render-time guards make "plaintext in prod" unrepresentable rather than a
+       reviewer convention:
+         1. Contradiction guard — allowPlaintextBootstrap AND a real
+            credentialKey secret cannot both be set; the operator must pick one.
+         2. requireEncryptedCredentials — when true (production/CI overlays set
+            this), the plaintext branch is forbidden outright and a credentialKey
+            secret is mandatory. Default false preserves the bootstrap path for
+            dev/migration. See gardenio/docs/audits/coop-plaintext-bootstrap-assertion.md. */}}
+{{- if and .Values.coopmux.credentialKey.allowPlaintextBootstrap .Values.coopmux.credentialKey.secretName .Values.coopmux.credentialKey.secretKey }}
+{{-   fail "coopmux.credentialKey.allowPlaintextBootstrap=true is set alongside a real credentialKey secretName/secretKey — these are mutually exclusive. Unset allowPlaintextBootstrap (the secret takes precedence and the plaintext branch is dead), or clear the secret to actually bootstrap plaintext (dev only)." }}
+{{- end }}
+{{- if .Values.coopmux.requireEncryptedCredentials }}
+{{-   if .Values.coopmux.credentialKey.allowPlaintextBootstrap }}
+{{-     fail "coopmux.requireEncryptedCredentials=true (production/CI posture) forbids coopmux.credentialKey.allowPlaintextBootstrap — COOP_ALLOW_PLAINTEXT_BOOTSTRAP must never be set in this namespace (claudemore R4-SEC-6). Set allowPlaintextBootstrap=false and wire a real credentialKey secret." }}
+{{-   end }}
+{{-   if not (and .Values.coopmux.credentialKey.secretName .Values.coopmux.credentialKey.secretKey) }}
+{{-     fail "coopmux.requireEncryptedCredentials=true requires coopmux.credentialKey.secretName AND secretKey — a real credential-encryption key must be wired (COOP_CREDENTIAL_KEY), not the plaintext bootstrap (claudemore R4-SEC-6)." }}
+{{-   end }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.coopmux.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coopmux.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.coopmux.replicaCount }}
+  {{- if gt (int .Values.coopmux.replicaCount) 1 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  {{- else }}
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.coopmux.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.coopmux.selectorLabels" . | nindent 8 }}
+      annotations:
+        {{- include "gardenio.doNotDisrupt" . | nindent 8 }}
+        {{- /* gd-sqfOLZE7i7: coopmux reads six Secrets via secretKeyRef at
+               runtime — COOP_MUX_AUTH_TOKEN and BEADS_TOKEN (operator-seeded,
+               unchanged by upgrade), COOP_CREDENTIAL_KEY (operator-seeded
+               when wired), DAEMON_HMAC_KEY (operator-provisioned edge-auth
+               secret), and COOP_MUX_NATS_TOKEN / COOP_MUX_NATS_RELAY_TOKEN
+               (chart-rendered by templates/nats/infra-creds-secret.yaml when
+               nats.auth.subjectIsolation.enabled — the same Secret the
+               controller reads, covered below by the matching checksum/
+               annotation). Every other config diff already rolls this pod via
+               native Deployment spec diffing, so the stamp only needs to fire
+               when an operator explicitly asks for it — e.g. to pick up an
+               external-secret rotation the pod spec itself can't see.
+               coopmux keeps agent sessions in memory (gd-StII9fmzym), so an
+               unconditional stamp here is the highest-blast-radius instance
+               of this bug. */}}
+        {{- if .Values.coopmux.forceRestartOnUpgrade }}
+        rollout.kubernetes.io/restartedAt: {{ now | date "2006-01-02T15:04:05Z07:00" | quote }}
+        {{- end }}
+        {{- /* Hashes whatever templates/nats/infra-creds-secret.yaml renders
+               for the current values — empty (stable hash) when
+               subjectIsolation is off, the raw Secret content in the non-ESO
+               branch when it's on, or the (rotation-insensitive)
+               ExternalSecret manifest otherwise — so this pod still restarts
+               when the chart-rendered infra token it reads for
+               COOP_MUX_NATS_TOKEN/COOP_MUX_NATS_RELAY_TOKEN changes. coopmux
+               never reads minio-credentials, so it gets no checksum for
+               that one. */}}
+        checksum/nats-infra-creds: {{ include "gardenio.contentChecksum" (include (print .Template.BasePath "/nats/infra-creds-secret.yaml") .) }}
+        # vmagent scrapes the coopmux edge-auth verify counters served on the
+        # main router's unauth GET /metrics (coop/crates/mux transport/mod.rs).
+        # The endpoint has shipped since 2026-05-22 but was never scraped — the
+        # pod carried no prometheus.io annotation (R2-delta A-2, epic
+        # ka-0000002391). Port is coopmux.mux.port, the same port the router binds.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.coopmux.mux.port | quote }}
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      {{- /* Drain guard (gd-27vcHmrurh): gives in-flight terminal/exec sessions
+             a window to finish before SIGTERM tears the mux down. Must exceed
+             preStop.sleepSeconds below with headroom for the process's own
+             graceful-shutdown work. */}}
+      terminationGracePeriodSeconds: {{ .Values.coopmux.terminationGracePeriodSeconds | default 30 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        {{- if .Values.coopmux.persistence.enabled }}
+        fsGroup: 1000
+        {{- else }}
+        fsGroup: 65534
+        {{- end }}
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: coopmux
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.coopmux.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.coopmux.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          command: ["coopmux"]
+          args:
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "{{ .Values.coopmux.mux.port }}"
+            - "--screen-poll-ms"
+            - "{{ .Values.coopmux.mux.screenPollMs }}"
+            - "--status-poll-ms"
+            - "{{ .Values.coopmux.mux.statusPollMs }}"
+            - "--health-check-ms"
+            - "{{ .Values.coopmux.mux.healthCheckMs }}"
+            - "--max-health-failures"
+            - "{{ .Values.coopmux.mux.maxHealthFailures }}"
+            {{- $natsURL := include "gardenio.coopmux.natsURL" . }}
+            {{- if $natsURL }}
+            - "--nats-url"
+            - "$(COOP_MUX_NATS_URL)"
+            {{- $muxNatsTokenArg := include "gardenio.nats.clientTokenSecretName" . }}
+            {{- if $muxNatsTokenArg }}
+            - "--nats-token"
+            - "$(COOP_MUX_NATS_TOKEN)"
+            {{- end }}
+            {{- if and .Values.coopmux.natsRelay .Values.coopmux.natsRelay.enabled }}
+            - "--nats-relay-url"
+            - "$(COOP_MUX_NATS_RELAY_URL)"
+            {{- if $muxNatsTokenArg }}
+            - "--nats-relay-token"
+            - "$(COOP_MUX_NATS_RELAY_TOKEN)"
+            {{- end }}
+            - "--nats-relay-prefix"
+            - {{ .Values.coopmux.natsRelay.prefix | default "coop.mux" | quote }}
+            {{- end }}
+            {{- end }}
+          env:
+            - name: COOP_MUX_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.coopmux.authTokenSecretName" . }}
+                  key: token
+            {{- /* W1 secrets hardening (ka-0000000955 / MR !2971): coopmux refuses
+                   to start unless COOP_CREDENTIAL_KEY (or _FILE) is set, OR
+                   COOP_ALLOW_PLAINTEXT_BOOTSTRAP=1 is set as a migration escape.
+                   Wire either the key from the named Secret or the bootstrap env. */}}
+            {{- if and .Values.coopmux.credentialKey.secretName .Values.coopmux.credentialKey.secretKey }}
+            - name: COOP_CREDENTIAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.coopmux.credentialKey.secretName | quote }}
+                  key: {{ .Values.coopmux.credentialKey.secretKey | quote }}
+            {{- else if .Values.coopmux.credentialKey.allowPlaintextBootstrap }}
+            - name: COOP_ALLOW_PLAINTEXT_BOOTSTRAP
+              value: "1"
+            {{- end }}
+            - name: RUST_LOG
+              value: "info"
+            {{- if .Values.coopmux.assignmentStrategy }}
+            - name: COOPMUX_ASSIGNMENT_STRATEGY
+              value: {{ .Values.coopmux.assignmentStrategy | quote }}
+            {{- end }}
+            {{- if .Values.coopmux.disableAutoAssign }}
+            # EMERGENCY KILL SWITCH (full rollback). Sessions register and
+            # appear in the dashboard but coopmux stages NOTHING — no fallback
+            # profiles, no switch. Agents run only on the env creds the
+            # controller injected at spawn, with no in-session rotation. The
+            # steady state is unset: coopmux stages health-filtered fallback
+            # profiles (no registration switch) so coop can self-rotate on a
+            # 429. See ka-0000005014 / ka-0000007230.
+            - name: COOPMUX_DISABLE_AUTO_ASSIGN
+              value: "1"
+            {{- end }}
+            {{- if .Values.coopmux.disableFailover }}
+            # Kill switch for the session-MOVING half of throttle handling
+            # (ka-0000005463): skips project-scoped rebalance + switchback so
+            # no /session/switch is pushed to live agents mid-work. Throttle
+            # marking and NATS events keep flowing for observability.
+            - name: COOPMUX_DISABLE_FAILOVER
+              value: "1"
+            {{- end }}
+            - name: BEADS_HTTP_ADDR
+              value: http://{{ include "gardenio.beads.host" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ include "gardenio.beads.httpPort" . }}
+            {{- /* P7 Task 2: coopmux's own daemon bearer used to be the beads
+                   token. coopmux.coopmuxTokenSecret is the AGENT-FACING token
+                   (agents register with it); splitting it from kd-beads-token
+                   is what keeps the primary daemon token out of agent pods.
+                   gd-ke6PC7bRto / gd-in7EZvvd3T: with the machine principal on,
+                   every coopmux daemon call runs as machine:<clientId> (#508;
+                   zero static-token traffic since 2026-10-18 21:30Z), so
+                   BEADS_TOKEN is not injected at all, ahead of the daemon
+                   refusing the shared token (#504). With it off (rollback) the
+                   token returns. */}}
+            {{- if not .Values.coopmux.machinePrincipal.enabled }}
+            - name: BEADS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.tokenSecretName" . }}
+                  key: token
+            {{- end }}
+            {{- /* Machine principal (gd-Wcu0DOkHfN): coopmux's account-bead
+                 write (status=exhausted on failover) authenticates as the
+                 Keycloak service account of coopmux.machinePrincipal.clientId
+                 instead of BEADS_TOKEN (which stays for everything else). The
+                 secret is a file, never an env var; its Secret is
+                 operator-created and optional, so a missing Secret still
+                 starts the pod — the write then fails closed (auth_unavailable
+                 in the log) exactly as it is denied today. Same env contract
+                 as templates/controller/deployment.yaml. */}}
+            {{- if .Values.coopmux.machinePrincipal.enabled }}
+            - name: BEADS_OIDC_TOKEN_URL
+              value: {{ include "gardenio.keycloak.tokenURL" . | quote }}
+            - name: BEADS_OIDC_CLIENT_ID
+              value: {{ .Values.coopmux.machinePrincipal.clientId | quote }}
+            - name: BEADS_OIDC_CLIENT_SECRET_FILE
+              value: /var/run/secrets/gardenio-machine/clientSecret
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            # The token URL is the keycloak-runtime https port: trust its CA
+            # (gd-lYPZlslOM7).
+            - name: BEADS_OIDC_CA_FILE
+              value: {{ include "gardenio.keycloakRuntime.caFile" . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* COOP_MUX_STATE_DIR points the credential broker at a writable
+                   dir. With readOnlyRootFilesystem: true, that dir must be
+                   backed by an explicit volume mount (PVC when persistence is
+                   enabled, otherwise an in-memory tmpfs emptyDir — see
+                   `volumes:` below and docs/coop-credentials-hardening.md). */}}
+            - name: COOP_MUX_STATE_DIR
+              value: {{ dir .Values.coopmux.persistence.path }}
+            {{- /*
+              BASE_PATH — derived via gardenio.unified.muxBasePath
+              (R3, ka-0000006743): returns paths.mux when unifiedHost is on
+              (BASE_PATH == Traefik strip-prefix by construction), else today's
+              hand-set coopmux.basePath. Byte-identical while
+              unifiedHost.enabled=false.
+            */ -}}
+            {{- $muxBasePath := include "gardenio.unified.muxBasePath" . -}}
+            {{- if ne $muxBasePath "" }}
+            - name: BASE_PATH
+              value: {{ $muxBasePath | quote }}
+            {{- end }}
+            {{- /* OIDC issuer for coopmux's JWKS verifier. An explicit
+                   coopmux.oidc.issuerUrl override (GitLab-direct front door,
+                   epic ka-0000004118) WINS over the Keycloak derivation for
+                   BOTH env vars; when it is empty the historical Keycloak
+                   path renders byte-identically (in-box + ephemeral CI). */}}
+            {{- $coopmuxOidc := .Values.coopmux.oidc | default dict }}
+            {{- if $coopmuxOidc.issuerUrl }}
+            - name: COOP_MUX_OIDC_ISSUER_URL
+              value: {{ $coopmuxOidc.issuerUrl | quote }}
+            {{- if $coopmuxOidc.clientId }}
+            - name: COOP_MUX_OIDC_CLIENT_ID
+              value: {{ $coopmuxOidc.clientId | quote }}
+            {{- end }}
+            {{- else }}
+            {{- $kcIssuerURL := include "gardenio.keycloak.issuerURL" . }}
+            {{- if and .Values.keycloak.enabled $kcIssuerURL }}
+            - name: COOP_MUX_OIDC_ISSUER_URL
+              value: {{ $kcIssuerURL | quote }}
+            {{- end }}
+            {{- if and .Values.keycloak.enabled .Values.keycloak.clients }}
+            {{- range .Values.keycloak.clients }}
+            {{- if eq .name "coopmux-api" }}
+            - name: COOP_MUX_OIDC_CLIENT_ID
+              value: {{ .clientId | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- /* Stage 3 / W-B-11 (ka-0000007914): daemon-side HMAC verify of
+                   the gardenio-edge-auth envelope. Wire the same shared secret
+                   used by the edge-auth Deployment so envelopes signed at the
+                   edge verify here. DAEMON_HMAC_VERIFY_ENFORCE defaults off in
+                   values.yaml — flip per-env only after a clean ≥7d burn-in
+                   per runbook ka-0000000026. */}}
+            {{- if .Values.edgeAuth.enabled }}
+            - name: DAEMON_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.edgeAuth.hmacSecretName" . }}
+                  key: {{ .Values.edgeAuth.hmacKey.secretKey | default "hmac-key" }}
+                  {{- /* dryRun: secret may not exist yet — mark optional so
+                         the pod can start even before the operator provisions
+                         gardenio-<env>-edge-auth-hmac. (ka-0000000726) */}}
+                  optional: {{ .Values.edgeAuth.dryRun | default false }}
+            {{- /* Split v2 envelope key (gd-h2tQrOwjGJ): verifies the
+                   role-bearing v2 envelope; unset falls back to
+                   DAEMON_HMAC_KEY. Wired with every other v2 signer/verifier
+                   from edgeAuth.hmacKey.secretKeyV2 in one upgrade. */}}
+            {{- if .Values.edgeAuth.hmacKey.secretKeyV2 }}
+            - name: DAEMON_HMAC_KEY_V2
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.edgeAuth.hmacSecretName" . }}
+                  key: {{ .Values.edgeAuth.hmacKey.secretKeyV2 }}
+                  optional: {{ .Values.edgeAuth.dryRun | default false }}
+            {{- end }}
+            {{- /* Glass relay key (gd-9ZGh01W5ub): verifies beads-viewer's
+                   relay envelope on the GET /ws watch upgrade only, watch-only.
+                   Only coopmux verifies it; never mounted into beads. */}}
+            {{- if .Values.edgeAuth.hmacKey.secretKeyRelay }}
+            - name: DAEMON_HMAC_KEY_RELAY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.edgeAuth.hmacSecretName" . }}
+                  key: {{ .Values.edgeAuth.hmacKey.secretKeyRelay }}
+                  optional: {{ .Values.edgeAuth.dryRun | default false }}
+            {{- end }}
+            {{- if .Values.daemonHmacVerify.enforce }}
+            - name: DAEMON_HMAC_VERIFY_ENFORCE
+              value: "true"
+            {{- end }}
+            {{- else if .Values.edgeAuth.hmacKey.secretKeyRelay }}
+            {{- /* Relay-only (ruling gd-P2Ybp03DPh): with edge-auth off,
+                   coopmux holds the relay key alone, so it verifies the
+                   Glass watch upgrade and nothing else (every other envelope
+                   is NoKey, never trusted). The key comes from the in-box
+                   self-seeded Secret or an operator-supplied secretName;
+                   ExternalSecrets maps it only with edge-auth on. */}}
+            {{- if and .Values.externalSecrets.enabled (not .Values.edgeAuth.hmacKey.secretName) }}
+            {{- fail "edgeAuth.hmacKey.secretKeyRelay with edgeAuth.enabled=false is seeded in-box only: on the ExternalSecrets path set edgeAuth.hmacKey.secretName to a Secret carrying the relay key, or enable edgeAuth, else coopmux and beads-viewer hit CreateContainerConfigError on rollout." }}
+            {{- end }}
+            - name: DAEMON_HMAC_KEY_RELAY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.edgeAuth.hmacSecretName" . }}
+                  key: {{ .Values.edgeAuth.hmacKey.secretKeyRelay }}
+                  optional: false
+            {{- end }}
+            {{- if $natsURL }}
+            {{- /* coopmux's NATS credential is its own: the infra-creds Secret
+                   under subject isolation, else nats.auth.clientTokenSecret
+                   (the legacy single-token server). It is never the beads
+                   token or the agent-facing coopmux token (gd-5QYwXtV7IA):
+                   with neither set no token is sent, which is what the
+                   auth-disabled server (nats.auth.enabled=false) expects. */}}
+            {{- $muxNatsTokenSecret := include "gardenio.nats.clientTokenSecretName" . }}
+            - name: COOP_MUX_NATS_URL
+              value: {{ $natsURL }}
+            {{- if .Values.nats.auth.subjectIsolation.enabled }}
+            {{- /* Username turns the shared secret into the infra user's
+                   PASSWORD — multi-user server entries only support
+                   user/password, so a bare token can never match one
+                   (ka-0000000002). clap env bindings pick these up; no arg
+                   changes needed. */}}
+            - name: COOP_MUX_NATS_USER
+              value: infra
+            {{- end }}
+            {{- if $muxNatsTokenSecret }}
+            - name: COOP_MUX_NATS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $muxNatsTokenSecret }}
+                  key: token
+            {{- end }}
+            {{- if and .Values.coopmux.natsRelay .Values.coopmux.natsRelay.enabled }}
+            - name: COOP_MUX_NATS_RELAY_URL
+              value: {{ .Values.coopmux.natsRelay.url | default $natsURL }}
+            {{- if .Values.nats.auth.subjectIsolation.enabled }}
+            - name: COOP_MUX_NATS_RELAY_USER
+              value: infra
+            {{- end }}
+            {{- if $muxNatsTokenSecret }}
+            - name: COOP_MUX_NATS_RELAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $muxNatsTokenSecret }}
+                  key: token
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.coopmux.landTokens.enabled }}
+            # Verifies tenant lands' coopmux-land.v1 bearers (gd-ApgYe740ps).
+            # coopmux refuses to start if this file is empty or unreadable.
+            - name: COOP_MUX_LAND_TOKEN_KEY_FILE
+              value: /var/run/secrets/coopmux-land-token-key/key
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: LLVM_PROFILE_FILE
+              value: "{{ .Values.global.coverage.mountPath }}/coopmux/coopmux-%p-%m.profraw"
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.coopmux.mux.port }}
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- /* Drain in-flight requests before SIGTERM (gd-27vcHmrurh). The
+                 pod is pulled from Service Endpoints as soon as SIGTERM is
+                 sent, but kube-proxy/iptables propagation across the cluster
+                 is not instantaneous, so a client can still dial this pod for
+                 a moment after termination starts. Sleeping here delays
+                 SIGTERM to the process itself, giving those already-in-flight
+                 requests a window to complete instead of getting reset. */}}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ .Values.coopmux.preStop.sleepSeconds | default 5 }}"]
+          volumeMounts:
+            - name: credentials-data
+              mountPath: {{ dir .Values.coopmux.persistence.path }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+            {{- if .Values.coopmux.machinePrincipal.enabled }}
+            - name: machine-client-secret
+              mountPath: /var/run/secrets/gardenio-machine
+              readOnly: true
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            {{- include "gardenio.keycloakRuntime.caVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.coopmux.landTokens.enabled }}
+            - name: coopmux-land-token-key
+              mountPath: /var/run/secrets/coopmux-land-token-key
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.coopmux.resources | nindent 12 }}
+      volumes:
+        {{- if .Values.coopmux.landTokens.enabled }}
+        - name: coopmux-land-token-key
+          secret:
+            secretName: {{ include "gardenio.coopmux.landTokenKeySecretName" . }}
+            defaultMode: 0440
+            items:
+              - key: key
+                path: key
+        {{- end }}
+        {{- if .Values.coopmux.machinePrincipal.enabled }}
+        # Machine-principal client secret (gd-Wcu0DOkHfN). optional: the operator
+        # creates the Secret by hand; without it the pod still starts and the
+        # account write fails closed with auth_unavailable in the log.
+        - name: machine-client-secret
+          secret:
+            secretName: {{ .Values.coopmux.machinePrincipal.secretName | quote }}
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: clientSecret
+                path: clientSecret
+        {{- if include "gardenio.keycloak.inClusterCA" . }}
+        {{- include "gardenio.keycloakRuntime.caVolume" . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+        - name: credentials-data
+          {{- if .Values.coopmux.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.coopmux.fullname" . }}-credentials
+          {{- else }}
+          {{- /* W10 (ka-0000006638): when persistence is disabled, back the
+                 credential broker dir with a tmpfs emptyDir so credentials.json
+                 never hits disk. sizeLimit caps the in-memory allocation. */}}
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.coopmux.persistence.tmpfsSizeLimit | default "16Mi" }}
+          {{- end }}
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.coopmux.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- /* HA spread (gd-27vcHmrurh). Only rendered at replicaCount > 1 — see
+             templates/litellm/deployment.yaml for the rationale this mirrors. */}}
+      {{- if gt (int (.Values.coopmux.replicaCount | default 1)) 1 }}
+      {{- with .Values.coopmux.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew | default 1 }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable | default "ScheduleAnyway" }}
+          labelSelector:
+            matchLabels:
+              {{- include "gardenio.coopmux.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- if .Values.coopmux.affinity }}
+      affinity:
+        {{- toYaml .Values.coopmux.affinity | nindent 8 }}
+      {{- else if and (gt (int (.Values.coopmux.replicaCount | default 1)) 1) .Values.coopmux.podAntiAffinity.enabled }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: {{ .Values.coopmux.podAntiAffinity.weight | default 100 }}
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "gardenio.coopmux.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- /* Fast reschedule on node failure (ka-0000004926): explicitly set a
+             short tolerationSeconds for the two node-condition taints so this
+             single-replica mux upstream is evicted+rescheduled fast when its
+             node goes NotReady/unreachable, instead of waiting out the 300s
+             DefaultTolerationSeconds admission-controller default. Unioned with
+             any operator-supplied coopmux.tolerations before the helper renders
+             the single tolerations: block. */}}
+      {{- $coopmuxTolerations := .Values.coopmux.tolerations | default list }}
+      {{- if .Values.coopmux.fastReschedule.enabled }}
+      {{- $frs := .Values.coopmux.fastReschedule.tolerationSeconds | default 30 }}
+      {{- $coopmuxTolerations = concat $coopmuxTolerations (list
+            (dict "key" "node.kubernetes.io/unreachable" "operator" "Exists" "effect" "NoExecute" "tolerationSeconds" (int $frs))
+            (dict "key" "node.kubernetes.io/not-ready"   "operator" "Exists" "effect" "NoExecute" "tolerationSeconds" (int $frs))) }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" $coopmuxTolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- /* Same class as the interactive (thread/dm/gardener) agent pods the
+      controller stamps: agents depend on this pod, so they must not be able
+      to preempt it (gd-cTobdw0kAL). */}}
+      {{- if .Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ .Values.global.systemPriorityClass.name }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,269 @@
+{{- if .Values.keycloak.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- range .Values.keycloak.identityProviders }}
+# ── KeycloakRealmIdentityProvider: {{ .alias }} ─────────────────────────────
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakRealmIdentityProvider
+metadata:
+  name: {{ $fullname }}-idp-{{ .alias }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: {{ .alias | quote }}
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: {{ .providerId | quote }}
+  enabled: {{ .enabled | default true }}
+  {{- if .displayName }}
+  displayName: {{ .displayName | quote }}
+  {{- end }}
+  {{- if .authenticateByDefault }}
+  authenticateByDefault: {{ .authenticateByDefault }}
+  {{- end }}
+  {{- if .trustEmail }}
+  trustEmail: {{ .trustEmail }}
+  {{- end }}
+  {{- if .linkOnly }}
+  linkOnly: {{ .linkOnly }}
+  {{- end }}
+  {{- if .storeToken }}
+  storeToken: {{ .storeToken }}
+  {{- end }}
+  {{- if .addReadTokenRoleOnCreate }}
+  addReadTokenRoleOnCreate: {{ .addReadTokenRoleOnCreate }}
+  {{- end }}
+  {{- if .firstBrokerLoginFlowAlias }}
+  firstBrokerLoginFlowAlias: {{ .firstBrokerLoginFlowAlias | quote }}
+  {{- end }}
+  {{- if .config }}
+  {{- $alias := .alias }}
+  config:
+    {{- range $key, $value := .config }}
+    {{- if and (eq $key "clientSecret") (eq $alias "gitlab") $.Values.keycloak.gitlabIdpClientSecret }}
+    {{ $key }}: {{ $.Values.keycloak.gitlabIdpClientSecret | quote }}
+    {{- else }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- if .mappers }}
+  mappers:
+    {{- toYaml .mappers | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+{{- /* ── GitHub IdP (Lands Track B §2.2 item 1, gd-0o4Ggf9ngP) ─────────────
+       keycloak.githubIdp in values.yaml has the whole contract. trustEmail is
+       fixed false: Keycloak's github provider takes /user's email, else the
+       primary entry of /user/emails, and never reads GitHub's `verified` flag,
+       so trusting it would mint email_verified=true for an unverified address.
+       The first broker login flow (auth-flow-github.yaml) never links an
+       existing user, and the post broker login flow refuses the admin role.
+       The client secret is an EDP `$<secret>:<key>` reference, never a
+       literal. */}}
+{{- if .Values.keycloak.githubIdp.enabled }}
+{{- $gh := .Values.keycloak.githubIdp }}
+{{- range .Values.keycloak.identityProviders }}
+{{- if eq .alias "github" }}
+{{- fail "keycloak.identityProviders has an alias \"github\" entry and keycloak.githubIdp.enabled is true: they render the same IdP. Use keycloak.githubIdp only." }}
+{{- end }}
+{{- end }}
+{{- /* Anyone with a GitHub account can register, so a realm default group
+       would hand every stranger its roles (B-D1: a new user has no group and
+       no role). */}}
+{{- if .Values.keycloak.realm.defaultGroups }}
+{{- fail (printf "keycloak.githubIdp.enabled lets anyone with a GitHub account register, but keycloak.realm.defaultGroups is %v: every registrant would join it. Set keycloak.realm.defaultGroups to []." .Values.keycloak.realm.defaultGroups) }}
+{{- end }}
+{{- /* The admin-only github_id/github_login user profile (realm.yaml) and the
+       no-link first broker login flow both live on the chart's KeycloakRealm.
+       Without it the IdP would run with user-editable attributes and no flow. */}}
+{{- if not .Values.keycloak.realm.create }}
+{{- fail "keycloak.githubIdp.enabled needs keycloak.realm.create: the chart's KeycloakRealm carries the admin-only github_id/github_login user profile and the github first broker login flow." }}
+{{- end }}
+# ── KeycloakRealmIdentityProvider: github ────────────────────────────────────
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakRealmIdentityProvider
+metadata:
+  name: {{ $fullname }}-idp-github
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: "github"
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: "github"
+  enabled: true
+  displayName: {{ $gh.displayName | default "GitHub" | quote }}
+  # GitHub's email is not known to be verified (see above): the user starts
+  # with email_verified=false and verifies it through Keycloak (SMTP).
+  trustEmail: false
+  # Create a new user or stop; never link an existing one (auth-flow-github.yaml).
+  firstBrokerLoginFlowAlias: "gardenio-github-first-broker-login"
+  # Refuse a {{ .Values.keycloak.mfa.adminRole | default "gardenio-admin" }} holder: a GitHub sign-in skips the admin
+  # passkey (auth-flow-github.yaml).
+  postBrokerLoginFlowAlias: "gardenio-github-post-broker-login"
+  config:
+    clientId: {{ required "keycloak.githubIdp.clientId is required when keycloak.githubIdp.enabled is true" $gh.clientId | quote }}
+    clientSecret: {{ printf "$%s:%s" (required "keycloak.githubIdp.clientSecretRef.name is required" $gh.clientSecretRef.name) (required "keycloak.githubIdp.clientSecretRef.key is required" $gh.clientSecretRef.key) | quote }}
+    defaultScope: {{ $gh.defaultScope | default "read:user user:email" | quote }}
+    syncMode: "IMPORT"
+  mappers:
+    # GitHub's numeric user id: the stable key (Lands setup check, invites).
+    # FORCE, not INHERIT: the IdP's IMPORT runs an INHERIT mapper only when a
+    # sign-in creates the user, so a user who linked GitHub from the account
+    # console would never get github_id. FORCE writes it on every GitHub
+    # sign-in; for one linked account the value never changes.
+    - name: "github-id"
+      identityProviderMapper: "github-user-attribute-mapper"
+      identityProviderAlias: "github"
+      config:
+        jsonField: "id"
+        userAttribute: "github_id"
+        syncMode: "FORCE"
+    # The GitHub login is a label and can be renamed, so it is re-synced on
+    # every sign-in.
+    - name: "github-login"
+      identityProviderMapper: "github-user-attribute-mapper"
+      identityProviderAlias: "github"
+      config:
+        jsonField: "login"
+        userAttribute: "github_login"
+        syncMode: "FORCE"
+---
+{{- end }}
+{{- /* ── Corporate IdP (Google Workspace / Azure AD / Generic OIDC) ──────── */}}
+{{- if .Values.keycloak.corporateIdp.enabled }}
+{{- $cidp := .Values.keycloak.corporateIdp }}
+{{- $provider := $cidp.provider | default "google" }}
+# ── KeycloakRealmIdentityProvider: corporate ─────────────────────────────
+# Corporate SSO federation — {{ $cidp.displayName | default "Corporate SSO" }}
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakRealmIdentityProvider
+metadata:
+  name: {{ $fullname }}-idp-corporate
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: "corporate"
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: "oidc"
+  enabled: true
+  {{- if $cidp.displayName }}
+  displayName: {{ $cidp.displayName | quote }}
+  {{- end }}
+  {{- if $cidp.authenticateByDefault }}
+  authenticateByDefault: {{ $cidp.authenticateByDefault }}
+  {{- end }}
+  trustEmail: {{ $cidp.trustEmail | default true }}
+  {{- if $cidp.firstBrokerLoginFlowAlias }}
+  firstBrokerLoginFlowAlias: {{ $cidp.firstBrokerLoginFlowAlias | quote }}
+  {{- end }}
+  config:
+    clientId: {{ $cidp.clientId | quote }}
+    {{- if $cidp.clientSecret }}
+    clientSecret: {{ $cidp.clientSecret | quote }}
+    {{- else }}
+    clientSecret: ""
+    {{- end }}
+    syncMode: {{ $cidp.syncMode | default "FORCE" | quote }}
+    defaultScope: {{ $cidp.defaultScope | default "openid email profile" | quote }}
+    {{- /* ── Provider-specific OIDC discovery endpoints ── */}}
+    {{- if eq $provider "google" }}
+    authorizationUrl: {{ $cidp.authorizationUrl | default "https://accounts.google.com/o/oauth2/v2/auth" | quote }}
+    tokenUrl: {{ $cidp.tokenUrl | default "https://oauth2.googleapis.com/token" | quote }}
+    userInfoUrl: {{ $cidp.userInfoUrl | default "https://openidconnect.googleapis.com/v1/userinfo" | quote }}
+    jwksUrl: {{ $cidp.jwksUrl | default "https://www.googleapis.com/oauth2/v3/certs" | quote }}
+    issuer: {{ $cidp.issuer | default "https://accounts.google.com" | quote }}
+    {{- else if eq $provider "azure" }}
+    {{- $tenant := required "keycloak.corporateIdp.azureTenantId is required for Azure AD" $cidp.azureTenantId }}
+    authorizationUrl: {{ $cidp.authorizationUrl | default (printf "https://login.microsoftonline.com/%s/oauth2/v2.0/authorize" $tenant) | quote }}
+    tokenUrl: {{ $cidp.tokenUrl | default (printf "https://login.microsoftonline.com/%s/oauth2/v2.0/token" $tenant) | quote }}
+    userInfoUrl: {{ $cidp.userInfoUrl | default "https://graph.microsoft.com/oidc/userinfo" | quote }}
+    jwksUrl: {{ $cidp.jwksUrl | default (printf "https://login.microsoftonline.com/%s/discovery/v2.0/keys" $tenant) | quote }}
+    issuer: {{ $cidp.issuer | default (printf "https://login.microsoftonline.com/%s/v2.0" $tenant) | quote }}
+    {{- else }}
+    {{- /* Generic OIDC — all endpoints required */}}
+    authorizationUrl: {{ required "keycloak.corporateIdp.authorizationUrl is required for generic OIDC" $cidp.authorizationUrl | quote }}
+    tokenUrl: {{ required "keycloak.corporateIdp.tokenUrl is required for generic OIDC" $cidp.tokenUrl | quote }}
+    {{- if $cidp.userInfoUrl }}
+    userInfoUrl: {{ $cidp.userInfoUrl | quote }}
+    {{- end }}
+    {{- if $cidp.jwksUrl }}
+    jwksUrl: {{ $cidp.jwksUrl | quote }}
+    {{- end }}
+    {{- if $cidp.issuer }}
+    issuer: {{ $cidp.issuer | quote }}
+    {{- end }}
+    {{- end }}
+  mappers:
+    # Map email claim to Keycloak email attribute
+    - name: "email"
+      identityProviderMapper: "oidc-user-attribute-idp-mapper"
+      identityProviderAlias: "corporate"
+      config:
+        claim: "email"
+        user.attribute: "email"
+        syncMode: "INHERIT"
+    # Map given_name claim to Keycloak firstName
+    - name: "first-name"
+      identityProviderMapper: "oidc-user-attribute-idp-mapper"
+      identityProviderAlias: "corporate"
+      config:
+        claim: "given_name"
+        user.attribute: "firstName"
+        syncMode: "INHERIT"
+    # Map family_name claim to Keycloak lastName
+    - name: "last-name"
+      identityProviderMapper: "oidc-user-attribute-idp-mapper"
+      identityProviderAlias: "corporate"
+      config:
+        claim: "family_name"
+        user.attribute: "lastName"
+        syncMode: "INHERIT"
+    # Map username from email (corporate IdP users identified by email)
+    - name: "username"
+      identityProviderMapper: "oidc-username-idp-mapper"
+      identityProviderAlias: "corporate"
+      config:
+        target: "LOCAL"
+        syncMode: "INHERIT"
+        template: "${CLAIM.email}"
+    {{- if and (eq $provider "google") $cidp.allowedEmailDomain }}
+    # Email domain restriction via Google Workspace 'hd' (hosted domain) claim.
+    # Only users whose 'hd' claim matches the allowed domain can log in.
+    - name: "email-domain-restriction"
+      identityProviderMapper: "hardcoded-attribute-idp-mapper"
+      identityProviderAlias: "corporate"
+      config:
+        syncMode: "INHERIT"
+        attribute: "corporate-idp-domain"
+        attribute.value: {{ $cidp.allowedEmailDomain | quote }}
+    {{- end }}
+    {{- if and (ne $provider "google") $cidp.allowedEmailDomain }}
+    # Email domain restriction — store the allowed domain as a user attribute
+    # for post-login validation. The beads API enforces domain restriction
+    # via BEADS_OIDC_ALLOWED_EMAIL_DOMAINS; oauth2-proxy enforces via
+    # --email-domain. This mapper provides Keycloak-level visibility.
+    - name: "email-domain-restriction"
+      identityProviderMapper: "hardcoded-attribute-idp-mapper"
+      identityProviderAlias: "corporate"
+      config:
+        syncMode: "INHERIT"
+        attribute: "corporate-idp-domain"
+        attribute.value: {{ $cidp.allowedEmailDomain | quote }}
+    {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,204 @@
+{{- if and .Values.keycloak.enabled .Values.keycloak.realm.create }}
+{{- $fullname := include "gardenio.fullname" . -}}
+# ── KeycloakRealm ──────────────────────────────────────────────────────────────
+# Creates the gardenio realm in Keycloak via the EDP keycloak-operator CRD.
+# References an existing ClusterKeycloak instance for the Keycloak connection.
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakRealm
+metadata:
+  name: {{ $fullname }}-realm
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  realmName: {{ .Values.keycloak.realm.name | default .Release.Name | quote }}
+  keycloakRef:
+    name: {{ .Values.keycloak.realm.clusterKeycloakRef | quote }}
+    kind: ClusterKeycloak
+  {{- if .Values.keycloak.realm.displayName }}
+  displayName: {{ .Values.keycloak.realm.displayName | quote }}
+  {{- end }}
+  {{- /* Frontend URL override. When the shared Keycloak renders http:// issuer
+         claims for realms that don't pin one (no KC_HOSTNAME, and
+         KC_PROXY_HEADERS=forwarded ignoring the LB's X-Forwarded-Proto), an
+         https:// issuerURL in the chart would never match the token's issuer
+         claim and OIDC verification fails closed. Setting frontendUrl to the
+         https base makes Keycloak stamp https:// issuer/token-service claims for
+         THIS realm. Base URL only (no realm path); see values.yaml. */ -}}
+  {{- if .Values.keycloak.realm.frontendUrl }}
+  frontendUrl: {{ .Values.keycloak.realm.frontendUrl | quote }}
+  {{- end }}
+  {{- /* Bind the custom MFA browser flow as the realm's active browser flow
+         when keycloak.mfa.enabled. The flow itself is defined in
+         templates/keycloak/auth-flow-mfa.yaml (KeycloakAuthFlow CRs). The EDP
+         operator reconciles the realm and the auth-flow CRs independently and
+         retries, so a transient "flow not yet created" is self-healing. MFA
+         epic ka-0000001366 / spike ka-0000006878. */ -}}
+  {{- if .Values.keycloak.mfa.enabled }}
+  browserFlow: {{ .Values.keycloak.mfa.flowAlias | default "gardenio-mfa-browser" | quote }}
+  {{- end }}
+  login:
+    userRegistration: {{ .Values.keycloak.realm.login.userRegistration }}
+    emailAsUsername: {{ .Values.keycloak.realm.login.emailAsUsername }}
+    loginWithEmail: {{ .Values.keycloak.realm.login.loginWithEmail }}
+    verifyEmail: {{ .Values.keycloak.realm.login.verifyEmail }}
+    forgotPassword: {{ .Values.keycloak.realm.login.forgotPassword }}
+    rememberMe: {{ .Values.keycloak.realm.login.rememberMe }}
+    editUsername: {{ .Values.keycloak.realm.login.editUsername }}
+    duplicateEmails: {{ .Values.keycloak.realm.login.duplicateEmails }}
+  {{- /* Realm SMTP (keycloak.realm.smtp, gd-hTlQPf59qf): the mail server
+         Keycloak sends verify-email and reset-password mail through. A GitHub
+         registrant starts with email_verified=false (trustEmail: false on the
+         github IdP), so without SMTP the VERIFY_EMAIL required action cannot
+         send and registration fails closed. The EDP 1.32.0 operator reads the
+         password only from a Secret/ConfigMap ref in the realm's namespace, so
+         it never sits in values or in the CR. */ -}}
+  {{- with .Values.keycloak.realm.smtp }}
+  {{- if .enabled }}
+  {{- if and .ssl .starttls }}
+  {{- fail "keycloak.realm.smtp: set ssl (implicit TLS, port 465) or starttls (port 587), not both" }}
+  {{- end }}
+  smtp:
+    template:
+      from: {{ required "keycloak.realm.smtp.from is required when keycloak.realm.smtp.enabled" .from | quote }}
+      {{- if .fromDisplayName }}
+      fromDisplayName: {{ .fromDisplayName | quote }}
+      {{- end }}
+      {{- if .replyTo }}
+      replyTo: {{ .replyTo | quote }}
+      {{- end }}
+      {{- if .replyToDisplayName }}
+      replyToDisplayName: {{ .replyToDisplayName | quote }}
+      {{- end }}
+      {{- if .envelopeFrom }}
+      envelopeFrom: {{ .envelopeFrom | quote }}
+      {{- end }}
+    connection:
+      host: {{ required "keycloak.realm.smtp.host is required when keycloak.realm.smtp.enabled" .host | quote }}
+      port: {{ .port | int }}
+      enableSSL: {{ .ssl }}
+      enableStartTLS: {{ .starttls }}
+      {{- if .auth.enabled }}
+      {{- $secret := required "keycloak.realm.smtp.auth.secretName is required when keycloak.realm.smtp.auth.enabled" .auth.secretName }}
+      {{- /* Username as a plain value wherever we can get one (gd-M8NN95y1Xh).
+             keycloak-operator 1.32.0 rewrites the CR on reconcile with
+             username: {} for secretKeyRef AND configMapKeyRef; only
+             username.value survives, so a ref-only username leaves the realm
+             with smtpServer.user="" and every send fails "535 AUTH failed".
+             Order: auth.username, then the Secret's username key read with
+             lookup at render time (an SES SMTP username is the access key id,
+             an identifier, and keeping it out of git keeps it out of values),
+             then the secretKeyRef. lookup returns nothing under helm template,
+             a client dry-run or a first install before the Secret exists;
+             those render the ref as before. The password stays a ref (the CRD
+             has no value form for it, and the operator keeps that ref). */ -}}
+      {{- $username := .auth.username }}
+      {{- if not $username }}
+      {{- $existing := lookup "v1" "Secret" $.Release.Namespace $secret }}
+      {{- if and $existing $existing.data (index $existing.data .auth.usernameKey) }}
+      {{- $username = index $existing.data .auth.usernameKey | b64dec }}
+      {{- end }}
+      {{- end }}
+      authentication:
+        username:
+          {{- if $username }}
+          value: {{ $username | quote }}
+          {{- else }}
+          secretKeyRef:
+            name: {{ $secret | quote }}
+            key: {{ .auth.usernameKey | quote }}
+          {{- end }}
+        password:
+          secretKeyRef:
+            name: {{ $secret | quote }}
+            key: {{ .auth.passwordKey | quote }}
+      {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- /* Realm events (keycloak.realm.events, gd-X2xwS9MoBP): the audit record
+         for admin impersonation (an admin event plus an IMPERSONATE user
+         event). The operator PUTs this whole block to events/config on every
+         reconcile, so every field is rendered. adminEventsExpiration reaches
+         the realm only while adminEventsEnabled is true. An empty
+         enabledEventTypes means every type, logins included. */ -}}
+  {{- with .Values.keycloak.realm.events }}
+  {{- if .enabled }}
+  realmEventConfig:
+    adminEventsEnabled: {{ .adminEventsEnabled }}
+    adminEventsDetailsEnabled: {{ .adminEventsDetailsEnabled }}
+    adminEventsExpiration: {{ .adminEventsExpiration | int }}
+    eventsEnabled: {{ .eventsEnabled }}
+    {{- with .enabledEventTypes }}
+    enabledEventTypes:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    eventsExpiration: {{ .eventsExpiration | int }}
+    {{- with .eventsListeners }}
+    eventsListeners:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  {{- end }}
+  {{- end }}
+  themes:
+    loginTheme: {{ .Values.keycloak.realm.themes.loginTheme | quote }}
+    {{- if .Values.keycloak.realm.themes.accountTheme }}
+    accountTheme: {{ .Values.keycloak.realm.themes.accountTheme | quote }}
+    {{- end }}
+    {{- if .Values.keycloak.realm.themes.emailTheme }}
+    emailTheme: {{ .Values.keycloak.realm.themes.emailTheme | quote }}
+    {{- end }}
+  sessions:
+    ssoSessionSettings:
+      idleTimeout: {{ .Values.keycloak.realm.sessions.ssoSessionIdleTimeout | int }}
+      maxLifespan: {{ .Values.keycloak.realm.sessions.ssoSessionMaxLifespan | int }}
+      {{- if .Values.keycloak.realm.sessions.ssoSessionIdleTimeoutRememberMe }}
+      idleTimeoutRememberMe: {{ .Values.keycloak.realm.sessions.ssoSessionIdleTimeoutRememberMe | int }}
+      {{- end }}
+      {{- if .Values.keycloak.realm.sessions.ssoSessionMaxLifespanRememberMe }}
+      maxLifespanRememberMe: {{ .Values.keycloak.realm.sessions.ssoSessionMaxLifespanRememberMe | int }}
+      {{- end }}
+    ssoOfflineSessionSettings:
+      idleTimeout: {{ .Values.keycloak.realm.sessions.offlineSessionIdleTimeout | int }}
+      maxLifespan: {{ .Values.keycloak.realm.sessions.offlineSessionMaxLifespan | int }}
+      maxLifespanEnabled: {{ .Values.keycloak.realm.sessions.offlineSessionMaxLifespanEnabled }}
+  tokenSettings:
+    accessTokenLifespan: {{ .Values.keycloak.realm.tokenSettings.accessTokenLifespan | int }}
+    accessCodeLifespan: {{ .Values.keycloak.realm.tokenSettings.accessCodeLifespan | int }}
+    revokeRefreshToken: {{ .Values.keycloak.realm.tokenSettings.revokeRefreshToken }}
+    refreshTokenMaxReuse: {{ .Values.keycloak.realm.tokenSettings.refreshTokenMaxReuse | int }}
+    defaultSignatureAlgorithm: {{ .Values.keycloak.realm.tokenSettings.defaultSignatureAlgorithm | quote }}
+  {{- if .Values.keycloak.realm.passwordPolicy }}
+  passwordPolicy:
+    {{- toYaml .Values.keycloak.realm.passwordPolicy | nindent 4 }}
+  {{- end }}
+  {{- if .Values.keycloak.realm.defaultGroups }}
+  defaultGroups:
+    {{- range .Values.keycloak.realm.defaultGroups }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- end }}
+  {{- /* GitHub IdP attributes (keycloak.githubIdp, gd-0o4Ggf9ngP). Keycloak 26
+         always runs the declarative user profile; declaring the two attributes
+         keeps them on the user and in tokens, and edit: [admin] means no user
+         can set their own github_id from the account console or the first
+         broker login review form (the IdP import writes them directly). The
+         operator merges these into the realm's existing attributes, but sets
+         unmanagedAttributePolicy to what is given here: unset, i.e. disabled,
+         which is Keycloak's default and what this realm already runs. */ -}}
+  {{- if .Values.keycloak.githubIdp.enabled }}
+  userProfileConfig:
+    attributes:
+      - name: github_id
+        displayName: "GitHub user id"
+        permissions:
+          view: ["admin"]
+          edit: ["admin"]
+      - name: github_login
+        displayName: "GitHub login"
+        permissions:
+          view: ["admin"]
+          edit: ["admin"]
+  {{- end }}
+{{- end }}

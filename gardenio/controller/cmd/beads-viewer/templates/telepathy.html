@@ -1,0 +1,113 @@
+{{template "layout" .}}
+{{define "title"}}Telepathy · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+
+<style>
+  /* Telepathy — unified cross-agent thinking feed (epic ka-0000007154).
+     Scoped under .telepathy-page so it never leaks into other pages. */
+  .telepathy-head { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; }
+  .telepathy-status { font-size: 0.85rem; color: var(--text-subtle, #888); display: inline-flex; align-items: center; gap: 0.35rem; }
+  .telepathy-status .dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: #bbb; display: inline-block; }
+  .telepathy-status[data-state="live"] .dot { background: #1a7f37; box-shadow: 0 0 0 3px rgba(26,127,55,0.2); }
+  .telepathy-status[data-state="connecting"] .dot { background: #d4a017; }
+  .telepathy-status[data-state="offline"] .dot,
+  .telepathy-status[data-state="error"] .dot,
+  .telepathy-status[data-state="auth-expired"] .dot { background: #cf222e; }
+
+  .telepathy-toolbar { display: flex; align-items: center; gap: 0.75rem; margin: 0.5rem 0 0.75rem; flex-wrap: wrap; }
+  .telepathy-toolbar label { font-size: 0.85rem; color: var(--text-subtle, #888); display: inline-flex; align-items: center; gap: 0.3rem; cursor: pointer; }
+  .telepathy-pause {
+    font: inherit; font-size: 0.85rem; padding: 0.2rem 0.6rem; cursor: pointer;
+    border: 1px solid rgba(128,128,128,0.4); border-radius: 4px;
+    background: var(--bg, #fff); color: inherit; white-space: nowrap;
+  }
+  .telepathy-pause[aria-pressed="true"] { background: #d4a017; border-color: #d4a017; color: #1a1a1a; font-weight: 600; }
+  .telepathy-filter { padding: 0.2rem 0.4rem; font: inherit; font-size: 0.85rem; border: 1px solid rgba(128,128,128,0.4); border-radius: 4px; background: var(--bg, #fff); color: inherit; }
+
+  .telepathy-feed {
+    display: flex; flex-direction: column; gap: 0.35rem;
+    max-height: calc(100vh - 12rem); overflow-y: auto;
+    border: 1px solid rgba(128,128,128,0.25); border-radius: 6px;
+    padding: 0.6rem; background: rgba(128,128,128,0.03);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .telepathy-event {
+    /* Flex (not a fixed grid) so the text column always claims the remaining
+       width even when the optional role/project chips are absent — otherwise
+       a missing chip leaves a dead gap on the right. */
+    display: flex;
+    align-items: baseline; gap: 0.5rem;
+    padding: 0.3rem 0.45rem; border-radius: 4px;
+    border-left: 3px solid hsl(var(--agent-hue, 210), 65%, 55%);
+    background: hsl(var(--agent-hue, 210), 60%, 96%);
+    animation: telepathy-flash 0.6s ease-out;
+  }
+  html[data-skin="dark-terminal"] .telepathy-event {
+    background: hsl(var(--agent-hue, 210), 35%, 14%);
+  }
+  @keyframes telepathy-flash {
+    from { filter: brightness(1.25); }
+  }
+
+  /* Fixed-shape columns (everything but the text) keep their intrinsic width. */
+  .telepathy-time, .telepathy-agent, .telepathy-role, .telepathy-project, .telepathy-clip { flex: 0 0 auto; }
+  .telepathy-time { font-size: 0.78rem; color: var(--text-subtle, #888); white-space: nowrap; }
+  .telepathy-agent {
+    font-weight: 700; font-size: 0.85rem; white-space: nowrap;
+    color: hsl(var(--agent-hue, 210), 65%, 38%); text-decoration: none;
+  }
+  html[data-skin="dark-terminal"] .telepathy-agent { color: hsl(var(--agent-hue, 210), 70%, 70%); }
+  .telepathy-agent:hover { text-decoration: underline; }
+  .telepathy-role, .telepathy-project {
+    font-size: 0.72rem; text-transform: lowercase; letter-spacing: 0.02em;
+    padding: 0.02rem 0.35rem; border-radius: 3px; white-space: nowrap;
+    background: rgba(128,128,128,0.15); color: var(--text-muted, #595959);
+  }
+  .telepathy-text { flex: 1 1 auto; font-size: 0.88rem; line-height: 1.4; white-space: pre-wrap; word-break: break-word; min-width: 0; }
+  .telepathy-empty { color: var(--text-subtle, #999); font-style: italic; }
+  .telepathy-clip { font-size: 0.72rem; color: var(--text-subtle, #888); white-space: nowrap; }
+
+  .telepathy-empty-state { padding: 2rem 1rem; text-align: center; color: var(--text-subtle, #888); }
+</style>
+
+<div class="telepathy-page"
+     data-events-url="{{.BasePath}}/telepathy/events"
+     data-status-url="{{.BasePath}}/agents/events-status">
+  <h1 class="telepathy-head">
+    Telepathy
+    <span class="meta">· live cross-agent thinking feed</span>
+    <span class="telepathy-status" data-state="connecting" aria-live="polite"><span class="dot"></span><span class="telepathy-status-label">connecting…</span></span>
+  </h1>
+
+  {{if not .FeedEnabled}}
+  <div class="banner banner-error">
+    Thinking feed is disabled — the viewer has no NATS connection configured
+    (set <code>NATS_URL</code>). The page renders but no events will stream.
+  </div>
+  {{end}}
+
+  <div class="telepathy-toolbar">
+    <button type="button" class="telepathy-pause" aria-pressed="false"
+            title="Freeze the feed so you can read — buffered thoughts flush on resume">
+      ⏸ Pause
+    </button>
+    <label>
+      <input type="checkbox" class="telepathy-autoscroll" checked>
+      auto-scroll
+    </label>
+    <label>
+      filter agent
+      <input type="search" class="telepathy-filter" placeholder="name contains…" aria-label="Filter by agent name">
+    </label>
+    <span class="meta telepathy-count" aria-live="polite"></span>
+  </div>
+
+  <div class="telepathy-feed" id="telepathy-feed" role="log" aria-label="Cross-agent thinking feed" aria-live="polite">
+    <div class="telepathy-empty-state">Waiting for agents to think…</div>
+  </div>
+</div>
+
+<script src="{{.BasePath}}/assets/static/telepathy.js" defer></script>
+{{end}}

@@ -1,0 +1,101 @@
+{{/*
+When clusterAdmin is enabled, the chart creates cluster-scoped resources
+(ClusterRoleBinding, ServiceAccount for cluster-admin agent pods). The
+DEPLOYER SA (the controller SA, which runs helm upgrades of this chart) needs
+permission to manage these resources during helm upgrade.
+
+BOOTSTRAP: The first time clusterAdmin is enabled, a cluster admin must
+apply this chart (or pre-create the ClusterRole/ClusterRoleBinding below)
+since the deployer SA won't yet have the permissions.
+
+SECURITY (ka-0000005117): the WRITE role below (create/update/patch/delete on
+clusterrolebindings) is bound ONLY to the deployer SA
+(gardenio.agents.serviceAccountName). It is deliberately NOT bound to the
+spawned-agent-pod SA (gardenio.coop.serviceAccountName): agent pods never run an
+in-cluster helm upgrade, so granting them write on the cluster-admin CRB was
+pure over-grant. An operator measured (2026-08-25) that any agent pod holding
+`delete` on this binding could strip cluster-admin from whatever depends on it
+(helm manages that CRB) with no admission check in the way — a fleet-wide
+availability hazard. Agent pods instead get a read-only role, so anything that
+merely inspects the binding still works.
+*/}}
+{{- if and .Values.agents.enabled .Values.agents.clusterAdmin.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-cluster-manager
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  # Manage ClusterRoleBindings created by agent-cluster-rbac.yaml
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resourceNames:
+      - {{ include "gardenio.coop.clusterAdminServiceAccountName" . }}
+  # Allow initial creation (resourceNames filter doesn't apply to create).
+  # Inherent to k8s RBAC: `create` cannot be scoped by resourceName, so binding
+  # the specific named CRB requires unrestricted `create`. Acceptable ONLY
+  # because this role is bound to the deployer SA alone (ka-0000005117).
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings"]
+    verbs: ["create"]
+  # Read cluster-admin ClusterRole (referenced in the binding)
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["get"]
+    resourceNames:
+      - cluster-admin
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-cluster-manager
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.agents.fullname" . }}-cluster-manager
+subjects:
+  # Deployer SA only — the controller SA that runs helm upgrades of this chart.
+  # The spawned-agent-pod SA is intentionally absent (ka-0000005117): it gets
+  # the read-only role below instead.
+  - kind: ServiceAccount
+    name: {{ include "gardenio.agents.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+{{/*
+Read-only view of the cluster-admin ClusterRoleBinding for spawned agent pods.
+Preserves the ability to INSPECT the binding (a `get` on the named object —
+e.g. `kubectl get clusterrolebinding <name> -o yaml` for diagnostics) while
+holding zero write verbs, so no agent pod can create, patch, or delete it.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-cluster-reader
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings"]
+    verbs: ["get"]
+    resourceNames:
+      - {{ include "gardenio.coop.clusterAdminServiceAccountName" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-cluster-reader
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.agents.fullname" . }}-cluster-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.coop.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

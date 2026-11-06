@@ -1,0 +1,1034 @@
+# Self-contained coverage workflow (ka-0000000353, epic ka-0000004002).
+#
+# Collapses four GitLab CI coverage jobs that each dispatched RWX and then
+# blocked on `rwx results --wait` (coverage-report, coverage-comment,
+# coverage-badge-refresh, coverage-ratchet — ~16,877 idle GitLab min/mo,
+# ~50% of gardenio CI) into ONE fire-and-forget dispatch. GitLab dispatches
+# this workflow and returns immediately; everything visibility-only happens
+# INSIDE RWX via the GitLab API.
+#
+# All four collapsed jobs were allow_failure:true / visibility-only — none
+# was a merge or release gate. The real gates are untouched:
+#   - gardenio-coverage-merge (.rwx/coverage-merge.yml) — still the input to
+#     the `Coverage / Patch` status check (gardenio-coverage-patch), which is
+#     self-contained (it dispatches its own merge).
+#   - gardenio-coverage-baselines (.rwx/coverage-baselines.yml) — operator
+#     one-shot, unchanged.
+#
+# Shape (one dispatch, three gated visibility outputs):
+#   1. Inline the coverage-merge pipeline (clone + toolchains + per-component
+#      unit coverage + merge) producing coverage.{unit,e2e,merged}.lcov and
+#      coverage.cobertura.xml. Byte-equivalent to .rwx/coverage-merge.yml.
+#   2. comment   [if mr-iid != '']    — build + run coverage-bot (patch mode)
+#                to upsert the sticky patch-cov MR comment via the GitLab API.
+#   3. badge     [if is-main == true] — compute combined % from the merged
+#                LCOV, upload the shields.io endpoint JSON to the generic
+#                package registry (coverage-health/latest/coverage.json), and
+#                publish coverage.merged.lcov to the registry for the manual
+#                coverage-baselines recompute to harvest.
+#   4. ratchet   [if is-main == true] — build gb, run `gb coverage-ratchet
+#                check` on the in-workflow merged LCOV, advance the baseline
+#                bead on pass (NEVER auto-revert on fail).
+#
+# Tradeoff vs. the old coverage-report GitLab job: the GitLab-native MR-widget
+# coverage % header and the per-line cobertura gutter marks in the "Changes"
+# diff drop — both require a blocking GitLab job that parses the `coverage:`
+# regex / ingests a coverage_report artifact, which is exactly the idle wait
+# we are removing. The coverage SIGNAL survives via the sticky bot comment
+# (patch-cov %, per-component deltas), the repo badge, and the main-push
+# ratchet. No gate is weakened.
+#
+# Trigger from GitLab CI (.gitlab-ci.yml `coverage`):
+#   rwx dispatch gardenio-coverage \
+#     --param commit-sha=$CI_COMMIT_SHA \
+#     --param ref-name=$CI_COMMIT_REF_NAME \
+#     --param is-main=<true|false> \
+#     --param mr-iid=<iid|''> \
+#     --param target-branch=<target|main> \
+#     --param pipeline-id=$CI_PIPELINE_ID
+#
+# Run manually (main path):
+#   rwx run .rwx/coverage.yml \
+#     --init commit-sha=$(git rev-parse main) \
+#     --init ref-name=refs/heads/main \
+#     --init is-main=true \
+#     --wait
+
+on:
+  dispatch:
+    - key: gardenio-coverage
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        ref-name: ${{ event.dispatch.params.ref-name }}
+        is-main: ${{ event.dispatch.params.is-main }}
+        mr-iid: ${{ event.dispatch.params.mr-iid }}
+        target-branch: ${{ event.dispatch.params.target-branch }}
+        pipeline-id: ${{ event.dispatch.params.pipeline-id }}
+        e2e-run-id: ${{ event.dispatch.params.e2e-run-id }}
+        mr-comment: ${{ event.dispatch.params.mr-comment }}
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to compute coverage for. Required."
+          required: true
+        - key: ref-name
+          name: Ref name
+          description: "Git ref (refs/heads/main or bare branch). Used only for clone provenance."
+          default: "refs/heads/main"
+          required: false
+        - key: is-main
+          name: Is main push
+          description: "'true' on a main-branch pipeline (enables badge + ratchet). 'false' on MR pipelines."
+          default: "false"
+          required: false
+        - key: mr-iid
+          name: MR IID
+          description: "GitLab merge-request iid (non-empty on MR pipelines — enables the sticky bot comment)."
+          default: ""
+          required: false
+        - key: target-branch
+          name: Target branch
+          description: "MR target branch — used to compute the comment merge-base diff."
+          default: "main"
+          required: false
+        - key: pipeline-id
+          name: GitLab pipeline id
+          description: "Dispatching pipeline id — ratchet idempotency key + bead audit field."
+          default: ""
+          required: false
+        - key: e2e-run-id
+          name: E2E run id
+          description: >-
+            Optional RWX run id of a gardenio-e2e dispatch (or an embedded e2e
+            sub-run) whose e2e-coverage task produced the
+            coverage-artifacts.coverage.tar.gz drain tarball. When set, the
+            drained E2E coverage is fetched, ingested into *-e2e.lcov, and
+            folded into the merged output. When empty (the default), the merge
+            is unit-only and byte-identical to before. Mirrors
+            .rwx/coverage-merge.yml (C3, ka-0000000708 / ka-0000007150).
+          default: ""
+          required: false
+        - key: mr-comment
+          name: Post combined-coverage MR comment
+          description: >-
+            'true' enables the C4 (ka-0000005662 / ka-0000000258) per-component
+            combined-coverage table comment: coverage-bot --mode=combined
+            upserts a sticky note (marker gardenio-coverage-bot:combined-cov:v1)
+            on the MR. When 'false' (the default) the combined-comment task
+            still renders the table to the run log in --dry-run mode so the
+            shape is observable, but posts nothing — the C5 SOAK task
+            (ka-0000000718) flips this default to true after validation. Only
+            has effect on MR pipelines (mr-iid non-empty). Sourced from the
+            Helm value global.coverage.mrComment.
+          default: "false"
+          required: false
+      title: Coverage (merge + comment + badge + ratchet)
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      ref-name: ${{ event.git.ref }}
+      is-main: "false"
+      mr-iid: ""
+      target-branch: "main"
+      pipeline-id: ""
+      e2e-run-id: ""
+      mr-comment: "false"
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  # ── Clone gardenio monorepo ─────────────────────────────────────────
+  # Full history + .git so the comment task can `git merge-base` / `git diff`
+  # against the MR target branch (mirrors .rwx/coverage-patch.yml `code`).
+  - key: code
+    # ── Retry-wrapped FULL clone, preserve .git (ka-0000001787 / ka-0000004454)
+    # Hand-rolled full-history clone with a bounded retry loop instead of
+    # `call: git/clone ... fetch-full-depth+preserve-git-dir` — the retry
+    # pattern proven in docker.yml (ka-0000007550). The stock package (through
+    # 2.0.8) has NO retry, so a single transient gitlab.com blip (exit 128)
+    # fails the whole run.
+    #
+    # Parity with `git/clone` fetch-full-depth:true + preserve-git-dir:true:
+    # NON-shallow fetch of the exact SHA (full ancestry, so `git merge-base`
+    # against origin/<target> resolves) and `.git` KEPT (consumers self-fetch
+    # origin/<target> and run merge-base/diff — ka-0000002355). No submodules/LFS.
+    run: |
+      set -eu
+      : "${GITLAB_CLONE_TOKEN:?GITLAB_CLONE_TOKEN is required}"
+      REPO="https://oauth2:${GITLAB_CLONE_TOKEN}@gitlab.com/Acme/Platform/gardenio.git"
+      SHA="${COMMIT_SHA}"
+      MAX_ATTEMPTS=5
+
+      # Redact the token from any tracing/output; never echo $REPO.
+      git init -q -b main
+      git remote add origin "$REPO"
+      git config --local maintenance.auto false
+      git config --local gc.auto 0
+
+      attempt=1
+      while :; do
+        echo "git-clone attempt ${attempt}/${MAX_ATTEMPTS} for ${SHA}"
+        if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch --no-auto-gc origin "+${SHA}:refs/rwx/git-clone/checkout"; then
+          echo "git-clone: fetch succeeded on attempt ${attempt}"
+          break
+        else
+          rc=$?
+          if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+            echo "git-clone: fetch FAILED after ${MAX_ATTEMPTS} attempts (last exit ${rc})" >&2
+            exit "$rc"
+          fi
+          # Exponential backoff: 5s, 10s, 20s, 40s.
+          sleep_s=$((5 * (1 << (attempt - 1))))
+          echo "git-clone: fetch failed (exit ${rc}); retrying in ${sleep_s}s" >&2
+          sleep "$sleep_s"
+          attempt=$((attempt + 1))
+        fi
+      done
+
+      git checkout -q --detach "$(git rev-parse refs/rwx/git-clone/checkout^{commit})"
+      git clean -fdq
+      echo "Checked out git repository at $(git rev-parse HEAD)"
+
+      # preserve-git-dir parity: KEEP .git so downstream `git merge-base` /
+      # `git diff` against the MR target branch resolve (ka-0000002355).
+    env:
+      GITLAB_CLONE_TOKEN:
+        value: ${{ secrets.GITLAB_CLONE_TOKEN }}
+        cache-key: excluded
+      COMMIT_SHA: ${{ init.commit-sha }}
+
+  # ── Toolchains (mirror .rwx/coverage-merge.yml exactly) ─────────────
+  - key: go
+    call: golang/install 1.2.1
+    with:
+      go-version: "1.25"
+
+  - key: rust
+    filter:
+      - .rwx/coverage.yml
+      - coop/rust-toolchain.toml
+    run: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain 1.93.0 -c rustfmt -c clippy -c llvm-tools
+      . "$HOME/.cargo/env"
+      rustc --version
+
+  - key: gcov2lcov
+    use: go
+    filter:
+      - .rwx/coverage.yml
+    run: GOWORK=off go install github.com/jandelgado/gcov2lcov@v1.1.1
+
+  - key: coop-system-deps
+    filter:
+      - .rwx/coverage.yml
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config libssl-dev tmux
+
+  - key: merge-tooling
+    filter:
+      - .rwx/coverage.yml
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y --no-install-recommends lcov python3-pip
+      # PEP 668 (ubuntu:24.04 externally-managed Python). Leaf package, no
+      # system overlap; --break-system-packages keeps it pinned/reproducible.
+      pip3 install --break-system-packages --no-cache-dir 'lcov_cobertura==2.1.1'
+      lcov --version
+      lcov_cobertura --help >/dev/null 2>&1 || python3 -m lcov_cobertura --help
+
+  - key: gardenio-deps
+    use: [code, go]
+    run: cd gardenio/controller && GOWORK=off go mod download
+    filter:
+      - gardenio/controller/go.mod
+      - gardenio/controller/go.sum
+      # controller replace => ../clicreds local module (ka-0000003839).
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+
+  - key: kbeads-deps
+    use: [code, go]
+    run: cd kbeads && GOWORK=off go mod download
+    filter:
+      - kbeads/go.mod
+      - kbeads/go.sum
+      # kbeads replace => ../gardenio/clicreds local module (ka-0000003839).
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+
+  - key: coop-deps
+    use: [code, rust, coop-system-deps]
+    run: |
+      . "$HOME/.cargo/env"
+      cd coop && cargo fetch
+    filter:
+      - coop/Cargo.lock
+      - coop/Cargo.toml
+      - coop/crates/*/Cargo.toml
+      - coop/crates/*/src/lib.rs
+      - coop/crates/*/src/main.rs
+      - coop/tests/*/Cargo.toml
+      - coop/tests/*/src/lib.rs
+
+  # ── Unit-test coverage (mirror .rwx/coverage-merge.yml) ─────────────
+  - key: test-gardenio-cov
+    use: gardenio-deps
+    # The full `./...` coverage run (slow cmd/beads-viewer package included, plus
+    # coverage instrumentation overhead) overruns the RWX default 10m task
+    # timeout under load and SIGKILLs, reporting the coverage run failed even
+    # though every package passes. Mirror the sibling test-gardenio ceiling
+    # (.rwx/ci.yml, ka-0000004988) so the whole suite completes.
+    timeout: 20m
+    filter:
+      - "gardenio/controller/**"
+      - "gardenio/clicreds/**"
+      # TestCostsTrustFloorsMatchValuesYAML reads ../../../helm/gardenio/values.yaml;
+      # materialize it or the test t.Fatalfs "no such file or directory"
+      # (ka-0000000434). Mirror the test-gardenio filter (.rwx/ci.yml).
+      - "gardenio/helm/gardenio/values.yaml"
+      # TestGitLabWebhookDeadmanE2E_ServedNamesMatchShippedAlertExpr reads the
+      # shipped PrometheusRule template to couple the emitted metric names to the
+      # alert expr (ka-0000005729). Materialize it here too so the coupling stays a
+      # HARD gate under coverage (the test SKIPs LOUD if absent, but this layer
+      # SHOULD run it). Mirror the test-gardenio filter (.rwx/ci.yml).
+      - "gardenio/helm/gardenio/templates/gitlab-bridge/webhook-deadman-alert.yaml"
+      # TestSlackBridgeRespawnPhaseE2E_ServedNamesMatchShippedAlertExpr reads the
+      # shipped vmalert configmap to couple the emitted respawn-phase metric names to
+      # the SlackBridgeRespawnPhaseSlow alert expr (ka-0000003422). Materialize it
+      # here too so the coupling stays a HARD gate under coverage (the test SKIPs
+      # LOUD if absent, but this layer SHOULD run it). Mirror the test-gardenio filter
+      # (.rwx/ci.yml).
+      - "gardenio/helm/gardenio/templates/vmalert/configmap.yaml"
+      # TestEmptyBranchScan_DashboardTreePresent (internal/grafanagrade/
+      # dashboards_scan_test.go, ka-0000004423) hard-fails under CI when the
+      # chart dashboards are absent from the layer, because the sibling
+      # TestEmptyBranchScan_NoNewDefects then skips and the masked-zero ratchet
+      # goes silently vacuous (ka-0000001628). This block was missing from
+      # test-gardenio-cov, leaving it RED on main while the sibling test-gardenio
+      # (.rwx/ci.yml) passed (ka-0000004290) — the same drift as ka-0000000140.
+      # scripts/check-rwx-cov-filter-parity.py now reds a fourth recurrence
+      # of this drift class mechanically (ka-0000004290).
+      - "gardenio/helm/gardenio/dashboards/*.json"
+      # TestClaudeMDDirectiveDensityBudget (cmd/gb/claude_md_directive_density_budget_test.go)
+      # reads the four harness-injected CLAUDE.md files off disk via
+      # findRepoRootForSizing() and t.Fatalfs if any is missing — the guard
+      # measures nothing if the file is absent, so it must NOT be softened to a
+      # skip. Materialize all four plus go.work: findRepoRootForSizing walks up
+      # for a go.work/.git marker, but this coverage layer has neither at/above
+      # the package dir, so without go.work it falls back to the test CWD
+      # (.../cmd/gb) and reads .../cmd/gb/CLAUDE.md (nonexistent). go.work is only
+      # a location marker here — the run is GOWORK=off, so materializing it does
+      # not change the build (ka-0000003785 / MR !7017). This block was missing
+      # from test-gardenio-cov, leaving it RED on main while the sibling
+      # test-gardenio (.rwx/ci.yml) passed (ka-0000000140).
+      - "go.work"
+      - "CLAUDE.md"
+      - "gardenio/CLAUDE.md"
+      - "coop/CLAUDE.md"
+      - "kbeads/CLAUDE.md"
+    run: |
+      cd gardenio/controller
+      mkdir -p coverage
+      GOWORK=off CGO_ENABLED=0 go test -short -parallel 8 \
+        -covermode=atomic -coverpkg=./... \
+        -coverprofile=coverage/unit.out ./...
+    outputs:
+      filesystem: false
+      artifacts:
+        - key: gardenio-coverage
+          path: gardenio/controller/coverage/unit.out
+
+  - key: test-kbeads-cov
+    use: kbeads-deps
+    filter:
+      - "kbeads/**"
+      - "gardenio/clicreds/**"
+      # Five kbeads guards parse gardenio sibling SOURCE across the module
+      # boundary and SKIP CLEANLY when it is absent — silently green, which is
+      # exactly the vacuity they exist to prevent. test-kbeads stages all of
+      # these (.rwx/ci.yml); staging them here too keeps the same guards live in
+      # the coverage layer instead of decorative (ka-0000004290):
+      #   config_driftguard_test.go       -> beadsapi/{projects,roles}.go
+      #   config_bridge_subset_guard_test.go -> bridge/init.go
+      #   config_seed_shadow_test.go      -> tests/e2e/scripts/*.sh
+      #   charts_grafana_dashboard_uid_disjoint_test.go -> helm dashboards/*.json
+      #   scif_approval_authz_test.go     -> cmd/scif-portal/*.go
+      # Read-only test inputs, not compiled into the binary.
+      - "gardenio/controller/internal/beadsapi/projects.go"
+      - "gardenio/controller/internal/beadsapi/roles.go"
+      - "gardenio/controller/internal/bridge/init.go"
+      - "gardenio/tests/e2e/scripts/*.sh"
+      - "gardenio/helm/gardenio/dashboards/*.json"
+      - "gardenio/controller/cmd/scif-portal/*.go"
+    run: |
+      cd kbeads
+      mkdir -p coverage
+      GOWORK=off CGO_ENABLED=0 go test -short -parallel 8 \
+        -covermode=atomic -coverpkg=./... \
+        -coverprofile=coverage/unit.out ./...
+    outputs:
+      filesystem: false
+      artifacts:
+        - key: kbeads-coverage
+          path: kbeads/coverage/unit.out
+
+  - key: test-coop-cov
+    use: [code, rust, coop-system-deps, coop-deps]
+    filter:
+      - "coop/crates/**"
+      - "coop/tests/**"
+      - "coop/proto/**"
+      - "coop/Cargo.toml"
+      - "coop/Cargo.lock"
+      - "coop/rust-toolchain.toml"
+      - .rwx/coverage.yml
+    run: |
+      . "$HOME/.cargo/env"
+      if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+        cargo install cargo-llvm-cov --version "^0.6" --locked
+      fi
+      mkdir -p .coverage/unit
+      # coop-specs smoke tests spawn the coop binary from target/debug/coop,
+      # but cargo llvm-cov builds into target/llvm-cov-target — the binary is
+      # never produced at the expected path. Exclude the smoke crate.
+      cd coop && cargo llvm-cov --workspace --exclude coop-specs --lcov \
+          --output-path "$(pwd)/../.coverage/unit/coop.lcov" \
+          -- --skip claude_ --skip attach_ --skip coop_vs_tmux_
+    outputs:
+      filesystem: false
+      artifacts:
+        - key: coop-unit-lcov
+          path: .coverage/unit/coop.lcov
+
+  # ── Fetch the drained E2E coverage tarball (C3, ka-0000007150) ──────
+  # Opt-in via the `e2e-run-id` dispatch param. When set, download the
+  # coverage-artifacts directory artifact (its coverage.tar.gz) from that
+  # gardenio-e2e run's e2e-coverage task (.rwx/e2e.yml). When empty — or when
+  # the token is missing, the download fails, or the run itself skipped
+  # coverage — drop a SKIPPED sentinel so the downstream ingest emits empty
+  # LCOVs and the merge degrades to unit-only (byte-identical to pre-C3).
+  #
+  # Kept byte-identical to .rwx/coverage-merge.yml `fetch-e2e-tarball` — the
+  # two files intentionally mirror each other (this workflow is the inlined
+  # copy the live GitLab `coverage` job dispatches; coverage-merge.yml is the
+  # standalone dispatch behind the `Coverage / Patch` gate).
+  - key: fetch-e2e-tarball
+    use: code
+    cache: false
+    env:
+      RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+      E2E_RUN_ID: ${{ init.e2e-run-id }}
+    run: |
+      set -euo pipefail
+      OUT=e2e-fetch
+      rm -rf "$OUT"; mkdir -p "$OUT"
+
+      # No e2e-run-id → opt-out. Emit the SKIPPED marker the ingest script
+      # short-circuits on (scripts/coverage/ingest-e2e-tarball.sh §Resolve tarball).
+      if [ -z "${E2E_RUN_ID:-}" ]; then
+        echo "fetch-e2e-tarball: e2e-run-id empty — E2E coverage opt-out, emitting SKIPPED"
+        echo "no-e2e-run-id" > "$OUT/SKIPPED"
+        exit 0
+      fi
+
+      # No RWX token wired → degrade to unit-only rather than fail the merge.
+      if [ -z "${RWX_ACCESS_TOKEN:-}" ]; then
+        echo "fetch-e2e-tarball: RWX_ACCESS_TOKEN unavailable — cannot fetch, emitting SKIPPED"
+        echo "no-rwx-token" > "$OUT/SKIPPED"
+        exit 0
+      fi
+
+      # Bootstrap the rwx CLI if the base image doesn't ship it. Pin v3.13.2
+      # to match .gitlab-ci.yml / .rwx/release.yml (ka-0000006447). The CLI
+      # moved rwx-cloud/cli -> rwx-cloud/rwx and now ships a raw static binary.
+      if ! command -v rwx >/dev/null 2>&1; then
+        # Verify exact bytes before install (ka-0000001204 / F3). Digest source
+        # + update procedure: docs/ci-toolchain-checksums.md.
+        RWX_SHA256=ef4afcad5ed9a6e7d24190050753f35cf1a6d609f07b949a1caa83074c16507e
+        curl -fsSL --retry 3 --retry-delay 3 \
+          "https://github.com/rwx-cloud/rwx/releases/download/v3.13.2/rwx-linux-x86_64-static" \
+          -o /tmp/rwx
+        echo "${RWX_SHA256}  /tmp/rwx" | sha256sum -c -
+        sudo install -m 0755 /tmp/rwx /usr/local/bin/rwx
+        rm -f /tmp/rwx
+      fi
+      rwx --version || true
+
+      # Download + auto-extract the e2e-coverage task's `coverage-artifacts`
+      # directory artifact (contains ./coverage.tar.gz, or ./SKIPPED when the
+      # e2e run itself opted out of coverage instrumentation). The v3.13.2 CLI
+      # positional form is `download <run-id> --task <key> <artifact-key>`.
+      echo "fetch-e2e-tarball: downloading coverage-artifacts from e2e run ${E2E_RUN_ID}"
+      if ! rwx artifacts download "$E2E_RUN_ID" \
+            --task e2e-coverage coverage-artifacts \
+            --auto-extract --output-dir "$OUT" 2>/tmp/rwx-art.err; then
+        echo "fetch-e2e-tarball: artifact download failed — emitting SKIPPED" >&2
+        cat /tmp/rwx-art.err >&2 || true
+        rm -rf "$OUT"; mkdir -p "$OUT"
+        echo "download-failed" > "$OUT/SKIPPED"
+        exit 0
+      fi
+
+      if [ -f "$OUT/SKIPPED" ]; then
+        echo "fetch-e2e-tarball: e2e run reported SKIPPED (coverage opt-in off upstream)"
+      elif [ -s "$OUT/coverage.tar.gz" ]; then
+        echo "fetch-e2e-tarball: fetched coverage.tar.gz ($(stat -c%s "$OUT/coverage.tar.gz") bytes)"
+      else
+        echo "fetch-e2e-tarball: no coverage.tar.gz and no SKIPPED in artifact — synthesizing SKIPPED" >&2
+        echo "empty-artifact" > "$OUT/SKIPPED"
+      fi
+      ls -la "$OUT/"
+    outputs:
+      artifacts:
+        - key: e2e-tarball
+          path: e2e-fetch
+
+  # ── Ingest the drained E2E tarball into per-component *-e2e.lcov ────
+  # Runs scripts/coverage/ingest-e2e-tarball.sh over the fetched tarball dir.
+  # The script itself graceful-degrades: on a SKIPPED sentinel or missing
+  # tarball it emits three EMPTY *-e2e.lcov files and exits 0 (before it even
+  # probes for toolchains), so the opt-out path needs no Go/Rust tooling. On a
+  # real tarball it produces controller-e2e.lcov + kbeads-e2e.lcov via the Go
+  # covdata→gcov2lcov path; the Rust (coop) path degrades to empty here because
+  # the cover-instrumented coop/coopmux object binaries that produced the
+  # profraw are baked into the agent image, not available in this dispatch —
+  # merge.sh tolerates the empty coop-e2e bucket the same as any other. Kept
+  # byte-identical to .rwx/coverage-merge.yml `ingest-e2e`.
+  - key: ingest-e2e
+    use: [code, go, gcov2lcov]
+    after: [fetch-e2e-tarball]
+    cache: false
+    env:
+      E2E_TARBALL_DIR: ${{ tasks.fetch-e2e-tarball.artifacts.e2e-tarball }}
+    run: |
+      set -euo pipefail
+      rm -rf .coverage-raw; mkdir -p .coverage-raw
+      ./scripts/coverage/ingest-e2e-tarball.sh \
+        --tarball        "$E2E_TARBALL_DIR/coverage.tar.gz" \
+        --output-dir     .coverage-raw \
+        --workspace-root "$PWD"
+
+      echo "ingest-e2e: produced e2e LCOVs:"
+      for c in controller kbeads coop; do
+        f=".coverage-raw/${c}-e2e.lcov"
+        if [ -s "$f" ]; then
+          echo "  $f: $(wc -c < "$f") bytes"
+        else
+          echo "  $f: empty"
+        fi
+      done
+    outputs:
+      artifacts:
+        - key: e2e-lcovs
+          path: .coverage-raw
+
+  # ── Cross-component merge + Cobertura derivation ────────────────────
+  # Identical to .rwx/coverage-merge.yml `coverage-merge`. Emits the four
+  # coverage artifacts and one `Coverage: NN.N%` stdout line. Folds in the
+  # ingest-e2e *-e2e.lcov files (empty when e2e-run-id is unset) alongside the
+  # per-component unit LCOVs — merge.sh's `-s` discovery skips empty buckets,
+  # so the e2e-absent path is byte-identical to the pre-C3 unit-only output.
+  - key: coverage-merge
+    use: [code, gcov2lcov, merge-tooling]
+    after: [test-gardenio-cov, test-kbeads-cov, test-coop-cov, ingest-e2e]
+    cache: false
+    env:
+      GARDENIO_COVERAGE_OUT: ${{ tasks.test-gardenio-cov.artifacts.gardenio-coverage }}
+      KBEADS_COVERAGE_OUT: ${{ tasks.test-kbeads-cov.artifacts.kbeads-coverage }}
+      COOP_UNIT_LCOV: ${{ tasks.test-coop-cov.artifacts.coop-unit-lcov }}
+      E2E_LCOV_DIR: ${{ tasks.ingest-e2e.artifacts.e2e-lcovs }}
+    run: |
+      set -euo pipefail
+
+      mkdir -p .coverage/unit
+      cp "$GARDENIO_COVERAGE_OUT" .coverage/unit/gardenio-controller.out
+      cp "$KBEADS_COVERAGE_OUT"  .coverage/unit/kbeads.out
+      ./scripts/coverage/emit-go-lcov.sh
+
+      mkdir -p .coverage-raw
+      cp .coverage/unit/gardenio-controller.lcov .coverage-raw/controller-unit.lcov
+      cp .coverage/unit/kbeads.lcov             .coverage-raw/kbeads-unit.lcov
+      cp "$COOP_UNIT_LCOV"                      .coverage-raw/coop-unit.lcov
+
+      # Stage the E2E LCOVs from ingest-e2e alongside the unit ones. These are
+      # empty files when e2e-run-id was unset (or the fetch/ingest degraded);
+      # merge.sh's `-s` discovery skips empty buckets, so copying them is a
+      # no-op in the e2e-absent case and folds in real E2E data otherwise.
+      for c in controller kbeads coop; do
+        if [ -f "$E2E_LCOV_DIR/${c}-e2e.lcov" ]; then
+          cp "$E2E_LCOV_DIR/${c}-e2e.lcov" ".coverage-raw/${c}-e2e.lcov"
+        fi
+      done
+
+      mkdir -p coverage-out
+      ./scripts/coverage/merge.sh \
+        --input-dir .coverage-raw \
+        --output-dir coverage-out \
+        --workspace-root "$PWD"
+
+      ls -la coverage-out/
+      for f in coverage.unit.lcov coverage.e2e.lcov coverage.merged.lcov coverage.cobertura.xml; do
+        if [ -f "coverage-out/$f" ]; then
+          echo "  $f: $(wc -c < "coverage-out/$f") bytes"
+        else
+          echo "  $f: MISSING"
+        fi
+      done
+    outputs:
+      artifacts:
+        - key: coverage-unit-lcov
+          path: coverage-out/coverage.unit.lcov
+        - key: coverage-e2e-lcov
+          path: coverage-out/coverage.e2e.lcov
+        - key: coverage-merged-lcov
+          path: coverage-out/coverage.merged.lcov
+        - key: coverage-cobertura-xml
+          path: coverage-out/coverage.cobertura.xml
+        # Per-component LCOV trio (controller/kbeads/coop × unit/e2e) staged
+        # under merge.sh's discovery layout. The C4 combined-comment task
+        # (ka-0000005662) feeds this directory to `coverage-bot --mode=combined
+        # --combined-input-dir` to build the per-component table.
+        - key: coverage-raw
+          path: .coverage-raw
+
+  # ── Build coverage-bot (MR comment only) ────────────────────────────
+  - key: build-coverage-bot
+    if: ${{ init.mr-iid != '' }}
+    use: gardenio-deps
+    filter:
+      - gardenio/controller/cmd/coverage-bot/**
+      - gardenio/controller/internal/coverage/**
+      - gardenio/controller/go.mod
+      - gardenio/controller/go.sum
+    run: |
+      set -euo pipefail
+      cd gardenio/controller
+      GOWORK=off go build -o "$PWD/../../coverage-bot-bin" ./cmd/coverage-bot/
+    outputs:
+      filesystem: false
+      artifacts:
+        - key: coverage-bot-bin
+          path: coverage-bot-bin
+
+  # ── Sticky patch-cov MR comment (MR pipelines only) ─────────────────
+  # Recomputes the patch-cov Result in-process (same inputs/library as the
+  # old `coverage-comment` GitLab job) and upserts the marker-keyed note.
+  # Never fails the workflow: a missing/stale comment is not a regression.
+  - key: comment
+    if: ${{ init.mr-iid != '' }}
+    use: code
+    after: [coverage-merge, build-coverage-bot]
+    cache: false
+    env:
+      BOT_BIN: ${{ tasks.build-coverage-bot.artifacts.coverage-bot-bin }}
+      LCOV: ${{ tasks.coverage-merge.artifacts.coverage-merged-lcov }}
+      GITLAB_CLONE_TOKEN: ${{ secrets.GITLAB_CLONE_TOKEN }}
+      GITLAB_PROJECT_ID: "12345678"
+      MR_IID: ${{ init.mr-iid }}
+      TARGET_BRANCH: ${{ init.target-branch }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+    run: |
+      set -euo pipefail
+      install -m 0755 "$BOT_BIN" /tmp/coverage-bot
+
+      API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}"
+
+      # Diff against the MR target branch (unified=0, post-change-only).
+      git fetch --no-tags origin "$TARGET_BRANCH" || true
+      MERGE_BASE=$(git merge-base "origin/${TARGET_BRANCH}" "$COMMIT_SHA" 2>/dev/null || true)
+      if [ -z "$MERGE_BASE" ]; then
+        echo "comment: empty merge-base — skipping (orphan branch?)"
+        exit 0
+      fi
+      git diff --unified=0 "${MERGE_BASE}...${COMMIT_SHA}" > mr.diff
+      wc -l mr.diff
+
+      # MR commits for the bypass-trailer parser. Empty array on API failure.
+      curl -sf -H "PRIVATE-TOKEN: ${GITLAB_CLONE_TOKEN}" \
+        "${API}/merge_requests/${MR_IID}/commits?per_page=100" \
+        > commits.json || {
+          echo "comment: GitLab commits API failed; using empty list"
+          echo "[]" > commits.json
+        }
+      echo "fetched $(jq 'length' commits.json) commit(s)"
+
+      # baselines.json from the W2b-6 generic package registry. 404 → degrade
+      # to MinThresholdPct (synthesise an empty baselines file).
+      URL="${API}/packages/generic/coverage-baselines/latest/baselines.json"
+      http_code=$(curl -sS -o baselines.json -w "%{http_code}" \
+        -H "PRIVATE-TOKEN: ${GITLAB_CLONE_TOKEN}" "$URL" || echo "000")
+      if [ "$http_code" = "200" ]; then
+        echo "fetched baselines.json ($(wc -c < baselines.json) bytes)"
+      else
+        echo "comment: baselines.json HTTP $http_code — falling back to MinThresholdPct"
+        echo '{"computed_at":"1970-01-01T00:00:00Z","schema_version":1,"components":{}}' > baselines.json
+      fi
+
+      /tmp/coverage-bot \
+        --lcov "$LCOV" \
+        --diff mr.diff \
+        --baselines baselines.json \
+        --commits-json commits.json \
+        --gitlab-base "https://gitlab.com" \
+        --gitlab-project "${GITLAB_PROJECT_ID}" \
+        --mr-iid "${MR_IID}" \
+        --rwx-run-url "${RWX_RUN_URL:-}" \
+        --bypass-docs-url "https://gitlab.com/Acme/Platform/gardenio/-/blob/main/docs/research/coverage-phase2b-design.md#7-bypass-trailer-parser--follow-up-bead-flow"
+
+  # ── Per-component combined-coverage MR comment (C4, MR pipelines) ────
+  # ka-0000005662 (renderer ka-0000000258). Invokes coverage-bot in
+  # `combined` mode over the per-component LCOV trio staged by
+  # coverage-merge (.coverage-raw/{component}-{unit,e2e}.lcov) plus the
+  # cross-component coverage.merged.lcov, and upserts a sticky note keyed by
+  # the marker `gardenio-coverage-bot:combined-cov:v1` — DISTINCT from the
+  # patch-cov comment's marker, so the two co-exist on one MR.
+  #
+  # Gated on mr-iid (MR pipelines only), same as the patch-cov comment. The
+  # `mr-comment` init (sourced from Helm value global.coverage.mrComment via
+  # the .gitlab-ci.yml dispatch) is the POST switch:
+  #   - mr-comment=='true'  → post/upsert the comment on the MR.
+  #   - mr-comment!='true'  → --dry-run: render the table to the run log so the
+  #                           shape is observable, but call no GitLab API. This
+  #                           is the C5 SOAK posture (ka-0000000718 flips the
+  #                           Helm default to true after validation).
+  # Never fails the workflow — a missing/stale comment is not a regression
+  # (coverage-bot §5.5: bot API errors log + exit 0 without --fail-on-api-error).
+  - key: combined-comment
+    if: ${{ init.mr-iid != '' }}
+    use: code
+    after: [coverage-merge, build-coverage-bot]
+    cache: false
+    env:
+      BOT_BIN: ${{ tasks.build-coverage-bot.artifacts.coverage-bot-bin }}
+      RAW_DIR: ${{ tasks.coverage-merge.artifacts.coverage-raw }}
+      MERGED_LCOV: ${{ tasks.coverage-merge.artifacts.coverage-merged-lcov }}
+      GITLAB_CLONE_TOKEN: ${{ secrets.GITLAB_CLONE_TOKEN }}
+      GITLAB_PROJECT_ID: "12345678"
+      MR_IID: ${{ init.mr-iid }}
+      MR_COMMENT: ${{ init.mr-comment }}
+    run: |
+      set -euo pipefail
+      install -m 0755 "$BOT_BIN" /tmp/coverage-bot
+
+      API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}"
+
+      # baselines.json from the W2b-6 generic package registry drives the Δ
+      # column. 404 / any non-200 → synthesise an empty baselines file so the
+      # Δ cells render as em-dash (no signal) rather than failing the task.
+      URL="${API}/packages/generic/coverage-baselines/latest/baselines.json"
+      http_code=$(curl -sS -o baselines.json -w "%{http_code}" \
+        -H "PRIVATE-TOKEN: ${GITLAB_CLONE_TOKEN}" "$URL" || echo "000")
+      if [ "$http_code" = "200" ]; then
+        echo "combined-comment: fetched baselines.json ($(wc -c < baselines.json) bytes)"
+      else
+        echo "combined-comment: baselines.json HTTP $http_code — Δ column degrades to em-dash"
+        echo '{"computed_at":"1970-01-01T00:00:00Z","schema_version":1,"components":{}}' > baselines.json
+      fi
+
+      # POST switch. When the Helm-sourced mr-comment flag is not 'true', run
+      # in --dry-run so the table shape is observable in the run log without
+      # touching the MR (C5 SOAK posture).
+      POST_ARGS="--gitlab-base https://gitlab.com --gitlab-project ${GITLAB_PROJECT_ID} --mr-iid ${MR_IID}"
+      if [ "${MR_COMMENT:-false}" != "true" ]; then
+        echo "combined-comment: mr-comment='${MR_COMMENT:-}' (!= 'true') — dry-run, rendering to log only."
+        POST_ARGS="--dry-run"
+      else
+        echo "combined-comment: mr-comment='true' — upserting combined-coverage comment on MR !${MR_IID}."
+      fi
+
+      /tmp/coverage-bot \
+        --mode combined \
+        --combined-input-dir "$RAW_DIR" \
+        --merged-lcov "$MERGED_LCOV" \
+        --baselines baselines.json \
+        --rwx-run-url "${RWX_RUN_URL:-}" \
+        $POST_ARGS
+
+  # ── Repo coverage badge refresh (main only) ─────────────────────────
+  # Computes combined % from the merged LCOV and uploads the shields.io
+  # endpoint JSON. Also publishes coverage.merged.lcov to the registry so
+  # the manual coverage-baselines recompute can harvest a stable source.
+  - key: badge
+    if: ${{ init.is-main == 'true' }}
+    use: code
+    after: coverage-merge
+    cache: false
+    env:
+      LCOV: ${{ tasks.coverage-merge.artifacts.coverage-merged-lcov }}
+      GITLAB_CLONE_TOKEN: ${{ secrets.GITLAB_CLONE_TOKEN }}
+      GITLAB_PROJECT_ID: "12345678"
+    run: |
+      set -euo pipefail
+      if [ -z "${GITLAB_CLONE_TOKEN:-}" ]; then
+        echo "ERROR: GITLAB_CLONE_TOKEN is not set; cannot upload the badge package."
+        exit 1
+      fi
+      if [ ! -s "$LCOV" ]; then
+        echo "ERROR: merged LCOV is missing or empty — merge contract regression."
+        exit 1
+      fi
+
+      # Combined line-coverage %: sum(LH)/sum(LF) across all SF blocks.
+      PCT=$(awk -F: '
+        /^LF:/ { total += $2 }
+        /^LH:/ { hit += $2 }
+        END {
+          if (total == 0) { print "0.0"; exit }
+          printf "%.1f", 100.0 * hit / total
+        }
+      ' "$LCOV")
+
+      # shields.io named color buckets (W4 design §5b convention).
+      INT_PCT=${PCT%.*}
+      if [ "$INT_PCT" -ge 90 ]; then COLOR="brightgreen"
+      elif [ "$INT_PCT" -ge 80 ]; then COLOR="green"
+      elif [ "$INT_PCT" -ge 70 ]; then COLOR="yellowgreen"
+      elif [ "$INT_PCT" -ge 60 ]; then COLOR="yellow"
+      elif [ "$INT_PCT" -ge 50 ]; then COLOR="orange"
+      else COLOR="red"
+      fi
+
+      jq -n \
+        --arg msg "${PCT}%" \
+        --arg color "$COLOR" \
+        '{schemaVersion: 1, label: "coverage", message: $msg, color: $color}' \
+        > coverage.json
+      echo "--- coverage.json ---" && cat coverage.json
+
+      API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}"
+      UPLOAD_BASE="${API}/packages/generic/coverage-health/latest"
+
+      HTTP_CODE=$(curl -sS -o /tmp/upload.out -w "%{http_code}" \
+        --header "PRIVATE-TOKEN: $GITLAB_CLONE_TOKEN" \
+        --upload-file coverage.json \
+        "${UPLOAD_BASE}/coverage.json" || echo "000")
+      if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+        echo "Uploaded coverage.json (HTTP $HTTP_CODE) → ${UPLOAD_BASE}/coverage.json"
+      else
+        echo "ERROR: upload of coverage.json failed (HTTP $HTTP_CODE)"
+        cat /tmp/upload.out || true
+        exit 1
+      fi
+
+      # Publish the merged LCOV alongside the badge so the manual
+      # coverage-baselines recompute can harvest a registry source once it
+      # is repointed off the removed coverage-report GitLab artifact.
+      HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+        --header "PRIVATE-TOKEN: $GITLAB_CLONE_TOKEN" \
+        --upload-file "$LCOV" \
+        "${UPLOAD_BASE}/coverage.merged.lcov" || echo "000")
+      echo "Uploaded coverage.merged.lcov (HTTP $HTTP_CODE) → ${UPLOAD_BASE}/coverage.merged.lcov"
+    outputs:
+      artifacts:
+        - key: coverage-json
+          path: coverage.json
+
+  # ── Build gb (ratchet only) ─────────────────────────────────────────
+  - key: build-gb
+    if: ${{ init.is-main == 'true' }}
+    use: [code, go]
+    filter:
+      - gardenio/controller/cmd/gb/**
+      - gardenio/controller/internal/**
+      - gardenio/controller/go.mod
+      - gardenio/controller/go.sum
+      # cmd/gb imports the local clicreds module (ka-0000003839).
+      - gardenio/clicreds/**
+    run: |
+      set -euo pipefail
+      cd gardenio/controller
+      GOWORK=off go build -o "$PWD/../../gb-bin" ./cmd/gb/
+    outputs:
+      filesystem: false
+      artifacts:
+        - key: gb-bin
+          path: gb-bin
+
+  # ── kubectl + AWS CLI (main only; ratchet reaches the daemon in-cluster) ──
+  # The ratchet updates the durable prod coverage-baseline bead. The old
+  # public host beads.gardenio.app.e2e.dev.acme.example is DEAD (frozen legacy 909
+  # cluster, 404-everywhere from RWX egress; current prod acct-133 exposes no
+  # public beads write ingress — ka-0000002196 / ka-0000000842). We instead
+  # port-forward svc/gardenio-beads in gardenio-system on prod-gardenio-eks,
+  # exactly as .rwx/release.yml's release-gate bug-filer does (MR !6079).
+  # Mirrors .rwx/info-density-audit.yml install-k8s-tools + kubeconfig.
+  - key: install-k8s-tools
+    if: ${{ init.is-main == 'true' }}
+    run: |
+      KUBE_VERSION=$(curl -sSfL https://dl.k8s.io/release/stable.txt)
+      curl -sSfL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl
+      sudo install /tmp/kubectl /usr/local/bin/kubectl
+      kubectl version --client
+      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+      (cd /tmp && unzip -q awscliv2.zip && sudo ./aws/install)
+      rm -rf /tmp/awscliv2.zip /tmp/aws
+      aws --version
+      sudo apt-get update && sudo apt-get install -y -q jq curl
+    filter:
+      - .rwx/e2e-system-deps.lock
+
+  # ── Configure kubeconfig for prod-gardenio-eks (acct 133) ────────────
+  # Prod lives on prod-gardenio-eks (acct 123456789012). The DEFAULT-vault
+  # E2E_AWS_* creds point at the frozen legacy 909 cluster, so we swap to the
+  # non-default gardenio-main vault's creds (ka-0000005509) — the same routing
+  # release.yml uses for its prod reach (.rwx/release.yml:339-341,509).
+  - key: kubeconfig
+    if: ${{ init.is-main == 'true' }}
+    use: install-k8s-tools
+    run: |
+      aws eks update-kubeconfig --name "$EKS_CLUSTER" --region us-east-1
+      kubectl config current-context
+    env:
+      AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      EKS_CLUSTER: "prod-gardenio-eks"
+
+  # ── Per-component coverage ratchet (main only) ──────────────────────
+  # Runs `gb coverage-ratchet check` on the in-workflow merged LCOV (no
+  # GitLab artifact round-trip) and advances the baseline bead on pass.
+  # NEVER auto-reverts on fail. Advisory posture — a non-zero ratchet exit
+  # logs the regression but does not block (the GitLab dispatch is
+  # fire-and-forget; the flip to enforcing is a separate, deferred change).
+  - key: ratchet
+    if: ${{ init.is-main == 'true' }}
+    use: [code, kubeconfig]
+    after: [coverage-merge, build-gb]
+    cache: false
+    env:
+      GB_BIN: ${{ tasks.build-gb.artifacts.gb-bin }}
+      LCOV: ${{ tasks.coverage-merge.artifacts.coverage-merged-lcov }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      PIPELINE_ID: ${{ init.pipeline-id }}
+      GARDENIO_COVERAGE_BASELINE_BEAD_ID: ${{ vars.GARDENIO_COVERAGE_BASELINE_BEAD_ID }}
+      # Durable prod beads daemon (gardenio.beads.fullname = "<release>-beads";
+      # prod release = "gardenio" in gardenio-system). Same target as
+      # release.yml's release-gate bug-filer (.rwx/release.yml:347-348).
+      BEADS_NAMESPACE: "gardenio-system"
+      BEADS_SVC: "gardenio-beads"
+      # The kubeconfig `aws eks update-kubeconfig` wrote uses an exec plugin
+      # (`aws eks get-token`) that runs on EVERY kubectl call — so this task,
+      # not just the kubeconfig task, needs the acct-133 creds in env. Mirrors
+      # info-density-audit.yml's run-audit task (:384-386).
+      AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+    run: |
+      set -euo pipefail
+
+      install -m 0755 "$GB_BIN" /tmp/gb-bin
+      GB_BIN=/tmp/gb-bin
+
+      # ── In-cluster beads reach (ka-0000000842) ──────────────────────
+      # The old public host is DEAD; port-forward the durable prod daemon and
+      # read its operator token in-cluster, mirroring release.yml:540-559.
+      # kd-beads-token is the daemon's operator token (RoleOperator) — NOT the
+      # read-only viewer token secrets.BEADS_TOKEN. `gb coverage-ratchet check`
+      # GETs the baseline bead and `gb coverage-baseline update` PATCHes it;
+      # both are operator-scoped, ownership-checked writes (not the create path,
+      # so no X-System-Operator header is required — verified live 2026-07-26).
+      # gb reads its bearer from BEADS_AUTH_TOKEN (defaultToken() in
+      # cmd/gb/main.go) — NOT BEADS_TOKEN, which gb ignores. The prior task set
+      # BEADS_TOKEN, which never authenticated; the dead-host GET 404'd first so
+      # it was never noticed.
+      BEADS_AUTH_TOKEN=$(kubectl -n "$BEADS_NAMESPACE" get secret kd-beads-token \
+        -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null || true)
+      if [ -z "$BEADS_AUTH_TOKEN" ]; then
+        echo "FATAL: could not read kd-beads-token from ${BEADS_NAMESPACE}." >&2
+        exit 1
+      fi
+      export BEADS_AUTH_TOKEN
+
+      kubectl -n "$BEADS_NAMESPACE" get svc "$BEADS_SVC" >/dev/null
+      kubectl -n "$BEADS_NAMESPACE" port-forward "svc/${BEADS_SVC}" 18080:8080 \
+        > port-forward-beads.log 2>&1 &
+      BEADS_PF_PID=$!
+      trap 'kill "$BEADS_PF_PID" 2>/dev/null || true' EXIT
+      export BEADS_HTTP_URL="http://localhost:18080"
+      READY=0
+      for i in $(seq 1 30); do
+        if curl -sf --max-time 2 "${BEADS_HTTP_URL}/v1/health" >/dev/null 2>&1; then
+          echo "  beads daemon tunnel ready (attempt ${i})"
+          READY=1
+          break
+        fi
+        sleep 1
+      done
+      if [ "$READY" -ne 1 ]; then
+        echo "FATAL: beads daemon port-forward did not become healthy within 30s" >&2
+        cat port-forward-beads.log >&2 || true
+        exit 1
+      fi
+      PIPELINE_ID="${PIPELINE_ID:-unknown}"
+
+      # GARDENIO_COVERAGE_BASELINE_BEAD_ID is operator CI config, not a code
+      # regression — if unset, skip with a synthetic tooling-broken bead so
+      # the §8 audit channel still sees one event (ka-0000008219).
+      if [ -z "${GARDENIO_COVERAGE_BASELINE_BEAD_ID:-}" ]; then
+        echo "WARN: GARDENIO_COVERAGE_BASELINE_BEAD_ID is not set — skipping ratchet."
+        "$GB_BIN" coverage-bypass file-followup \
+          --scope=ratchet \
+          --reason=tooling-broken \
+          --synthetic \
+          --commit-sha="$COMMIT_SHA" \
+          --pipeline-id="$PIPELINE_ID" \
+          --detail="GARDENIO_COVERAGE_BASELINE_BEAD_ID env var unset; ratchet cannot resolve baseline bead" || true
+        exit 0
+      fi
+
+      if [ ! -s "$LCOV" ] || ! grep -q '^SF:' "$LCOV"; then
+        echo "WARN: in-workflow merged LCOV missing/invalid — filing synthetic tooling-broken bead."
+        "$GB_BIN" coverage-bypass file-followup \
+          --scope=ratchet \
+          --reason=tooling-broken \
+          --synthetic \
+          --commit-sha="$COMMIT_SHA" \
+          --pipeline-id="$PIPELINE_ID" \
+          --detail="in-workflow coverage.merged.lcov missing or not a valid LCOV" || true
+        exit 0
+      fi
+      cp "$LCOV" coverage.merged.lcov
+      echo "coverage.merged.lcov: $(wc -c < coverage.merged.lcov) bytes"
+
+      # Run the ratchet check. Capture exit separately so we still emit the
+      # artifact + summary on fail.
+      set +e
+      "$GB_BIN" coverage-ratchet check \
+        --merged-lcov=coverage.merged.lcov \
+        --commit-sha="$COMMIT_SHA" \
+        --pipeline-id="$PIPELINE_ID" \
+        --tolerance-pct=1.0 \
+        --min-sample=200 \
+        --mode=advisory \
+        --output=ratchet-result.json
+      ratchet_exit=$?
+      set -e
+      echo ""
+      echo "--- ratchet-result.json ---"
+      cat ratchet-result.json || true
+      echo ""
+
+      overall=$(jq -r '.overall' ratchet-result.json 2>/dev/null || echo "unknown")
+      if [ "$overall" = "pass" ] || [ "$overall" = "pass-bypass" ]; then
+        echo "Ratchet ${overall} — advancing coverage-baseline bead..."
+        "$GB_BIN" coverage-baseline update \
+          --commit-sha="$COMMIT_SHA" \
+          --pipeline-id="$PIPELINE_ID" \
+          --merged-lcov=coverage.merged.lcov \
+          --method=last-green-main
+      else
+        echo "Ratchet not pass (overall=${overall}) — bead is NOT updated."
+        echo "Never auto-revert: fix-forward MR or Coverage-Bypass trailer."
+      fi
+
+      # Advisory: surface the ratchet exit as the task exit. The GitLab side
+      # is fire-and-forget (no --wait), so this never blocks a pipeline.
+      exit "$ratchet_exit"
+    outputs:
+      artifacts:
+        - key: ratchet-result
+          path: ratchet-result.json

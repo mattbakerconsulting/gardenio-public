@@ -1,0 +1,118 @@
+# The land door's route allowlist (Door D.18 gd-nvvTcZeBZD).
+#
+# /land/<name>/v1/* reaches exactly these daemon routes, as METHOD and the mux
+# pattern registerRoutes registers; every other route is 404 on the land path.
+# The edge ($land_door_route in gardenio/helm/gardenio-ziti/public-edge.yaml),
+# landgate (gardenio/controller/cmd/landgate/land_door_routes.txt, a byte-for-
+# byte copy) and kbeads (land_door_routes.go) all enforce this list, and tests
+# hold each of them to it. Every route here must be one a land principal may
+# reach (scopedRouteClasses classFiltered or classScopedSafe), and its handler
+# cuts the caller to its one land.
+#
+# Two callers use the door (owner choice C, doc gd-K7BUSVVHJF): a tenant's gl,
+# which speaks only the Lands API, and a tenant's agent, which runs kd and gb
+# under a land-scoped agent token. A land's owner also runs gb plan share
+# through it on their own land token. The comment on each line names who
+# needs it; TestLandDoorRoutes_AgentVerbs drives every verb named here through
+# the door with a land token.
+#
+# Never listed: token routes (bridge-tokens, fleet-tokens, auth), admin,
+# hooks, embeddings, the daemon's SSE streams (events/stream, bus/events: the
+# agent's wake path is the land feed below), configs, gates and every other
+# global or cross-project route.
+#
+# The hook routes stay off (gd-2iqSr9ANOH): emit takes its actor from the
+# body and runs git and advice hooks in the daemon, publish writes any bus
+# subject. A land agent's presence is its own traffic through the door
+# (kbeads land_door_presence.go): gb sends its SessionStart and heartbeat as
+# GET /v1/me, and the roster through a door lists only that land's agents.
+
+# --- The Lands API (gl, the contract in lands/contract/openapi.yaml) ---
+GET    /v1/lands/v1/lands/{land}
+GET    /v1/lands/v1/lands/{land}/plots
+GET    /v1/lands/v1/lands/{land}/plots/{plot}
+GET    /v1/lands/v1/lands/{land}/crew
+GET    /v1/lands/v1/lands/{land}/crew/{member}
+GET    /v1/lands/v1/lands/{land}/whoami
+GET    /v1/lands/v1/lands/{land}/tickets
+POST   /v1/lands/v1/lands/{land}/tickets
+GET    /v1/lands/v1/lands/{land}/tickets/{ticket}
+PATCH  /v1/lands/v1/lands/{land}/tickets/{ticket}
+POST   /v1/lands/v1/lands/{land}/tickets/{ticket}/comments
+POST   /v1/lands/v1/lands/{land}/tickets/{ticket}/close
+POST   /v1/lands/v1/lands/{land}/tickets/{ticket}/reopen
+GET    /v1/lands/v1/lands/{land}/search/tickets
+GET    /v1/lands/v1/lands/{land}/decisions
+GET    /v1/lands/v1/lands/{land}/decisions/{decision}
+POST   /v1/lands/v1/lands/{land}/decisions/{decision}/resolve
+POST   /v1/lands/v1/lands/{land}/decisions/{decision}/cancel
+POST   /v1/lands/v1/lands/{land}/decisions/{decision}/comments
+GET    /v1/lands/v1/lands/{land}/decisions/{decision}/evidence/{image}
+GET    /v1/lands/v1/lands/{land}/escalations
+POST   /v1/lands/v1/lands/{land}/escalations
+GET    /v1/lands/v1/lands/{land}/escalations/{escalation}
+GET    /v1/lands/v1/lands/{land}/plans
+GET    /v1/lands/v1/lands/{land}/plans/{plan}
+POST   /v1/lands/v1/lands/{land}/plans/{plan}/answer
+GET    /v1/lands/v1/lands/{land}/threads
+GET    /v1/lands/v1/lands/{land}/threads/{thread}
+GET    /v1/lands/v1/lands/{land}/threads/{thread}/messages
+POST   /v1/lands/v1/lands/{land}/threads/{thread}/messages
+GET    /v1/lands/v1/lands/{land}/budget
+GET    /v1/lands/v1/lands/{land}/budget/history
+GET    /v1/lands/v1/lands/{land}/releases
+GET    /v1/lands/v1/lands/{land}/releases/{release}
+POST   /v1/lands/v1/lands/{land}/releases/{release}/deployments
+# The land feed (D.9): gl watch, and the agent's wake path.
+GET    /v1/lands/v1/lands/{land}/events
+# A member's own-machine agent (D.17): gl starts, lists and stops it on the
+# member's sign-in; the agent refreshes its own token here, since the token
+# routes are never on the door.
+GET    /v1/lands/v1/lands/{land}/agents
+POST   /v1/lands/v1/lands/{land}/agents
+GET    /v1/lands/v1/lands/{land}/agents/{agent}
+POST   /v1/lands/v1/lands/{land}/agents/{agent}/refresh
+POST   /v1/lands/v1/lands/{land}/agents/{agent}/revoke
+
+# --- The agent loop (kd and gb under a land agent token) ---
+# Recorded by running each verb against a logging proxy (kd) and traced in
+# gardenio/controller/cmd/gb (gb). gb's routes outside this list fail soft on
+# the land path: gb ready and gb stop satisfy the decision gate
+# (/v1/agents/{id}/gates, admin-only) as a warning, and gb yield and a waiting
+# gb decision create fall back from /v1/events/stream to polling the decision.
+GET    /v1/me                                  # gb thread
+# Reading beads.
+GET    /v1/beads                               # kd list, kd search, kd claim, gb ready, gb news, gb prime, gb inbox, gb yield, gb stop, gb say, gb decision create, gb escalation create
+GET    /v1/beads/{id}                          # kd show, kd children, kd close, gb prime, gb advice show, gb yield, gb stop, gb decision create, gb mr link
+GET    /v1/batch/beads                         # kd show, gb news
+GET    /v1/beads/{id}/dependencies             # kd dep list, gb news, gb stop, gb decision create
+GET    /v1/beads/{id}/dependents               # kd show, kd children
+GET    /v1/beads/{id}/mentions                 # kd show
+GET    /v1/beads/{id}/mentioned-by             # kd show
+GET    /v1/beads/{id}/comments                 # kd comment list, gb news
+POST   /v1/search/semantic                     # kd search --semantic
+# Writing beads.
+POST   /v1/beads                               # kd create, gb say, gb decision create, gb escalation create
+PATCH  /v1/beads/{id}                          # kd claim, kd update, kd reopen, gb ready, gb stop, gb yield, gb mr link
+POST   /v1/beads/{id}/close                    # kd close, gb say, gb stop
+POST   /v1/beads/{id}/comments                 # kd comment add, gb say, gb stop
+POST   /v1/beads/{id}/dependencies             # kd dep add, gb say, gb decision create, gb escalation create
+DELETE /v1/beads/{id}/dependencies             # kd dep remove
+POST   /v1/beads/{id}/labels                   # kd label add, gb escalation create --close-on-execute
+DELETE /v1/beads/{id}/labels/{label}           # kd label remove, gb escalation create
+# The land's roster.
+GET    /v1/agents/roster                       # gb prime
+GET    /v1/agents-by-name/{name}               # gb prime, gb wake
+# Windows (Lands: the Window, plan gd-pz87vf3xsB): gb plan share on the land
+# owner's own land token. The daemon admits only the owner tier of the plan's
+# land (windowManageDenial), and the door cuts the token to its one land. The
+# preview mints nothing: it is the page a window on the plan would show, for
+# the owner to check before a mint (PW.4). A window on the whole land (gb
+# lands share, plan gd-4iVYF9tGsn LW.5) takes the same four routes, naming a
+# land where a plan window names its plan_id. The window bearer's own routes,
+# GET /v1/windows/self/view and its stream GET /v1/windows/self/live, are
+# never listed: the /w/ page reads them in-cluster, not through a land door.
+POST   /v1/windows                             # gb plan share, gb lands share
+GET    /v1/windows                             # gb plan share list, gb lands share list
+DELETE /v1/windows/{id}                        # gb plan share revoke, gb lands share revoke
+GET    /v1/windows/preview                     # the Share panel's preview, before a mint; gb lands share preview

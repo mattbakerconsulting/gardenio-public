@@ -1,0 +1,929 @@
+{{- if and .Values.ziti.enabled .Values.ziti.controller.enabled }}
+# ziti-controller -- the OpenZiti controller, in k3s, replacing the Vultr
+# `ziti edge quickstart` process.
+#
+# Why: quickstart is a demo harness -- controller and router in one process,
+# started as `ziti edge quickstart ... -u admin -p <PASSWORD IN ARGV>`, which
+# puts the admin password in the process table for anything on the box to
+# read. This manifest runs the real `openziti/ziti-controller` image in its
+# documented bootstrap mode: config is generated from env vars
+# (ZITI_BOOTSTRAP_CONFIG), the admin password comes from a Secret via
+# ZITI_PWD (an env var, never a CLI arg), and the controller runs alone --
+# no router in the same process. See gardenio/docs/ziti-controller-k3s.md.
+#
+# This is a SEPARATE, freshly-bootstrapped ziti network (fresh PKI, fresh
+# admin identity) running ALONGSIDE the Vultr controller, not a replica of
+# it -- the two are not clustered. None of the eight enrolled identities
+# point here yet; re-enrollment against this controller is Phase 2
+# (gd-Vn8uWTbQ9S). The Vultr controller keeps running until this one is
+# proven.
+#
+# Durable storage (gd-fY6ipET226), SECOND attempt. This cluster has no EBS
+# CSI driver (checked terraform/modules/k3s -- only the built-in local-path
+# provisioner), and a local-path PVC does not solve this even with node-class
+# pinning: the PV it binds gets a nodeAffinity for whichever node it first
+# lands on, so once that node is replaced (instance refresh, AZ event -- not
+# just a spot reclaim) the PVC stays Bound to a PV naming a node that no
+# longer exists and the pod is Pending forever, with no in-pod way to un-stick
+# a stuck PVC. So this holds no PersistentVolumeClaim. `data` is an
+# `emptyDir` -- always binds, on any node -- and durability instead comes from
+# an initContainer plus two sidecars, all documented in
+# gardenio/docs/ziti-controller-backup.md:
+#   - `restore-if-empty` restores the pinned backup (see "Restore is pinned,
+#     not latest" below) whenever ZITI_HOME is empty, which after this change
+#     is every pod (re)start.
+#   - `ziti-snapshot` asks the controller for a consistent raft snapshot over
+#     loopback every 15 minutes.
+#   - `s3-backup` tars, encrypts and uploads the whole ZITI_HOME on the same
+#     cadence, reusing the k3s node role's IAM grant
+#     (terraform/modules/k3s var.extra_backup_prefixes = ["ziti-ctrl"],
+#     commit bd49105) -- no further terraform change needed.
+#
+# FIRST ATTEMPT (PR #7, commit c616795) was applied live and reverted
+# (commit 0f158ff) for one blocking defect plus three review findings, ALL
+# fixed in this version:
+#   1. It ran s3-backup/restore-if-empty on plain `amazon/aws-cli:2.36.48`,
+#      which has no tar, gzip or openssl -- s3-backup crash-looped
+#      "tar: command not found" and NO backup was ever taken. Fixed by a
+#      purpose-built image, gardenio/images/ziti-ctrl-backup (this repo's CI
+#      builds it; yum-installs the three tools at BUILD time, not on the
+#      controller's boot path).
+#   2. The S3 prefix was wrong ("k3s-dolt/ziti-ctrl" instead of "ziti-ctrl",
+#      the prefix the terraform grant and gardenio/scripts/ziti-ctrl-backup
+#      actually use) -- silently sent every restore down the
+#      no-backup-found path. Fixed below.
+#   3. restore-if-empty verified the archive against a `.sha256` object
+#      fetched from the SAME S3 prefix it restored from. This cluster has no
+#      IRSA -- the node role (PutObject/DeleteObject on this prefix) is
+#      inherited by every pod that can reach IMDS, so whoever can write the
+#      backup can write its digest too; the check proved nothing against the
+#      attacker it mattered against. Fixed by pinning the restore point (S3
+#      key, object VERSION ID, and ciphertext sha256) as Deployment env vars
+#      below -- git, not S3, is the thing the node role cannot write to. See
+#      "Restore is pinned, not latest" below.
+#   Also folded in: ALLOW_FRESH_PKI now defaults to "false". A controller
+#   that refuses to start beats one that quietly comes up on a brand-new PKI
+#   because the pin was never set. It is explicitly "true" below for THIS
+#   FIRST bootstrap only -- flip it back to "false" (or drop it) once the
+#   first backup lands and the operator has pinned a real restore point.
+#
+# ## Restore is pinned, not latest
+#
+# `restore-if-empty` does NOT take "whatever sorted last" in the S3 prefix --
+# that is exactly the vulnerability finding 3 above describes. It only
+# restores when RESTORE_S3_KEY, RESTORE_S3_VERSION_ID and
+# RESTORE_CIPHERTEXT_SHA256 are all set below, verifies the downloaded
+# ciphertext's sha256 against the pinned value BEFORE decrypting, and fails
+# closed (initContainer exits non-zero, pod never comes up) if the object is
+# missing, the digest mismatches, or the decrypted archive has no root CA key.
+#
+# This trades automatic recovery for a manual step: after a node replacement
+# (or any restart with no pin set), the pod stays Pending until an operator
+# reads the `s3-backup` sidecar's log from BEFORE the restart (it prints the
+# key/version/sha256 of every object it uploads) and updates the three
+# RESTORE_* values below, or explicitly re-sets ALLOW_FRESH_PKI=true knowing
+# that means abandoning every identity enrolled since the pin. Re-pin
+# periodically in normal operation (weekly is plenty -- this only bounds how
+# much state a genuine node-replacement restore can lose, not the 15-minute
+# RPO a routine restart already has via ziti-snapshot) rather than only after
+# an incident.
+#
+# Deliberately out of scope here (separate follow-on task against the same
+# epic, gd-i5eu4YiVVq):
+#   - Public reachability (gd-mClQbiOtPk): PARTIALLY landed, and the Service
+#     below is deliberately ClusterIP — do NOT set it back to LoadBalancer.
+#     A cert-manager Certificate for `ziti-ctrl.clonk.tv` IS issued and kept.
+#     But port 8440 is ONE bind point serving edge-client, edge-management AND
+#     fabric, so LoadBalancing it publishes the MANAGEMENT API; that is why the
+#     LoadBalancer from PR #6 was reverted in 0a2dbea3. The correct shape is a
+#     SECOND `web` bind point on 8441 serving edge-client ONLY, carrying the
+#     publicly-trusted cert via identity.alt_server_certs, and exposing that —
+#     see helm/ziti/README.md. VERIFIED against the live config this
+#     morning rather than inferred: the running controller has exactly ONE web
+#     listener ("client-management", 0.0.0.0:8440, address
+#     ziti-ctrl.clonk.tv:8440) and it binds edge-management, edge-client,
+#     fabric, edge-oidc AND spa — so the reverted LoadBalancer really would
+#     have published the management API, and the second-bind-point design is
+#     the right shape. The generator even leaves the stanza in place, commented
+#     out, under that listener's identity block (#alt_server_certs:).
+#
+#     CORRECTION to what this comment said before: it claimed
+#     ZITI_BOOTSTRAP_CONFIG=true "cannot express a second bind point or
+#     alt_server_certs, so both need a supplied config.yml via ConfigMap". The
+#     first half is right — the generator will not produce them. The second
+#     half overstated the obstacle. /bootstrap.bash line 577 is
+#       if [[ -s "${_ctrl_config_file}" && "${ZITI_BOOTSTRAP_CONFIG}" != force ]]
+#     i.e. an existing non-empty config.yml is PRESERVED, never regenerated,
+#     unless the value is literally "force". This controller already proves it:
+#     it boots logging "INFO: config file exists in /ziti-controller/config.yml"
+#     and runs the config.yml restored from the pinned backup. So supplying a
+#     config is not blocked; it already happens.
+#
+#     SECOND CORRECTION (gd-mClQbiOtPk): "carrying the publicly-trusted cert
+#     via identity.alt_server_certs" above is the design that was tried and
+#     didn't work -- the 8441 listener's identity.server_cert (verbatim-copied
+#     from 8440) and the alt LE cert collided on the same SAN
+#     (ziti-ctrl.clonk.tv), so the controller deterministically kept presenting
+#     the ziti-PKI leaf regardless of alt_server_certs. See
+#     controller-config.yaml's client-public listener for the actual fix: the
+#     LE cert is that listener's PRIMARY server_cert/server_key, not an alt.
+#
+#     A ConfigMap is still the right vehicle, for reasons that are about
+#     durability and review rather than feasibility: a config that lives only
+#     inside the backup is exactly as durable as the pin and disappears on any
+#     genuine fresh bootstrap, and an edit made inside an emptyDir is invisible
+#     to code review. Do not, however, design around a constraint that is not
+#     there. The terraform SG rule stays a separate lane.
+#
+# Prerequisites (not applied by this file -- both secrets must exist before
+# the controller's first boot):
+#
+#   kubectl -n ziti create secret generic ziti-controller-admin \
+#     --from-literal=password="$(openssl rand -hex 24)"
+#
+#   kubectl -n ziti create secret generic ziti-ctrl-backup-passphrase \
+#     --from-literal=passphrase="$(openssl rand -base64 32)"
+#
+# The backup passphrase is a NEW secret, independent of the Vultr box's SSM
+# SecureString (/gardenio/ziti/backup-passphrase) -- that parameter is not
+# reachable from in-cluster pods without a terraform change (no OIDC/IRSA on
+# this cluster; pods only inherit the node's IAM role via IMDS, which is not
+# scoped to SSM). Losing this passphrase does not lose the backups' data
+# path, only the ability to decrypt past ones.
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ziti-controller
+  namespace: ziti
+  labels:
+    app: ziti-controller
+    app.kubernetes.io/part-of: gas-city
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # never run two pods with independently-restored raft state at once
+  selector:
+    matchLabels:
+      app: ziti-controller
+  template:
+    metadata:
+      labels:
+        app: ziti-controller
+        # P7 Task 6: the s3-backup sidecar uses the node role over IMDS.
+        gardenio.io/imds: allow
+    spec:
+      securityContext:
+        runAsUser: 2171 # ziggy, the image's user (matches router-aws-1)
+        runAsGroup: 2171
+        fsGroup: 2171
+      # Runs before `controller` on every pod (re)start, sharing its emptyDir.
+      # `data` is always empty at this point (emptyDir never survives a pod
+      # restart), so this always attempts a restore -- the /ziti-controller/pki
+      # check below only tells a genuine already-populated volume apart from
+      # an empty one; with emptyDir that is effectively "did a previous
+      # initContainer retry in this same pod attempt already restore it".
+      initContainers:
+        - name: restore-if-empty
+          image: 360190250083.dkr.ecr.us-east-1.amazonaws.com/ghcr/mattbakerconsulting/gardenio/ziti-ctrl-backup:2026.286.6
+          env:
+            - name: HOME
+              value: /tmp
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "false"
+            - name: BACKUP_PASSPHRASE
+              valueFrom:
+                secretKeyRef:
+                  name: ziti-ctrl-backup-passphrase
+                  key: passphrase
+            # THIS FIRST BOOT ONLY. No backup exists yet, so there is nothing
+            # to pin. Flip to "false" (or delete this line) once the first
+            # backup has landed in S3 and been pinned below -- see "Restore
+            # is pinned, not latest" above.
+            # STILL true, and that is a KNOWN FAIL-OPEN — see below.
+            #
+            # Pinning is BLOCKED ON IAM, verified the expensive way: applying
+            # a pin put this controller into Init:CrashLoopBackOff with
+            #   AccessDenied ... not authorized to perform: s3:GetObjectVersion
+            # The k3s node role's BackupObjects statement grants PutObject,
+            # GetObject, DeleteObject and AbortMultipartUpload. GetObject is
+            # NOT sufficient to read a SPECIFIC object version, and
+            # restore-if-empty requires all three of KEY / VERSION_ID /
+            # CIPHERTEXT_SHA256 — deliberately, so there is no "pin without
+            # the version" stopgap.
+            #
+            # The fail-open this leaves: delete this S3 prefix, restart, and
+            # the controller silently mints a BRAND-NEW PKI rather than
+            # refusing to start. Tolerable only while nothing is enrolled
+            # here. MUST be closed before Phase 2 moves any identity over.
+            #
+            # READY TO PIN the moment s3:GetObjectVersion is granted; these
+            # are verified values for this controller's own first backup:
+            #   RESTORE_S3_KEY            ziti-ctrl/ziti-ctrl-20260920T070042Z.tar.gz.enc
+            #   RESTORE_S3_VERSION_ID     oMt8Nxwtdigf7UfLMGMKYZOxovZfLhSp
+            #   RESTORE_CIPHERTEXT_SHA256 5f7909543274178f63a1614fc0a13b0749342d96b50912ba76cb411ea6b66f43
+            # NOTE: those were taken from a PREVIOUS bootstrap. Each restart
+            # regenerates the PKI while unpinned, so re-derive them from a
+            # current s3-backup log line before pinning.
+            # PINNED 2026-09-20, and ALLOW_FRESH_PKI is now FALSE. Unblocked
+            # by fimba-e6 granting s3:GetObjectVersion (3ff00e49) — GetObject
+            # alone cannot read a SPECIFIC object version, which is what a pin
+            # is. gd-EsqimcVTtN.
+            #
+            # PIN ELIGIBILITY IS NOT "the newest backup". The first pin tried
+            # here (072238Z) was the pod's FIRST backup, taken at t+120s, and
+            # it contained NO ctrl-ha.db-<ts> snapshot member — ziti-snapshot
+            # does not run until t+900s. Restoring it would have come up on
+            # the live bolt DB copied mid-write. Verified by decrypting it:
+            # 30 entries, ./raft/ctrl-ha.db only. This pin (080304Z) is the
+            # SECOND backup, taken 08:03:04 after the 08:00:48 snapshot, and
+            # carries ./raft/ctrl-ha.db-20260920-080048 — confirmed by
+            # decrypting it and listing members before pinning. s3-backup now
+            # refuses to advertise a snapshot-less archive as pinnable, and
+            # restore-if-empty refuses to restore one.
+            #
+            # RE-PINNED 2026-09-23 to 214054Z: the first backup after the
+            # 21:38 snapshot on the post-00ec9d02 pod (raft leader restored).
+            # It is the first pin that carries edge router router-public-1
+            # (JK-4CbiIYO); the 080304Z pin predates it, so a restart on the
+            # old pin would have silently dropped the router.
+            #
+            # RE-PINNED 2026-10-12 to 20261012T165848Z (gd-UIX5ufQHnt, fresh-network
+            # path per gd-oEO8YQB2EB). Decrypted and listed before pinning: root
+            # key present, newest snapshot member raft/ctrl-ha.db-20261012-165039
+            # (8 min before the archive). Proven by a Recreate rollout restoring
+            # from it with the root CA fingerprint unchanged (76:00:8D:3D...CE:7D).
+            #
+            # WHY false MATTERS: while true, deleting this S3 prefix and
+            # restarting would silently mint a BRAND-NEW PKI and strand every
+            # enrolled identity — a fabric reset with no error. Now the
+            # initContainer restores exactly this object, verifies the
+            # ciphertext digest, and REFUSES TO START if it cannot. A
+            # controller that does not come up is a page; a controller that
+            # comes up on a new PKI is a silent outage discovered later.
+            #
+            # The digest is read from HERE, not from a .sha256 object beside
+            # the backup: the node role can write that prefix, so a digest
+            # stored next to the ciphertext proves nothing against the only
+            # attacker who matters.
+            #
+            # RE-PIN after enrolling identities: take a backup, copy the three
+            # values from the s3-backup log line (it prints them ready to
+            # paste), apply. Until re-pinned a restart restores THIS state.
+            - name: ALLOW_FRESH_PKI
+              value: "false"
+            - name: RESTORE_S3_KEY
+              value: "ziti-ctrl/ziti-ctrl-20261012T165848Z.tar.gz.enc"
+            - name: RESTORE_S3_VERSION_ID
+              value: "zeYnpnq308749XVbvHtPjJdsz9Yl0Od6"
+            - name: RESTORE_CIPHERTEXT_SHA256
+              value: "fba602900f3c73ad1ffb866ecfe1e8b0f33ceffce2e203e8bc843d9ced48196b"
+          command:
+            - sh
+            - -ec
+            - |
+              BUCKET="gardenio-hq-backups-360190250083"
+              # A NON-EMPTY pki/ IS NOT PROOF OF A COMPLETED RESTORE, which is
+              # what this check used to assume. Caught on the pod that first
+              # ran the pin (gd-EsqimcVTtN): initContainer restartCount=1,
+              # attempt 1 exited 2 after two seconds, and attempt 2 logged
+              # "existing PKI found, no restore needed" and exited 0 -- because
+              # attempt 1 had already extracted the archive before dying. The
+              # kubelet retries a failed initContainer against the SAME volume,
+              # so a restore that dies anywhere after `tar -xzf` gets skipped by
+              # its own retry and the controller boots on a half-restored
+              # directory: a torn ctrl-ha.db with a stale raft log, because the
+              # snapshot-promotion step below never ran. Silent, and exactly the
+              # corruption that step exists to prevent.
+              #
+              # Fixed by making the restore atomic rather than by making the
+              # check cleverer: extract and promote in $STAGE, publish into
+              # ZITI_HOME only once that has fully succeeded, and write $DONE
+              # last. A failed attempt therefore leaves pki/ EMPTY and its retry
+              # restores cleanly from the pin.
+              DONE=/ziti-controller/.restore-complete
+              STAGE=/ziti-controller/.restore-stage
+              if [ -d /ziti-controller/pki ] && [ -n "$(ls -A /ziti-controller/pki 2>/dev/null)" ]; then
+                if [ -f "$DONE" ]; then
+                  echo "restore-if-empty: existing PKI found and $DONE present, no restore needed"
+                  exit 0
+                fi
+                echo "restore-if-empty: REFUSING -- /ziti-controller/pki is populated but $DONE is absent, so this data directory is of unknown provenance (a partly-written restore, or state predating this marker). Do NOT assume it is usable: a half-restored tree boots happily and loses raft state." >&2
+                echo "restore-if-empty: inspect it, and if you are certain it is complete and correct, 'touch $DONE' in the volume and restart. On the emptyDir this Deployment uses, the safe move is almost always to delete the pod and let the pin restore cleanly." >&2
+                exit 1
+              fi
+              rm -rf "$STAGE"
+              echo "restore-if-empty: /ziti-controller/pki is empty"
+              if [ -z "${RESTORE_S3_KEY:-}" ] || [ -z "${RESTORE_S3_VERSION_ID:-}" ] || [ -z "${RESTORE_CIPHERTEXT_SHA256:-}" ]; then
+                if [ "${ALLOW_FRESH_PKI:-false}" = "true" ]; then
+                  echo "restore-if-empty: no restore point pinned, and ALLOW_FRESH_PKI=true -- allowing bootstrap to create a brand-new PKI"
+                  exit 0
+                fi
+                echo "restore-if-empty: REFUSING to start -- no restore point pinned (RESTORE_S3_KEY / RESTORE_S3_VERSION_ID / RESTORE_CIPHERTEXT_SHA256) and ALLOW_FRESH_PKI is not 'true'." >&2
+                echo "restore-if-empty: pin those three to a known-good backup (gardenio/docs/ziti-controller-backup.md), or set ALLOW_FRESH_PKI=true for an INTENTIONAL fresh bootstrap that abandons every identity enrolled since the last pin." >&2
+                exit 1
+              fi
+              echo "restore-if-empty: restoring $RESTORE_S3_KEY (version $RESTORE_S3_VERSION_ID)"
+              cd /tmp || exit 1
+              aws s3api get-object --bucket "$BUCKET" --key "$RESTORE_S3_KEY" --version-id "$RESTORE_S3_VERSION_ID" ./backup.tar.gz.enc >/dev/null
+              actual=$(sha256sum ./backup.tar.gz.enc | awk '{print $1}')
+              if [ "$actual" != "$RESTORE_CIPHERTEXT_SHA256" ]; then
+                echo "restore-if-empty: REFUSING to restore -- ciphertext sha256 mismatch (pinned $RESTORE_CIPHERTEXT_SHA256, got $actual). Verify BEFORE decrypting; do not proceed on unverified bytes." >&2
+                exit 1
+              fi
+              openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in ./backup.tar.gz.enc -out ./backup.tar.gz -pass env:BACKUP_PASSPHRASE
+              # Accept EITHER PKI layout. This check previously looked only
+              # for 'pki/root-ca/keys/root-ca.key', which is the VULTR
+              # quickstart's naming. The in-cluster controller bootstrapped by
+              # openziti/ziti-controller:2.0.4 lays its PKI out as
+              # 'pki/root/keys/root.key', so the guard rejected every valid
+              # backup THIS controller produces — verified by decrypting one:
+              # 30 pki entries including ./pki/root/keys/root.key, refused
+              # anyway. It failed CLOSED, which is the right direction for a
+              # wrong guard, but it made pinning impossible (gd-EsqimcVTtN).
+              if ! tar -tzf ./backup.tar.gz | grep -qE '(^|/)pki/(root-ca/keys/root-ca|root/keys/root)\.key$'; then
+                echo "restore-if-empty: REFUSING -- decrypted archive has no root CA key under either pki/root/keys/root.key or pki/root-ca/keys/root-ca.key; not a usable controller backup" >&2
+                exit 1
+              fi
+              # Everything below lands in $STAGE, never directly in ZITI_HOME,
+              # so that a failure at ANY step leaves pki/ empty and the retry
+              # redoes the whole restore instead of inheriting half of it.
+              mkdir -p "$STAGE"
+              tar -C "$STAGE" -xzf ./backup.tar.gz --numeric-owner
+              # gd-l4d2fT0Ie8: ziti (and older backups taken before that fix
+              # landed on the Vultr box) leave pki/*/keys/*.key at 0644 --
+              # world-readable CA private keys. Correct it on every restore,
+              # regardless of what mode the archive itself carried.
+              find "$STAGE/pki" -path '*/keys/*.key' -exec chmod 600 {} +
+              rm -f ./backup.tar.gz.enc ./backup.tar.gz
+              # Stage the newest consistent snapshot member for IMPORT and
+              # start raft from an EMPTY data dir (gd-3AhYZKV7yH).
+              #
+              # This used to promote the snapshot over raft/ctrl-ha.db and drop
+              # raft.db. That restores the edge DB but not raft MEMBERSHIP (it
+              # lives in raft.db), so every restored controller booted with
+              # zero peers: no leader, every model write CLUSTER_NO_LEADER,
+              # every OIDC login 401 -- and `ziti agent cluster init` refuses
+              # because the DB already has an admin. The live controller ran
+              # like that from 2026-09-23T04:32Z.
+              #
+              # The supported path is the controller's own import: with the
+              # raft dir empty and a top-level `db:` naming a bolt file,
+              # ziti 2.0.4 runs RaftRestoreFromBoltDb, bootstraps a
+              # single-voter cluster, becomes leader, then EXITS once
+              # ("database restore requires controller restart"); the kubelet
+              # restarts the container and it comes up leader on the imported
+              # state. install-config adds that `db:` line only while
+              # raft/raft.db is absent. Verified against a copy of pin
+              # 080304Z in a scratch namespace, through the image's own
+              # /entrypoint.bash: 1 voter + leader, edge-router POST ok,
+              # `ziti edge login` ok, `ziti edge db snapshot` ok, same admin
+              # identity id and cluster id, root CA fingerprint unchanged, and
+              # no re-import on later restarts.
+              #
+              # The import file is deliberately NOT named ctrl-ha.db-*: after a
+              # restore the data dir must hold no snapshot member until
+              # ziti-snapshot writes a fresh one, or s3-backup's pin check
+              # passes on the 3-day-old restored member (it did, every archive
+              # after 04:32Z).
+              newest=$(find "$STAGE" -name 'ctrl-ha.db-*' | sort | tail -1)
+              if [ -n "$newest" ]; then
+                echo "restore-if-empty: staging $(basename "$newest") for import; raft starts empty"
+                mkdir -p "$STAGE/import"
+                mv "$newest" "$STAGE/import/ctrl-import.db"
+                rm -rf "$STAGE/raft" "$STAGE"/instance-*/raft
+                mkdir -p "$STAGE/raft"
+              else
+                echo "restore-if-empty: REFUSING -- restored archive has no ctrl-ha.db-<ts> snapshot member to promote, so the only database in it is the live (possibly torn) one. Coming up on that is how raft state gets silently lost; take a fresh backup with a snapshot member and re-pin." >&2
+                exit 1
+              fi
+              # Publish, then mark. $DONE is written LAST and is the only thing
+              # a later start trusts.
+              # `rm -rf` the destination name before each mv. Without it, a
+              # retry after a publish that died PART-WAY (say it moved raft/ but
+              # not yet pki/) would `mv $STAGE/raft` INTO the surviving directory
+              # and create /ziti-controller/raft/raft -- the controller would
+              # then boot on an empty raft dir with the real state one level
+              # down. The emptiness gate above only inspects pki/, so it cannot
+              # catch that by itself. Safe because we only reach this line when
+              # pki/ was empty, which means anything else still sitting in
+              # ZITI_HOME is debris from an aborted publish, never live state.
+              for f in "$STAGE"/* "$STAGE"/.[!.]*; do
+                [ -e "$f" ] || continue
+                rm -rf "/ziti-controller/$(basename "$f")"
+                mv "$f" /ziti-controller/
+              done
+              rmdir "$STAGE"
+              touch "$DONE"
+              echo "restore-if-empty: done"
+          volumeMounts:
+            - name: data
+              mountPath: /ziti-controller
+        # Installs the REVIEWED config.yml from the ConfigMap, AFTER any restore.
+        # Ordering is the whole point: restore-if-empty may lay down a config.yml
+        # from inside the pinned backup, and bootstrap.bash:577 then keeps
+        # whatever is already on disk. Writing ours last makes git the source of
+        # truth for the controller's listeners instead of a tarball nobody reviews.
+        - name: install-config
+          image: 360190250083.dkr.ecr.us-east-1.amazonaws.com/ghcr/mattbakerconsulting/gardenio/ziti-ctrl-backup:2026.286.6
+          command:
+            - sh
+            - -ec
+            - |
+              # Fail loudly rather than silently booting the generated config: a
+              # missing ConfigMap would otherwise look like success and come up
+              # WITHOUT the 8441 listener, which is the failure nobody notices.
+              [ -s /config-src/config.yml ] || { echo "install-config: /config-src/config.yml missing or empty" >&2; exit 1; }
+              cp /config-src/config.yml /ziti-controller/config.yml
+              # First boot after a restore: point the controller at the staged
+              # snapshot so it bootstraps raft FROM it (see restore-if-empty,
+              # gd-3AhYZKV7yH). Only while raft has never started -- once
+              # raft.db exists the controller ignores `db:`, but not writing it
+              # keeps the steady-state config exactly the reviewed ConfigMap.
+              IMPORT=/ziti-controller/import/ctrl-import.db
+              if [ -s "$IMPORT" ] && [ ! -e /ziti-controller/raft/raft.db ]; then
+                { echo "db: $IMPORT"; cat /config-src/config.yml; } > /ziti-controller/config.yml
+                echo "install-config: raft is empty and $IMPORT is staged -- controller will import it, then restart once"
+              fi
+              echo "install-config: wrote /ziti-controller/config.yml ($(wc -l < /ziti-controller/config.yml) lines)"
+          volumeMounts:
+            - name: data
+              mountPath: /ziti-controller
+            - name: controller-config
+              mountPath: /config-src
+              readOnly: true
+      containers:
+        - name: controller
+          image: openziti/ziti-controller:2.0.4 # pin to the fleet's ziti version; bump deliberately, not floating
+          env:
+            - name: ZITI_HOME
+              value: /ziti-controller
+            - name: ZITI_BOOTSTRAP
+              value: "true"
+            - name: ZITI_BOOTSTRAP_CONFIG
+              value: "true"
+            - name: ZITI_BOOTSTRAP_PKI
+              value: "true"
+            - name: ZITI_BOOTSTRAP_DATABASE
+              value: "true"
+            - name: ZITI_AUTO_RENEW_CERTS
+              value: "true"
+            # Permanent external name, decided in gd-zU3VrMUTpo. A real DNS
+            # name (unlike the router's IP-based address), so none of the
+            # router's IP-SAN workarounds apply here.
+            - name: ZITI_CTRL_ADVERTISED_ADDRESS
+              value: ziti-ctrl.clonk.tv
+            - name: ZITI_CTRL_ADVERTISED_PORT
+              value: "8440" # unchanged from the Vultr box, per gd-zU3VrMUTpo
+            - name: ZITI_CLUSTER_NODE_NAME
+              value: ziti-controller1
+            # BOTH of these are REQUIRED by the 2.0.4 image and their absence
+            # is not a graceful failure. /bootstrap.bash runs under `set -u`
+            # and dereferences ZITI_BOOTSTRAP_CLUSTER with NO default
+            # ("${ZITI_BOOTSTRAP_CLUSTER}", not "${ZITI_BOOTSTRAP_CLUSTER:-}"),
+            # so leaving it unset crashes the container at line 20 with
+            #   /bootstrap.bash: line 20: ZITI_BOOTSTRAP_CLUSTER: unbound variable
+            # before any ziti code runs. Verified live: CrashLoopBackOff.
+            #
+            # true, not false: the fleet's existing controller is HA/raft
+            # (its state machine is instance-1/raft/ctrl-ha.db), and
+            # ZITI_CLUSTER_NODE_NAME above only means anything in cluster
+            # mode. Matching that shape now is what lets Phase 2 restore the
+            # backed-up raft DB into this controller instead of hand
+            # re-enrolling every identity.
+            - name: ZITI_BOOTSTRAP_CLUSTER
+              value: "true"
+            # Required whenever ZITI_BOOTSTRAP_CLUSTER=true; bootstrap exits
+            # "ZITI_CLUSTER_TRUST_DOMAIN must be set" without it. It becomes
+            # the SPIFFE trust domain baked into the root CA
+            # (spiffe://<value>), so it is effectively PERMANENT for this
+            # network: changing it later invalidates every identity enrolled
+            # against this PKI. Set to the advertised name from gd-zU3VrMUTpo
+            # so the trust domain and the endpoint agree.
+            #
+            # The Vultr controller does NOT pin one (its ctrl.yaml leaves
+            # trustDomain commented out — quickstart-generated PKI), so there
+            # is no existing value to match and nothing is being diverged from.
+            - name: ZITI_CLUSTER_TRUST_DOMAIN
+              value: ziti-ctrl.clonk.tv
+            # The bootstrap-time admin password. An env var sourced from a
+            # Secret -- readable via /proc/<pid>/environ by the same
+            # audience that could already read a Secret volume/env in this
+            # pod, but categorically not visible in `ps`/argv the way
+            # quickstart's `-p <password>` was to anything on the box.
+            - name: ZITI_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: ziti-controller-admin
+                  key: password
+          # gd-l4d2fT0Ie8: on a genuine fresh bootstrap (ALLOW_FRESH_PKI=true,
+          # first boot only -- see the initContainer above, which already
+          # chmods a RESTORED pki), ziti itself creates pki/*/keys/*.key at
+          # its default 0644 -- world-readable root/intermediate CA private
+          # keys, mint-any-identity for the whole overlay. This is not a
+          # mounted Secret with a defaultMode to set; ziti writes these files
+          # at runtime inside this container, so the fix has to run after
+          # ziti creates them. Poll (bootstrap is not instant) and re-chmod
+          # once found plus one settle pass, rather than a single shot, since
+          # the root CA, intermediate CA and server keys don't necessarily
+          # land in the same instant. No-op, and returns quickly, on a
+          # restored volume -- the initContainer already fixed those modes
+          # before this container ever started.
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - sh
+                  - -ec
+                  - |
+                    i=0
+                    while [ "$i" -lt 150 ]; do
+                      if find /ziti-controller/pki -path '*/keys/*.key' -print -quit 2>/dev/null | grep -q .; then
+                        # KEEP CHMOD'ING, do not chmod-twice-and-exit.
+                        # On a FRESH bootstrap the CA keys appear first and
+                        # the intermediate client.key / server.key are written
+                        # seconds LATER, so a fixed 5s window misses them:
+                        # observed 2026-09-20 with root.key + both
+                        # intermediate.key at 0600 but client.key and
+                        # server.key still 0644. The earlier "verified on a
+                        # fresh pod" check passed only because that pod had a
+                        # PRE-EXISTING PKI where every key already existed.
+                        # Sweep for 120s so late-written keys are caught too;
+                        # chmod on an already-0600 file is a no-op.
+                        j=0
+                        while [ "$j" -lt 24 ]; do
+                          find /ziti-controller/pki -path '*/keys/*.key' -exec chmod 600 {} + 2>/dev/null || true
+                          j=$((j + 1))
+                          sleep 5
+                        done
+                        echo "postStart: pki key modes swept to 0600 for 120s"
+                        exit 0
+                      fi
+                      i=$((i + 1))
+                      sleep 2
+                    done
+                    echo "postStart: WARNING -- no pki key files appeared within 300s of container start, modes not corrected" >&2
+          ports:
+            - name: ctrl
+              containerPort: 8440
+          volumeMounts:
+            - name: data
+              mountPath: /ziti-controller
+            # The publicly-trusted cert the 8441 listener presents as its
+            # identity.server_cert/server_key (see controller-config.yaml for
+            # why it is the listener's PRIMARY cert, not an alt_server_certs
+            # entry -- gd-mClQbiOtPk). Read-only, and the ziti PKI under
+            # /ziti-controller/pki is untouched -- it still roots every enrolled
+            # identity and the ctrl channel (and 8440's own listener identity).
+            - name: public-certs
+              mountPath: /public-certs
+              readOnly: true
+          # No HTTP health endpoint; `ziti agent stats` is what the
+          # upstream image's own compose healthcheck uses -- it talks to
+          # the controller process over its local agent socket.
+          # timeoutSeconds is the fix for 9 restarts with exit 137 and no
+          # OOMKilled. The container was HEALTHY when killed — its own logs
+          # show raft leadership and "network started" three minutes before
+          # the SIGKILL, and it uses 87Mi against a 512Mi limit. The cause was
+          # the LIVENESS probe: an exec that must spawn a process and talk
+          # over a socket, given timeoutSeconds: 1, on the single on-demand
+          # node that also carries postgres, vmsingle, nats, the controller
+          # and every interactive agent. Under that contention a 1s exec
+          # flakes; five flakes at 30s apart is a kill, and 60+5*30=210s
+          # matches the observed 234s container lifetime.
+          # A startupProbe is added so bootstrap (PKI + raft init) is never
+          # racing liveness, and liveness only begins once startup succeeds.
+          startupProbe:
+            exec:
+              command: ["ziti", "agent", "stats"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: ["ziti", "agent", "stats"]
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["ziti", "agent", "stats"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+        # Asks the controller for a consistent raft state-machine snapshot
+        # (writes raft/ctrl-ha.db-<ts>) every 15 minutes, over loopback --
+        # same pod, same network namespace, so `localhost:8440` just works,
+        # the exact workaround already documented for `kubectl exec` access
+        # in docs/ziti-controller-k3s.md. Logs in fresh every loop rather than
+        # persisting a session: simpler than caching/refreshing a token across
+        # a container that otherwise has no state of its own.
+        - name: ziti-snapshot
+          image: openziti/ziti-controller:2.0.4
+          env:
+            - name: ZITI_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: ziti-controller-admin
+                  key: password
+          command:
+            - sh
+            - -ec
+            - |
+              while true; do
+                sleep 900
+                if ziti edge login localhost:8440 -u admin -p "$ZITI_PWD" -y >/dev/null 2>&1; then
+                  # Rate-limited by the controller to ~1/minute; this loop is
+                  # far slower than that, so no retry/backoff is needed.
+                  # Print the controller's own error. The old fixed text ("rate-
+                  # limited or controller not ready") hid 55 straight failures
+                  # of a LEADERLESS controller (gd-3AhYZKV7yH) as a transient.
+                  if out=$(ziti edge db snapshot 2>&1); then
+                    echo "ziti-snapshot: snapshot written"
+                  else
+                    echo "ziti-snapshot: snapshot FAILED -- will retry next loop: $(echo "$out" | tail -3 | tr '\n' ' ')"
+                  fi
+                else
+                  echo "ziti-snapshot: login failed -- controller not ready yet"
+                fi
+              done
+          volumeMounts:
+            - name: data
+              mountPath: /ziti-controller
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+        # Tars the whole ZITI_HOME (PKI + raft state, including whatever
+        # ctrl-ha.db-<ts> member ziti-snapshot most recently wrote), encrypts
+        # it, and uploads it to S3 -- prefix "ziti-ctrl/", the SAME prefix
+        # gardenio/scripts/ziti-ctrl-backup uses for the Vultr box's manual
+        # backups (terraform/modules/k3s extra_backup_prefixes, commit
+        # bd49105) -- every 15 minutes, offset behind the snapshot loop so
+        # steady-state cycles pick up a fresh snapshot member: this loop runs
+        # at t+120s then every 900s, the snapshot loop at t+900s then every
+        # 900s, so from the second backup onward each one lands ~120s after a
+        # snapshot. The FIRST backup of a pod (t+120s) is the exception and
+        # provably has no snapshot member -- it is NOT pin-eligible, the code
+        # below now says so instead of offering it as a restore point, and
+        # restore-if-empty REFUSES such an archive rather than falling back to
+        # the on-disk ctrl-ha.db (that fallback was removed: coming up on a
+        # possibly-torn live database is silent raft loss, gd-EsqimcVTtN).
+        # Same encryption scheme and object-naming convention as
+        # gardenio/scripts/ziti-ctrl-backup (openssl aes-256-cbc, pbkdf2,
+        # 600000 iterations; `<key>.sha256` holds the PLAINTEXT digest,
+        # despite the `.enc` in `<key>`) so the documented laptop-side
+        # `ziti-ctrl-backup verify`/`restore` tooling works unmodified
+        # against these archives too. Prints the key/version/ciphertext-sha256
+        # of every upload -- that log line is what an operator copies into
+        # RESTORE_S3_KEY/RESTORE_S3_VERSION_ID/RESTORE_CIPHERTEXT_SHA256 above
+        # to advance the pin (see "Restore is pinned, not latest" above).
+        - name: s3-backup
+          image: 360190250083.dkr.ecr.us-east-1.amazonaws.com/ghcr/mattbakerconsulting/gardenio/ziti-ctrl-backup:2026.286.6
+          env:
+            - name: HOME
+              value: /tmp
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "false"
+            - name: BACKUP_PASSPHRASE
+              valueFrom:
+                secretKeyRef:
+                  name: ziti-ctrl-backup-passphrase
+                  key: passphrase
+          command:
+            - sh
+            - -ec
+            - |
+              PREFIX="ziti-ctrl"
+              BUCKET="gardenio-hq-backups-360190250083"
+              sleep 120 # let bootstrap/restore finish before the first tar
+              while true; do
+                if [ -d /ziti-controller/pki ] && [ -n "$(ls -A /ziti-controller/pki 2>/dev/null)" ]; then
+                  ts=$(date -u +%Y%m%dT%H%M%SZ)
+                  cd /tmp || exit 1
+                  # Contents-only (no top-level ziti-controller/ entry), to match
+                  # restore-if-empty's `tar -C /ziti-controller -xzf` above.
+                  tar -czf "./ziti-ctrl-$ts.tar.gz" -C /ziti-controller --numeric-owner .
+                  plainsum=$(sha256sum "./ziti-ctrl-$ts.tar.gz" | awk '{print $1}')
+                  openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt \
+                    -in "./ziti-ctrl-$ts.tar.gz" -out "./ziti-ctrl-$ts.tar.gz.enc" -pass env:BACKUP_PASSPHRASE
+                  key="$PREFIX/ziti-ctrl-$ts.tar.gz.enc"
+                  vid=$(aws s3api put-object --bucket "$BUCKET" --key "$key" --body "./ziti-ctrl-$ts.tar.gz.enc" --query VersionId --output text)
+                  printf '%s  ziti-ctrl-%s.tar.gz\n' "$plainsum" "$ts" \
+                    | aws s3 cp - "s3://$BUCKET/$key.sha256" --only-show-errors
+                  ciphersum=$(sha256sum "./ziti-ctrl-$ts.tar.gz.enc" | awk '{print $1}')
+                  echo "s3-backup: uploaded s3://$BUCKET/$key (version $vid, ciphertext sha256 $ciphersum)"
+                  # ONLY advertise a pin for an archive that restore-if-empty can
+                  # actually promote. The two sidecars have different first-run
+                  # delays -- s3-backup starts at t+120s, ziti-snapshot at t+900s
+                  # -- so the FIRST backup of every pod structurally cannot contain
+                  # a ctrl-ha.db-<ts> snapshot member, and the only database in it
+                  # is the live one, copied while the controller was writing to it.
+                  # Pinning such an archive yields a restore that comes up on a
+                  # possibly-torn bolt DB with its raft log intact but inconsistent.
+                  # That is how gd-EsqimcVTtN's first pin (072238Z) was chosen: this
+                  # line printed ready-to-paste values for it and said nothing about
+                  # the missing snapshot.
+                  # Deliberately the SAME loose pattern as restore-if-empty's
+                  # `find -name 'ctrl-ha.db-*'`. A stricter test here could bless
+                  # an archive that restore cannot actually promote, or vice
+                  # versa; eligibility must mean exactly what the restorer does.
+                  if tar -tzf "./ziti-ctrl-$ts.tar.gz" | grep -qE '(^|/)ctrl-ha\.db-.'; then
+                    echo "s3-backup: to pin this as the restore point, set RESTORE_S3_KEY=$key RESTORE_S3_VERSION_ID=$vid RESTORE_CIPHERTEXT_SHA256=$ciphersum"
+                  else
+                    echo "s3-backup: NOT PIN-ELIGIBLE -- this archive has no ctrl-ha.db-<ts> snapshot member, so a restore from it would have to come up on the live (possibly torn) database. Do NOT pin it. Wait for a backup taken after ziti-snapshot has run at least once (first snapshot is ~15min after pod start); restore-if-empty refuses this archive by design." >&2
+                  fi
+                  rm -f "./ziti-ctrl-$ts.tar.gz" "./ziti-ctrl-$ts.tar.gz.enc"
+                else
+                  echo "s3-backup: /ziti-controller/pki is empty -- nothing to back up yet"
+                fi
+                sleep 900
+              done
+          volumeMounts:
+            - name: data
+              mountPath: /ziti-controller
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 256Mi }
+      # Node-CLASS pinning, kept from the earlier iteration of this file: the
+      # only node schedulable WITHOUT a toleration is
+      # gardenio.io/lifecycle=spot, and landing there would mean every spot
+      # reclaim throws away up to 15 minutes of raft state (the backup
+      # interval) and costs a restore-from-S3 on top of the reschedule delay.
+      # BOTH labels are required, same as postgres and vmsingle: lifecycle=
+      # on-demand alone also matches the t3.small k3s server (an etcd member,
+      # not where this belongs); role=platform confines it to the node that
+      # carries the gardenio.agent taint -- hence the toleration below.
+      #
+      # Unlike the old local-path-PVC design, this is no longer load-bearing
+      # for correctness -- `data` is an emptyDir, so this pod schedules and
+      # restores fine on ANY node, spot included, node replacement included.
+      # Pinning now only trades away the spot market's occasional reclaim
+      # churn (each one costs an S3 restore + up to 15 min of raft state) for
+      # the modest on-demand cost of one small pod.
+      # ECR pull-through, per operator decision gd-t3qBWzQ4rC (chosen over
+      # publishing the image publicly, consistent with the no-public-footprint
+      # rule). imagePullSecrets are NAMESPACED, so ns gardenio's copy does
+      # nothing here — the `ecr` secret in ns ziti is written and refreshed by
+      # the ecr-token-refresh CronJob, which now targets both namespaces. Do
+      # NOT hand-copy it: the ECR token lasts 12h, so a manual copy expires
+      # and surfaces later as an ImagePullBackOff on a restart nobody connects
+      # back to the copy.
+      imagePullSecrets:
+        - name: ecr
+      nodeSelector:
+        gardenio.io/lifecycle: on-demand
+        gardenio.io/role: platform
+      tolerations:
+        - key: "gardenio.agent"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: controller-config
+          configMap:
+            name: ziti-controller-config
+        - name: public-certs
+          secret:
+            secretName: ziti-controller-public-tls
+---
+# PDB only (gd-27vcHmrurh) — no topologySpreadConstraints/podAntiAffinity:
+# this pod holds the sole raft-state instance and runs strategy:Recreate
+# ("never run two pods with independently-restored raft state at once"
+# above), so it is architecturally single-replica forever; a spread/
+# anti-affinity block would be dead YAML. maxUnavailable, NOT minAvailable
+# (ka-0000001453): on a 1-replica Deployment minAvailable:1 ==
+# maxUnavailable:0, which makes the eviction API refuse the pod forever and
+# wedges a managed-nodegroup drain. maxUnavailable:1 only blocks eviction
+# while the pod is currently unhealthy.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ziti-controller
+  namespace: ziti
+  labels:
+    app: ziti-controller
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: ziti-controller
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ziti-controller
+  namespace: ziti
+  labels:
+    app: ziti-controller
+    app.kubernetes.io/part-of: gas-city
+spec:
+  # LoadBalancer, not ClusterIP -- gd-mClQbiOtPk (public reachability, needed
+  # for Phase 2 identity re-enrollment to reach this controller from outside
+  # the cluster/VPC). This reuses the SAME mechanism the cluster's Traefik
+  # already gets its public listener from: k3s's built-in ServiceLB
+  # (klipper-lb), not a new AWS NLB -- every node already carries a public IP
+  # (node.sh.tftpl, `associate_public_ip_address = true`), and the SG's `web`
+  # rule already opens 80/443 the identical way
+  # (terraform/modules/k3s/main.tf:97-105, `aws_vpc_security_group_ingress_rule.web`).
+  #
+  # NOT done by this change (terraform is a different lane, gd-oI2AIaSzjF --
+  # see gd-mClQbiOtPk's escalation): the equivalent SG rule opening 8440 to
+  # 0.0.0.0/0, and the public Route53 A record (deferred to gd-fY6ipET226 per
+  # gd-zU3VrMUTpo's decision comment). Until both land, this Service has no
+  # real external listener yet despite the type.
+  #
+  # In-cluster verification (e.g. `ziti edge login
+  # ziti-controller.ziti.svc.cluster.local:8440`) still needs
+  # --tls-server-name/-y or a hosts-file workaround: the ctrl channel keeps
+  # presenting the network's own self-signed cert (SAN ziti-ctrl.clonk.tv),
+  # which the in-cluster DNS name does not match. See the Certificate below
+  # for the SEPARATE publicly-trusted cert this task also adds, and its
+  # comment for what is still unverified about wiring it into the edge
+  # listener.
+  # ClusterIP, NOT LoadBalancer — reverted deliberately, see below.
+  #
+  # PR #6 put a LoadBalancer on 8440. That is unsafe: this bind point serves
+  # ALL THREE controller APIs — edge-client, edge-management AND fabric — so
+  # opening 8440 publicly publishes the MANAGEMENT API, which the epic's trust
+  # boundary explicitly forbids (helm/ziti/README.md, "alt_server_certs
+  # changes which cert TLS presents, not which APIs a port serves"). An
+  # unauthenticated probe gets 401 on management endpoints, but "authenticated
+  # management API on the internet" is not the exposure that was authorised.
+  #
+  # The correct shape is a SECOND web bind point on 8441 serving edge-client
+  # ONLY, carrying the publicly-trusted alt cert, and exposing THAT. 8440 stays
+  # reachable solely over the ziti overlay, exactly as today.
+  #
+  # Blocked on the same constraint as the router's second listener: the
+  # controller runs ZITI_BOOTSTRAP_CONFIG=true, and bootstrap env cannot
+  # express a second `web` bind point or `identity.alt_server_certs`. It needs
+  # a supplied config.yml via ConfigMap, which is its own change.
+  type: ClusterIP
+  selector:
+    app: ziti-controller
+  ports:
+    - name: ctrl
+      port: 8440
+      targetPort: 8440
+---
+# Publicly-trusted certificate for ziti-ctrl.clonk.tv (gd-mClQbiOtPk), issued
+# by DNS-01 -- reusing the SAME ClusterIssuer already minting the
+# gardenio.clonk.tv / mux.clonk.tv front-door certs
+# (gardenio/helm/gardenio-ziti/tls-clusterissuer.yaml: ambient node-role
+# credentials against the clonk.tv zone, `enable_acme_dns01` in
+# terraform/modules/k3s). Reused by name, not redefined, so there stays
+# exactly one Let's Encrypt account/ClusterIssuer in this cluster.
+#
+# UNLIKE gardenio.clonk.tv/mux.clonk.tv (deliberately no public A record --
+# they resolve only inside the ziti tunnel), ziti-ctrl.clonk.tv is meant to
+# be resolvable from the public internet: Phase 2 identity re-enrollment has
+# no tunnel to use yet -- enrolling against this controller is what would
+# eventually create one. The A record itself is out of scope here; see the
+# Service comment above.
+#
+# WHAT THIS DOES NOT ANSWER: whether/how OpenZiti's edge-client API can be
+# configured (via the ZITI_BOOTSTRAP_* env vars this Deployment already uses)
+# to present THIS certificate instead of -- or alongside -- its own
+# self-signed one, without touching the ctrl-channel listener that routers
+# mTLS against. That listener MUST keep using the network's own PKI: its
+# trust domain (spiffe://ziti-ctrl.clonk.tv) is baked into the root CA and
+# changing it invalidates every enrolled identity (see the top-of-file
+# comment). This crew has no cluster access to inspect the 2.0.4 image's
+# bootstrap.bash to confirm the right knob, the way gd-1hMSYnoW1d's live
+# apply did for ZITI_BOOTSTRAP_CLUSTER -- flagged in this task's escalation
+# for whoever applies it. Minting the cert into a Secret here is safe and
+# useful regardless of the answer; consuming it is not.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ziti-controller-public
+  namespace: ziti
+  labels:
+    app: ziti-controller
+    app.kubernetes.io/part-of: gas-city
+spec:
+  secretName: ziti-controller-public-tls
+  # 90-day LE cert; cert-manager renews at ~60 days unattended -- same
+  # duration/renewBefore as the gardenio/mux front-door certs.
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  dnsNames:
+    - ziti-ctrl.clonk.tv
+  issuerRef:
+    name: letsencrypt-dns01
+    kind: ClusterIssuer
+{{- end }}

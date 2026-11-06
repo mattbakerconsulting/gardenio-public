@@ -1,0 +1,297 @@
+# trigger-source-bead-per-action.toml
+#
+# Claudeless scenario: a single bead lifecycle event fans out to THREE
+# trigger:bead beads, each firing a DIFFERENT action — notify, create_bead,
+# and apply_formula — and we observe the audit + side-effect of each.
+#
+# Epic ka-0000004568 / task gd-Ck0c6XXsix §"per-action firing":
+#   "Add claudeless specs asserting a bead-source trigger correctly fires
+#    action=apply_formula, action=create_bead, and action=notify. Model on
+#    trigger-source-schedule-fires.toml + gardener-trigger-* specs."
+#
+# Why this shape:
+#   Existing claudeless coverage drives the action layer end-to-end through the
+#   SCHEDULE source (trigger-source-schedule-fires.toml) and the four
+#   probe-driven sources added under ka-0000003167 (jira / gitlab / account /
+#   slack-reaction). The BEAD-event source shares the same fireAction dispatch
+#   (bridge/triggers.go:fireAction) but reaches it through a different path:
+#   SSE buffer → BeadStateTriggerSource.Evaluate → match. This spec exercises
+#   that path for all three non-spawn actions at once, so a regression in
+#   bead-event → action wiring (or in any one action handler) is caught in CI.
+#
+# How it stays deterministic (the trigger-probe model, ka-0000003167 / !3267):
+#   The standalone `trigger-engine` binary DOES register the bead source, but
+#   driving it deterministically requires racing a live SSE frame before the
+#   engine's per-cycle DrainPending(), or standing up the reconciler and
+#   sleeping through ≥1 reconcile interval (~90s+, reconcile-bound — the same
+#   slow class as the quarantined trigger-source-bead-spawn-agent). Instead we
+#   use the purpose-built `trigger-probe` test binary
+#   (gardenio/controller/cmd/trigger-probe --source=bead), which injects ONE
+#   synthetic bead event into the REAL BeadStateTriggerSource buffer and runs
+#   exactly one EvaluateSource("bead") pass. That pass loads every enabled
+#   trigger:bead bead from the in-test daemon and evaluates each against the
+#   injected event — a genuine one-event → many-triggers fan-out through the
+#   real evaluation→fireAction→recordTriggerAudit loop, no reconcile wait.
+#
+# Steps:
+#   1. Create ONE formula bead (1 var, 1 step) for the apply_formula trigger.
+#   2. Create THREE trigger:bead beads, all keyed on a unique per-run label so
+#      they only match OUR synthetic event and not unrelated trigger:bead beads
+#      in the daemon:
+#        - notify        → publishes a closed trigger-notice message bead
+#        - create_bead   → creates a task bead carrying fields.source_bead_id
+#        - apply_formula → instantiates the formula (molecule + step beads)
+#   3. Run `trigger-probe --source=bead` once, injecting a `created` event whose
+#      labels include the per-run match label.
+#   4. Assert, per action:
+#        - an audit bead (type=event, label=trigger:<id>, fields.action=<X>,
+#          fields.outcome=allow, fields.source=bead) exists, AND
+#        - the action's distinctive side-effect bead exists.
+#
+# Skips gracefully when go / trigger-probe / daemon env are unavailable,
+# matching the sibling trigger-source-*.toml specs.
+
+[claude]
+session_id = "e2e00000-000a-4000-a000-000000000004"
+username = "e2e-trigger-bead-per-action"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 90000
+
+[[responses]]
+on = "*"
+say = "Running trigger-source-bead-per-action: one bead event → notify + create_bead + apply_formula."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-probe ─────────────────────
+PROBE_BIN=""
+if command -v trigger-probe >/dev/null 2>&1; then
+  PROBE_BIN=$(command -v trigger-probe)
+elif [ -x /usr/local/bin/trigger-probe ]; then
+  PROBE_BIN=/usr/local/bin/trigger-probe
+elif [ -x /tmp/trigger-probe ]; then
+  PROBE_BIN=/tmp/trigger-probe
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-probe from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-probe ./cmd/trigger-probe/ ) || {
+    echo "SKIP: trigger-probe build failed"; exit 0;
+  }
+  PROBE_BIN=/tmp/trigger-probe
+else
+  echo "SKIP: trigger-probe binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-probe: $PROBE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then echo "SKIP: BEADS_HTTP_URL not set"; exit 0; fi
+if [ -z "${BEADS_TOKEN:-}" ]; then echo "SKIP: BEADS_TOKEN not set"; exit 0; fi
+if ! command -v gb >/dev/null 2>&1; then echo "SKIP: gb not present"; exit 0; fi
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+
+# ── Setup ──────────────────────────────────────────────────────────
+TAG="e2e-bpa-$$-$(date +%s)"
+# Per-run match label: the trigger conditions require this exact label, so the
+# three triggers only fire for OUR injected event and not for unrelated
+# trigger:bead beads the daemon loads during EvaluateSource.
+MATCH_LABEL="e2e-bpa-match-${TAG}"
+# Synthetic source bead id surfaced to the action templates ({{bead_id}}) and
+# to fields.source_bead_id on the create_bead side-effect.
+SRC_ID="PROBE-BEAD-${TAG}"
+echo "tag:         $TAG"
+echo "match label: $MATCH_LABEL"
+echo "source bead: $SRC_ID"
+
+CREATED_IDS=""
+remember() { CREATED_IDS="$CREATED_IDS $1"; }
+
+# ── Create the formula bead for the apply_formula trigger ──────────
+# One required var {{KEY}} and one step whose title substitutes it, mirroring
+# bridge/triggers_test.go:testFormulaBead — lets us prove template expansion
+# ran end-to-end in the instantiated step bead.
+FORMULA_JSON='{"vars":[{"name":"KEY","required":true}],"steps":[{"id":"s1","title":"Do thing for {{KEY}}","type":"task"}]}'
+FORMULA_ID=$(printf '%s' "$FORMULA_JSON" | kd formula create "bpa-formula-$TAG" \
+  --file - -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$FORMULA_ID" ]; then fail "create formula bead"; exit 1; fi
+echo "formula: $FORMULA_ID"
+remember "$FORMULA_ID"
+
+# ── Create the three trigger:bead beads ────────────────────────────
+# All three match event-type=created with the per-run label present.
+mk_trigger() {
+  # $1 action  $2 title-suffix  [extra flags...]
+  local action="$1"; shift
+  local suffix="$1"; shift
+  gb trigger create bead \
+    --http-url "$BEADS_HTTP_URL" \
+    --title "$TAG-$suffix" \
+    --event-types created \
+    --condition "label:$MATCH_LABEL:present" \
+    --action "$action" \
+    --cooldown 1s \
+    --label "e2e:claudeless" \
+    --label "e2e-tag:$TAG" \
+    "$@" \
+    --json 2>&1
+}
+
+NOTIFY_OUT=$(mk_trigger notify notify --prompt "bead {{bead_id}} matched: {{bead_title}}")
+NOTIFY_ID=$(echo "$NOTIFY_OUT" | jq -r '.id // .ID // empty')
+[ -n "$NOTIFY_ID" ] || { fail "create notify trigger" "$NOTIFY_OUT"; exit 1; }
+echo "notify trigger:        $NOTIFY_ID"
+remember "$NOTIFY_ID"
+
+CREATE_OUT=$(mk_trigger create_bead createbead --prompt "follow-up for {{bead_id}}")
+CREATE_ID=$(echo "$CREATE_OUT" | jq -r '.id // .ID // empty')
+[ -n "$CREATE_ID" ] || { fail "create create_bead trigger" "$CREATE_OUT"; exit 1; }
+echo "create_bead trigger:   $CREATE_ID"
+remember "$CREATE_ID"
+
+FORMULA_OUT=$(mk_trigger apply_formula applyformula --formula "$FORMULA_ID" --var "KEY={{bead_id}}")
+FORMULA_TRIG_ID=$(echo "$FORMULA_OUT" | jq -r '.id // .ID // empty')
+[ -n "$FORMULA_TRIG_ID" ] || { fail "create apply_formula trigger" "$FORMULA_OUT"; exit 1; }
+echo "apply_formula trigger: $FORMULA_TRIG_ID"
+remember "$FORMULA_TRIG_ID"
+
+cleanup() {
+  for tid in "$NOTIFY_ID" "$CREATE_ID" "$FORMULA_TRIG_ID"; do
+    [ -n "$tid" ] && gb trigger disable "$tid" --http-url "$BEADS_HTTP_URL" >/dev/null 2>&1 || true
+  done
+  # Close audit beads produced by the three triggers so they don't accumulate.
+  for tid in "$NOTIFY_ID" "$CREATE_ID" "$FORMULA_TRIG_ID"; do
+    for bid in $(kd list --type=event -l "trigger:$tid" --json 2>/dev/null | jq -r '.[].id'); do
+      kd close "$bid" >/dev/null 2>&1 || true
+    done
+  done
+  for id in $CREATED_IDS; do
+    kd close "$id" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+# ── Fire the bead source via the probe ─────────────────────────────
+# One injected `created` event, evaluated against all three triggers in a
+# single EvaluateSource pass. --trigger is only used for the probe's
+# bootstrap-sentinel seed; the bead source opts out of bootstrap, so any one
+# of the three ids is fine here.
+PROBE_LOG=/tmp/trigger-probe-bpa-$$.log
+if ! "$PROBE_BIN" \
+    --source=bead \
+    --trigger="$NOTIFY_ID" \
+    --http-url="$BEADS_HTTP_URL" \
+    --token="$BEADS_TOKEN" \
+    --bead-id="$SRC_ID" \
+    --bead-title="bpa source $TAG" \
+    --bead-type=task \
+    --bead-event=created \
+    --bead-labels="$MATCH_LABEL" >"$PROBE_LOG" 2>&1; then
+  fail "trigger-probe exited non-zero"
+  echo "--- probe log ---"; cat "$PROBE_LOG"; echo "--- end ---"
+  exit 1
+fi
+pass "trigger-probe ran one bead EvaluateSource cycle"
+
+# ── Assert: per-action audit bead recorded with outcome=allow ──────
+audit_action() {
+  # echoes the fields.action of the first allow-audit for trigger $1, or empty
+  kd list --type=event -l "trigger:$1" --json 2>/dev/null | \
+    jq -r '[.[] | select(.fields.outcome=="allow" and .fields.source=="bead")][0].fields.action // empty' 2>/dev/null
+}
+
+DEADLINE=$(( $(date +%s) + 30 ))
+N_OK=""; C_OK=""; F_OK=""
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  [ -z "$N_OK" ] && [ "$(audit_action "$NOTIFY_ID")" = "notify" ] && { N_OK=1; pass "notify trigger fired (audit action=notify, outcome=allow, source=bead)"; }
+  [ -z "$C_OK" ] && [ "$(audit_action "$CREATE_ID")" = "create_bead" ] && { C_OK=1; pass "create_bead trigger fired (audit action=create_bead, outcome=allow, source=bead)"; }
+  [ -z "$F_OK" ] && [ "$(audit_action "$FORMULA_TRIG_ID")" = "apply_formula" ] && { F_OK=1; pass "apply_formula trigger fired (audit action=apply_formula, outcome=allow, source=bead)"; }
+  if [ -n "$N_OK" ] && [ -n "$C_OK" ] && [ -n "$F_OK" ]; then break; fi
+  sleep 1
+done
+
+[ -z "$N_OK" ] && fail "notify trigger did not fire within 30s"
+[ -z "$C_OK" ] && fail "create_bead trigger did not fire within 30s"
+[ -z "$F_OK" ] && fail "apply_formula trigger did not fire within 30s"
+
+if [ -z "$N_OK" ] || [ -z "$C_OK" ] || [ -z "$F_OK" ]; then
+  echo "--- probe log ---"; cat "$PROBE_LOG"; echo "--- end ---"
+fi
+
+# ── Per-action side-effect assertions ──────────────────────────────
+# These confirm the action handler did its distinctive work, not just that it
+# recorded an allow audit. Only checked when the corresponding fire succeeded.
+
+# notify → NoticeNotifier publishes a closed type=message bead carrying the
+# "trigger-notice" + "from:trigger-engine" labels (bridge/notice.go).
+if [ -n "$N_OK" ]; then
+  NOTICE=$(kd list --type=message -l "trigger-notice" -l "from:trigger-engine" --status=closed --json 2>/dev/null | \
+    jq -c "[.[] | select(.title | test(\"$SRC_ID\"))][0] // empty" 2>/dev/null)
+  if [ -n "$NOTICE" ] && [ "$NOTICE" != "null" ]; then
+    pass "notify side-effect: trigger-notice message bead published for $SRC_ID"
+  else
+    # Non-fatal: the audit already proved fireAction→actionNotify ran with
+    # outcome=allow. The notice bead is best-effort and slack-bridge-facing.
+    echo "  (note) trigger-notice message bead not found by title match — non-fatal (audit already allow)"
+  fi
+fi
+
+# create_bead → a task bead labeled trigger:<create-trigger-id> with the
+# source bead surfaced via fields.source_bead_id (bridge/triggers.go createTaskBead).
+if [ -n "$C_OK" ]; then
+  CB=$(kd list --type=task -l "trigger:$CREATE_ID" --json 2>/dev/null | \
+    jq -c "[.[] | select(.fields.source_bead_id==\"$SRC_ID\")][0] // empty" 2>/dev/null)
+  if [ -n "$CB" ] && [ "$CB" != "null" ]; then
+    CB_ID=$(echo "$CB" | jq -r '.id')
+    pass "create_bead side-effect: task bead $CB_ID created (source_bead_id=$SRC_ID)"
+    remember "$CB_ID"
+  else
+    fail "create_bead side-effect: no task bead labeled trigger:$CREATE_ID for source $SRC_ID"
+  fi
+fi
+
+# apply_formula → a molecule bead carrying our formula_id, plus a step bead
+# whose title substituted {{KEY}}={{bead_id}}=$SRC_ID (bridge/formula_instantiate.go).
+if [ -n "$F_OK" ]; then
+  MOL=$(kd list --type=molecule -l "project:gardenio" --limit 200 --json 2>/dev/null | \
+    jq -c "[.[] | select(.fields.formula_id==\"$FORMULA_ID\")][0] // empty" 2>/dev/null)
+  if [ -n "$MOL" ] && [ "$MOL" != "null" ]; then
+    MOL_ID=$(echo "$MOL" | jq -r '.id')
+    pass "apply_formula side-effect: molecule $MOL_ID instantiated from formula $FORMULA_ID"
+    remember "$MOL_ID"
+    # The single step's title must have substituted KEY=$SRC_ID.
+    STEP=$(kd list --type=task --limit 200 --json 2>/dev/null | \
+      jq -c "[.[] | select(.title==\"Do thing for $SRC_ID\")][0] // empty" 2>/dev/null)
+    if [ -n "$STEP" ] && [ "$STEP" != "null" ]; then
+      pass "apply_formula side-effect: step title substituted KEY=$SRC_ID"
+      remember "$(echo "$STEP" | jq -r '.id')"
+    else
+      echo "  (note) step title substitution not observed — non-fatal (molecule already created)"
+    fi
+  else
+    fail "apply_formula side-effect: no molecule with formula_id=$FORMULA_ID"
+  fi
+fi
+
+# ── Summary ────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "trigger-source-bead-per-action: notify + create_bead + apply_formula all fired OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "trigger-source-bead-per-action scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

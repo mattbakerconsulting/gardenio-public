@@ -1,0 +1,234 @@
+{{- if .Values.grafana.enabled }}
+{{- /* Fixed custom-plugin id — must match gardenio-assistant-app/src/plugin.json
+       and the unsigned-allow scope + plugins subdir in deployment.yaml (C4
+       ka-0000007568). Defined per-file since Helm vars do not cross templates. */}}
+{{- $assistantPluginID := "gardenio-assistant-app" -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.grafana.fullname" . }}-provisioning
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.grafana.labels" . | nindent 4 }}
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: VictoriaMetrics
+        type: prometheus
+        access: proxy
+        url: {{ .Values.grafana.datasourceURL | default (printf "http://%s:8428" (include "gardenio.vmsingle.fullname" .)) }}
+        uid: victoriametrics
+        isDefault: true
+        editable: false
+      {{- if .Values.vtsingle.enabled }}
+      - name: VictoriaTraces
+        type: jaeger
+        access: proxy
+        url: {{ printf "%s/select/jaeger" (include "gardenio.vtsingle.baseURL" .) }}
+        uid: victoriatraces
+        editable: false
+        jsonData:
+          tracesToMetrics:
+            datasourceUid: victoriametrics
+      {{- end }}
+      {{- if .Values.alertmanager.enabled }}
+      {{- /* Alertmanager datasource (ka-0000004459; epic ka-0000000770). Points
+             Grafana at the in-chart prom/alertmanager (ka-0000003392) so the
+             Grafana Alerting UI surfaces the firing/silenced alert list AND lets
+             an operator create/expire SILENCES against it — the "see + modify
+             alerts from Grafana" ask. NB this datasource governs alert STATE
+             (silences), NOT the alert RULES (those are the chart's vmalert
+             rules). implementation:prometheus is REQUIRED — the
+             type defaults to mimir, and prom/alertmanager v0.28.1 speaks the
+             prometheus API dialect (silences read/write; contact points read-only).
+             handleGrafanaManagedAlerts:false keeps this a read/silence view of
+             externally-fired (vmalert) alerts — it does NOT route Grafana-managed
+             alerts outbound here, and does NOT gate silence management. Reaching it
+             needs the paired grafana-egress->:9093 allow + a grafana peer on
+             alertmanager-ingress (both in networkpolicies.yaml). editable:false
+             matches the sibling datasources — the ConfigMap is the source of truth. */}}
+      - name: Alertmanager
+        type: alertmanager
+        access: proxy
+        url: {{ printf "http://%s:%d" (include "gardenio.alertmanager.fullname" .) (int (.Values.alertmanager.service.port | default 9093)) }}
+        uid: alertmanager
+        editable: false
+        jsonData:
+          implementation: prometheus
+          handleGrafanaManagedAlerts: false
+      {{- end }}
+      {{- if .Values.grafana.victoriaLogsDatasource.enabled }}
+      {{- /* VictoriaLogs datasource. Points Grafana at the in-chart
+             VictoriaLogs (vlsingle) store so the LogsQL dashboards
+             (edge-traffic-geomap) can run queries. type is the
+             seeded victoriametrics-logs-datasource plugin id (backend datasource,
+             commercial-signed, pre-baked by the seed-vl-datasource-plugin
+             initContainer so PROD keeps allowCatalogEgress:false). uid
+             `victorialogs` is what the dashboard JSON references. The URL derives
+             from the in-chart vlsingle Service (release-relative, correct on any
+             release name) unless overridden to an out-of-chart store; the
+             /select/logsql query API the plugin dials lives under this base.
+             editable:false matches the sibling datasources — the ConfigMap is the
+             source of truth. Reaching the store needs the paired
+             grafana-egress->:9428 allow (networkpolicies.yaml) + the grafana peer
+             on vlsingle-ingress (already present). */}}
+      {{- $vlURL := .Values.grafana.victoriaLogsDatasource.url | default (include "gardenio.vlsingle.baseURL" .) }}
+      - name: VictoriaLogs
+        type: victoriametrics-logs-datasource
+        access: proxy
+        url: {{ $vlURL }}
+        uid: victorialogs
+        editable: false
+      {{- end }}
+  {{- if .Values.grafana.sidecar.enabled }}
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: sidecar
+        orgId: 1
+        folder: ""
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        options:
+          path: {{ .Values.grafana.sidecar.folder }}
+          foldersFromFilesStructure: false
+  {{- end }}
+  {{- if or .Values.grafana.llm.enabled .Values.grafana.assistant.enabled }}
+  {{- /* Plugin app provisioning (epic ka-0000002011 — OSS Grafana chat
+         frontend, Path C). Mounted by deployment.yaml under
+         /etc/grafana/provisioning/plugins so Grafana auto-enables the listed
+         apps at boot. Rendered when EITHER the grafana-llm-app foundation (C1)
+         or the custom gardenio-assistant-app (C4) is enabled. */}}
+  plugins.yaml: |
+    apiVersion: 1
+    apps:
+    {{- if .Values.grafana.llm.enabled }}
+    {{- /* grafana-llm-app (ka-0000004453, Phase A). Points the Apache-2.0
+           grafana-llm-app at gardenio's in-cluster LiteLLM proxy as an
+           OpenAI-compatible provider (no Grafana Cloud, no off-cluster egress).
+           secureJsonData.openAIKey: $LITELLM_API_KEY is interpolated by Grafana
+           from the LITELLM_API_KEY env injected in the Deployment. */}}
+    {{- $litellmURL := .Values.grafana.llm.openaiURL | default (printf "http://%s:%d" (include "gardenio.litellm.fullname" .) (int (.Values.litellm.port | default 4000))) }}
+      - type: grafana-llm-app
+        org_id: 1
+        disabled: false
+        jsonData:
+          provider: openai
+          openAI:
+            provider: openai
+            url: {{ $litellmURL }}
+          {{- /* Curated embedded-MCP tool surface (C7, ka-0000001262; epic
+                 ka-0000002011). grafana-llm-app's backend unmarshals this whole
+                 jsonData into its Settings struct, including
+                 Settings.MCP.Toolsets (one *bool per tool FAMILY). A nil/unset
+                 family defaults to ENABLED upstream, so to keep the chat box's
+                 tool surface tight + auditable EVERY family is listed EXPLICITLY
+                 here (default map in values.yaml). The allow-list is read +
+                 dashboard-create ONLY:
+                   ENABLED  — search, datasource, prometheus, navigation,
+                              rendering (read), dashboard (read +
+                              update_dashboard create-or-OVERWRITE), folder
+                              (create_folder).
+                   DISABLED — admin, alerting (its embedded toolset registers
+                              ManageRulesReadWrite, i.e. WRITE), annotations
+                              (write), oncall, incident, asserts, sift,
+                              pyroscope, loki, clickhouse, cloudwatch,
+                              elasticsearch, examples, searchlogs.
+                 SECURITY-OF-RECORD (corrects C7 !4943, ka-0000007430): the
+                 toolset family allow-list is the LOAD-BEARING control. It is NOT
+                 backstopped by a narrower managed-SA RBAC — the managed external
+                 SA inherits grafana-llm-app's FULL plugin.json iam (dashboards +
+                 folders read/write, alert.rules:read/create/write/DELETE,
+                 datasources, orgs/teams/users reads — see grafana/deployment.yaml
+                 + values.yaml), so the SA could mutate/delete alert rules if the
+                 alerting family were ever enabled here. Never relax this list for
+                 alerting/admin without a separate RBAC review (forking plugin.json
+                 is the only way to actually narrow the SA). Rendered only when
+                 grafana.llm.mcp carries .disabled or .toolsets, so an env that
+                 does not opt in is byte-identical and no bare `mcp:` null key
+                 is emitted.
+
+                 OPERATOR ESCAPE HATCH (ka-0000007430): to TURN OFF the embedded
+                 server, set `grafana.llm.mcp.disabled: true` (which still
+                 renders mcp + disabled:true). Do NOT null the `toolsets` field
+                 to "clear" the allow-list (`toolsets: null` erases the chart
+                 default and the embedded server falls through to upstream's
+                 nil-means-ENABLED for every family). An empty-map override
+                 (`toolsets: {}`) is safe — helm deep-merges it with the
+                 chart-default map so the full deny-list survives — but
+                 prefer mcp.disabled if you want fewer tools, not toolset
+                 manipulation. mcp.disabled is the fail-closed lever. */}}
+          {{- with .Values.grafana.llm.mcp }}
+          {{- if or .disabled .toolsets }}
+          mcp:
+            {{- if .disabled }}
+            disabled: true
+            {{- end }}
+            {{- with .toolsets }}
+            toolsets:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+          {{- end }}
+          {{- end }}
+        secureJsonData:
+          openAIKey: $LITELLM_API_KEY
+    {{- end }}
+    {{- if .Values.grafana.assistant.enabled }}
+    {{- /* Custom gardenio-assistant-app (C4 ka-0000007568 + C8 ka-0000005589;
+           epic ka-0000002011). ENABLE the app so its chat nav page
+           (/a/gardenio-assistant-app/chat) + Configuration page actually appear.
+           On-disk discovery (the seeded plugins dir) plus the unsigned-allow env
+           only REGISTER a Grafana app plugin — an app stays DISABLED until
+           provisioned enabled (disabled: false) or autoEnabled. The chat UX
+           reaches the LLM through the grafana-llm-app foundation (above), not its
+           own plugin config.
+
+           jsonData.enableDashboardWrites is the C8 plugin write gate: the plugin
+           reads it (AppRootProps meta.jsonData) and, when true, offers the model
+           the vetted dashboard/folder write tools (update_dashboard,
+           create_folder) — and ONLY those. DEFAULT FALSE keeps the chat box
+           read-only; an env opts in via grafana.assistant.enableDashboardWrites.
+           Rendered as an explicit bool so the write posture is auditable at the
+           overlay layer. The write surface is bounded to dashboard + folder
+           create/update — no alerting/admin/datasource — and all LLM + MCP
+           traffic stays on the in-cluster grafana-llm-app -> LiteLLM path.
+
+           NB the plugin-packaging seam (initContainer dist-seed +
+           GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS) lives under
+           grafana.assistant.image (C4); this entry only ENABLES + configures the
+           app. Default-off/additive: an env that does not opt in renders
+           byte-identically. */}}
+      - type: {{ $assistantPluginID }}
+        org_id: 1
+        disabled: false
+        jsonData:
+          enableDashboardWrites: {{ .Values.grafana.assistant.enableDashboardWrites | default false }}
+          {{- /* MCP transport repoint (ka-0000000293). The plugin BACKEND
+                 reverse-proxies the chat box's MCP traffic to the IN-CLUSTER
+                 write-capable mcp-grafana instance instead of grafana-llm-app's
+                 EMBEDDED server (which dials Grafana's external edge-auth'd
+                 app_url and 403s on every server-to-server call). Two non-secret
+                 in-cluster Service URLs:
+                   - mcpUpstreamURL: the write sidecar base
+                     (http://<release>-mcp-grafana-write:<port>); the backend
+                     appends the /mcp endpoint path.
+                   - grafanaInClusterURL: the in-cluster Grafana base the sidecar
+                     must call, forwarded as X-Grafana-URL so it NEVER resolves
+                     the external app_url. Honours serveFromSubPath via
+                     gardenio.mcpGrafana.grafanaURL (the same derivation the read
+                     sidecar + image-renderer callback use).
+                 Rendered only when mcpGrafanaWrite.enabled; otherwise the chat
+                 box would point at a non-existent Service. The backend logs +
+                 CheckHealth surface a misconfig if these are absent. */}}
+          {{- if .Values.mcpGrafanaWrite.enabled }}
+          mcpUpstreamURL: http://{{ include "gardenio.mcpGrafanaWrite.fullname" . }}:{{ .Values.mcpGrafanaWrite.service.port | default 8000 }}
+          {{- $assistantGrafanaURL := include "gardenio.mcpGrafana.grafanaURL" . }}
+          {{- if $assistantGrafanaURL }}
+          grafanaInClusterURL: {{ $assistantGrafanaURL | quote }}
+          {{- end }}
+          {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}

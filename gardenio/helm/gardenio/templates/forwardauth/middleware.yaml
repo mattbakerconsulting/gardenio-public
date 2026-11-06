@@ -1,0 +1,47 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+# ── Traefik ForwardAuth Middleware ─────────────────────────────────────────────
+# Routes auth requests to oauth2-proxy configured with --upstream=static://202.
+# Unauthenticated requests → oauth2-proxy returns 302 to Keycloak login.
+# Authenticated requests → oauth2-proxy proxies to static://202 → returns 202.
+# Traefik treats 2xx as "pass", non-2xx as "reject and forward response to client".
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-forwardauth
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: forwardauth
+spec:
+  forwardAuth:
+    address: http://{{ $fullname }}-forwardauth.{{ .Release.Namespace }}.svc.cluster.local:4180/
+    # trustForwardHeader forwards the *incoming* X-Forwarded-* headers
+    # unchanged to oauth2-proxy. This is only safe when the cluster-level
+    # Traefik install (NOT this chart) has `forwardedHeaders.trustedIPs` set
+    # to the LB / front-proxy CIDR — otherwise a client can forge
+    # X-Forwarded-Proto: https or spoof their source IP, which oauth2-proxy
+    # echoes back into the auth decision.
+    #
+    # Defaults true to preserve the ALB-fronted prod/staging behaviour. The
+    # Gardenio-in-a-Box overlay (deploy-values/gardenio-inbox.yaml) flips this
+    # OFF: with Traefik directly internet-facing and no upstream LB there is
+    # no trusted front-proxy, so X-Forwarded-* is attacker-controlled and must
+    # NOT feed the auth decision (ingress research §G2, ka-0000002581).
+    #
+    # Audit: see gardenio/docs/audits/ingress-tls-static.md finding F9.
+    # Operator runbook: see gardenio/docs/runbooks/ingress-trusted-ips.md
+    # for how to verify the cluster-Traefik trustedIPs configuration.
+    {{- /* Direct reference (NOT `| default true`): Helm's `default` treats a
+           boolean false as empty and would force it back to true. The key
+           always ships in values.yaml (default true), so reference it. */}}
+    trustForwardHeader: {{ .Values.keycloak.forwardAuth.trustForwardHeader }}
+    # NOTE: Authorization is intentionally NOT in authResponseHeaders.
+    # See values.yaml (forwardAuth) and docs/audits/forwardauth-authorization-collision.md
+    # (audit ka-0000000839, follow-up ka-0000002928).
+    authResponseHeaders:
+      - X-Auth-Request-User
+      - X-Auth-Request-Email
+      - X-Auth-Request-Groups
+      - X-Auth-Request-Access-Token
+{{- end }}

@@ -1,0 +1,1744 @@
+{
+  "schemaVersion": 39,
+  "uid": "gardenio-edge-traffic-geomap",
+  "title": "Gardenio — Edge Traffic Geomap (Phase-1 orientation console)",
+  "description": "Orientation console for internet-facing edge traffic (design ka-0000007287#c3, epic ka-0000008216, task ka-0000003019). Reads the Traefik JSON access log in VictoriaLogs and orients a human by geography/ASN in ~10 seconds when the analyst loop escalates. The map is the CONSOLE, not the product (ka-0000007287#c2-3): it ships ZERO alerts — detection lives in the L2 rules + L3 analyst loop. Field names follow the edge log-field contract via the hidden f_* constant variables (sourceCountry / sourceASN / client_ip / DownstreamStatus / RequestHost / principal); if a per-env transport publishes different field names, adjust the f_* variables, never the panel queries. Depends on L0 transport (ka-0000001563) + L1 geo enrichment (ka-0000000583); inert/dark until both land and the datasource is wired.",
+  "tags": [
+    "gardenio",
+    "security",
+    "edge",
+    "intrusion-detection",
+    "geomap",
+    "victorialogs"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timezone": "utc",
+  "refresh": "",
+  "templating": {
+    "list": [
+      {
+        "name": "DS_VICTORIALOGS",
+        "type": "datasource",
+        "query": "victoriametrics-logs-datasource",
+        "current": {},
+        "hide": 0,
+        "label": "VictoriaLogs datasource",
+        "refresh": 1
+      },
+      {
+        "name": "f_country",
+        "type": "constant",
+        "label": "Field: source country",
+        "description": "Log field the enriched ISO-3166 alpha-2 country lands under. Default sourceCountry — the country dimension L1 (ka-0000000583) adds alongside sourceASN. Change only if the transport publishes a different field name.",
+        "query": "sourceCountry",
+        "current": {
+          "text": "sourceCountry",
+          "value": "sourceCountry"
+        },
+        "hide": 2
+      },
+      {
+        "name": "f_asn",
+        "type": "constant",
+        "label": "Field: source ASN",
+        "description": "Log field the enriched ASN token lands under (auditxform.FieldSourceASN). Default sourceASN. Change only if the transport publishes a different field name.",
+        "query": "sourceASN",
+        "current": {
+          "text": "sourceASN",
+          "value": "sourceASN"
+        },
+        "hide": 2
+      },
+      {
+        "name": "f_sourceip",
+        "type": "constant",
+        "label": "Field: client IP",
+        "description": "Log field the client IP lands under. Default client_ip — the enriched scalar (the raw XFF chain stores as an opaque JSON-string that ipv4_range cannot filter; ka-0000006176). Change only if the transport publishes a different field name.",
+        "query": "client_ip",
+        "current": {
+          "text": "client_ip",
+          "value": "client_ip"
+        },
+        "hide": 2
+      },
+      {
+        "name": "f_status",
+        "type": "constant",
+        "label": "Field: response status",
+        "description": "Log field the HTTP response status lands under (Traefik JSON access log: DownstreamStatus). Change only if the transport publishes a different field name.",
+        "query": "DownstreamStatus",
+        "current": {
+          "text": "DownstreamStatus",
+          "value": "DownstreamStatus"
+        },
+        "hide": 2
+      },
+      {
+        "name": "f_host",
+        "type": "constant",
+        "label": "Field: request host",
+        "description": "Log field the requested hostname lands under (Traefik JSON access log: RequestHost). Change only if the transport publishes a different field name.",
+        "query": "RequestHost",
+        "current": {
+          "text": "RequestHost",
+          "value": "RequestHost"
+        },
+        "hide": 2
+      },
+      {
+        "name": "f_principal",
+        "type": "constant",
+        "label": "Field: principal",
+        "description": "Log field the authenticated principal lands under. Both L0 edge shippers now stamp the surface-agnostic 'principal' contract field (auditxform.FieldPrincipal): the Traefik adapter lifts ClientUsername and the AVA OCSF adapter lifts the Verified Access user identity, both normalised to '-' when unauthenticated (ka-0000005007). The prior value 'ClientUsername' existed only on Traefik rows and was itself '-' on 53,777 of 53,778 rows, so the post-compromise panels had no principal to attribute a novel geo to; the earlier 'principal' value was absent on every row and blanked every panel (ka-0000008216). Change only if a per-env transport publishes a different field name.",
+        "query": "principal",
+        "current": {
+          "text": "principal",
+          "value": "principal"
+        },
+        "hide": 2
+      },
+      {
+        "name": "host",
+        "type": "textbox",
+        "label": "Host",
+        "description": "Scope the whole board to one public hostname (e.g. cli.gardenio.example.com). * = all hosts.",
+        "query": "*",
+        "current": {
+          "text": "*",
+          "value": "*"
+        },
+        "hide": 0
+      },
+      {
+        "name": "principal",
+        "type": "textbox",
+        "label": "Principal",
+        "description": "Scope the whole board to one authenticated principal. * = all (including unauthenticated hits).",
+        "query": "*",
+        "current": {
+          "text": "*",
+          "value": "*"
+        },
+        "hide": 0
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "gardenio rollout",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "victoriametrics"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "semi-dark-orange",
+        "expr": "count(changes(process_start_time_seconds{namespace=\"gardenio-system\",component!=\"\"}[$__interval]) > 0) >= 3",
+        "step": "1m",
+        "titleFormat": "gardenio rollout",
+        "textFormat": "3+ gardenio-system components restarted at once - a release deploy or chart apply. Check this marker before hunting a code cause for a step change on this board."
+      },
+      {
+        "name": "component restart",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "victoriametrics"
+        },
+        "enable": false,
+        "hide": false,
+        "iconColor": "semi-dark-blue",
+        "expr": "changes(process_start_time_seconds{namespace=\"gardenio-system\",component!=\"\"}[$__interval]) > 0",
+        "step": "1m",
+        "tagKeys": "component",
+        "titleFormat": "{{component}} restarted",
+        "textFormat": "gardenio-system/{{component}} moved its process start time - deploy, OOM-kill or crash-loop. Off by default: ~22 single-component restarts/day fleet-wide would bury the rollout markers."
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "All gardenio boards",
+      "type": "dashboards",
+      "tags": [
+        "gardenio"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Every gardenio board, with this board's time range carried over"
+    },
+    {
+      "title": "Inbound webhook liveness",
+      "type": "link",
+      "url": "/grafana/d/gardenio-webhook-liveness",
+      "icon": "external link",
+      "tooltip": "The webhooks entrypoint behind this edge - per-door delivery and the dark-hook deadman",
+      "targetBlank": false,
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### Edge traffic geomap — orientation console (NOT the detector)\n\n> **⚠ Inert by default — VictoriaLogs datasource not wired / edge log store empty in this environment.** Every panel below reads the **Traefik edge access log** via the **VictoriaLogs** datasource (`victoriametrics-logs-datasource`), which is **off by default** (`grafana.victoriaLogsDatasource.enabled=false` + `vlsingle.enabled=false`). The rows are **collapsed on purpose** so the board reads as intentionally-dark rather than a wall of datasource errors — expand a row only once the datasource is wired and the store is populated.\n\n**This map is the CONSOLE, not the product** (design `ka-0000007287`#c2-3). It exists so a human can **orient in ~10 seconds when the analyst loop escalates** — nobody watches a map at 03:00 Sunday, which is when a competent APT operates. It ships **zero alerts** (Phase-1 = charts only). Detection lives in the L2 rules and the L3 analyst loop, not here.\n\n**To light this board up:** set `grafana.victoriaLogsDatasource.enabled=true` **and** `vlsingle.enabled=true`, then land the edge L0 transport (Traefik access logs → VictoriaLogs, `ka-0000001563`) so the store is populated and the L1 geo/ASN enrichment (`ka-0000000583`) so `sourceCountry` / `sourceASN` exist. Field names are referenced through the hidden `f_*` constant variables — if a per-env transport publishes different field names, adjust the `f_*` **variables**, never the panel queries.\n\n**Offline by design:** the map draws no external basemap tiles (this is a mirrored-image, default-deny-egress estate). Country geography comes from Grafana's **bundled** gazetteer (`public/gazetteer/countries.json`) + country-outline GeoJSON — same-origin, zero off-cluster fetch. The `gazetteer` option is resolved by Grafana as a **URL path**, never a friendly name: a bare `countries` fetches `/countries`, 404s, and silently drops every marker (blank map). A blank plane behind the country markers is expected and correct.\n"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Where is our edge traffic coming from? (request geo distribution)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "panels": [
+        {
+          "type": "stat",
+          "title": "Requests in scope",
+          "description": "Total edge requests matching the current host / principal / time scope.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 5,
+            "w": 6,
+            "x": 0,
+            "y": 10
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records matched $host / $principal in this range — either the scope is too narrow or the edge log stream stopped shipping. Clear the filters and widen the range: if the whole board is empty the shipper is dark, not the internet.",
+              "unit": "short",
+              "color": {
+                "mode": "fixed",
+                "fixedColor": "text"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "none",
+            "graphMode": "area",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | stats count() as requests"
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Distinct countries",
+          "description": "How many countries the edge saw traffic from in scope — a spread in the ambient scanner floor, not by itself a signal.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 5,
+            "w": 6,
+            "x": 6,
+            "y": 10
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records in scope, so country cardinality is UNKNOWN (not 0 countries). Clear $host / $principal and widen the range before concluding the edge saw no traffic.",
+              "unit": "short",
+              "color": {
+                "mode": "fixed",
+                "fixedColor": "text"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "none",
+            "graphMode": "area",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | stats count_uniq(${f_country}) as countries"
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Distinct ASNs",
+          "description": "How many autonomous systems the edge saw traffic from in scope.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 5,
+            "w": 6,
+            "x": 12,
+            "y": 10
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records in scope, so ASN cardinality is UNKNOWN (not 0 ASNs). Clear $host / $principal and widen the range first.",
+              "unit": "short",
+              "color": {
+                "mode": "fixed",
+                "fixedColor": "text"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "none",
+            "graphMode": "area",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | stats count_uniq(${f_asn}) as asns"
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Distinct client IPs",
+          "description": "How many distinct client IPs hit the edge in scope.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 5,
+            "w": 6,
+            "x": 18,
+            "y": 10
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records in scope, so client-IP cardinality is UNKNOWN (not 0 IPs). Clear $host / $principal and widen the range first.",
+              "unit": "short",
+              "color": {
+                "mode": "fixed",
+                "fixedColor": "text"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "none",
+            "graphMode": "area",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | stats count_uniq(${f_sourceip}) as ips"
+            }
+          ]
+        },
+        {
+          "type": "geomap",
+          "title": "Requests by country (orient here)",
+          "description": "Edge request volume by source country — the 10-second orientation view. Marker size + colour scale with request count; geography is the bundled `countries` gazetteer (zero egress). Rename to `country` is what the gazetteer lookup keys on. This is the console: a bright new country against a quiet floor is a prompt to LOOK, never a page.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 16,
+            "w": 24,
+            "x": 0,
+            "y": 15
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records in scope to place on the map — an empty map means “nothing matched”, never “no traffic reached the edge”. Clear $host / $principal and widen the range; if “Requests in scope” above is also empty the edge log shipper has stopped.",
+              "unit": "short",
+              "color": {
+                "mode": "continuous-BlPu"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "view": {
+              "id": "zero",
+              "lat": 20,
+              "lon": 0,
+              "zoom": 1.4
+            },
+            "controls": {
+              "showZoom": true,
+              "mouseWheelZoom": true,
+              "showAttribution": false,
+              "showScale": false,
+              "showMeasure": false,
+              "showDebug": false
+            },
+            "basemap": {
+              "type": "default",
+              "name": "Basemap"
+            },
+            "layers": [
+              {
+                "type": "geojson",
+                "name": "Country outlines",
+                "config": {
+                  "src": "public/maps/countries.geojson",
+                  "style": {
+                    "color": {
+                      "fixed": "text"
+                    },
+                    "opacity": 0.12,
+                    "size": {
+                      "fixed": 1
+                    }
+                  }
+                },
+                "tooltip": false
+              },
+              {
+                "type": "markers",
+                "name": "By country",
+                "location": {
+                  "mode": "lookup",
+                  "lookup": "country",
+                  "gazetteer": "public/gazetteer/countries.json"
+                },
+                "config": {
+                  "style": {
+                    "size": {
+                      "field": "requests",
+                      "fixed": 6,
+                      "max": 30,
+                      "min": 5
+                    },
+                    "color": {
+                      "field": "requests",
+                      "fixed": "dark-blue"
+                    },
+                    "opacity": 0.75,
+                    "symbol": {
+                      "mode": "fixed",
+                      "fixed": "img/icons/marker/circle.svg"
+                    },
+                    "textConfig": {
+                      "fontSize": 12,
+                      "textAlign": "center",
+                      "textBaseline": "middle"
+                    }
+                  },
+                  "showLegend": true
+                },
+                "tooltip": true
+              }
+            ],
+            "tooltip": {
+              "mode": "details"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | rename ${f_country} as country | stats by (country) count() as requests | sort by (requests desc) | limit 300"
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "title": "Top countries by request volume",
+          "description": "The map as a sortable table (the accessibility / colour-blind view of the same data). Scoped by $host / $principal.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 10,
+            "w": 24,
+            "x": 0,
+            "y": 31
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records matched $host / $principal in this range. This table and the map above share one query, so they go empty together — check “Requests in scope” to tell “scope too narrow” from “shipper dark”.",
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "requests"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  },
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-background",
+                      "mode": "gradient"
+                    }
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "continuous-YlOrRd"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "distinct_ips"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "distinct_asns"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "sortBy": [
+              {
+                "displayName": "requests",
+                "desc": true
+              }
+            ]
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | rename ${f_country} as country | stats by (country) count() as requests, count_uniq(${f_sourceip}) as distinct_ips, count_uniq(${f_asn}) as distinct_asns, max(_time) as last_seen | sort by (requests desc) | limit 300"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "convertFieldType",
+              "options": {
+                "conversions": [
+                  {
+                    "targetField": "last_seen",
+                    "destinationType": "time"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "ASN concentration (who owns the address space)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 10
+      },
+      "panels": [
+        {
+          "type": "table",
+          "title": "Top ASNs by request volume",
+          "description": "Edge request volume grouped by source ASN — an APT campaign often concentrates in one or a few autonomous systems (design C2.1 campaign-shift tier). Sort by requests; a new ASN climbing the list is worth a look, not a page. Scoped by $host / $principal.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 11,
+            "w": 14,
+            "x": 0,
+            "y": 11
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records matched $host / $principal in this range, so ASN concentration is UNKNOWN. Clear the filters and widen the range before reading this as “no campaign”.",
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "requests"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  },
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-background",
+                      "mode": "gradient"
+                    }
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "continuous-YlOrRd"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "distinct_ips"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "countries"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "sortBy": [
+              {
+                "displayName": "requests",
+                "desc": true
+              }
+            ]
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | rename ${f_asn} as asn | stats by (asn) count() as requests, count_uniq(${f_sourceip}) as distinct_ips, count_uniq(${f_country}) as countries, max(_time) as last_seen | sort by (requests desc) | limit 200"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "convertFieldType",
+              "options": {
+                "conversions": [
+                  {
+                    "targetField": "last_seen",
+                    "destinationType": "time"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Request rate by top ASN over time",
+          "description": "Per-ASN edge request rate — a step-change in an ASN's share is the campaign-shift signal (charted, never paged in Phase-1).",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 11,
+            "w": 10,
+            "x": 14,
+            "y": 11
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records in scope over time — there is no ambient floor to draw, which means nothing matched the scope, not that the floor is zero. Clear $host / $principal and widen the range.",
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "showLegend": true,
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "sum",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "statsRange",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | rename ${f_asn} as asn | stats by (asn) count() as requests"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Auth-failure geography (where are the failures coming from)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 11
+      },
+      "panels": [
+        {
+          "type": "geomap",
+          "title": "Auth failures by country",
+          "description": "Failed edge responses (4xx/5xx) by source country — probes, scans and credential-stuffing land here (the ambient floor, design C2.1). Sized/coloured by failure count. Never sample non-2xx: failures ARE the signal. Geography via the bundled `countries` gazetteer.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 16,
+            "w": 24,
+            "x": 0,
+            "y": 12
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no failed (4xx/5xx) edge responses matched $host / $principal in this range. A genuinely quiet window is possible here — but confirm “Requests in scope” is non-empty first, otherwise the whole stream is missing rather than the failures.",
+              "unit": "short",
+              "color": {
+                "mode": "continuous-YlOrRd"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "view": {
+              "id": "zero",
+              "lat": 20,
+              "lon": 0,
+              "zoom": 1.4
+            },
+            "controls": {
+              "showZoom": true,
+              "mouseWheelZoom": true,
+              "showAttribution": false,
+              "showScale": false,
+              "showMeasure": false,
+              "showDebug": false
+            },
+            "basemap": {
+              "type": "default",
+              "name": "Basemap"
+            },
+            "layers": [
+              {
+                "type": "geojson",
+                "name": "Country outlines",
+                "config": {
+                  "src": "public/maps/countries.geojson",
+                  "style": {
+                    "color": {
+                      "fixed": "text"
+                    },
+                    "opacity": 0.12,
+                    "size": {
+                      "fixed": 1
+                    }
+                  }
+                },
+                "tooltip": false
+              },
+              {
+                "type": "markers",
+                "name": "By country",
+                "location": {
+                  "mode": "lookup",
+                  "lookup": "country",
+                  "gazetteer": "public/gazetteer/countries.json"
+                },
+                "config": {
+                  "style": {
+                    "size": {
+                      "field": "failures",
+                      "fixed": 6,
+                      "max": 30,
+                      "min": 5
+                    },
+                    "color": {
+                      "field": "failures",
+                      "fixed": "dark-blue"
+                    },
+                    "opacity": 0.75,
+                    "symbol": {
+                      "mode": "fixed",
+                      "fixed": "img/icons/marker/circle.svg"
+                    },
+                    "textConfig": {
+                      "fontSize": 12,
+                      "textAlign": "center",
+                      "textBaseline": "middle"
+                    }
+                  },
+                  "showLegend": true
+                },
+                "tooltip": true
+              }
+            ],
+            "tooltip": {
+              "mode": "details"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} -${f_status}:range(100, 399) | rename ${f_country} as country | stats by (country) count() as failures | sort by (failures desc) | limit 300"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Successful vs failed responses over time",
+          "description": "Edge response outcome over time (success = 1xx–3xx, failure = 4xx/5xx). The failure floor is weather; a coordinated spike against one host is campaign-shift. Charted only.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 9,
+            "w": 24,
+            "x": 0,
+            "y": 28
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records in scope — neither the success nor the failure series has anything to draw. Empty is “nothing matched”, not “100% success”. Clear $host / $principal and widen the range.",
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "failures"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#d03b3b"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "successes"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#0ca30c"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "showLegend": true,
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "sum",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "statsRange",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} ${f_status}:range(100, 399) | stats count() as successes"
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "statsRange",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} -${f_status}:range(100, 399) | stats count() as failures"
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "title": "Auth failures by country + ASN",
+          "description": "Where failures concentrate, by (country, ASN) — the accessibility view of the failure map. Scoped by $host / $principal.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 10,
+            "w": 24,
+            "x": 0,
+            "y": 37
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no failed (4xx/5xx) edge responses matched $host / $principal in this range. Cross-check “Requests in scope”: non-empty there plus empty here really is a clean window; empty in both means the stream is missing.",
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "failures"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  },
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-background",
+                      "mode": "gradient"
+                    }
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "continuous-YlOrRd"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "distinct_ips"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "sortBy": [
+              {
+                "displayName": "failures",
+                "desc": true
+              }
+            ]
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} -${f_status}:range(100, 399) | rename ${f_country} as country, ${f_asn} as asn | stats by (country, asn) count() as failures, count_uniq(${f_sourceip}) as distinct_ips, max(_time) as last_seen | sort by (failures desc) | limit 200"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "convertFieldType",
+              "options": {
+                "conversions": [
+                  {
+                    "targetField": "last_seen",
+                    "destinationType": "time"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Campaign timeline (is the floor changing character?)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Request & failure rate over time (the floor)",
+          "description": "Total edge request rate vs failure rate over time — the ambient floor and its shape. A *change in character* (a new plateau, a coordinated burst) is the campaign-shift tier (design C2.1). Weather, not a pager.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 9,
+            "w": 24,
+            "x": 0,
+            "y": 13
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records in scope — the ambient floor cannot be drawn. The floor is never truly zero on a public edge, so an empty panel here is a shipping/scope problem, not quiet weather.",
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "showLegend": true,
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "sum",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "statsRange",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | stats count() as requests"
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "statsRange",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} -${f_status}:range(100, 399) | stats count() as failures"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "New-country arrival rate over time",
+          "description": "Distinct source countries per bucket — a jump in geographic spread is a campaign-shift cue. Charted only.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 0,
+            "y": 22
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records in scope, so per-bucket country spread is UNKNOWN (not “no new countries”). Clear $host / $principal and widen the range.",
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "showLegend": true,
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "sum",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "statsRange",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | stats count_uniq(${f_country}) as countries"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "New-ASN arrival rate over time",
+          "description": "Distinct source ASNs per bucket — a jump in ASN spread often precedes a distributed campaign. Charted only.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 22
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records in scope, so per-bucket ASN spread is UNKNOWN (not “no new ASNs”). Clear $host / $principal and widen the range.",
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "showLegend": true,
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "sum",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "statsRange",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | stats count_uniq(${f_asn}) as asns"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Novel geo for a known principal (post-compromise orientation)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "panels": [
+        {
+          "type": "table",
+          "title": "Successful authenticated requests by principal × country × ASN",
+          "description": "The crown-jewel orientation table (design C3 L2 post-compromise tier): a SUCCESSFUL authenticated request from a country/ASN that is novel FOR THAT PRINCIPAL is the strongest single edge signal of credential compromise. This board only ORIENTS — it lists every (principal, country, ASN) a working credential was seen from so a human can spot the novel one; the actual novel-vs-baseline detection + page is the L2 rule + L3 analyst loop, not this panel. Filter $principal to one identity, sort by last_seen. Scoped by $host / $principal.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 12,
+            "w": 24,
+            "x": 0,
+            "y": 14
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no SUCCESSFUL authenticated edge requests matched $host / $principal in this range. Empty is the good state for the post-compromise view only if “Requests in scope” is non-empty — otherwise the records are simply absent and this panel is blind.",
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "successes"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  },
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-background",
+                      "mode": "gradient"
+                    }
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "continuous-YlOrRd"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "distinct_ips"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "sortBy": [
+              {
+                "displayName": "last_seen",
+                "desc": true
+              }
+            ]
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} ${f_status}:range(100, 399) ${f_principal}:* | rename ${f_principal} as principal, ${f_country} as country, ${f_asn} as asn | stats by (principal, country, asn) count() as successes, count_uniq(${f_sourceip}) as distinct_ips, min(_time) as first_seen, max(_time) as last_seen | sort by (last_seen desc) | limit 300"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "convertFieldType",
+              "options": {
+                "conversions": [
+                  {
+                    "targetField": "first_seen",
+                    "destinationType": "time"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "convertFieldType",
+              "options": {
+                "conversions": [
+                  {
+                    "targetField": "last_seen",
+                    "destinationType": "time"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "title": "Raw edge access records (scoped)",
+          "description": "The most recent edge access-log records in scope — the drill-down after the map orients you. Scoped by $host / $principal.",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 11,
+            "w": 24,
+            "x": 0,
+            "y": 26
+          },
+          "fieldConfig": {
+            "defaults": {
+              "noValue": "no edge access records matched $host / $principal in this range — the drill-down has nothing to show. Clear the filters and widen the range; a permanently empty raw view means the edge log stream stopped shipping.",
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "hits"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "sortBy": [
+              {
+                "displayName": "last_seen",
+                "desc": true
+              }
+            ]
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "queryType": "instant",
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | rename ${f_principal} as principal, ${f_sourceip} as source_ip, ${f_country} as country, ${f_asn} as asn, ${f_host} as host, ${f_status} as status | stats by (host, principal, source_ip, country, asn, status) count() as hits, max(_time) as last_seen | sort by (last_seen desc) | limit 300"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "convertFieldType",
+              "options": {
+                "conversions": [
+                  {
+                    "targetField": "last_seen",
+                    "destinationType": "time"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Fan-out shape — is this one client or a spread?",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Requests per client IP — p50 / p95 / p99 (fan-out shape)",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 15
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "noValue": "no edge access records in scope — either nothing reached the edge under this scope, or the access-log transport is not publishing here"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | rename ${f_sourceip} as source_ip | stats by (source_ip) count() as requests | stats quantile(0.5, requests) as p50",
+              "refId": "A",
+              "queryType": "statsRange",
+              "legendFormat": "p50 per IP"
+            },
+            {
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | rename ${f_sourceip} as source_ip | stats by (source_ip) count() as requests | stats quantile(0.95, requests) as p95",
+              "refId": "B",
+              "queryType": "statsRange",
+              "legendFormat": "p95 per IP"
+            },
+            {
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | rename ${f_sourceip} as source_ip | stats by (source_ip) count() as requests | stats quantile(0.99, requests) as p99",
+              "refId": "C",
+              "queryType": "statsRange",
+              "legendFormat": "p99 per IP"
+            }
+          ],
+          "description": "Distribution of request volume across distinct client IPs in scope. A p99 far above p50 is a single loud client (scan or retry storm); p50 rising with p99 is broad traffic growth. This is the shape check that the count panels above cannot show."
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Failure ratio — the shape-independent alarm",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
+      "panels": [
+        {
+          "type": "bargauge",
+          "title": "Auth-failure ratio in scope (now)",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 6,
+            "w": 8,
+            "x": 0,
+            "y": 16
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.25
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.5
+                  }
+                ]
+              },
+              "noValue": "no edge access records in scope — either nothing reached the edge under this scope, or the access-log transport is not publishing here"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            },
+            "displayMode": "gradient",
+            "orientation": "horizontal",
+            "showUnfilled": true
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | stats count() as requests, count() if (-${f_status}:range(100, 399)) as fail | math fail / requests as fail_ratio | fields fail_ratio",
+              "refId": "A",
+              "queryType": "instant",
+              "legendFormat": "fail ratio"
+            }
+          ],
+          "description": "Fraction of in-scope edge responses that are NOT 1xx-3xx. The floor is background internet scanning, measured at 6% over the default window and 11% over 24h on 2026-09-02 — so the thresholds sit at multiples of that floor (amber 25%, red 50%), not at zero. A jump into amber with request volume flat is a credential-stuffing or broken-client pattern; a jump with volume is a scan campaign, and the geo panels above say from where."
+        },
+        {
+          "type": "timeseries",
+          "title": "Auth-failure ratio over time",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "gridPos": {
+            "h": 6,
+            "w": 16,
+            "x": 8,
+            "y": 16
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "noValue": "no edge access records in scope — either nothing reached the edge under this scope, or the access-log transport is not publishing here",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.25
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.5
+                  }
+                ]
+              },
+              "custom": {
+                "thresholdsStyle": {
+                  "mode": "dashed"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "victoriametrics-logs-datasource",
+                "uid": "${DS_VICTORIALOGS}"
+              },
+              "expr": "${f_host}:${host} ${f_principal}:${principal} | stats count() as requests, count() if (-${f_status}:range(100, 399)) as fail | math fail / requests as fail_ratio | fields fail_ratio",
+              "refId": "A",
+              "queryType": "statsRange",
+              "legendFormat": "fail ratio"
+            }
+          ],
+          "description": "Fraction of in-scope edge responses that are NOT 1xx-3xx. The floor is background internet scanning, measured at 6% over the default window and 11% over 24h on 2026-09-02 — so the thresholds sit at multiples of that floor (amber 25%, red 50%), not at zero. A jump into amber with request volume flat is a credential-stuffing or broken-client pattern; a jump with volume is a scan campaign, and the geo panels above say from where. Ratio, unlike the count panels above, is immune to a traffic surge — it moves only when the *character* of the traffic changes."
+        }
+      ]
+    }
+  ]
+}

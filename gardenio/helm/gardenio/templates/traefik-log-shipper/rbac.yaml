@@ -1,0 +1,60 @@
+{{- if .Values.traefikLogShipper.enabled }}
+{{- /*
+traefik-log-shipper RBAC (edge-IDP L0 transport, task ka-0000001563, epic
+ka-0000008216).
+
+The shipper's ServiceAccount lives in THIS release's namespace
+(.Release.Namespace = gardenio-system) — that is where regcred and the
+VictoriaLogs Service already are, so no second-namespace image-pull plumbing is
+needed. But the Traefik pod it streams runs in a SEPARATE namespace
+(.Values.traefikLogShipper.pod.namespace, default "traefik", a
+terraform-managed cluster addon). Reading a pod's log is a namespaced permission
+in the pod's OWN namespace, so the Role + RoleBinding below are created THERE and
+bind back to the gardenio-system ServiceAccount as a cross-namespace subject.
+
+Least-privilege: list/get pods (to resolve the single Traefik pod by selector)
+and get pods/log (to open the follow stream) in the Traefik namespace ONLY.
+Nothing else — no write verbs, no other namespaces, no cluster scope.
+*/}}
+{{- $ns := .Values.traefikLogShipper.pod.namespace | default "traefik" -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "gardenio.traefikLogShipper.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.traefikLogShipper.labels" . | nindent 4 }}
+---
+# Role in the TRAEFIK namespace: read-only access to the Traefik pod + its logs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "gardenio.traefikLogShipper.fullname" . }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.traefikLogShipper.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+# RoleBinding in the TRAEFIK namespace back to the gardenio-system SA.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "gardenio.traefikLogShipper.fullname" . }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.traefikLogShipper.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "gardenio.traefikLogShipper.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.traefikLogShipper.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

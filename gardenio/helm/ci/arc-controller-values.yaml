@@ -1,0 +1,39 @@
+# actions-runner-controller, gha-runner-scale-set mode (controller half).
+# Chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+# Namespace: arc-systems. One controller serves every scale set in the cluster.
+replicaCount: 1
+
+resources:
+  requests: { cpu: 50m, memory: 128Mi }
+  limits: { memory: 384Mi }
+
+# Servers are the only untainted nodes; state it anyway so a future
+# general-purpose agent pool cannot pull the controller onto spot agents.
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  - key: gardenio.agent
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+# Home off the servers (gd-ybTutceJpn). On 2026-10-14 a server drain piled this
+# onto the surviving 2 GiB servers and each ran out of memory in turn. PREFER
+# the platform pool; the control-plane toleration above stays as the fallback so
+# a drain with no platform capacity cannot strand it Pending.
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: gardenio.io/role
+              operator: In
+              values: ["platform"]
+
+flags:
+  logLevel: info
+  logFormat: text
+  # Only watch the runner namespace; keeps the controller's RBAC narrow.
+  watchSingleNamespace: arc-runners

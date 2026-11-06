@@ -1,0 +1,128 @@
+# gardener-trigger-bead-event-in-subtree.toml
+#
+# Live-flow scenario for ka-0000002765 §3: bead_event Match
+# in_subtree_of=<epic> → gardener fires for grandchild closure.
+#
+# Engine code covered:
+#   - gardenio/controller/internal/scheduler/triggers.go:541-612
+#     (evaluateEventEntry runs Match expression against event payload)
+#   - gardenio/controller/internal/scheduler/conditions/* — in_subtree_of
+#     operator resolves to a walk-up-to-ancestor lookup via Env.Ancestor.
+#   - gardenio/controller/internal/scheduler/scheduler.go:213-440 (fire path)
+#
+# Without live-flow coverage, a regression in the in_subtree_of operator
+# (e.g. depth limit, missing ancestor link, broken cache invalidation)
+# would still make gardener-conditions-fan-in.toml pass while real
+# gardeners stop firing on transitively-nested children.
+
+[claude]
+session_id = "e2e00000-000c-4000-a000-000000000003"
+username = "e2e-gardener-in-subtree"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 180000
+
+[[responses]]
+on = "*"
+say = "Running gardener-trigger-bead-event-in-subtree: close grandchild → gardener fires."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if [ -z "${BEADS_HTTP_URL:-}" ] || [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL/BEADS_TOKEN unset"; exit 0
+fi
+
+TAG="e2e-cist-$$-$(date +%s)"
+
+# Three-level tree: epic → child (task) → grandchild (task)
+EPIC_ID=$(kd create "gardener-subtree-epic-$TAG" --type=epic -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+CHILD_ID=$(kd create "subtree-child-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$CHILD_ID" ]; then fail "create child"; exit 1; fi
+kd dep add "$CHILD_ID" "$EPIC_ID" --type parent-child >/dev/null 2>&1 || true
+GRAND_ID=$(kd create "subtree-grand-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$GRAND_ID" ]; then fail "create grandchild"; exit 1; fi
+kd dep add "$GRAND_ID" "$CHILD_ID" --type parent-child >/dev/null 2>&1 || true
+echo "tree: epic=$EPIC_ID child=$CHILD_ID grand=$GRAND_ID"
+
+TRIGGERS=$(cat <<JSON
+[
+  {"kind":"cron","cron":"0 0 1 1 *","timezone":"UTC"},
+  {"kind":"bead_event","events":["closed"],
+   "match":{"all":[{"field":"id","op":"in_subtree_of","value":"$EPIC_ID"}]}}
+]
+JSON
+)
+STOP='{"loop_end":{"any":[{"kind":"max_runs"}]},"run_end":{"any":[{"kind":"no_actionable_state"}]},"hard_stop":{"any":[{"kind":"manual_force","field":"force_close","value":"true"}]}}'
+
+SCHED_ID=$(kd create "gardener-sched-$TAG" --type=schedule \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "role:gardener" -l "project:gardenio" \
+  -f "enabled=true" -f "role=gardener" -f "assign_bead=$EPIC_ID" -f "project=gardenio" \
+  -f "prompt=gardener test prompt" -f "max_runs=1" \
+  -f "cron=0 0 1 1 *" -f "timezone=UTC" \
+  -f "triggers=$TRIGGERS" -f "stop=$STOP" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$SCHED_ID" ]; then fail "create schedule"; exit 1; fi
+echo "schedule: $SCHED_ID"
+
+cleanup() {
+  kd update "$SCHED_ID" -f "enabled=false" -f "force_close=true" >/dev/null 2>&1 || true
+  AGENT=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.last_agent_id // empty')
+  [ -n "$AGENT" ] && kd close "$AGENT" >/dev/null 2>&1 || true
+  for id in "$SCHED_ID" "$GRAND_ID" "$CHILD_ID" "$EPIC_ID"; do
+    kd close "$id" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+sleep 5
+
+# Mutate: close the GRANDCHILD (two levels deep) — only in_subtree_of
+# can resolve this; field "parent" would not match because grand's parent
+# is child, not epic.
+kd close "$GRAND_ID" >/dev/null 2>&1 || { fail "kd close grandchild"; exit 1; }
+echo "closed grandchild $GRAND_ID at $(date -u +%FT%TZ)"
+
+DEADLINE=$(( $(date +%s) + 150 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  RAW=$(kd show "$SCHED_ID" --json 2>/dev/null)
+  RS=$(echo "$RAW" | jq -r '.fields.runs_spawned // "0"')
+  LA=$(echo "$RAW" | jq -r '.fields.last_agent_id // empty')
+  if [ "${RS:-0}" -ge 1 ] 2>/dev/null || [ -n "$LA" ]; then
+    FIRED=1
+    pass "gardener fired on grandchild closure (runs_spawned=$RS)"
+    break
+  fi
+  sleep 5
+done
+
+if [ "$FIRED" = "0" ]; then
+  fail "gardener did not fire within 150s on grandchild closure"
+  kd show "$SCHED_ID" 2>/dev/null | head -40 || true
+  exit 1
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "gardener-trigger-bead-event-in-subtree OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-trigger-bead-event-in-subtree scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

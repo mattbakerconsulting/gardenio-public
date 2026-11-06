@@ -1,0 +1,86 @@
+{{define "inbox_row"}}
+{{- /* One Gmail-density row in the unified inbox activity stream.
+       Anatomy: [glyph] [title] [chips: type · source · status] [actor] [meta · ago] [badges].
+       Kind discriminator drives glyph + variant chrome; kind-specific blocks
+       (decision options, agent task, epic status) render only when relevant. */ -}}
+<li class="inbox-stream-row inbox-stream-row-kind-{{.Kind}}{{if .Pinned}} is-pinned{{end}}{{if .Forwarded}} is-forwarded{{end}}{{if .AgentClosed}} is-closed{{end}}"
+    data-kind="{{.Kind}}"
+    data-bead-id="{{.ID}}"
+    {{if .UpdatedAtRFC}}data-last-activity-ts="{{.UpdatedAtRFC}}"{{end}}>
+  <span class="inbox-stream-glyph" aria-hidden="true">{{template "inbox_row_glyph" .}}</span>
+  <div class="inbox-stream-body">
+    <div class="inbox-stream-line">
+      <a class="inbox-stream-title" href="{{.Href}}">{{displayTitle .ShortTitle .Title}}</a>
+      {{- /* ka-0000002992: title= attributes surface the full chip/meta content via the
+             browser's native tooltip. CSS clips groups with overflow:hidden + a right-edge
+             fade to signal "more content clipped"; this title= is the +N reveal. */ -}}
+      <span class="inbox-stream-chips" title="{{.ID}}{{if .Type}} · {{.Type}}{{end}}{{if .Source}} · {{.Source}}{{end}}{{if and (eq .Kind "epic") .EpicStatus}} · {{.EpicStatus}}{{end}}{{if and (eq .Kind "agent") .AgentState}} · {{.AgentState}}{{end}}{{if and (eq .Kind "agent") .PodPhase}} · pod: {{.PodPhase}}{{end}}{{if .AgentClosed}} · closed{{end}}{{if .MRState}} · mr: {{.MRState}}{{end}}">
+        <span class="bead-row-id">{{.ID}}</span>
+        {{if .Type}}<span class="chip-type chip-type-{{.Type}}">{{.Type}}</span>{{end}}
+        {{if .Source}}<span class="chip-type">{{.Source}}</span>{{end}}
+        {{if and (eq .Kind "epic") .EpicStatus}}<span class="chip-status chip-status-{{.EpicStatus}}">{{.EpicStatus}}</span>{{end}}
+        {{- /* ka-0000007315: MR-state chip surfaces the linked merge-request's
+               state on MR-shaped beads (own fields) and on task beads whose
+               `produces` edge resolves to an MR. mrChipsEmpty MRState
+               suppresses the chip so non-MR rows stay clean. */ -}}
+        {{if .MRState}}<span class="chip-mr chip-mr-{{.MRState}}" title="merge request: {{.MRState}}{{if .MRURL}} ({{.MRURL}}){{end}}">mr: {{.MRState}}</span>{{end}}
+        {{if and (eq .Kind "agent") .AgentState}}<span class="inbox-agent-pill agent-state-{{.AgentState}}">{{.AgentState}}</span>{{end}}
+        {{if and (eq .Kind "agent") .PodPhase}}<span class="inbox-agent-pill">pod: {{.PodPhase}}</span>{{end}}
+        {{if .AgentClosed}}<span class="inbox-agent-pill">closed</span>{{end}}
+        {{- /* ka-0000004013: explicit overflow affordance. Always rendered as
+               last child; CSS pins it absolutely at the right edge with a
+               fade backdrop so it only reads as "more" when content actually
+               clips. The full chip-cluster content is surfaced via the title=
+               attribute on the parent (ka-0000002992). */ -}}
+        <span class="inbox-stream-more" aria-hidden="true">⋯</span>
+      </span>
+      <span class="inbox-stream-meta" title="{{if .Actor}}{{.Actor}}{{end}}{{if .Project}} · {{.Project}}{{end}}{{if .Ago}} · {{.Ago}}{{if .UpdatedAtRFC}} ({{.UpdatedAtRFC}}){{end}}{{end}}">
+        {{- /* ka-0000005380: owner avatar/initial collapse. The full actor
+               renders by default; the initials span is hidden by CSS until
+               the row narrows past the meta breakpoint, at which point the
+               full name hides and the initials surface. title= on the parent
+               preserves the full string for hover + screen readers. */ -}}
+        {{if .Actor}}<span class="bead-row-assignee" title="{{.Actor}}" aria-label="owner {{.Actor}}"><span class="actor-full">{{.Actor}}</span><span class="actor-initials" aria-hidden="true">{{actorInitials .Actor}}</span></span>{{end}}
+        {{if .Project}}<span class="chip-type inbox-stream-project" title="project: {{.Project}}">{{.Project}}</span>{{end}}
+        {{if .Ago}}<span class="inbox-stream-ago" title="{{.UpdatedAtRFC}}" aria-label="updated {{.Ago}} ago">{{.Ago}}</span>{{end}}
+        <span class="inbox-stream-more" aria-hidden="true">⋯</span>
+      </span>
+      <span class="inbox-stream-badges" aria-label="badges">
+        {{if .BlockedOn}}<span title="blocked on decision" aria-label="blocked on decision">⏸</span>{{end}}
+        {{if .HasReport}}<span title="has report" aria-label="has report">📄</span>{{end}}
+        {{if .Flagged}}<span class="inbox-row-flag" title="flag:operator-blocking" aria-label="operator-blocking flag">⚑</span>{{end}}
+        {{if .InboxWorthy}}<span title="flag:inbox-worthy" aria-label="inbox-worthy">★</span>{{end}}
+        {{if .Pinned}}<span title="flag:inbox-pinned" aria-label="pinned">📌</span>{{end}}
+        {{- /* ka-0000005380: drop "forwarded" word — the ↪ glyph + is-forwarded
+               row tint already encode the signal; title= keeps the full label
+               for hover. */ -}}
+        {{if .Forwarded}}<span title="forwarded to you" aria-label="forwarded to you">↪</span>{{end}}
+      </span>
+    </div>
+    {{if eq .Kind "agent"}}
+      {{if .AgentTaskID}}
+      <div class="inbox-stream-sub">on <a href="{{$.Href}}"><code>{{.AgentTaskID}}</code></a>{{if .AgentTaskTitle}} · {{.AgentTaskTitle}}{{end}}{{if .AgentRole}} · <span class="inbox-agent-pill">{{.AgentRole}}</span>{{end}}{{if .SpawnedBy}} · by <code>{{.SpawnedBy}}</code>{{end}}</div>
+      {{end}}
+    {{else if eq .Kind "decision"}}
+      {{if .DecisionPrompt}}<div class="inbox-stream-sub inbox-stream-prompt">{{.DecisionPrompt}}</div>{{end}}
+      {{if .DecisionOptions}}
+      <div class="inbox-stream-options">
+        {{range .DecisionOptions}}<code class="inbox-decision-option-id">{{.ID}}</code>{{if .Short}} <span class="inbox-decision-option-short">{{.Short}}</span>{{end}} · {{end}}
+      </div>
+      {{end}}
+    {{else if .DescPreview}}
+      <div class="inbox-stream-sub">{{.DescPreview}}</div>
+    {{end}}
+  </div>
+</li>
+{{end}}
+
+{{define "inbox_row_glyph"}}
+{{- if eq .Kind "intake" -}}✉
+{{- else if eq .Kind "decision" -}}◆
+{{- else if eq .Kind "agent" -}}🤖
+{{- else if eq .Kind "epic" -}}⊞
+{{- else if eq .Kind "forwarded" -}}↪
+{{- else -}}•
+{{- end -}}
+{{end}}

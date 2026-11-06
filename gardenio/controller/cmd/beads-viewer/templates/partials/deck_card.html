@@ -1,0 +1,103 @@
+{{/* deck_card — the LEAN swipe-through card face (plan ka-0000000492 step 3,
+     task ka-0000004313). Served ONLY as a bare fragment by GET /plans/{id}/card
+     into the deck (Step 4's /deck page). It is the intentionally-slim parallel
+     to plan_peek: the peek renders the full timeline + crew + chat + pour picker
+     (a rich click-to-inspect drawer, ~146 KB); this card carries ONLY the face —
+     title, project, age, and the ONE question the plan is waiting on — so a deck
+     can flip through and PREFETCH cards at <10 KB / <150 ms each
+     (TestDeckCard_SizeAndRoundTripBudget gates both).
+
+     Deliberately NO {{template ...}} includes: pulling in plan_steps / plan_crew
+     / bead_chat is exactly the weight the deck cannot afford. The decision's
+     context block is Go-rendered markup (decisionContextView.Block), not a
+     partial, so it costs no include. The option buttons
+     POST to the SAME /plans/{id}/decisions/{d}/resolve route the peek + cockpit
+     use, so answering-in-place needs no new handler.
+
+     Data bag: PlanID, Title, Project, Status, PlanState, Ago, AgoRFC,
+     Decision (*deckCardDecision or nil), IsOperator, Error (string), BasePath.
+
+     ANSWER-IN-PLACE (Step 4, task ka-0000000701). The one-tap resolve forms
+     carry from_card=1 so the plan-scoped resolve handler re-renders THIS lean
+     fragment back into the slot (renderDeckCard) rather than the cockpit
+     #plan-decisions panel — the whole surface would break if a deck answer
+     swapped a cockpit panel into .deck-card (decision ka-0000001748). They also
+     carry data-deck-no-swipe so a tap on an answer is never read as a drag, and
+     target `closest .deck-card` with outerHTML so the answered card is replaced
+     by its now-resolved next question (or a header-only "all clear" face). */}}
+{{define "deck_card"}}
+<article class="deck-card{{if .Error}} deck-card-has-error{{end}}" data-plan-id="{{.PlanID}}">
+  {{with .Badge}}<img class="deck-card-cover" src="{{$.BasePath}}{{.Src}}" alt="" width="112" height="112" loading="lazy" decoding="async">{{end}}
+  <header class="deck-card-head">
+    <h2 class="deck-card-title">{{- with .Heraldry}}<span class="heraldry-slot">{{heraldry . 40}}</span>{{end -}}
+      <a href="{{.BasePath}}/plans/{{.PlanID}}" title="Open the full plan cockpit">{{displayTitle .ShortTitle .Title}}</a></h2>
+    <p class="deck-card-meta">
+      {{if .Status}}<span class="chip chip-status chip-status-{{.Status}}">{{.Status}}</span>{{end}}
+      {{if .PlanState}}<span class="chip deck-card-state deck-card-state-{{.PlanState}}">{{.PlanState}}</span>{{end}}
+      {{if .Project}}<a class="chip chip-type" href="{{.BasePath}}/plans?project={{.Project}}">{{.Project}}</a>{{end}}
+      {{if .Ago}}<span class="meta deck-card-age" title="{{.AgoRFC}}">{{.Ago}}</span>{{end}}
+    </p>
+  </header>
+
+  {{/* Inline failure banner. deck-card-error is the marker the deck's JS
+       advance-guard looks for: a card that swapped in carrying an error (a
+       failed answer or "no gardener bound" build) must NOT be auto-dropped, or
+       the error flashes and the card vanishes before it can be read. */}}
+  {{if .Error}}<p class="deck-card-error" role="alert">{{.Error}}</p>{{end}}
+
+  {{/* The card FACE: the one clarifying-question this plan is waiting on. Its
+       options render as full-width tappable buttons (Step 4 styles them >=44px).
+       Operators get one-tap resolve forms (same route as the cockpit); read-only
+       viewers get static chips + a click-out to the decision bead. */}}
+  {{if .Decision}}
+  {{$dec := .Decision}}
+  <section class="deck-card-decision" data-decision-id="{{$dec.ID}}">
+    <p class="deck-card-question">{{$dec.Prompt}}</p>
+    {{$dec.Context.Block}}
+    {{$dec.Evidence}}
+    {{if $dec.Options}}
+    <ul class="deck-card-options" aria-label="Answer options">
+      {{range $dec.Options}}
+      <li class="deck-card-opt">
+        {{if $.IsOperator}}
+        <form class="deck-card-opt-form" method="post"
+              action="{{$.BasePath}}/plans/{{$.PlanID}}/decisions/{{$dec.ID}}/resolve"
+              hx-post="{{$.BasePath}}/plans/{{$.PlanID}}/decisions/{{$dec.ID}}/resolve"
+              hx-target="closest .deck-card" hx-swap="outerHTML"
+              hx-disabled-elt="find button" data-deck-no-swipe>
+          <input type="hidden" name="from_card" value="1">
+          <input type="hidden" name="option_id" value="{{.ID}}">
+          <button type="submit" class="bead-action deck-card-opt-btn" title="Answer with option {{.ID}}">
+            {{if .Short}}{{.Short}}{{else if .Label}}{{.Label}}{{else}}{{.ID}}{{end}}
+            {{if .Description}}<span class="opt-desc">{{.Description}}</span>{{end}}
+          </button>
+        </form>
+        {{else}}
+        <span class="deck-card-opt-static">{{if .Short}}{{.Short}}{{else if .Label}}{{.Label}}{{else}}{{.ID}}{{end}}{{if .Description}}<span class="opt-desc">{{.Description}}</span>{{end}}</span>
+        {{end}}
+      </li>
+      {{end}}
+    </ul>
+    {{end}}
+    <a class="meta deck-card-decision-open" href="{{.BasePath}}/{{$dec.ID}}" title="Open the decision bead">{{$dec.ID}} &rarr;</a>
+  </section>
+  {{else if not .Error}}
+  {{/* No open question and no error: the plan's last question was just answered
+       (or it never had one). Say so, so the swapped-in card reads as progress
+       rather than a blank face. The deck's JS still auto-advances past this
+       (it carries no deck-card-error), moving the operator to the next card. */}}
+  <p class="deck-card-allclear">✓ Answered — nothing else is waiting on this plan.</p>
+  {{end}}
+
+  {{/* data-deck-up marks this as the target for the "swipe UP to action" flick
+       (deck_swipe.js Step 5b, ka-0000005224): a scroll-safe upward flick on the
+       card .click()s this link to open the plan cockpit — the design mock's
+       `flick-up: open full cockpit`. It stays a plain <a href> so a tap, a
+       keyboard, or JS-off reach the same place; the gesture is pure enhancement
+       and, being a GET to a read surface, can never commit. data-deck-no-swipe
+       keeps a tap that STARTS on the link from being read as a drag. */}}
+  <footer class="deck-card-foot">
+    <a class="deck-card-full-link" data-deck-up data-deck-no-swipe href="{{.BasePath}}/plans/{{.PlanID}}">Open full cockpit &rarr;</a>
+  </footer>
+</article>
+{{end}}

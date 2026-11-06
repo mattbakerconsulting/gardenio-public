@@ -1,0 +1,138 @@
+{{- if and .Values.pushBridge .Values.pushBridge.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.fullname" . }}-push-bridge
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: push-bridge
+spec:
+  replicas: {{ .Values.pushBridge.replicaCount | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: push-bridge
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: push-bridge
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: push-bridge
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.pushBridge.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.pushBridge.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: {{ .Values.pushBridge.listenPort | default 8091 }}
+              protocol: TCP
+          env:
+            - name: BEADS_HTTP_ADDR
+              value: "http://{{ include "gardenio.beads.host" . }}:{{ include "gardenio.beads.httpPort" . }}"
+            {{- if .Values.beads.tokenSecret }}
+            - name: BEADS_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.tokenSecretName" . }}
+                  key: token
+            {{- end }}
+            # Where an alert's deep link points: the bead's place in the Commons
+            # (Commons on a phone M6). Unset sends no link.
+            {{- $beadsViewerURL := include "gardenio.link.beadsViewerURL" . -}}
+            {{- if ne $beadsViewerURL "" }}
+            - name: BEADS_VIEWER_URL
+              value: {{ $beadsViewerURL | quote }}
+            {{- end }}
+            - name: PUSH_BRIDGE_LISTEN
+              value: ":{{ .Values.pushBridge.listenPort | default 8091 }}"
+            {{- if .Values.pushBridge.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.pushBridge.logLevel | quote }}
+            {{- end }}
+            # APNs credentials. Key comes from a K8s secret when
+            # pushBridge.apns.keySecret is set (preferred); otherwise
+            # from pushBridge.apns.keyPEM inline.
+            {{- if .Values.pushBridge.apns.keySecret }}
+            - name: APNS_KEY_PATH
+              value: /secrets/apns/apns.p8
+            {{- else if .Values.pushBridge.apns.keyPEM }}
+            - name: APNS_KEY_PEM
+              value: {{ .Values.pushBridge.apns.keyPEM | quote }}
+            {{- end }}
+            - name: APNS_KEY_ID
+              value: {{ .Values.pushBridge.apns.keyID | quote }}
+            - name: APNS_TEAM_ID
+              value: {{ .Values.pushBridge.apns.teamID | quote }}
+            - name: APNS_BUNDLE_ID
+              value: {{ .Values.pushBridge.apns.bundleID | quote }}
+            - name: APNS_PRODUCTION
+              value: {{ .Values.pushBridge.apns.production | ternary "true" "false" | quote }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: "{{ .Values.global.coverage.mountPath }}/push-bridge"
+            {{- end }}
+          {{- if or .Values.pushBridge.apns.keySecret .Values.global.coverage.enabled }}
+          volumeMounts:
+            {{- if .Values.pushBridge.apns.keySecret }}
+            - name: apns-key
+              mountPath: /secrets/apns
+              readOnly: true
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.pushBridge.resources | nindent 12 }}
+      {{- if .Values.global.coverage.enabled }}
+      terminationGracePeriodSeconds: 45
+      {{- end }}
+      {{- if or .Values.pushBridge.apns.keySecret .Values.global.coverage.enabled }}
+      volumes:
+        {{- if .Values.pushBridge.apns.keySecret }}
+        - name: apns-key
+          secret:
+            secretName: {{ .Values.pushBridge.apns.keySecret }}
+            items:
+              - key: apns.p8
+                path: apns.p8
+        {{- end }}
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+      {{- end }}
+{{- end }}

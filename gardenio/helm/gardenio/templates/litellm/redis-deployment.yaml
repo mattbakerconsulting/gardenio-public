@@ -1,0 +1,113 @@
+{{- if and .Values.litellm.enabled .Values.litellm.redis.enabled .Values.litellm.redis.deploy.enabled }}
+{{- /*
+Optional in-chart Redis for LiteLLM multi-replica router coordination
+(H4, ka-0000003463, epic ka-0000005228).
+
+Single-node Redis Deployment backing the shared Router state (rate-limit
+counters, model cooldowns, router cache) that otherwise diverges across
+replicaCount>=2 (H2, ka-0000007221). NO persistence: this state is ephemeral
+coordination data, not truth (spend/virtual-key truth lives in Postgres), so a
+Redis restart just re-warms counters/cooldowns rather than losing anything
+durable — an emptyDir keeps the pod PSA-restricted with a read-only rootfs.
+
+PSA-restricted (non-root uid 999 = the upstream redis user, no privileged, drop
+ALL caps, RuntimeDefault seccomp, read-only rootfs) so it admits cleanly into
+the workload namespace. Reachable only in-cluster over ClusterIP, and (with
+networkPolicies.enabled) only from the litellm pod via the redis ingress +
+litellm->redis egress legs. Auth-less by design here — the NetworkPolicy is the
+isolation boundary; managed endpoints (deploy.enabled=false) supply auth via
+litellm.redis.passwordSecret instead.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.litellm.redis.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.litellm.redis.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Single-node Redis on an emptyDir: Recreate avoids two pods racing the same
+  # (ephemeral) state during a rollout. The router state self-heals on restart.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.litellm.redis.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.litellm.redis.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: redis
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.litellm.redis.deploy.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.litellm.redis.deploy.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            - redis-server
+            # No AOF/RDB persistence: coordination state is ephemeral (see the
+            # header). --save "" disables RDB snapshots; appendonly no keeps the
+            # rootfs read-only-friendly (nothing written to /data).
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --dir
+            - /tmp
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 20
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.litellm.redis.deploy.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.litellm.redis.deploy.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.litellm.redis.deploy.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.litellm.redis.deploy.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

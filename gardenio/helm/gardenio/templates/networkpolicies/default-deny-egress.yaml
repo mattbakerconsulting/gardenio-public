@@ -1,0 +1,1419 @@
+{{- if and .Values.networkPolicies.enabled .Values.networkPolicies.defaultDenyEgress }}
+{{- $releaseName := include "gardenio.fullname" . -}}
+{{- $namespace := .Release.Namespace -}}
+# ─── Default deny egress ─────────────────────────────────────────────────────
+# Audit finding F0 (ka-0000006988): without a default-deny egress policy any
+# pod that does not match an explicit `*-egress` selector has unrestricted
+# egress — including IMDS (169.254.169.254), in-cluster postgres, arbitrary
+# internet. This policy denies all egress namespace-wide; per-component allow
+# rules below explicitly re-enable what each component genuinely needs.
+#
+# NetworkPolicy union semantics: components that already carry their own
+# `*-egress` policy (agent, slack-bridge, *-bridge, grafana, vmagent) are
+# selected by both this default-deny and their existing allow rules — the
+# allow rules still take effect. Components without an existing egress policy
+# (controller, beads, coopmux, NATS, postgres, forwardauth, landing,
+# vmsingle) are blocked unless they match a rule below.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-default-deny-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+{{- if .Values.agents.enabled }}
+---
+# ─── Controller egress ───────────────────────────────────────────────────────
+# Controller (component: agents) reconciles bead state into pods. It needs:
+#   • Kubernetes API server (configurable CIDRs for private endpoints; the
+#     internet 443 rule covers public EKS endpoints)
+#   • beads HTTP+gRPC, NATS, coopmux, slack-bridge (in-cluster)
+#   • keycloak-runtime https, when the Lands provisioner or the machine
+#     principal dials it
+#   • kube-dns
+#   • Internet 443/80 for external integrations (GitLab/JIRA/Slack APIs,
+#     AWS APIs via IRSA), with RFC1918+IMDS+CGNAT excluded so a controller
+#     compromise cannot pivot via node IAM or cross-pod IP routing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-controller-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.agents.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # Beads daemon (HTTP + gRPC — controller is a trusted gRPC client).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+        - protocol: TCP
+          port: {{ .Values.beads.service.grpcPort | default 9090 }}
+    {{- if .Values.nats.enabled }}
+    # NATS (event bus)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: nats
+      ports:
+        - protocol: TCP
+          port: 4222
+    {{- end }}
+    {{- if .Values.coopmux.enabled }}
+    # Coopmux (credential sync + health checks)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: coopmux
+      ports:
+        - protocol: TCP
+          port: {{ .Values.coopmux.mux.port | default 9800 }}
+    {{- end }}
+    {{- if .Values.slackBridge.enabled }}
+    # Slack bridge (health checks + bridge events)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: slack-bridge
+      ports:
+        - protocol: TCP
+          port: {{ .Values.slackBridge.service.port | default 8090 }}
+    {{- end }}
+    {{- if .Values.litellm.enabled }}
+    # In-cluster LiteLLM proxy (epic ka-0000007994) — the controller syncs
+    # model_group_alias entries (litellm_aliases.go) and health-checks the proxy.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: litellm
+      ports:
+        - protocol: TCP
+          port: {{ .Values.litellm.port | default 4000 }}
+    {{- end }}
+    {{- if or (and .Values.agents.lands.provisioner.enabled (include "gardenio.keycloakRuntime.tlsEnabled" .)) (and .Values.agents.machinePrincipal.enabled (include "gardenio.keycloak.inClusterCA" .)) }}
+    # In-cluster Keycloak over https — the Lands provisioner's admin client
+    # (keycloakadmin, gd-XRsosVFAau) and the machine-principal token fetch
+    # (gd-lYPZlslOM7).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+    {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+    # Kubernetes API server (configured for private/in-cluster endpoints).
+    - to:
+        {{- range .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if .Values.networkPolicies.apiServerPostDNAT }}
+    {{- include "gardenio.netpol.k3sApiServerPostDNATEgress" . | nindent 4 }}
+    {{- end }}
+    # Internet 443/80 — external integrations (GitLab/JIRA/Slack APIs, AWS
+    # APIs, public EKS API). Excludes RFC1918 + IMDS (169.254/16) + CGNAT
+    # (100.64/10) so a controller SSRF/RCE cannot pivot to node IAM or
+    # cross-pod IP routing.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+{{- end }}
+---
+# ─── Beads daemon egress ─────────────────────────────────────────────────────
+# beads talks to: postgres, NATS, kube-dns. No internet egress required —
+# beads serves clients but doesn't call out. When beads.databaseURL points at
+# an off-cluster database (e.g. an Aurora endpoint resolving to an RFC1918
+# ENI), the in-cluster postgres allow does NOT cover it and the internet rules
+# (which the policy intentionally OMITS for beads) would not help either —
+# every internet allow elsewhere EXCLUDES RFC1918. Set
+# networkPolicies.beads.externalDatabaseCIDRs to scope the off-cluster DB
+# allow as tightly as possible. ka-0000005077.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-beads-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.beads.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.postgres.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.postgres.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    {{- end }}
+    {{- with .Values.networkPolicies.beads.externalDatabaseCIDRs }}
+    # External (off-cluster) database — Aurora / RDS / managed PG endpoint.
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    {{- end }}
+    {{- if .Values.nats.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: nats
+      ports:
+        - protocol: TCP
+          port: 4222
+    {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.beads.rbacProbe.enabled }}
+    {{- /* Spawn permission snapshot probe (gd-g9zzRfy1WL): read-only RBAC
+           reads from the API server. Same private-endpoint reach as the
+           controller (kubeApiServer.cidrs on EKS, post-DNAT 6443 on k3s);
+           beads still gets NO internet egress, so behind a public EKS API
+           endpoint the probe reports "unknown" rather than widening egress. */}}
+    {{- if .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+    # Kubernetes API server (private/in-cluster endpoint) — RBAC reads only.
+    - to:
+        {{- range .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if .Values.networkPolicies.apiServerPostDNAT }}
+    {{- include "gardenio.netpol.k3sApiServerPostDNATEgress" . | nindent 4 }}
+    {{- end }}
+    {{- end }}
+{{- if and .Values.beads.embedding.enabled .Values.beads.embedding.backfill.enabled }}
+---
+# ─── Embedding backfill CronJob egress (ka-0000008129) ───────────────────────
+# The backfill Job execs `kd embed sync --only-missing`, which reaches the
+# beads daemon over HTTP (POST /v1/embeddings/sync-batch) and resolves DNS.
+# Without this rule the namespace default-deny-egress blocks it and every run
+# fails "connection refused / timeout". No internet egress — embedding happens
+# server-side on the daemon, not from this pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-beads-embedding-backfill-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: beads-embedding-backfill
+  policyTypes:
+    - Egress
+  egress:
+    # Beads daemon (HTTP — the CLI drives the server-side backfill).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.coopmux.enabled }}
+---
+# ─── Coopmux egress ──────────────────────────────────────────────────────────
+# coopmux is the credential broker / terminal mux. It talks to beads (HTTP),
+# NATS, kube-dns, and may validate credentials with upstream provider APIs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-coopmux-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.coopmux.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    {{- if .Values.nats.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: nats
+      ports:
+        - protocol: TCP
+          port: 4222
+    {{- end }}
+    # Agent pods (ka-0000006038 sibling): coopmux MUST reach each agent's coop
+    # HTTP API to (a) health-check the upstream at session registration
+    # (POST /api/v1/sessions rejects the session if the health probe to the
+    # agent's :8080 fails) and (b) push refreshed credentials as profiles.
+    # Without this egress rule the registration health-check is default-denied,
+    # the session never enters the distributor's session set, credentials are
+    # never delivered, and the agent's Claude Code process boots with no auth
+    # ("Not logged in · Please run /login") → every model call 401s and the
+    # agent goes silent even though ingress + login look healthy.
+    - to:
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 9090
+    {{- if .Values.landNamespaces.enabled }}
+    # Tenant land pods: the coop port only, the one port each land-fence
+    # admits from coopmux (landns.CoopPort).
+    - to:
+        - namespaceSelector:
+            matchExpressions:
+              - key: gardenio.io/land
+                operator: Exists
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if include "gardenio.keycloakRuntime.machineHTTPS" (dict "root" . "c" .Values.coopmux) }}
+    # In-cluster Keycloak over https — the machine-principal token fetch
+    # (BEADS_OIDC_TOKEN_URL, gd-lYPZlslOM7 / gd-PhU6jPtSxa). This one pod and
+    # port only.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+    {{- end }}
+    # Internet 443 — credential provider validation (Anthropic, etc.).
+    # Private ranges + IMDS excluded.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if .Values.nats.enabled }}
+---
+# ─── NATS egress ─────────────────────────────────────────────────────────────
+# NATS clusters with peers (4222/6222) and resolves DNS. No internet egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-nats-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.nats.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # NATS cluster peers
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: nats
+      ports:
+        - protocol: TCP
+          port: 4222
+        - protocol: TCP
+          port: 6222
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.postgres.enabled }}
+---
+# ─── PostgreSQL egress ───────────────────────────────────────────────────────
+# postgres only resolves DNS. No internet egress, no peer egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-postgres-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.postgres.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled }}
+---
+# ─── ForwardAuth (oauth2-proxy) egress ───────────────────────────────────────
+# oauth2-proxy resolves DNS and reaches keycloak (typically external on 443).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-forwardauth-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}-forwardauth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Keycloak (external 443). Private ranges + IMDS excluded.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- if and (eq .Values.keycloak.forwardAuth.sessionStore.type "redis") .Values.keycloak.forwardAuth.sessionStore.redis.deploy.enabled }}
+    # Session-store Redis (gd-C2Sl6ClxAY); paired with the redis ingress allow in
+    # networkpolicies.yaml.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.forwardAuth.redis.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.forwardAuth.sessionStore.redis.port | default 6379 }}
+    {{- end }}
+{{- end }}
+{{- if .Values.zitiBrowser.enabled }}
+---
+# ─── Private Ziti ForwardAuth (oauth2-proxy) egress ─────────────────────────
+# DNS plus Microsoft Entra OIDC endpoints on public HTTPS. Private and
+# link-local ranges remain excluded.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-ziti-forwardauth-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}-ziti-forwardauth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if and .Values.keycloak.enabled .Values.keycloak.runtime.enabled }}
+---
+# ─── Keycloak runtime egress ─────────────────────────────────────────────────
+# The in-cluster Keycloak server resolves DNS and, when auto-wired to the
+# shared in-cluster postgres, connects to it on 5432 (create-db initContainer +
+# Quarkus runtime). Without this rule the default-deny-egress policy blocks the
+# DB connection and the create-db init container loops on Init:0/1
+# (ka-0000007036). No internet egress required.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-keycloak-runtime-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: keycloak-runtime
+  policyTypes:
+    - Egress
+  egress:
+    {{- if and .Values.postgres.enabled .Values.keycloak.runtime.db.autoWire }}
+    # In-cluster postgres (auto-wired DB).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.postgres.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- if .Values.keycloak.runtime.firstAdmin.enabled }}
+---
+# ─── Keycloak first-admin Job egress ─────────────────────────────────────────
+# The post-install first-admin bootstrap Job (component=keycloak-runtime-first-admin)
+# reaches the in-cluster Keycloak admin REST API via the Service FQDN (https
+# 8443 with keycloak.runtime.tls's in-cluster clients on, gd-lYPZlslOM7; http
+# 8080 otherwise), and resolves DNS. No DB or internet egress required.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-keycloak-first-admin-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: keycloak-runtime-first-admin
+  policyTypes:
+    - Egress
+  egress:
+    # In-cluster Keycloak runtime (admin REST API).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          {{- if include "gardenio.keycloakRuntime.clientsTLS" . }}
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+          {{- else }}
+          port: {{ .Values.keycloak.runtime.service.httpPort | default 8080 }}
+          {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if include "gardenio.keycloakRuntime.roleDriftProbe.on" . }}
+---
+# ─── Keycloak role-drift probe egress ────────────────────────────────────────
+# The role-drift probe CronJob (component=keycloak-runtime-role-drift,
+# gd-L2MyfEe9lL) needs what the bootstrap Job above needs: the Keycloak admin
+# REST API and DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-keycloak-role-drift-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: keycloak-runtime-role-drift
+  policyTypes:
+    - Egress
+  egress:
+    # In-cluster Keycloak runtime (admin REST API).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          {{- if include "gardenio.keycloakRuntime.clientsTLS" . }}
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+          {{- else }}
+          port: {{ .Values.keycloak.runtime.service.httpPort | default 8080 }}
+          {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- end }}
+{{- if .Values.landing.enabled }}
+---
+# ─── Landing page egress ─────────────────────────────────────────────────────
+# landing serves static content; only kube-dns is needed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-landing-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.landing.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.vmsingle.enabled }}
+---
+# ─── vmsingle egress ─────────────────────────────────────────────────────────
+# vmsingle is a TSDB sink; only kube-dns is needed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vmsingle-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vmsingle.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.bridgeLogShipper.enabled }}
+---
+# ─── bridge-log-shipper egress (non-AVA webhook-audit transport, ka-0000000320) ─
+# The Go streamer READS the jira-bridge + gitlab-bridge pods' stdout over the
+# Kubernetes pod-log API and POSTs the filtered webhook-audit records into the
+# in-chart VictoriaLogs. It needs NO internet egress —
+# both its source (in-namespace bridge pods, via the API server) and its sink
+# (in-cluster vlsingle) are inside the cluster. It needs:
+#   • kube-dns (resolve the in-cluster vlsingle Service name)
+#   • the Kubernetes API server (pods/log follow streams) — same reach model as
+#     the controller/grafana-bridge apiserver allows (private-endpoint CIDRs on
+#     EKS via kubeApiServer.cidrs, the post-DNAT 6443 allow on k3s), plus the
+#     internet-443 escape hatch for a public EKS API endpoint.
+#   • in-cluster VictoriaLogs (vlsingle) :9428 — the /insert/jsonline sink.
+#     Paired with the bridge-log-shipper carve-out in the vlsingle-ingress policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-bridge-log-shipper-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.bridgeLogShipper.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.bridgeLogShipper.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.vlsingle.enabled }}
+    # In-cluster VictoriaLogs (vlsingle) /insert/jsonline on :9428.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vlsingle.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9428
+    {{- end }}
+    {{- if .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+    # Kubernetes API server (configured for private/in-cluster endpoints) — the
+    # pods/log follow streams. Reuses the controller's apiserver CIDR list.
+    - to:
+        {{- range .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if .Values.networkPolicies.apiServerPostDNAT }}
+    {{- include "gardenio.netpol.k3sApiServerPostDNATEgress" . | nindent 4 }}
+    {{- end }}
+    # Internet 443 — a public EKS API endpoint (the pods/log stream target).
+    # Excludes RFC1918 + IMDS (169.254/16) + CGNAT (100.64/10) so a compromised
+    # shipper cannot pivot to node IAM or cross-pod IP routing.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if .Values.litellm.enabled }}
+---
+# ─── LiteLLM proxy egress (epic ka-0000007994) ──────────────────────────────
+# The in-cluster inference chokepoint. It is the ONLY pod allowed to egress to
+# the upstream provider — agent pods stay default-deny to the internet and reach
+# inference only via the in-cluster Service. Allow:
+#   • in-cluster postgres :5432 (litellm state — spend, virtual keys)
+#   • kube-dns
+#   • the single upstream provider on :443 (api.anthropic.com). The default is
+#     0.0.0.0/0 minus RFC1918+IMDS+CGNAT (Anthropic fronts many CDN IPs);
+#     tighten to specific CIDRs via networkPolicies.litellm.providerCIDRs when
+#     the provider publishes a stable range or when targeting a fixed proxy IP.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-litellm-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.litellm.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.litellm.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.postgres.enabled }}
+    # In-cluster postgres (litellm DB — spend tracking + virtual keys).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.postgres.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    {{- end }}
+    {{- if and .Values.litellm.redis.enabled .Values.litellm.redis.deploy.enabled }}
+    # In-chart Redis (H4, ka-0000003463) — multi-replica router coordination
+    # (rate-limit / cooldown / cache). Paired with the redis ingress allow in
+    # networkpolicies.yaml (a NetworkPolicy flow needs BOTH sides). Only the
+    # in-chart Redis is a pod-selector target; a managed/external endpoint is
+    # reached via the DNS + egress paths the operator provisions separately.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.litellm.redis.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.litellm.redis.port | default 6379 }}
+    {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Upstream provider (api.anthropic.com:443) — the SINGLE provider egress.
+    {{- if .Values.networkPolicies.litellm.providerCIDRs }}
+    - to:
+        {{- range .Values.networkPolicies.litellm.providerCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- else }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+{{- end }}
+{{- if .Values.mcpGrafana.enabled }}
+---
+# ─── mcp-grafana egress (Track A A1, ka-0000004361) ──────────────────────────
+# The standalone mcp-grafana server talks ONLY to the in-cluster gardenio
+# Grafana API (Bearer token) and kube-dns. No internet egress — it is a
+# read-only MCP proxy in front of Grafana, not a Cloud client.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-mcp-grafana-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.mcpGrafana.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.mcpGrafana.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.grafana.enabled }}
+    # In-cluster gardenio Grafana API.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.grafana.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.grafana.service.port | default 3000 }}
+    {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.mcpVictoriaLogs.enabled }}
+---
+# ─── mcp-victorialogs egress (task ka-0000006956) ────────────────────────────
+# The standalone mcp-victorialogs server talks ONLY to the in-cluster
+# VictoriaLogs (vlsingle) select API and kube-dns. No internet egress — it is a
+# read-only MCP proxy in front of VictoriaLogs, not a Cloud client.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-mcp-victorialogs-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.mcpVictoriaLogs.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.mcpVictoriaLogs.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.vlsingle.enabled }}
+    # In-cluster VictoriaLogs (vlsingle) LogsQL select API on :9428.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vlsingle.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9428
+    {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.mcpGrafanaWrite.enabled }}
+---
+# ─── mcp-grafana-write egress (ka-0000000293) ───────────────────────────────
+# The write-capable mcp-grafana instance talks ONLY to the in-cluster gardenio
+# Grafana API (per-request Bearer from the plugin backend's X-Grafana-API-Key)
+# and kube-dns. NO internet egress — the write surface is fully in-cluster. This
+# is the network-layer guarantee that backs the "zero off-cluster egress" claim
+# for the chat box's dashboard-create path.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-mcp-grafana-write-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.mcpGrafanaWrite.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.mcpGrafanaWrite.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.grafana.enabled }}
+    # In-cluster gardenio Grafana API.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.grafana.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.grafana.service.port | default 3000 }}
+    {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.triggerEngine.enabled }}
+---
+# ─── Trigger-engine egress (ka-0000001605) ──────────────────────────────────
+# The trigger-engine subscribes to beads.bead.closed/updated over the beads
+# daemon HTTP/SSE API and fires spawns off it. It talks ONLY to the in-cluster
+# beads daemon (BEADS_HTTP_ADDR) and kube-dns — no NATS client, no internet.
+# This component shipped after MR !1754, so it had no egress allow and would be
+# fully blocked the day NP enforcement is enabled (inert until then).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-trigger-engine-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: trigger-engine
+  policyTypes:
+    - Egress
+  egress:
+    # In-cluster beads daemon (bead-lifecycle subscription + spawn writes).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if include "gardenio.keycloakRuntime.machineHTTPS" (dict "root" . "c" .Values.triggerEngine) }}
+    # In-cluster Keycloak over https — the machine-principal token fetch
+    # (BEADS_OIDC_TOKEN_URL, gd-lYPZlslOM7 / gd-PhU6jPtSxa). This one pod and
+    # port only.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+    {{- end }}
+{{- end }}
+{{- if .Values.releaseDeployer.enabled }}
+---
+# ─── release-deployer egress (gd-PhU6jPtSxa, gd-VgdO1sx1Ju) ──────────────────
+# The release-deployer CronJob (entrypoint + the tagged release-deploy.sh) is
+# a helm/kubectl/git/gh client. It needs:
+#   • the Kubernetes API server: kubectl (pause switch, theme ConfigMap apply,
+#     verify-image-tags) and helm (status, get values, upgrade, rollback).
+#     Same reach model as the controller: kubeApiServer.cidrs on EKS, the
+#     post-DNAT 6443 allow on k3s, internet-443 for a public EKS endpoint.
+#   • GitHub over 443: git ls-remote + shallow clone of releaseDeployer.repo
+#     (github.com) and gh api for the images.yml gate (api.github.com). The
+#     chart is packed from the clone (no chart repo); images are pulled by
+#     kubelet, never by this pod, so no ECR rule.
+#   • the beads daemon http port (KD_URL deploy-outcome reports; paired with
+#     the release-deployer peer in beads-ingress).
+#   • keycloak-runtime https, when the machine principal fetches its token
+#     there (KD_OIDC_TOKEN_URL).
+#   • kube-dns.
+# No LiteLLM, Slack or NATS: the deployer reports through beads only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-release-deployer-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: release-deployer
+  policyTypes:
+    - Egress
+  egress:
+    # Beads daemon (deploy-outcome event/bug beads over HTTP).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    {{- if include "gardenio.keycloakRuntime.machineHTTPS" (dict "root" . "c" .Values.releaseDeployer) }}
+    # In-cluster Keycloak over https — the machine-principal token fetch.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+    {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+    # Kubernetes API server (configured for private/in-cluster endpoints).
+    # Reuses the controller's apiserver CIDR list.
+    - to:
+        {{- range .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if .Values.networkPolicies.apiServerPostDNAT }}
+    {{- include "gardenio.netpol.k3sApiServerPostDNATEgress" . | nindent 4 }}
+    {{- end }}
+    # Internet 443 — GitHub (git + gh api) and a public EKS API endpoint.
+    # Excludes RFC1918 + IMDS (169.254/16) + CGNAT (100.64/10) so a
+    # compromised deployer cannot pivot to node IAM or cross-pod IP routing.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if .Values.vlsingle.enabled }}
+---
+# ─── vlsingle (VictoriaLogs) egress (ka-0000001605) ─────────────────────────
+# In-chart VictoriaLogs is a storage SINK: it accepts ingest and serves the
+# LogsQL select API, but does not push logs anywhere off-box (single-node
+# -storageDataPath). Only kube-dns egress is needed. Shipped after MR !1754 —
+# no prior egress allow (inert until NP enforcement is enabled).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vlsingle-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.vlsingle.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vlsingle.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.vtsingle.enabled }}
+---
+# ─── vtsingle (VictoriaTraces) egress (ka-0000001605) ───────────────────────
+# In-chart VictoriaTraces is a storage SINK: it accepts OTLP/Jaeger ingest and
+# serves the select API, but does not push traces off-box (single-node
+# -storageDataPath). Only kube-dns egress is needed. The perf/dev traces relays
+# (separate pods, own policies below) are what pull from external sources.
+# Shipped after MR !1754 — no prior egress allow (inert until NP enforcement).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vtsingle-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.vtsingle.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vtsingle.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if and .Values.vtsingle.enabled .Values.vtsingle.relay.enabled }}
+---
+# ─── perf-traces-relay egress (ka-0000001605) ───────────────────────────────
+# The perf-traces relay (a controller subcommand) PULLS from perf's public
+# authed VictoriaTraces Jaeger query API on :443, converts Jaeger→OTLP, and
+# POSTs to THIS release's in-cluster vtsingle OTLP/HTTP insert path (:10428).
+# Allow: kube-dns, in-cluster vtsingle :10428, and external :443 (source pull).
+# Private ranges + IMDS excluded from the internet allow. Shipped after
+# MR !1754 — no prior egress allow (inert until NP enforcement is enabled).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-perf-traces-relay-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.vtsingle.relay.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vtsingle.relay.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # In-cluster vtsingle OTLP/HTTP insert (:10428) — the relay's dest.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vtsingle.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 10428
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # External perf VictoriaTraces source (:443). Private ranges + IMDS excluded.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if and .Values.vtsingle.enabled .Values.vtsingle.devRelay.enabled }}
+---
+# ─── dev-traces-relay egress (ka-0000001605) ────────────────────────────────
+# The dev-traces relay is the dev-source sibling of the perf relay: same PULL
+# transport (external authed Jaeger query API on :443 → Jaeger→OTLP → in-cluster
+# vtsingle :10428). Allow: kube-dns, in-cluster vtsingle :10428, external :443.
+# Private ranges + IMDS excluded. Shipped after MR !1754 — no prior egress allow
+# (inert until NP enforcement is enabled).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-dev-traces-relay-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.vtsingle.devRelay.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vtsingle.devRelay.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # In-cluster vtsingle OTLP/HTTP insert (:10428) — the relay's dest.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vtsingle.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 10428
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # External dev VictoriaTraces source (:443). Private ranges + IMDS excluded.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- end }}

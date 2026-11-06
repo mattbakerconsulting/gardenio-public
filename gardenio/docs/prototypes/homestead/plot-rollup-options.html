@@ -1,0 +1,109 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Plot rollup options</title>
+<style>
+  body{margin:0;background:#5fae3e;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;color:#2a1a14}
+  .wrap{padding:16px 20px 20px;width:1240px}
+  h1{font-size:16px;margin:0 0 2px}
+  h2{font-size:13px;margin:16px 0 6px;background:#2a1a14;color:#fffaf0;display:inline-block;padding:2px 8px;border-radius:3px}
+  p{margin:0 0 4px}
+  .row{display:flex;gap:28px;align-items:flex-start}
+  table{border-collapse:collapse}
+  th{font-weight:bold;text-align:center;padding:2px 6px 6px;background:#2a1a14;color:#fffaf0}
+  td{padding:6px 6px;text-align:center;vertical-align:top}
+  td.n{text-align:left;font-weight:bold;padding-top:14px;white-space:nowrap}
+  td small{display:block;color:#2a1a14;background:#fffaf0;padding:0 4px;margin:4px auto 0;width:max-content;border:1px solid #2a1a14}
+  canvas{image-rendering:pixelated;display:block;margin:0 auto}
+  .big td{padding:8px 12px}
+  .legend{background:#fffaf0;border:1px solid #2a1a14;padding:6px 10px;margin-top:10px;width:max-content;max-width:1200px}
+  .legend b{display:inline-block;min-width:140px}
+</style></head><body><div class="wrap">
+<h1>Homestead: what a plan's plot shows at the <i>project</i> depth (the LOD rollup)</h1>
+<p>Each plot is drawn from the plan data the page already holds (phases, per-phase counts, needs_human, gardeners on the plot). Sizes are real: a plot cell is ~66 px when a 3x3 project fills a 1280 px desktop, ~48 px on a 390 px phone (cursor spec 4.1). Fence colour is today's crop colour; the gold ring is today's "needs you" ring.</p>
+<div class="row">
+ <div><h2>Desktop, 66 px cells</h2><table id="desk"></table></div>
+ <div><h2>Phone, 48 px cells</h2><table id="phone"></table></div>
+</div>
+<h2>Blow-up, 4x, plan "Homestead World" (7 phases: 2 done, on phase 3, 1 blocked, 1 needs you, 3 gardeners)</h2>
+<table class="big" id="big"></table>
+<div class="legend" id="legend"></div>
+</div>
+<script>
+var DAY={k:"#2a1a14",K:"#5a3a2c",g:"#5fae3e",h:"#7cc957",d:"#458f36",D:"#357a30",s:"#a8703c",t:"#7e4c26",u:"#c8905a",l:"#35a03c",m:"#5ccf4f",n:"#a6ee7a",L:"#1f6e34",w:"#3a86e0",x:"#78c0f4",y:"#2757b0",z:"#dff6ff",b:"#b5793f",B:"#85532a",c:"#dba35e",r:"#9ea4b4",R:"#6c728a",q:"#d4d8e4",e:"#d94a3a",E:"#9a2c2c",f:"#ff8e7c",o:"#f28c28",O:"#b45c12",p:"#ffc850",Y:"#f2d44a",Z:"#b89824",v:"#a672d8",V:"#6c46a4",W:"#dcb8f6",a:"#f6caa0",A:"#c48c66",j:"#fffaf0",J:"#d9d0c0",i:"#4c7ae0",I:"#2f4c9c",F:"#ff9ec4",P:"#e4cc94",Q:"#bd9f66",N:"#f2e2b4",G:"#ffe680",T:"#8c7a3c"};
+var CROP_COL={post:"Y",blocked:"R",fruit:"o",wilt:"Z",sprout:"m"};
+var STATE_COL={in_progress:"m",review:"o",blocked:"R",open:"c",deferred:"Z"};
+var HATS=["#d94a3a","#3a86e0","#f2d44a","#a672d8","#f28c28","#ff9ec4"];
+var DIGITS={0:["kkk","k.k","k.k","k.k","kkk"],1:[".k.","kk.",".k.",".k.","kkk"],2:["kk.","..k",".k.","k..","kkk"],3:["kk.","..k",".k.","..k","kk."],4:["k.k","k.k","kkk","..k","..k"],5:["kkk","k..","kk.","..k","kk."],6:[".kk","k..","kk.","k.k",".k."],7:["kkk","..k",".k.",".k.",".k."],8:[".k.","k.k",".k.","k.k",".k."],9:[".k.","k.k",".kk","..k","kk."]};
+var ORDER=["in_progress","review","blocked","open","deferred"];
+function ph(c,status){var o={in_progress:0,review:0,blocked:0,open:0,deferred:0,closed:0};for(var k in c)o[k]=c[k];return {counts:o,status:status||""};}
+var PLANS=[
+ {title:"Homestead World",needs:1,gard:3,phases:[ph({closed:12},"closed"),ph({closed:8},"closed"),ph({in_progress:3,review:1,blocked:1,open:4,closed:5}),ph({open:6}),ph({open:4}),ph({blocked:1,open:3}),ph({open:2})]},
+ {title:"Keycloak passkeys",needs:2,gard:0,phases:[ph({closed:6},"closed"),ph({blocked:3,open:2,closed:2}),ph({open:5}),ph({open:3})]},
+ {title:"Night sky",needs:0,gard:1,phases:[ph({in_progress:1,open:2}),ph({open:3})]},
+ {title:"Release pipeline",needs:0,gard:2,phases:[ph({closed:5},"closed"),ph({closed:4},"closed"),ph({closed:7},"closed"),ph({closed:3},"closed"),ph({closed:6},"closed"),ph({closed:2},"closed"),ph({closed:9},"closed"),ph({review:2,closed:3}),ph({open:1})]}
+];
+function tot(c){return ORDER.reduce(function(a,k){return a+c[k];},0)+c.closed;}
+function summarise(p){var n={in_progress:0,review:0,blocked:0,open:0,deferred:0,closed:0};p.phases.forEach(function(x){for(var k in n)n[k]+=x.counts[k];});
+ var crop="sprout";if(p.needs>0)crop="post";else if(n.blocked>0&&n.in_progress===0)crop="blocked";else if(n.review>0)crop="fruit";else if(n.in_progress===0&&n.closed===0&&p.gard===0)crop="wilt";
+ var cur=-1;p.phases.forEach(function(x,i){if(cur<0&&x.status!=="closed")cur=i;});
+ return {n:n,crop:crop,cur:cur,total:tot(n)};}
+function box(ctx,ch,x,y,w,h){ctx.fillStyle=DAY[ch]||ch;ctx.fillRect(x,y,w,h);}
+function digit(ctx,n,x,y,s,ch){var r=DIGITS[n]||[];ctx.fillStyle=DAY[ch||"k"];r.forEach(function(row,j){for(var i=0;i<3;i++)if(row.charAt(i)==="k")ctx.fillRect(x+i*s,y+j*s,s,s);});}
+/* ---------- shared marks, screen px (s = 1 at 66/48 px, 4 in the blow-up) ---------- */
+function needMark(ctx,x,y,n,s){box(ctx,"k",x,y,13*s,9*s);box(ctx,"Y",x+s,y+s,11*s,7*s);box(ctx,"k",x+3*s,y+2*s,s,3*s);box(ctx,"k",x+3*s,y+6*s,s,s);digit(ctx,Math.min(n,9),x+6*s,y+2*s,s);}
+function heads(ctx,x,y,n,s,right){for(var i=0;i<Math.min(n,4);i++){var hx=right?x-(i+1)*6*s:x+i*6*s;box(ctx,"k",hx,y,5*s,5*s);box(ctx,HATS[i%HATS.length],hx+s,y+s,3*s,2*s);box(ctx,"a",hx+s,y+3*s,3*s,s);}}
+function ring(ctx,x,y,w,s){ctx.strokeStyle=DAY.Y;ctx.lineWidth=2*s;ctx.strokeRect(x-3*s,y-3*s,w+6*s,w+6*s);}
+function plate(ctx,x,y,w,crop,s){box(ctx,"k",x,y,w,w);box(ctx,CROP_COL[crop],x+s,y+s,w-2*s,w-2*s);box(ctx,"P",x+3*s,y+3*s,w-6*s,w-6*s);}
+/* ---------- TODAY: the flat plate ---------- */
+function drawToday(ctx,x,y,w,p,s){var S=summarise(p);box(ctx,"k",x,y,w,w);box(ctx,CROP_COL[S.crop],x+s,y+s,w-2*s,w-2*s);if(p.needs)ring(ctx,x,y,w,s);}
+/* ---------- A: true miniature of the plan depth (drawPlotFlat at the project depth) ---------- */
+var OFF=[32,192,352],BED=144,BLK=48;
+function drawA(ctx,x,y,w,p,s){var S=summarise(p),sc=w/512;ctx.save();ctx.translate(x,y);ctx.scale(sc,sc);
+ box(ctx,"k",0,0,512,512);box(ctx,CROP_COL[S.crop],4,4,504,504);box(ctx,"P",16,16,480,480);
+ p.phases.slice(0,9).forEach(function(phs,k){var bx=OFF[k%3],by=OFF[Math.floor(k/3)],closed=phs.status==="closed";
+  for(var r=0;r<3;r++)for(var c=0;c<3;c++)box(ctx,closed?((r+c)%2?"N":"P"):((r+c)%2?"t":"s"),bx+c*BLK,by+r*BLK,BLK,BLK);
+  if(k===S.cur){ctx.fillStyle=DAY.Y;ctx.fillRect(bx-12,by-12,BED+24,12);ctx.fillRect(bx-12,by+BED,BED+24,12);ctx.fillRect(bx-12,by,12,BED);ctx.fillRect(bx+BED,by,12,BED);}
+  if(closed)return;var i=0;ORDER.forEach(function(st){for(var j=0;j<phs.counts[st];j++){var cell=cellAt(i++);box(ctx,"k",bx+cell.c*16+1,by+cell.r*16+1,14,14);box(ctx,STATE_COL[st],bx+cell.c*16+2,by+cell.r*16+2,12,12);if(st==="blocked")box(ctx,"k",bx+cell.c*16+5,by+cell.r*16+6,6,5);}});
+  for(var j=0;j<phs.counts.closed&&i<81;j++){var cell=cellAt(i++);box(ctx,"Q",bx+cell.c*16+3,by+cell.r*16+3,10,10);}
+ });
+ for(var g=0;g<Math.min(p.gard,6);g++){var gx=40+g*40;box(ctx,"k",gx,480,24,30);box(ctx,HATS[g%HATS.length],gx+4,484,16,10);box(ctx,"a",gx+4,494,16,8);box(ctx,"i",gx+4,502,16,8);}
+ ctx.restore();
+ if(p.needs)ring(ctx,x,y,w,s);
+ if(p.needs)needMark(ctx,x+w-13*s-2*s,y+2*s,p.needs,s);
+}
+function cellAt(i){var b=Math.floor(i/9),j=i%9;return {c:(b%3)*3+j%3,r:Math.floor(b/3)*3+Math.floor(j/3)};}
+/* ---------- B: rollup stamp, screen px: 3x3 phase grid with progress fill + marks ---------- */
+function drawB(ctx,x,y,w,p,s){var S=summarise(p);plate(ctx,x,y,w,S.crop,s);
+ var inner=w-10*s,gap=w>=60?2*s:1*s,c=Math.floor((inner-2*gap)/3),gx=x+Math.round((w-(3*c+2*gap))/2),gy=y+4*s;
+ p.phases.slice(0,9).forEach(function(phs,k){var cx=gx+(k%3)*(c+gap),cy=gy+Math.floor(k/3)*(c+gap),n=phs.counts,t=tot(n),done=n.closed,closed=phs.status==="closed";
+  var frame=k===S.cur?"Y":closed?"L":(n.blocked>0&&n.in_progress===0)?"e":n.review>0?"o":"k";
+  box(ctx,frame,cx,cy,c,c);box(ctx,"t",cx+s,cy+s,c-2*s,c-2*s);
+  if(closed){box(ctx,"l",cx+s,cy+s,c-2*s,c-2*s);var u=c>=48?2*s:s,ox=cx+Math.round((c-7*u)/2),oy=cy+Math.round((c-5*u)/2);[[0,2],[1,3],[2,4],[3,3],[4,2],[5,1],[6,0]].forEach(function(q){box(ctx,"j",ox+q[0]*u,oy+q[1]*u,u,u);});}
+  else{var h=t?Math.round((c-2*s)*done/t):0;if(h)box(ctx,"l",cx+s,cy+c-s-h,c-2*s,h);
+   if(n.in_progress){box(ctx,"n",cx+Math.floor(c/2)-s,cy+2*s,2*s,c-4*s-h>0?Math.max(2*s,Math.floor((c-4*s-h)*.6)):2*s);}
+   if(n.blocked)box(ctx,"k",cx+2*s,cy+2*s,3*s,2*s);
+   if(n.review)box(ctx,"o",cx+c-5*s,cy+2*s,3*s,3*s);}
+ });
+ var bar=y+w-5*s,bw=w-8*s,bx=x+4*s;box(ctx,"k",bx-s,bar-s,bw+2*s,4*s+2*s);var acc=0;["closed","in_progress","review","blocked","open","deferred"].forEach(function(k){var v=S.n[k];if(!v)return;var ww=Math.round(bw*v/S.total);box(ctx,k==="closed"?"l":STATE_COL[k],bx+acc,bar,ww,4*s);acc+=ww;});
+ if(p.needs)ring(ctx,x,y,w,s);
+ if(p.needs)needMark(ctx,x+w-15*s,y-4*s,p.needs,s);
+ if(p.gard)heads(ctx,x+w-3*s,y+w-16*s,p.gard,s,true);
+}
+/* ---------- C: jar fill + phase pips, lightest ---------- */
+function drawC(ctx,x,y,w,p,s){var S=summarise(p);box(ctx,"k",x,y,w,w);box(ctx,CROP_COL[S.crop],x+s,y+s,w-2*s,w-2*s);
+ var ix=x+3*s,iy=y+3*s,iw=w-6*s,ih=w-6*s;box(ctx,"t",ix,iy,iw,ih);
+ var acc=0;["closed","in_progress","review","blocked","open","deferred"].forEach(function(k){var v=S.n[k];if(!v)return;var hh=Math.round(ih*v/S.total);box(ctx,k==="closed"?"l":STATE_COL[k],ix,iy+ih-acc-hh,iw,hh);acc+=hh;});
+ var pip=w>=60?5*s:4*s,step=pip+2*s,px=ix+2*s,py=iy+2*s;
+ p.phases.slice(0,9).forEach(function(phs,k){var cx=px+k*step;if(cx+pip>ix+iw-2*s)return;var closed=phs.status==="closed";box(ctx,"k",cx,py,pip,pip);box(ctx,k===S.cur?"Y":closed?"l":"N",cx+s,py+s,pip-2*s,pip-2*s);});
+ if(p.needs)ring(ctx,x,y,w,s);
+ if(p.needs)needMark(ctx,x+w-15*s,y-4*s,p.needs,s);
+ if(p.gard)heads(ctx,x+w-3*s,y+w-9*s,p.gard,s,true);
+}
+var OPTS=[["Today","flat plate",drawToday],["A · mini-beds","the plan depth, shrunk",drawA],["B · rollup stamp","3x3 phase grid + bar + marks",drawB],["C · jar + pips","state fill + phase pips",drawC]];
+function cv(w,h){var c=document.createElement("canvas");c.width=w;c.height=h;c.style.width=w+"px";c.style.height=h+"px";return c;}
+function grid(id,w){var t=document.getElementById(id),hr=document.createElement("tr");hr.appendChild(document.createElement("th"));OPTS.forEach(function(o){var th=document.createElement("th");th.innerHTML=o[0]+"<br><span style='font-weight:normal'>"+o[1]+"</span>";hr.appendChild(th);});t.appendChild(hr);
+ PLANS.forEach(function(p){var tr=document.createElement("tr"),n=document.createElement("td");n.className="n";var S=summarise(p);n.innerHTML=p.title+"<br><span style='font-weight:normal'>"+p.phases.length+" ph · "+S.n.closed+"/"+S.total+" done"+(S.n.blocked?" · "+S.n.blocked+" blocked":"")+(p.needs?" · "+p.needs+" need you":"")+(p.gard?" · "+p.gard+" gardeners":"")+"</span>";tr.appendChild(n);
+  OPTS.forEach(function(o){var td=document.createElement("td"),c=cv(w+16,w+16),ctx=c.getContext("2d");o[2](ctx,8,8,w,p,1);td.appendChild(c);var sm=document.createElement("small");sm.textContent=p.title.length>10?p.title.slice(0,9)+"…":p.title;td.appendChild(sm);tr.appendChild(td);});t.appendChild(tr);});}
+grid("desk",66);grid("phone",48);
+(function(){var t=document.getElementById("big"),tr=document.createElement("tr"),hr=document.createElement("tr");OPTS.slice(1).forEach(function(o){var th=document.createElement("th");th.textContent=o[0];hr.appendChild(th);var td=document.createElement("td"),c=cv(300,300),ctx=c.getContext("2d");ctx.imageSmoothingEnabled=false;o[2](ctx,18,18,264,PLANS[0],4);td.appendChild(c);tr.appendChild(td);});t.appendChild(hr);t.appendChild(tr);})();
+document.getElementById("legend").innerHTML="<b>Reads in every option</b> fence colour = today's crop (gold post: needs you, grey: blocked, orange: fruit/review, green: growing) · gold ring = needs you · <span style='background:#f2d44a;padding:0 3px;border:1px solid #2a1a14'>!N</span> = how many wait on a human · hat heads = gardeners on the plot<br><b>A mini-beds</b> the real 3x3 beds and task squares drawn small; the current phase bed has a gold path; done phases are stubble; gardeners stand on the fence<br><b>B rollup stamp</b> one cell per phase in the bed's real position; fills from the bottom with done/total; gold frame = current phase, green = done phase (tick), red frame = blocked and nothing moving, orange = in review; bar = all tasks by state<br><b>C jar + pips</b> the whole plot fills with tasks by state (green done, bright green in progress, orange review, red blocked, tan open); pips across the top = phases (green done, gold current, cream ahead)";
+</script></body></html>

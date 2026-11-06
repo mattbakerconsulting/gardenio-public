@@ -1,0 +1,90 @@
+{{- if and .Values.gitlabBridge.enabled .Values.gitlabBridge.releaseDrought.enabled .Values.gitlabBridge.releaseDrought.prometheusRule.enabled }}
+{{- $cfg := .Values.gitlabBridge.releaseDrought.prometheusRule }}
+# PrometheusRule for the release-drought deadman watchdog (ka-0000002594,
+# P0 post-mortem ka-0000007176).
+#
+# Source metrics: gardenio_release_drought_* gauges emitted by the watchdog in
+# gitlab-bridge (gardenio/controller/internal/bridge/release_drought.go),
+# served on the bridge's internal :9092 /metrics endpoint (scraped via the
+# pod annotations on the gitlab-bridge Deployment).
+#
+# This is the watchdog's third, most-independent alert leg: it survives a
+# beads-daemon or slack-bridge outage. Two alerts:
+#   - ReleaseDrought: the watchdog observed a drought (oldest unreleased
+#     calver tag past the threshold) — releases have stopped landing while
+#     tags keep being pushed.
+#   - ReleaseDroughtWatchdogSilent: the watchdog itself stopped reporting
+#     (no successful assessment for 1h against a 15m default cadence) — the
+#     deadman for the deadman.
+# Off by default; per-env overlays opt in. Requires the
+# monitoring.coreos.com/v1 PrometheusRule CRD.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-release-drought
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gitlab-bridge
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.release_drought
+      interval: 60s
+      rules:
+        - alert: ReleaseDrought
+          expr: |
+            max by (project) (gardenio_release_drought_active) == 1
+          for: {{ $cfg.for | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gitlab-bridge
+            subsystem: release_drought
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "release drought: tags pushed but no successful release for over {{ .Values.gitlabBridge.releaseDrought.threshold }}"
+            description: |
+              The release-drought watchdog found calver tags waiting longer
+              than {{ .Values.gitlabBridge.releaseDrought.threshold }} for a GitLab Release in
+              {{`{{ $labels.project }}`}}. Tags are being cut but nothing is
+              shipping — the release pipeline is failing, possibly silently
+              (its own failure notifier has broken before: P0 ka-0000007176).
+              Check the images.yml workflow runs for the waiting calver tags.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/release-drought-watchdog.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: ReleaseDroughtWatchdogSilent
+          # Deadman for the watchdog itself: the last successful assessment
+          # is over an hour old (default cadence 15m) or the series is gone
+          # entirely (bridge down / watchdog disabled unexpectedly).
+          expr: |
+            (time() - max(gardenio_release_drought_last_check_timestamp_seconds)) > 3600
+            or
+            absent(gardenio_release_drought_last_check_timestamp_seconds)
+          for: {{ $cfg.for | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gitlab-bridge
+            subsystem: release_drought
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "release-drought watchdog has stopped reporting"
+            description: |
+              No successful release-drought assessment for over an hour —
+              the watchdog (gitlab-bridge) is down, wedged, or unable to
+              reach GitLab. While it is silent, a release drought would go
+              unnoticed. Check the gitlab-bridge pod and
+              gardenio_release_drought_check_errors_total.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/release-drought-watchdog.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright (c) 2026 Matt Baker <fimbaz@gmail.com>
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+
+use crate::error::ErrorCode;
+use crate::transport::state::Store;
+use crate::transport::ErrorResponse;
+
+/// Constant-time string comparison to prevent timing side-channel attacks.
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+/// Validate a Bearer token from HTTP headers.
+///
+/// Returns `Ok(())` when `expected` is `None` (auth disabled) or when the
+/// header matches. Returns `Err(ErrorCode::Unauthorized)` otherwise.
+pub fn validate_bearer(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ErrorCode> {
+    let expected = match expected {
+        Some(tok) => tok,
+        None => return Ok(()),
+    };
+
+    let header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(ErrorCode::Unauthorized)?;
+
+    let token = header.strip_prefix("Bearer ").ok_or(ErrorCode::Unauthorized)?;
+    if constant_time_eq(token, expected) {
+        Ok(())
+    } else {
+        Err(ErrorCode::Unauthorized)
+    }
+}
+
+/// Validate a token from a WebSocket upgrade query string (`?token=...`).
+///
+/// Returns `Ok(())` when `expected` is `None` (auth disabled) or the token
+/// matches. Returns `Err(ErrorCode::Unauthorized)` otherwise.
+pub fn validate_ws_query(query: &str, expected: Option<&str>) -> Result<(), ErrorCode> {
+    let expected = match expected {
+        Some(tok) => tok,
+        None => return Ok(()),
+    };
+
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("token=") {
+            if constant_time_eq(value, expected) {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(ErrorCode::Unauthorized)
+}
+
+/// Validate a token from the WebSocket `Auth` message.
+pub fn validate_ws_auth(token: &str, expected: Option<&str>) -> Result<(), ErrorCode> {
+    match expected {
+        None => Ok(()),
+        Some(tok) if constant_time_eq(tok, token) => Ok(()),
+        Some(_) => Err(ErrorCode::Unauthorized),
+    }
+}
+
+/// Paths that bypass HTTP auth entirely (liveness/readiness/metrics + WS upgrade).
+///
+/// WebSocket auth is enforced inside the WS handler via query param or Auth
+/// message, not at the middleware layer.
+fn is_public_path(path: &str) -> bool {
+    matches!(path, "/api/v1/health" | "/api/v1/livez" | "/api/v1/ready" | "/metrics" | "/ws")
+}
+
+/// Paths called from the agent's hook subprocess. Authenticated against the
+/// per-session `hook_token` (separate from the operator-facing `auth_token`).
+fn is_hook_path(path: &str) -> bool {
+    matches!(path, "/api/v1/hooks/stop" | "/api/v1/hooks/start" | "/api/v1/stop/resolve")
+}
+
+/// Axum middleware that enforces Bearer token authentication.
+///
+/// Two token slots are distinguished:
+/// - `auth_token`: operator-facing, used on general API routes.
+/// - `hook_token`: per-session, used only on hook callback paths
+///   (`/api/v1/hooks/{stop,start}`, `/api/v1/stop/resolve`).
+///
+/// When the relevant token slot is `None`, requests pass through unauthenticated
+/// (matches the pre-existing "auth disabled" semantics).
+pub async fn auth_layer(
+    state: State<Arc<Store>>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+
+    if is_public_path(path) {
+        return next.run(req).await;
+    }
+
+    let expected = if is_hook_path(path) {
+        state.config.hook_token.as_deref()
+    } else {
+        state.config.auth_token.as_deref()
+    };
+
+    if let Err(code) = validate_bearer(req.headers(), expected) {
+        let body = ErrorResponse { error: code.to_error_body("unauthorized") };
+        return (
+            StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::UNAUTHORIZED),
+            axum::Json(body),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
+}
+
+#[cfg(test)]
+#[path = "auth_tests.rs"]
+mod tests;

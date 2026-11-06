@@ -1,0 +1,556 @@
+{{- /*
+First-admin bootstrap Job — solves the OIDC chicken-and-egg lock-out.
+
+Research ka-0000004895 §3 / doc §3 / task ka-0000007117.
+
+PROBLEM: when the in-box Keycloak comes up for the first time, the only admin
+credential is the master-REALM bootstrap superuser (admin-secret.yaml). That
+user cannot log into beads over OIDC. The first human who logs in is
+auto-provisioned a roleless type=user bead and inherits ONLY gardenio-viewer
+(realm.defaultGroups), so they land read-only; write_authz.go blocks every
+admin write and userRegistration=false leaves no self-service escape. The box
+LOCKS with no usable admin.
+
+FIX: this post-install/post-upgrade hook Job uses the master-realm bootstrap
+creds (via kcadm.sh, which ships inside the Keycloak runtime image) against the
+in-cluster admin REST API to create a gardenio-REALM user and join it to the
+gardenio-admins group (carries the gardenio-admin role). It is fully idempotent:
+on re-run it only re-ensures the user exists, is enabled, and is a group member
+— it does NOT reset the password. The one-time installer password lives in the
+chart-generated first-admin Secret (first-admin-secret.yaml).
+
+ORDERING: the realm and its groups are reconciled ASYNCHRONOUSLY by the EDP
+keycloak-operator from the KeycloakRealm / KeycloakRealmGroup CRs, so this Job
+polls until (a) the admin API answers, (b) the target realm exists, and (c) the
+target group exists, before acting. As a Helm post-* hook it is decoupled from
+the StatefulSet readiness gate, hence the explicit waits.
+
+FALLBACK (documented in the runbook, ka-0000005523): if this Job is disabled or
+exhausts its retries, port-forward the Keycloak console and create the admin
+user manually — a missing bootstrap is a hard lock-out.
+
+Gated by runtime.enabled AND firstAdmin.enabled. Precedent: the hook shape
+follows templates/beads/migrate-job.yaml; kcadm/image usage follows
+templates/keycloak-runtime/statefulset.yaml.
+*/ -}}
+{{- if and .Values.keycloak.enabled .Values.keycloak.runtime.enabled .Values.keycloak.runtime.firstAdmin.enabled }}
+{{- $runtime := .Values.keycloak.runtime -}}
+{{- $fa := $runtime.firstAdmin -}}
+{{- $realm := .Values.keycloak.realm.name | default .Release.Name -}}
+{{- $svc := include "gardenio.keycloakRuntime.fullname" . -}}
+{{- $path := $runtime.httpRelativePath | default "/auth" -}}
+{{- /* With keycloak.runtime.tls's in-cluster clients on (gd-lYPZlslOM7) kcadm
+     dials the https port and trusts the CA through truststore.p12, which
+     cert-manager writes into the leaf Secret (templates/keycloak-runtime/tls.yaml). */ -}}
+{{- $tls := include "gardenio.keycloakRuntime.clientsTLS" . -}}
+{{- $serverURL := "" -}}
+{{- if $tls -}}
+{{- $serverURL = printf "https://%s.%s.svc.cluster.local:%v%s" $svc .Release.Namespace (($runtime.service.httpsPort | default 8443) | toString) $path -}}
+{{- else -}}
+{{- $serverURL = printf "http://%s.%s.svc.cluster.local:%v%s" $svc .Release.Namespace (($runtime.service.httpPort | default 8080) | toString) $path -}}
+{{- end -}}
+{{- $faSecret := include "gardenio.keycloakRuntime.firstAdmin.secretName" . -}}
+{{- $bruteForce := ($runtime.realmHardening | default dict).bruteForce | default dict -}}
+{{- $passkeys := ($runtime.realmHardening | default dict).passkeys | default dict -}}
+{{- /* Passkey policy (step 2c). Everything is resolved and validated at render
+time so a bad value fails `helm template`, not the hook at 3am. */ -}}
+{{- $pkRpId := "" -}}
+{{- if $passkeys.enabled -}}
+{{- $pkHost := regexReplaceAll "^https?://" (regexFind "^https?://[^/:?#]+" ($runtime.hostnameUrl | default "")) "" | lower -}}
+{{- $pkRpId = (($passkeys.rpId | default "") | toString | trim | lower) | default $pkHost -}}
+{{- if not $pkRpId -}}
+{{- fail "keycloak.runtime.realmHardening.passkeys.enabled needs an RP ID: set keycloak.runtime.hostnameUrl (https://<host>/auth) or passkeys.rpId. The RP ID is the identity of every enrolled passkey, so it is never left implicit." -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$" $pkRpId) -}}
+{{- fail (printf "keycloak.runtime.realmHardening.passkeys.rpId %q is not a bare host name (no scheme, port or path)" $pkRpId) -}}
+{{- end -}}
+{{- if and $pkHost (ne $pkRpId $pkHost) (not (hasSuffix (printf ".%s" $pkRpId) $pkHost)) -}}
+{{- fail (printf "keycloak.runtime.realmHardening.passkeys.rpId %q is not the issuer host %q or a parent domain of it; a browser rejects an RP ID that is not a suffix of the page's host" $pkRpId $pkHost) -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9 ._-]*$" ($passkeys.rpName | default "" | toString)) -}}
+{{- fail "keycloak.runtime.realmHardening.passkeys.rpName must be non-empty and use only letters, digits, space, '.', '_' and '-'" -}}
+{{- end -}}
+{{- if not (has $passkeys.userVerification (list "required" "preferred" "discouraged")) -}}
+{{- fail "keycloak.runtime.realmHardening.passkeys.userVerification must be required, preferred or discouraged" -}}
+{{- end -}}
+{{- if not (has $passkeys.requireResidentKey (list "Yes" "No")) -}}
+{{- fail "keycloak.runtime.realmHardening.passkeys.requireResidentKey must be \"Yes\" or \"No\"" -}}
+{{- end -}}
+{{- if not (has $passkeys.attestation (list "none" "indirect" "direct")) -}}
+{{- fail "keycloak.runtime.realmHardening.passkeys.attestation must be none, indirect or direct" -}}
+{{- end -}}
+{{- if not (has ($passkeys.authenticatorAttachment | default "") (list "" "platform" "cross-platform")) -}}
+{{- fail "keycloak.runtime.realmHardening.passkeys.authenticatorAttachment must be \"\" (not specified), platform or cross-platform" -}}
+{{- end -}}
+{{- if not $passkeys.signatureAlgorithms -}}
+{{- fail "keycloak.runtime.realmHardening.passkeys.signatureAlgorithms must list at least one algorithm" -}}
+{{- end -}}
+{{- range $passkeys.signatureAlgorithms -}}
+{{- if not (has . (list "ES256" "ES384" "ES512" "RS256" "RS384" "RS512" "EdDSA")) -}}
+{{- fail (printf "keycloak.runtime.realmHardening.passkeys.signatureAlgorithms: unknown algorithm %q" .) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /* Client scope mappings (step 2d). keycloak.clients[].scopeMappings is not a
+KeycloakClient field (EDP operator 1.32.0 has none), so the hook writes it.
+Validated here: the names go into the script unquoted, and a scope mapping
+means nothing on a client with full scope. */ -}}
+{{- $scopeMapped := list -}}
+{{- range .Values.keycloak.clients -}}
+{{- if .scopeMappings -}}
+{{- if not (regexMatch "^[a-z][a-z0-9-]{0,62}$" (.clientId | toString)) -}}
+{{- fail (printf "keycloak.clients[].scopeMappings: clientId %q must be a lowercase name (letters, digits, '-')" .clientId) -}}
+{{- end -}}
+{{- if or (not (hasKey . "fullScopeAllowed")) .fullScopeAllowed -}}
+{{- fail (printf "keycloak.clients %s: scopeMappings needs fullScopeAllowed: false (a full-scope client already carries every role the user holds)" .clientId) -}}
+{{- end -}}
+{{- range .scopeMappings -}}
+{{- if not (regexMatch "^[a-z][a-z0-9-]{0,62}$" (.clientId | toString)) -}}
+{{- fail (printf "keycloak.clients[].scopeMappings[].clientId %q must be a lowercase name (letters, digits, '-')" .clientId) -}}
+{{- end -}}
+{{- if not .roles -}}
+{{- fail (printf "keycloak.clients[].scopeMappings[] for %s must list at least one role" .clientId) -}}
+{{- end -}}
+{{- range .roles -}}
+{{- if not (regexMatch "^[a-z][a-z0-9-]{0,62}$" (. | toString)) -}}
+{{- fail (printf "keycloak.clients[].scopeMappings[].roles: %q must be a lowercase role name (letters, digits, '-')" .) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $scopeMapped = append $scopeMapped . -}}
+{{- end -}}
+{{- end -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-first-admin" $svc | trunc 63 | trimSuffix "-" }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.keycloakRuntime.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-runtime-first-admin
+  annotations:
+    # post-* so the StatefulSet/Service/realm CRs are applied first; the script
+    # still polls for actual readiness since helm does not gate post-hooks on it.
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  activeDeadlineSeconds: {{ $fa.activeDeadlineSeconds | default 600 }}
+  backoffLimit: {{ $fa.backoffLimit | default 3 }}
+  ttlSecondsAfterFinished: {{ $fa.ttlSecondsAfterFinished | default 600 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.keycloakRuntime.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: keycloak-runtime-first-admin
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        # Upstream quay.io/keycloak/keycloak runs as UID 1000 (was 1001 under
+        # Bitnami). kcadm.sh lives at /opt/keycloak/bin; the script passes an
+        # explicit --config under the writable /tmp emptyDir below (kcadm.sh
+        # ignores $HOME and otherwise targets the read-only /opt/keycloak).
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: first-admin
+          image: {{ include "gardenio.mirroredImage" (dict "image" $runtime.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ $runtime.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            # HOME=/tmp feeds the script's KCADM_CONFIG=${HOME:-/tmp}/kcadm.config
+            # default, which is passed to kcadm via --config (kcadm.sh ignores
+            # $HOME itself). Keep it pointed at the writable emptyDir.
+            - name: HOME
+              value: /tmp
+            - name: KC_SERVER
+              value: {{ $serverURL | quote }}
+            - name: KC_REALM
+              value: {{ $realm | quote }}
+            {{- if $tls }}
+            - name: TRUSTSTORE_FILE
+              value: /etc/keycloak-runtime-ca/truststore.p12
+            - name: TRUSTSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ printf "%s-truststore-password" $svc | quote }}
+                  key: password
+            {{- end }}
+            - name: KC_GROUP
+              value: {{ $fa.group | default "gardenio-admins" | quote }}
+            - name: KC_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $runtime.admin.existingSecret | quote }}
+                  key: {{ $runtime.admin.usernameKey | default "username" | quote }}
+            - name: KC_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $runtime.admin.existingSecret | quote }}
+                  key: {{ $runtime.admin.passwordKey | default "password" | quote }}
+            - name: FIRST_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $faSecret | quote }}
+                  key: {{ $fa.passwordSecret.usernameKey | default "username" | quote }}
+            - name: FIRST_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $faSecret | quote }}
+                  key: {{ $fa.passwordSecret.passwordKey | default "password" | quote }}
+            # When "false" the bootstrap is best-effort: any FATAL path dumps the
+            # captured kcadm diagnostics and exits 0 so the Helm post-* hook does
+            # NOT trip its timeout and mark an otherwise-healthy release failed.
+            # Default "true" preserves the fresh-install lock-out guard — a missing
+            # admin on a brand-new box IS a hard failure worth surfacing loudly.
+            # The in-box overlay sets this false: the box is long-lived, the realm
+            # admin is already bootstrapped, and a cosmetic re-ensure miss must not
+            # fail every `helm upgrade` (ka-0000006886).
+            # NB: Helm's `default` treats the bool `false` as empty, so an
+            # explicit failOnError:false would wrongly render "true". Use an
+            # if/else on a nil check so only an UNSET value falls back to true.
+            - name: FAIL_ON_ERROR
+              value: {{ if kindIs "invalid" $fa.failOnError }}"true"{{ else }}{{ $fa.failOnError | quote }}{{ end }}
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              # kcadm.sh (Keycloak 26.x) resolves its config dir from the JVM
+              # user.home system property, NOT the shell $HOME. Under restricted
+              # PSA the non-root uid has no /etc/passwd entry, so user.home falls
+              # back to the read-only image default /opt/keycloak and every kcadm
+              # call dies writing /opt/keycloak/.keycloak/kcadm.config. Pass
+              # --config explicitly so the login config lands in the writable
+              # /tmp emptyDir (ka-0000003447). --config is valid on every
+              # subcommand used below (config credentials, get, create, update,
+              # set-password).
+              KCADM_CONFIG="${HOME:-/tmp}/kcadm.config"
+              KCADM_ERR="${HOME:-/tmp}/kcadm.err"
+              # BUG FIX (2026-09-19): this wrapper used to splice --config in
+              # after the FIRST word:
+              #   kcadm() { ... "$1" --config "$KCADM_CONFIG" "${@:2}"; }
+              # That is correct for single-word subcommands (get/create/update/
+              # set-password) but WRONG for the only two-word one, `config
+              # credentials`, which it rendered as
+              #   kcadm.sh config --config <path> credentials --server ...
+              # i.e. the flag landed BETWEEN the two words of the subcommand.
+              # kcadm then exits 1 having written no config file, so step 1's
+              # authentication loop could never succeed and the hook burned all
+              # 60 attempts and hit activeDeadlineSeconds on EVERY run — a hard
+              # lock-out per this chart's own runbook (ka-0000005523), because
+              # the realm admin is never created.
+              #
+              # It was invisible for two reasons: the loop sends stdout to
+              # /dev/null (kcadm prints its usage error there, not to stderr),
+              # so the deliberately-captured $KCADM_ERR was EMPTY and the
+              # die() diagnostics had nothing to show; and the symptom —
+              # "waiting for Keycloak admin API" — points at the network or the
+              # credentials, both of which were fine. Verified in-cluster: the
+              # spliced order returns rc=1 with no config written, while the
+              # same call with --config appended returns rc=0 and writes it.
+              #
+              # Appending --config LAST works for every subcommand used here;
+              # confirmed against `config credentials` and `get` on Keycloak
+              # 26.x. It also drops the "${@:2}" bashism.
+              kcadm() { /opt/keycloak/bin/kcadm.sh "$@" --config "$KCADM_CONFIG"; }
+
+              # die <message> — on a terminal failure, dump the LAST captured
+              # kcadm diagnostics (so a 401 credential drift is distinguishable
+              # from an unreachable endpoint — historically both surfaced as the
+              # same opaque "waiting for admin API" loop, ka-0000006886) then
+              # either fail the hook (FAIL_ON_ERROR=true, fresh-install guard) or
+              # exit 0 best-effort (FAIL_ON_ERROR=false, long-lived in-box).
+              die() {
+                echo "[first-admin] FATAL: $1"
+                if [ -s "$KCADM_ERR" ]; then
+                  echo "[first-admin] last kcadm diagnostics:"
+                  sed 's/^/[first-admin]   kcadm> /' "$KCADM_ERR"
+                fi
+                if [ "${FAIL_ON_ERROR}" = "false" ]; then
+                  echo "[first-admin] FAIL_ON_ERROR=false — treating as non-fatal; exiting 0 so the Helm hook does not mark the release failed."
+                  echo "[first-admin] NOTE: the realm admin was NOT (re-)ensured this run; if this is a fresh box, bootstrap manually (runbook ka-0000005523)."
+                  exit 0
+                fi
+                exit 1
+              }
+              echo "[first-admin] target server=${KC_SERVER} realm=${KC_REALM} group=${KC_GROUP} user=${FIRST_ADMIN_USER} failOnError=${FAIL_ON_ERROR}"
+
+              # 0) In-cluster TLS (gd-lYPZlslOM7): trust the keycloak-runtime CA
+              #    for every kcadm call below. kcadm keeps the truststore in
+              #    its --config file, so one call covers the rest.
+              if [ -n "${TRUSTSTORE_FILE:-}" ]; then
+                if ! kcadm config truststore --trustpass "$TRUSTSTORE_PASSWORD" "$TRUSTSTORE_FILE" >/dev/null 2>"$KCADM_ERR"; then
+                  die "kcadm could not load the keycloak-runtime CA truststore ${TRUSTSTORE_FILE}"
+                fi
+                echo "[first-admin] trusting the keycloak-runtime CA (${TRUSTSTORE_FILE})"
+              fi
+
+              # 1) Wait for the admin API + authenticate as the master-realm
+              #    bootstrap superuser. Retries cover cold StatefulSet starts.
+              #    kcadm stderr is captured (not discarded) so the LAST attempt's
+              #    real error — connection refused vs HTTP 401 — is logged on
+              #    timeout instead of vanishing into /dev/null.
+              for i in $(seq 1 60); do
+                if kcadm config credentials --server "$KC_SERVER" \
+                     --realm master --user "$KC_ADMIN_USER" \
+                     --password "$KC_ADMIN_PASSWORD" >/dev/null 2>"$KCADM_ERR"; then
+                  echo "[first-admin] authenticated to master realm"
+                  break
+                fi
+                echo "[first-admin] waiting for Keycloak admin API ($i/60)..."
+                sleep 5
+                if [ "$i" = "60" ]; then die "admin API never authenticated (see diagnostics — connection error => netpol/DNS/path; HTTP 401 => master-admin credential drift)"; fi
+              done
+
+              # 2) Wait for the target realm (reconciled async by the operator).
+              for i in $(seq 1 60); do
+                if kcadm get "realms/${KC_REALM}" --fields id >/dev/null 2>"$KCADM_ERR"; then
+                  echo "[first-admin] realm ${KC_REALM} present"
+                  break
+                fi
+                echo "[first-admin] waiting for realm ${KC_REALM} ($i/60)..."
+                sleep 5
+                if [ "$i" = "60" ]; then die "realm ${KC_REALM} never appeared"; fi
+              done
+
+              {{- if $bruteForce.enabled }}
+              # 2b) Realm brute-force detection (realmHardening.bruteForce). The
+              #     KeycloakRealm CRD has no field for it. Idempotent: the same
+              #     values are written on every run. A failure here is reported
+              #     but never fails the hook, so the admin bootstrap below still
+              #     runs and a cosmetic miss cannot mark the release failed.
+              if kcadm update "realms/${KC_REALM}" \
+                   -s bruteForceProtected=true -s permanentLockout=false \
+                   -s failureFactor=10 -s waitIncrementSeconds=60 \
+                   -s maxFailureWaitSeconds=900 -s maxDeltaTimeSeconds=43200 \
+                   >/dev/null 2>"$KCADM_ERR"; then
+                echo "[first-admin] brute-force detection enabled on realm ${KC_REALM}"
+              else
+                echo "[first-admin] WARNING: could not enable brute-force detection on realm ${KC_REALM}; continuing"
+                sed 's/^/[first-admin]   kcadm> /' "$KCADM_ERR" || true
+              fi
+
+              {{- end }}
+              {{- if $passkeys.enabled }}
+              # --- passkeys:begin
+              # 2c) WebAuthn Passwordless policy (realmHardening.passkeys; design
+              #     doc 4.2). The KeycloakRealm CRD cannot express it. Needs
+              #     Keycloak >= 26.4. Idempotent: the same values are written on
+              #     every run. NON-FATAL like 2b: a failure is logged and the
+              #     admin bootstrap below still runs. The RP ID is always written
+              #     explicitly (it is the identity of every enrolled passkey).
+              #     Uses ...ResidentKey, not the deprecated ...RequireResidentKey
+              #     (stays "not specified" on 26.7). Attribute names were read
+              #     back from a 26.7.5 realm; the harness asserts each of them.
+              if kcadm update "realms/${KC_REALM}" \
+                   -s webAuthnPolicyPasswordlessPasskeysEnabled=true \
+                   -s webAuthnPolicyPasswordlessRpId={{ $pkRpId }} \
+                   -s webAuthnPolicyPasswordlessRpEntityName='{{ $passkeys.rpName }}' \
+                   -s webAuthnPolicyPasswordlessUserVerificationRequirement={{ $passkeys.userVerification }} \
+                   -s webAuthnPolicyPasswordlessResidentKey={{ if eq $passkeys.requireResidentKey "Yes" }}required{{ else }}discouraged{{ end }} \
+                   -s webAuthnPolicyPasswordlessAttestationConveyancePreference={{ $passkeys.attestation }} \
+                   -s webAuthnPolicyPasswordlessAuthenticatorAttachment='{{ $passkeys.authenticatorAttachment | default "not specified" }}' \
+                   -s 'webAuthnPolicyPasswordlessSignatureAlgorithms={{ $passkeys.signatureAlgorithms | toJson }}' \
+                   -s webAuthnPolicyPasswordlessAvoidSameAuthenticatorRegister={{ if $passkeys.avoidSameAuthenticatorRegister }}true{{ else }}false{{ end }} \
+                   >/dev/null 2>"$KCADM_ERR"; then
+                echo "[first-admin] passkey (WebAuthn passwordless) policy applied on realm ${KC_REALM} (rpId={{ $pkRpId }})"
+              else
+                echo "[first-admin] WARNING: could not apply the passkey policy on realm ${KC_REALM} (needs Keycloak >= 26.4); continuing"
+                sed 's/^/[first-admin]   kcadm> /' "$KCADM_ERR" || true
+              fi
+              # --- passkeys:end
+
+              {{- end }}
+              {{- if $scopeMapped }}
+              # --- scope-mappings:begin
+              # 2d) Client scope mappings (keycloak.clients[].scopeMappings). The
+              #     EDP operator's KeycloakClient has no field for them. Add-only
+              #     and idempotent: a role already mapped is skipped, and one
+              #     dropped from values stays mapped until removed by hand.
+              #     NON-FATAL like 2b: a client the operator has not made yet is
+              #     waited for briefly, then left to the next upgrade. Without
+              #     its mappings a fullScopeAllowed=false client carries no
+              #     client role, so a miss fails closed.
+              scope_map() { # <client> <target client> <role>...
+                SM_CLIENT="$1"; SM_TARGET="$2"; shift 2
+                SM_CID=""
+                for i in $(seq 1 12); do
+                  SM_CID=$(kcadm get clients -r "$KC_REALM" -q "clientId=${SM_CLIENT}" \
+                             --fields id --format csv --noquotes 2>"$KCADM_ERR" | head -1)
+                  [ -n "$SM_CID" ] && break
+                  echo "[first-admin] waiting for client ${SM_CLIENT} ($i/12)..."
+                  sleep 5
+                done
+                SM_TID=$(kcadm get clients -r "$KC_REALM" -q "clientId=${SM_TARGET}" \
+                           --fields id --format csv --noquotes 2>"$KCADM_ERR" | head -1)
+                if [ -z "$SM_CID" ] || [ -z "$SM_TID" ]; then
+                  echo "[first-admin] WARNING: client ${SM_CLIENT} or ${SM_TARGET} not found; scope mappings not set; continuing"
+                  sed 's/^/[first-admin]   kcadm> /' "$KCADM_ERR" || true
+                  return 0
+                fi
+                SM_HAVE=$(kcadm get "clients/${SM_CID}/scope-mappings/clients/${SM_TID}" -r "$KC_REALM" \
+                            --fields name --format csv --noquotes 2>"$KCADM_ERR") || {
+                  echo "[first-admin] WARNING: could not read ${SM_CLIENT}'s scope mappings for ${SM_TARGET}; continuing"
+                  sed 's/^/[first-admin]   kcadm> /' "$KCADM_ERR" || true
+                  return 0
+                }
+                SM_BODY=""
+                for SM_ROLE in "$@"; do
+                  if printf '%s\n' "$SM_HAVE" | grep -qx -- "$SM_ROLE"; then continue; fi
+                  SM_RID=$(kcadm get "clients/${SM_TID}/roles/${SM_ROLE}" -r "$KC_REALM" \
+                             --fields id --format csv --noquotes 2>"$KCADM_ERR" | head -1)
+                  if [ -z "$SM_RID" ]; then
+                    echo "[first-admin] WARNING: role ${SM_TARGET}/${SM_ROLE} not found; skipping it"
+                    continue
+                  fi
+                  SM_BODY="${SM_BODY:+${SM_BODY},}{\"id\":\"${SM_RID}\",\"name\":\"${SM_ROLE}\"}"
+                done
+                if [ -z "$SM_BODY" ]; then
+                  echo "[first-admin] ${SM_CLIENT} scope mappings for ${SM_TARGET} already present"
+                  return 0
+                fi
+                if kcadm create "clients/${SM_CID}/scope-mappings/clients/${SM_TID}" -r "$KC_REALM" \
+                     -b "[${SM_BODY}]" >/dev/null 2>"$KCADM_ERR"; then
+                  echo "[first-admin] ${SM_CLIENT} scope mappings for ${SM_TARGET} added: ${SM_BODY}"
+                else
+                  echo "[first-admin] WARNING: could not add ${SM_CLIENT} scope mappings for ${SM_TARGET}; continuing"
+                  sed 's/^/[first-admin]   kcadm> /' "$KCADM_ERR" || true
+                fi
+              }
+              {{- range $scopeMapped }}
+              {{- $client := .clientId }}
+              {{- range .scopeMappings }}
+              scope_map {{ $client }} {{ .clientId }}{{ range .roles }} {{ . }}{{ end }}
+              {{- end }}
+              {{- end }}
+              # --- scope-mappings:end
+
+              {{- end }}
+              # 3) Wait for the target group and capture its id.
+              GID=""
+              for i in $(seq 1 60); do
+                # NO awk IN THE KEYCLOAK IMAGE (verified on 26.x: awk and
+                # python3 and jq are all absent; sed, grep, cut, tr, head are
+                # present). This previously ran
+                #   awk -F, -v g="$KC_GROUP" '$2==g {print $1; exit}'
+                # which died "awk: command not found" AFTER the realm check
+                # passed, so the hook failed fast with a shell error rather
+                # than any [first-admin] diagnostic.
+                #
+                # --fields id,name --format csv --noquotes emits exactly two
+                # columns per line ("<id>,<name>"), so anchoring on ",<group>$"
+                # is the same exact field-2 match awk did, and -m1 reproduces
+                # its `exit` after the first hit.
+                GID=$(kcadm get groups -r "$KC_REALM" -q "search=${KC_GROUP}" \
+                        --fields id,name --format csv --noquotes 2>"$KCADM_ERR" \
+                        | grep -m1 -- ",${KC_GROUP}$" | cut -d, -f1)
+                if [ -n "$GID" ]; then
+                  echo "[first-admin] group ${KC_GROUP} id=${GID}"
+                  break
+                fi
+                echo "[first-admin] waiting for group ${KC_GROUP} ($i/60)..."
+                sleep 5
+                if [ "$i" = "60" ]; then die "group ${KC_GROUP} never appeared"; fi
+              done
+
+              # 4) Create the realm user if absent (idempotent). Only set the
+              #    password when the user is freshly created — a re-run must NOT
+              #    clobber a password the admin may have rotated.
+              UID_VAL=$(kcadm get users -r "$KC_REALM" -q "username=${FIRST_ADMIN_USER}" \
+                          --fields id --format csv --noquotes 2>/dev/null | head -1)
+              if [ -z "$UID_VAL" ]; then
+                echo "[first-admin] creating user ${FIRST_ADMIN_USER}"
+                kcadm create users -r "$KC_REALM" \
+                  -s username="${FIRST_ADMIN_USER}" \
+                  -s email="${FIRST_ADMIN_USER}" \
+                  -s emailVerified=true \
+                  -s enabled=true >/dev/null
+                UID_VAL=$(kcadm get users -r "$KC_REALM" -q "username=${FIRST_ADMIN_USER}" \
+                            --fields id --format csv --noquotes 2>/dev/null | head -1)
+                echo "[first-admin] created user id=${UID_VAL}; setting initial password"
+                # MUST be checked. kcadm set-password exits 0 even when the
+                # server REJECTS the password against the realm passwordPolicy
+                # (it reports "Invalid password: ..." on stdout), so the old
+                # `>/dev/null` with no check silently produced a user with an
+                # EMPTY credentials list — created, enabled, in the admins
+                # group, and unable to log in. Capture the output and treat any
+                # "Invalid password" as fatal, so a policy/generator mismatch
+                # fails the hook loudly instead of yielding a locked-out box.
+                SETPW_OUT=$(kcadm set-password -r "$KC_REALM" --username "${FIRST_ADMIN_USER}" \
+                  --new-password "${FIRST_ADMIN_PASSWORD}" 2>&1) || true
+                case "$SETPW_OUT" in
+                  *"Invalid password"*|*"error"*|*"Error"*)
+                    echo "[first-admin] set-password rejected: $SETPW_OUT"
+                    die "initial password rejected by the realm passwordPolicy — the generated password does not satisfy it" ;;
+                esac
+                # Confirm a credential actually exists; an empty list here means
+                # the password never landed whatever the command printed.
+                if [ -z "$(kcadm get "users/${UID_VAL}/credentials" -r "$KC_REALM" --fields type --format csv --noquotes 2>/dev/null | head -1)" ]; then
+                  die "user ${FIRST_ADMIN_USER} was created but has NO credential — login would fail with 'Invalid username or password'"
+                fi
+                echo "[first-admin] initial password set and credential verified"
+              else
+                echo "[first-admin] user ${FIRST_ADMIN_USER} already exists id=${UID_VAL} (password left unchanged); ensuring enabled+verified"
+                kcadm update "users/${UID_VAL}" -r "$KC_REALM" \
+                  -s enabled=true -s emailVerified=true >/dev/null || true
+              fi
+
+              if [ -z "$UID_VAL" ]; then
+                die "could not resolve user id after create"
+              fi
+
+              # 5) Join the admins group (idempotent — repeats are a no-op).
+              echo "[first-admin] ensuring ${FIRST_ADMIN_USER} is in group ${KC_GROUP}"
+              kcadm update "users/${UID_VAL}/groups/${GID}" -r "$KC_REALM" \
+                -s realm="${KC_REALM}" -s userId="${UID_VAL}" -s groupId="${GID}" -n >/dev/null
+
+              echo "[first-admin] DONE. Admin '${FIRST_ADMIN_USER}' is a member of '${KC_GROUP}'."
+              echo "[first-admin] Retrieve the one-time password with:"
+              echo "[first-admin]   kubectl get secret {{ $faSecret }} -n {{ .Release.Namespace }} -o jsonpath='{.data.{{ $fa.passwordSecret.passwordKey | default "password" }}}' | base64 -d"
+          resources:
+            {{- toYaml $fa.resources | nindent 12 }}
+          volumeMounts:
+            - name: home
+              mountPath: /tmp
+            {{- if $tls }}
+            - name: keycloak-runtime-ca
+              mountPath: /etc/keycloak-runtime-ca
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: home
+          emptyDir: {}
+        {{- if $tls }}
+        # truststore.p12 ONLY from the leaf Secret. Not optional: the pod
+        # waits for cert-manager to write it (activeDeadlineSeconds bounds it).
+        - name: keycloak-runtime-ca
+          secret:
+            secretName: {{ include "gardenio.keycloakRuntime.tlsSecretName" . | quote }}
+            defaultMode: 0444
+            items:
+              - key: truststore.p12
+                path: truststore.p12
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" $runtime.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with $runtime.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" $runtime.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

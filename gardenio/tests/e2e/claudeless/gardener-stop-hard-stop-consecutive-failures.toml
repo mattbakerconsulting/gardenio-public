@@ -1,0 +1,141 @@
+# gardener-stop-hard-stop-consecutive-failures.toml
+#
+# Live-flow scenario for ka-0000002765 §10: stop.hard_stop with
+# consecutive_failures=3 fires when the schedule has 3 successive failed
+# runs → schedule auto-closes AND the running pod is killed.
+#
+# Engine code covered:
+#   - gardenio/controller/internal/scheduler/stop.go:322-327
+#     (consecutive_failures evaluator: returns true once
+#     sched.ConsecutiveFailures >= threshold).
+#   - gardenio/controller/internal/scheduler/stop.go:413-450
+#     (enforceStopSpec: hard_stop slot kills last_agent_id before
+#     closing the schedule).
+#
+# This test exercises the EVALUATOR via the persisted counter — we set
+# consecutive_failures=3 directly on the schedule bead, then wait for the
+# next reconcile tick to observe enforceStopSpec close it. We don't try
+# to actually fail three runs because (a) that needs real agent failures
+# and (b) the failure-tracking path is covered by execution_tracking_test.
+#
+# Why live-flow: shape tests pass even if the integer-comparison in the
+# evaluator regresses (off-by-one) or enforceStopSpec drops the
+# hard_stop branch entirely.
+
+[claude]
+session_id = "e2e00000-000c-4000-a000-00000000000a"
+username = "e2e-gardener-stop-cf"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 240000
+
+[[responses]]
+on = "*"
+say = "Running gardener-stop-hard-stop-consecutive-failures: counter reaches 3 → schedule auto-closes."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if [ -z "${BEADS_HTTP_URL:-}" ] || [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL/BEADS_TOKEN unset"; exit 0
+fi
+
+TAG="e2e-cscf-$$-$(date +%s)"
+
+EPIC_ID=$(kd create "gardener-stop-cf-epic-$TAG" --type=epic -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+
+TRIGGERS='[{"kind":"cron","cron":"0 0 1 1 *","timezone":"UTC"}]'
+STOP=$(cat <<'JSON'
+{
+  "loop_end": {"any":[{"kind":"max_runs"}]},
+  "run_end": {"any":[{"kind":"no_actionable_state"}]},
+  "hard_stop": {"any":[
+    {"kind":"consecutive_failures","value":"3"},
+    {"kind":"manual_force","field":"force_close","value":"true"}
+  ]}
+}
+JSON
+)
+
+SCHED_ID=$(kd create "gardener-sched-$TAG" --type=schedule \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "role:gardener" -l "project:gardenio" \
+  -f "enabled=true" -f "role=gardener" -f "assign_bead=$EPIC_ID" -f "project=gardenio" \
+  -f "prompt=gardener test prompt" -f "max_runs=10" \
+  -f "cron=0 0 1 1 *" -f "timezone=UTC" \
+  -f "consecutive_failures=0" \
+  -f "triggers=$TRIGGERS" -f "stop=$STOP" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$SCHED_ID" ]; then fail "create schedule"; exit 1; fi
+echo "schedule: $SCHED_ID"
+
+cleanup() {
+  kd update "$SCHED_ID" -f "enabled=false" -f "force_close=true" >/dev/null 2>&1 || true
+  kd close "$SCHED_ID" >/dev/null 2>&1 || true
+  kd close "$EPIC_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+sleep 10
+
+# Sanity: schedule still open while counter < 3.
+STATUS=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.status // empty')
+if [ "$STATUS" = "open" ] || [ "$STATUS" = "in_progress" ]; then
+  pass "schedule open while consecutive_failures=0 (status=$STATUS)"
+else
+  fail "schedule unexpectedly $STATUS before counter trip"; exit 1
+fi
+
+# ── Mutate: bump consecutive_failures to threshold ───────────────
+kd update "$SCHED_ID" -f "consecutive_failures=3" >/dev/null 2>&1 || \
+  { fail "kd update consecutive_failures"; exit 1; }
+echo "set consecutive_failures=3 at $(date -u +%FT%TZ)"
+
+DEADLINE=$(( $(date +%s) + 150 ))
+CLOSED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  STATUS=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.status // empty')
+  if [ "$STATUS" = "closed" ]; then
+    CLOSED=1
+    pass "schedule auto-closed on hard_stop (status=closed)"
+    break
+  fi
+  sleep 5
+done
+
+if [ "$CLOSED" = "0" ]; then
+  fail "schedule did not auto-close within 150s of counter trip"
+  kd show "$SCHED_ID" 2>/dev/null | head -40 || true
+  exit 1
+fi
+
+# Close-reason comment should name hard_stop:consecutive_failures.
+COMMENTS=$(kd show "$SCHED_ID" 2>/dev/null | grep -i "terminated\\|hard_stop\\|consecutive_failures" | head -3 || true)
+if echo "$COMMENTS" | grep -q "hard_stop" && echo "$COMMENTS" | grep -q "consecutive_failures"; then
+  pass "close-reason comment names hard_stop:consecutive_failures"
+else
+  echo "  (note) no close-reason comment found — non-fatal"
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "gardener-stop-hard-stop-consecutive-failures OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-stop-hard-stop-consecutive-failures scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

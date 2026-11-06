@@ -1,0 +1,74 @@
+{{- if .Values.agents.metrics.prometheusRule.vpaGuardrails.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.vpaGuardrails }}
+{{- $sm := $cfg.recommenderServiceMonitor }}
+{{- if $sm.enabled }}
+# vpa-recommender metrics plumbing.
+#
+# The Fairwinds vpa subchart (the wrapper chart's charts/vpa) ships the recommender
+# Deployment but NO Service — its :8942 /metrics endpoint is unscraped by
+# default. We add a headless Service selecting the recommender pods plus a
+# ServiceMonitor so the recommender operational series reach the observability
+# Prometheus and back the VPARecommenderDown / VPARecommenderNoRecommendation
+# alerts:
+#   vpa_recommender_vpa_objects_count{matches_pods,has_recommendation,update_mode}
+#   vpa_recommender_aggregate_container_states_count
+#   vpa_recommender_execution_latency_seconds / _recommendation_latency_seconds
+#   vpa_recommender_metric_server_responses
+#
+# The Service lives in the gardenio namespace alongside the recommender (the
+# charts/vpa install is `-n gardenio`); the ServiceMonitor is discovered
+# cluster-wide by the observability Prometheus (empty serviceMonitorSelector).
+#
+# SCRAPE PATH (ka-0000000525): as with the reco-value exporter, the
+# ServiceMonitor is honored only where a prometheus-operator Prometheus runs.
+# The in-chart vmagent runs a STATIC -promscrape.config and cannot consume it,
+# and prod-gardenio-eks has no observability Prometheus — so on prod these series
+# (and the up{job=~".*vpa-recommender.*"} health signal) reach vmsingle via the
+# dedicated static `vpa-recommender` vmagent scrape job that targets this
+# Service's :8942. Both paths are gated on recommenderServiceMonitor.enabled.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-vpa-recommender-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- toYaml $sm.selectorMatchLabels | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 8942
+      targetPort: 8942
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-vpa-recommender
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.agents.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/part-of: vpa-guardrails
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ $sm.interval | default "30s" }}
+      # Pin the job label so the VPARecommenderDown up{job=~".*vpa-recommender.*"}
+      # selector matches deterministically regardless of operator relabeling.
+      relabelings:
+        - targetLabel: job
+          replacement: vpa-recommender
+{{- end }}
+{{- end }}

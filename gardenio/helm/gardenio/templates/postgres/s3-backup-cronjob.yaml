@@ -1,0 +1,199 @@
+{{- if and .Values.postgres.enabled .Values.postgres.s3Backup.enabled }}
+# Off-node logical backup for the postgres StatefulSet (gd-vekJWxnNGG).
+#
+# Unlike postgres.backup (backup-cronjob.yaml) and the gardenio-in-a-box
+# backup.postgres dumpall (backup/postgres-cronjob.yaml), this writes NO PVC.
+# Both of those land their dump on another local-path volume that binds to
+# the SAME node as the live data — on a single-node cluster that protects
+# against a corrupt data PV, not against losing the node. This CronJob runs
+# `pg_dumpall` straight to an emptyDir, then ships it to S3 with an aws-cli
+# sidecar reading the node's IMDS role — modelled on
+# helm/beads/dolt-backup-cronjob.yaml's dump -> emptyDir -> s3-sync shape.
+# Requires the node role to be granted the target S3 prefix (terraform
+# `extra_backup_prefixes`); see terraform/composition/gardenio/main.tf.
+# Restore runbook: gardenio/docs/postgres-backup-restore.md
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "gardenio.postgres.fullname" . }}-s3-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.postgres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-s3-backup
+spec:
+  schedule: {{ .Values.postgres.s3Backup.schedule | quote }}
+  # Forbid: never run two dumps against the same DB at once. A still-running
+  # prior dump means this slot is skipped — the next tick covers it.
+  concurrencyPolicy: Forbid
+  # After an outage, don't backfill missed slots; if a run can't start within
+  # 5 min of its slot, skip it.
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      activeDeadlineSeconds: {{ .Values.postgres.s3Backup.activeDeadlineSeconds }}
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "gardenio.postgres.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: postgres-s3-backup
+            # P7 Task 6: uploads to S3 with the node role over IMDS.
+            gardenio.io/imds: allow
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+          {{- /* s3Backup.nodeSelector, when set, replaces postgres.nodeSelector
+                 (gd-RbR8vI9K5e): postgres is pinned to one on-demand node by its
+                 local PV, but the backup only needs to share its zone, so it may
+                 select a wider class (e.g. the zone's spot platform nodes). */}}
+          {{- include "gardenio.nodeSelector" (dict "local" (.Values.postgres.s3Backup.nodeSelector | default .Values.postgres.nodeSelector) "global" .Values.global.nodeSelector) | nindent 10 }}
+          {{- include "gardenio.tolerations" (dict "local" .Values.postgres.tolerations "global" .Values.global.tolerations) | nindent 10 }}
+          # Run near postgres so the uncompressed dump (zstd runs in THIS pod,
+          # ~33 GB raw per run on 2026-10-25) never crosses an AZ: cross-AZ is
+          # $0.01/GB each way. B1 (gd-diP4TgbQv4) preferred the postgres node;
+          # that alone did not hold once Shape A filled it, and runs still
+          # landed in 1a (gd-RbR8vI9K5e). requireSameZone makes the ZONE a hard
+          # rule and keeps the node as a preference. A run waits only if no
+          # selected node in that zone can make room: the pod asks 50m/64Mi,
+          # and with global.systemPriorityClass.create it may preempt
+          # lower-priority pods (agents) there. A run still Pending at
+          # activeDeadlineSeconds fails, and the next slot tries again.
+          affinity:
+            podAffinity:
+              {{- if .Values.postgres.s3Backup.requireSameZone }}
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: topology.kubernetes.io/zone
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/component: postgres
+                      app.kubernetes.io/instance: {{ .Release.Name }}
+              {{- end }}
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    topologyKey: kubernetes.io/hostname
+                    labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/component: postgres
+                        app.kubernetes.io/instance: {{ .Release.Name }}
+          initContainers:
+            - name: dumpall
+              image: {{ include "gardenio.mirroredImage" (dict "image" .Values.postgres.image "global" .Values.global) | quote }}
+              imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              env:
+                # application_name (gd-rXqkv4rSmG): libpq and lib/pq read PGAPPNAME, so
+                # pg_stat_activity and the postgres exporter attribute this client's load.
+                - name: PGAPPNAME
+                  value: "gardenio-backup"
+                - name: PGHOST
+                  value: {{ include "gardenio.postgres.fullname" . | quote }}
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  value: "postgres"
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .) }}
+                      key: password
+                - name: BACKUP_DIR
+                  value: /backups
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+                  OUT="${BACKUP_DIR}/pgdumpall-${STAMP}.sql.zst"
+                  TMP="${OUT}.partial"
+
+                  echo "=== pg_dumpall start: host=${PGHOST} -> ${OUT} ==="
+                  echo "[backup] waiting for postgres to accept connections"
+                  for i in $(seq 1 30); do
+                    if pg_isready -q; then break; fi
+                    echo "[backup]   not ready yet (${i}/30)"; sleep 5
+                  done
+
+                  # pg_dumpall captures ALL databases + global roles in one
+                  # plaintext stream (zstd-compressed). Write to .partial then
+                  # atomic rename so a killed run never leaves a truncated dump
+                  # that the sidecar would upload as if it were good. pipefail
+                  # makes a pg_dumpall failure fail the whole pipe.
+                  # zstd, not gzip (gd-w24jkWkith): with gzip -6 the ~33 GB raw
+                  # stream took 96-100 min under this container's CPU limit on
+                  # 2026-10-28; zstd -3 compresses several times faster per CPU
+                  # at a similar ratio. /usr/bin/zstd ships in pgvector:pg17.
+                  pg_dumpall | zstd -T2 -3 -q -c > "${TMP}"
+                  mv "${TMP}" "${OUT}"
+                  SIZE=$(stat -c %s "${OUT}" 2>/dev/null || echo "?")
+                  echo "[backup] wrote ${OUT} (${SIZE} bytes)"
+              resources:
+                {{- toYaml .Values.postgres.s3Backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+          {{- if $.Values.global.systemPriorityClass.create }}
+          priorityClassName: {{ $.Values.global.systemPriorityClass.name }}
+          {{- end }}
+          containers:
+            - name: s3-upload
+              image: amazon/aws-cli:2.36.48
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: AWS_REGION
+                  value: {{ .Values.postgres.s3Backup.region | quote }}
+                - name: AWS_EC2_METADATA_DISABLED
+                  value: "false"
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                readOnlyRootFilesystem: true
+              command:
+                - sh
+                - -ec
+                - |
+                  # `cp`, not `sync --delete`: each run is a new timestamped
+                  # object, not a mirror. Retention is the S3 lifecycle rule
+                  # on this prefix (terraform modules/hq), not job-side pruning.
+                  aws s3 cp /backups/ "s3://{{ .Values.postgres.s3Backup.bucket }}/{{ .Values.postgres.s3Backup.prefix }}/" \
+                    --recursive --exclude "*" --include "pgdumpall-*.sql.zst" --no-progress --only-show-errors
+                  echo "uploaded $(date -u +%FT%TZ):"
+                  aws s3 ls "s3://{{ .Values.postgres.s3Backup.bucket }}/{{ .Values.postgres.s3Backup.prefix }}/" | tail -5
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                {{- toYaml .Values.postgres.s3Backup.resources | nindent 16 }}
+          volumes:
+            - name: backups
+              emptyDir: {}
+            - name: tmp
+              emptyDir: {}
+{{- end }}

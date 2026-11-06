@@ -1,0 +1,53 @@
+{{/*
+Plain networking.k8s.io/v1 Ingress for the jira-bridge /webhook endpoint —
+for clusters WITHOUT Traefik (e.g. prod-gardenio-eks, which runs only the AWS
+Load Balancer Controller, ingressclass "alb"). Deliberately NOT gated on
+gardenio.traefik.ingressRoutesEnabled: it coexists with (does not replace) the
+Traefik IngressRoute in ingressroute.yaml. It IS gated on
+jiraBridge.webhook.enabled — that flag is the webhook-feature switch that also
+gates the webhook-secret ExternalSecret (external-secrets.yaml), so an Ingress
+never renders for a bridge whose webhook handling is off. Controller-specific
+annotations (ALB scheme/target-type/listen-ports/certificate-arn/inbound-cidrs)
+are fully caller-supplied via jiraBridge.webhookIngress.annotations — see
+values.yaml for examples.
+*/}}
+{{- if and .Values.jiraBridge.enabled .Values.jiraBridge.webhook.enabled .Values.jiraBridge.webhookIngress.enabled }}
+{{- if empty .Values.jiraBridge.webhookIngress.host }}
+{{- fail "jiraBridge.webhookIngress.enabled is true but jiraBridge.webhookIngress.host is empty: set the external webhook hostname (e.g. jira-webhook.<workload-domain>)." }}
+{{- end }}
+{{- $fullname := printf "%s-jira-bridge" (include "gardenio.fullname" .) -}}
+{{- $ing := .Values.jiraBridge.webhookIngress -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jira-bridge
+  {{- with $ing.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $ing.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- with $ing.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ $ing.host | quote }}
+      http:
+        paths:
+          - path: {{ $ing.path | default "/webhook" }}
+            pathType: {{ $ing.pathType | default "Exact" }}
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  # Named port on the jira-bridge Service (service.yaml) —
+                  # stays correct if jiraBridge.service.port is overridden.
+                  name: http
+{{- end }}

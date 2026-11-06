@@ -1,0 +1,427 @@
+# Helm chart CI/CD — auto-publishes on v* tags, manual lint via CLI.
+# Lint manually: rwx run .rwx/helm.yml --init commit-sha=$(git rev-parse HEAD) --wait
+on:
+  github:
+    push:
+      if: ${{ starts-with(event.git.tag, '20') }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: ${{ event.git.ref }}
+      status-checks:
+        name: Helm
+    pull_request:
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: pr
+      status-checks:
+        - tasks: [helm-lint]
+          name: Helm
+        - tasks: [helm-security]
+          name: Helm / Security
+  gitlab:
+    push:
+      if: ${{ event.git.branch == 'main' }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: main
+      # Disable default status check: without `false`, RWX still posts
+      # "RWX: helm.yml (push)" even with no status-checks block.
+      status-checks: false
+    tag-push:
+      if: ${{ starts-with(event.git.ref, 'refs/tags/20') }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: ${{ event.git.ref }}
+      status-checks: false
+    merge-request:
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: pr
+      status-checks:
+        - tasks: [helm-lint]
+          name: Helm
+        - tasks: [helm-security]
+          name: Helm / Security
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      ref-name: cli
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: code
+    # ── Retry-wrapped shallow clone (ka-0000001787 / ka-0000004454) ─────────
+    # Hand-rolled shallow clone with a bounded retry loop instead of
+    # `call: git/clone` — the pattern proven in docker.yml (ka-0000007550) and
+    # the release-DAG workflows (!7031). The stock package (through 2.0.8) has
+    # NO retry and RWX has no task-level auto-retry, so a single transient
+    # gitlab.com blip during fetch-pack (`Connection to gitlab.com closed by
+    # remote host`, exit 128) fails the whole run.
+    #
+    # Parity with `git/clone` DEFAULTS (all this task used): shallow `--depth=1`
+    # fetch of the exact ref, detached checkout, `.git` stripped afterwards
+    # (cleanup-git-dir default) for identical downstream cache keys, no
+    # submodules, no LFS. Token auth stays in the repository URL.
+    run: |
+      set -eu
+      : "${GITLAB_CLONE_TOKEN:?GITLAB_CLONE_TOKEN is required}"
+      REPO="https://oauth2:${GITLAB_CLONE_TOKEN}@gitlab.com/Acme/Platform/gardenio.git"
+      SHA="${COMMIT_SHA}"
+      MAX_ATTEMPTS=5
+
+      # Redact the token from any tracing/output; never echo $REPO.
+      git init -q -b main
+      git remote add origin "$REPO"
+      git config --local maintenance.auto false
+      git config --local gc.auto 0
+
+      attempt=1
+      while :; do
+        echo "git-clone attempt ${attempt}/${MAX_ATTEMPTS} for ${SHA}"
+        if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch --no-auto-gc --depth=1 origin "+${SHA}:refs/rwx/git-clone/checkout"; then
+          echo "git-clone: fetch succeeded on attempt ${attempt}"
+          break
+        else
+          rc=$?
+          if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+            echo "git-clone: fetch FAILED after ${MAX_ATTEMPTS} attempts (last exit ${rc})" >&2
+            exit "$rc"
+          fi
+          # Exponential backoff: 5s, 10s, 20s, 40s.
+          sleep_s=$((5 * (1 << (attempt - 1))))
+          echo "git-clone: fetch failed (exit ${rc}); retrying in ${sleep_s}s" >&2
+          sleep "$sleep_s"
+          attempt=$((attempt + 1))
+        fi
+      done
+
+      git checkout -q --detach "$(git rev-parse refs/rwx/git-clone/checkout^{commit})"
+      git clean -fdq
+      echo "Checked out git repository at $(git rev-parse HEAD)"
+
+      # Strip .git for cache-key parity with git/clone's cleanup-git-dir default.
+      rm -rf .git
+    env:
+      GITLAB_CLONE_TOKEN:
+        value: ${{ secrets.GITLAB_CLONE_TOKEN }}
+        cache-key: excluded
+      COMMIT_SHA: ${{ init.commit-sha }}
+
+  # ── Helm installation (cached until version changes) ────────────────
+  - key: helm-setup
+    run: |
+      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      # python3 — scripts/pack-gardenio-chart.sh runs
+      # scripts/strip-helm-template-comments.py (python3) to strip Go-template
+      # comments from templates/ at package time; that is the strip that
+      # actually shrinks the Helm release-history Secret under the K8s 1 MiB
+      # limit (ka-0000007585). Ubuntu runner base ships python3, but install
+      # defensively so a base-image change can't silently break packaging.
+      command -v python3 >/dev/null 2>&1 || { sudo apt-get update -q && sudo apt-get install -y -q python3; }
+      # yq (mikefarah) — used by scripts/pack-gardenio-chart.sh to strip
+      # values.yaml comments at package time (defense-in-depth, shrinks the
+      # chart tarball). Pinned to match .rwx/ci.yml.
+      YQ_VERSION=4.53.2
+      ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; esac
+      sudo curl -fsSL -o /usr/local/bin/yq \
+        "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${ARCH}"
+      sudo chmod +x /usr/local/bin/yq
+      yq --version
+    filter:
+      - .rwx/helm-version.lock
+
+  # ── Registry login (needed to push charts to OCI registry) ──────────
+  - key: helm-login
+    use: helm-setup
+    # helm-login exists only to enable helm-publish, which runs on tag pushes
+    # (its `if` excludes cli/pr/main). Match that guard so we never run a
+    # registry login in PR/main contexts where nothing is published. This also
+    # keeps the merge-request pipeline green: the previous unconditional task
+    # was only ever pruned because its sole consumer was skipped, so editing
+    # its body (CHART_REGISTRY param) surfaced a latent PR-time login failure
+    # (ka-0000000040).
+    if: ${{ init.ref-name != 'cli' && init.ref-name != 'pr' && init.ref-name != 'main' }}
+    run: |
+      # Log in to the chart registry host derived from CHART_REGISTRY
+      # (ka-0000000040). Defaults to registry.gitlab.com; override the
+      # CHART_REGISTRY vault var to point at a LOL-owned registry such as
+      # ghcr.io/liveoaklabs/gardenio/charts.
+      CHART_REGISTRY="${CHART_REGISTRY:-registry.gitlab.com/acme/platform/gardenio/charts}"
+      CHART_REGISTRY="${CHART_REGISTRY#oci://}"   # tolerate an oci:// prefix in the vault value
+      CHART_HOST="${CHART_REGISTRY%%/*}"
+      set +x  # defensive: never xtrace the token, even if set -x is added later (ka-0000002171)
+      echo "$REGISTRY_TOKEN" | helm registry login "$CHART_HOST" -u "$REGISTRY_USER" --password-stdin
+    env:
+      CHART_REGISTRY: ${{ secrets.CHART_REGISTRY }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+
+  # ── Helm lint (only when charts change) ─────────────────────────────
+  - key: helm-lint
+    use: [code, helm-setup]
+    run: |
+      for chart in gardenio/helm/*/; do
+        if [ -f "$chart/Chart.yaml" ]; then
+          echo "=== Linting $chart ==="
+          helm lint "$chart"
+          helm template "$(basename $chart)" "$chart" > /dev/null
+        fi
+      done
+    filter:
+      - gardenio/helm/*/Chart.yaml
+      - gardenio/helm/*/values.yaml
+      - gardenio/helm/*/templates/**
+
+  # ── Security scanner binaries (cached until lockfile bumps) ─────────
+  # Pins live in .rwx/helm-security-tools.lock so version bumps invalidate
+  # the cache without forcing a rebuild on every helm-security change.
+  - key: helm-security-tools
+    use: [code]
+    filter:
+      - .rwx/helm-security-tools.lock
+    run: |
+      set -euo pipefail
+      # shellcheck disable=SC1091
+      . .rwx/helm-security-tools.lock
+
+      sudo apt-get update
+      sudo apt-get install -y --no-install-recommends jq python3-pip ca-certificates curl
+
+      # kube-linter (stackrox)
+      curl -fsSL "https://github.com/stackrox/kube-linter/releases/download/v${KUBE_LINTER_VERSION}/kube-linter-linux.tar.gz" \
+        | sudo tar -xz -C /usr/local/bin kube-linter
+      sudo chmod +x /usr/local/bin/kube-linter
+
+      # kubescape
+      curl -fsSL "https://github.com/kubescape/kubescape/releases/download/v${KUBESCAPE_VERSION}/kubescape-ubuntu-latest" \
+        -o /tmp/kubescape
+      sudo install -m 0755 /tmp/kubescape /usr/local/bin/kubescape
+
+      # checkov (pip; --break-system-packages required on Ubuntu 24.04 PEP 668)
+      sudo pip3 install --break-system-packages "checkov==${CHECKOV_VERSION}"
+
+      # polaris (FairwindsOps)
+      curl -fsSL "https://github.com/FairwindsOps/polaris/releases/download/${POLARIS_VERSION}/polaris_linux_amd64.tar.gz" \
+        | sudo tar -xz -C /usr/local/bin polaris
+      sudo chmod +x /usr/local/bin/polaris
+
+      kube-linter version
+      kubescape version
+      checkov --version
+      polaris version
+
+  # ── Helm security scan (kube-linter, kubescape, checkov, polaris) ───
+  # Renders the chart, runs all four scanners, uploads each report as an
+  # artifact, and fails the task if any scanner reports a HIGH-severity
+  # finding. Each scanner runs unconditionally so artifacts always upload;
+  # severity is re-evaluated at the end.
+  - key: helm-security
+    use: [code, helm-setup, helm-security-tools]
+    filter:
+      - gardenio/helm/*/Chart.yaml
+      - gardenio/helm/*/values.yaml
+      - gardenio/helm/*/templates/**
+      - .rwx/helm.yml
+      - .rwx/helm-security-tools.lock
+    run: |
+      set -uo pipefail
+      mkdir -p security-reports
+
+      helm template gardenio gardenio/helm/gardenio > security-reports/manifests.yaml
+
+      fail=0
+
+      echo "=== kube-linter ==="
+      # SARIF "error" level == high severity in stackrox conventions.
+      kube-linter lint --format sarif security-reports/manifests.yaml \
+        > security-reports/kube-linter.sarif 2> security-reports/kube-linter.log || true
+      kl_high=$(jq '[.runs[].results[]? | select(.level=="error")] | length' \
+        security-reports/kube-linter.sarif 2>/dev/null || echo 0)
+      echo "kube-linter HIGH findings: ${kl_high}"
+      [ "${kl_high:-0}" -gt 0 ] && fail=1
+
+      echo "=== kubescape ==="
+      kubescape scan framework nsa security-reports/manifests.yaml \
+        --format json --output security-reports/kubescape.json \
+        --severity-threshold high || true
+      ks_high=$(jq '[.results[]?.controls[]? | select(.status.severity=="high" or .status.severity=="critical")] | length' \
+        security-reports/kubescape.json 2>/dev/null || echo 0)
+      echo "kubescape HIGH/CRITICAL findings: ${ks_high}"
+      [ "${ks_high:-0}" -gt 0 ] && fail=1
+
+      echo "=== checkov ==="
+      # Suppressions (ka-0000005812, ka-0000006837): the gardenio chart has
+      # long-standing HIGH findings in categories that are deliberate chart
+      # conventions, not regressions. Each suppression below is
+      # policy-reviewed:
+      #
+      #   CKV_K8S_21  - Default namespace. The chart ships namespace-agnostic
+      #                 manifests; namespace is selected at install time via
+      #                 `helm install --namespace`. Rendering with
+      #                 `helm template` (no --namespace) makes checkov flag
+      #                 every workload as default-namespace; not actionable
+      #                 at chart level.
+      #   CKV_K8S_35  - Secrets-as-env vs files. All gardenio services consume
+      #                 secrets via env vars (DATABASE_URL, NATS_PASSWORD,
+      #                 SLACK_BOT_TOKEN, etc.). Switching to projected-volume
+      #                 files would require coordinated app changes across
+      #                 controller / bridge / kbeads / coopmux and provides
+      #                 no marginal protection vs. the existing
+      #                 ExternalSecrets + IRSA flow.
+      #   CKV_K8S_43  - Image digest pinning. Releases use immutable calver
+      #                 tags (e.g. registry/gardenio:2026.129.4) produced by
+      #                 the rwx docker.yml + promote-images flow; digest
+      #                 pinning would break the -rc → plain promotion model
+      #                 and helm upgrade UX. Tag immutability is enforced
+      #                 by the registry.
+      #   CKV2_K8S_6  - NetworkPolicy coverage. The chart ships an extensive
+      #                 NetworkPolicy template tree under templates/networkpolicies/
+      #                 plus per-component egress rules; default-deny-egress
+      #                 work is tracked under ka-0000006988 / MR !1754.
+      #                 checkov's helm framework does not correlate
+      #                 NetworkPolicy podSelectors against workload labels
+      #                 across separate manifest documents and reports
+      #                 false positives for every workload.
+      #   CKV_K8S_38  - ServiceAccount token automount. Two pre-install/
+      #                 pre-upgrade Helm Hook Jobs (psa-labels,
+      #                 adopt-pvcs) call kubectl against the cluster API and
+      #                 legitimately require the SA token. Every long-running
+      #                 workload in the chart explicitly sets
+      #                 `automountServiceAccountToken: false` (audit:
+      #                 grep -rn automountServiceAccountToken
+      #                 gardenio/helm/gardenio/templates/ — 19 explicit `false`
+      #                 entries). The two hook Jobs hold tightly-scoped
+      #                 ClusterRole/Role rules (namespace get/patch and pvc
+      #                 get/list/patch) and are deleted after success, so the
+      #                 mount window is bounded.
+      #   CKV_K8S_15  - Image Pull Policy = Always. The chart pins
+      #                 gardenio-owned images via Chart.AppVersion (calver,
+      #                 immutable per registry policy). Mirrored sidecar
+      #                 images are pinned to immutable identities: an
+      #                 immutable version tag (kubectlImage 1.33.4, mirrored
+      #                 from bitnamilegacy — ka-0000004129) or a sha256 digest
+      #                 (natsBoxImage). The forwardauth oauth2-proxy image is
+      #                 pinned to an upstream tag (v7.8.1); upstream
+      #                 oauth2-proxy releases are immutable. `IfNotPresent`
+      #                 is the correct policy for pinned images — `Always`
+      #                 just adds startup latency without security gain. The
+      #                 staging override `global.latestMode=true` already
+      #                 forces `Always` where mutable tags are in use.
+      checkov -d gardenio/helm/gardenio --framework helm \
+        --skip-check CKV_K8S_21,CKV_K8S_35,CKV_K8S_43,CKV2_K8S_6,CKV_K8S_38,CKV_K8S_15 \
+        --output sarif --output-file-path security-reports/checkov \
+        --soft-fail || true
+      ck_high=$(jq '[.runs[].results[]? | select(.level=="error")] | length' \
+        security-reports/checkov/results_sarif.sarif 2>/dev/null || echo 0)
+      echo "checkov HIGH findings: ${ck_high}"
+      [ "${ck_high:-0}" -gt 0 ] && fail=1
+
+      echo "=== polaris ==="
+      polaris audit --audit-path security-reports/manifests.yaml --format json \
+        > security-reports/polaris.json || true
+      pl_high=$(jq '[.AuditData.ClusterSummary.Results.Totals.Dangers // 0] | add' \
+        security-reports/polaris.json 2>/dev/null || echo 0)
+      echo "polaris dangerous findings: ${pl_high}"
+      [ "${pl_high:-0}" -gt 0 ] && fail=1
+
+      echo
+      echo "=== Summary ==="
+      printf "kube-linter HIGH:  %s\n" "${kl_high}"
+      printf "kubescape HIGH:    %s\n" "${ks_high}"
+      printf "checkov HIGH:      %s\n" "${ck_high}"
+      printf "polaris DANGEROUS: %s\n" "${pl_high}"
+
+      exit "${fail}"
+    outputs:
+      filesystem: false
+      artifacts:
+        - key: helm-security-reports
+          path: security-reports
+
+  # ── Helm package & publish (tag pushes only) ────────────────────────
+  - key: helm-publish
+    use: [helm-lint, helm-login]
+    if: ${{ init.ref-name != 'cli' && init.ref-name != 'pr' && init.ref-name != 'main' }}
+    run: |
+      # Publishing policy:
+      #   - Tag push:  publish `{version}-rc` only. The plain `{version}`
+      #                chart is cut by `promote-helm-chart` in docker.yml
+      #                after `e2e-rwx` passes — if E2E fails we don't
+      #                want a zombie plain chart referencing plain image
+      #                tags that promote-images never created.
+      #   - Non-tag:   publish plain version (main pushes etc.).
+      IS_TAG="no"
+      if [[ "${REF_NAME:-}" == refs/tags/20* ]]; then
+        IS_TAG="yes"
+      fi
+
+      # Chart registry is parameterized (ka-0000000040): defaults to the
+      # GitLab OCI charts path; override via the CHART_REGISTRY vault var
+      # (bare host/path, no oci:// prefix — e.g.
+      # ghcr.io/liveoaklabs/gardenio/charts) for a LOL-owned target. Mirrors
+      # the IMAGE_REGISTRY ${:-default} convention used by docker.yml. A
+      # leading oci:// in the vault value is tolerated and stripped.
+      CHART_REGISTRY="${CHART_REGISTRY:-registry.gitlab.com/acme/platform/gardenio/charts}"
+      CHART_REGISTRY="${CHART_REGISTRY#oci://}"
+
+      # Retry shim for `helm push`. The GitLab OCI registry occasionally
+      # closes the HTTP/2 stream mid-push with REFUSED_STREAM; helm cannot
+      # retry internally because the SDK does not set Request.GetBody
+      # (ka-0000007048).
+      helm_push_with_retry() {
+        local tgz="$1"
+        local dest="$2"
+        local max_attempts=5
+        local attempt=1
+        local delay=5
+        while :; do
+          if helm push "$tgz" "$dest"; then
+            return 0
+          fi
+          if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "helm push failed after ${max_attempts} attempts: $tgz → $dest" >&2
+            return 1
+          fi
+          echo "helm push attempt ${attempt}/${max_attempts} failed; retrying in ${delay}s..." >&2
+          sleep "$delay"
+          attempt=$((attempt + 1))
+          delay=$((delay * 2))
+        done
+      }
+
+      for chart in gardenio/helm/*/; do
+        if [ -f "$chart/Chart.yaml" ]; then
+          name=$(basename "$chart")
+          version=$(grep '^version:' "$chart/Chart.yaml" | awk '{print $2}')
+
+          # Package via the shared helper, which strips values.yaml comments so
+          # the tarball stays under the K8s 1 MiB Secret limit (ka-0000007585).
+          # It prints the produced .tgz path on its last stdout line.
+          if [[ "$IS_TAG" == "yes" ]]; then
+            rc_version="${version}-rc"
+            echo "Tag push — publishing $name v$rc_version only (plain is promoted later)"
+            # helm package --version/--app-version stamp the -rc version into
+            # the packaged Chart.yaml so {{ .Chart.AppVersion }} renders the -rc
+            # image tags docker.yml just pushed (no source-tree sed needed).
+            tgz=$(scripts/pack-gardenio-chart.sh "$chart" /tmp/helm-packages \
+              --version "$rc_version" --app-version "$rc_version" | tail -1)
+            helm_push_with_retry "$tgz" "oci://${CHART_REGISTRY}"
+            echo "Published: oci://${CHART_REGISTRY}/${name}:${rc_version}"
+          else
+            echo "Publishing $name v$version..."
+            tgz=$(scripts/pack-gardenio-chart.sh "$chart" /tmp/helm-packages | tail -1)
+            helm_push_with_retry "$tgz" "oci://${CHART_REGISTRY}"
+            echo "Published: oci://${CHART_REGISTRY}/${name}:${version}"
+          fi
+        fi
+      done
+    env:
+      CHART_REGISTRY: ${{ secrets.CHART_REGISTRY }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      REF_NAME: ${{ init.ref-name }}
+    outputs:
+      filesystem: false

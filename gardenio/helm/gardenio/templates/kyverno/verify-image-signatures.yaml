@@ -1,0 +1,124 @@
+{{- /*
+Kyverno ClusterPolicy — REQUIRE a valid cosign keyless signature on every
+gardenio release image before it is admitted. Closes attacker path A6 from the
+CI/CD supply-chain audit (ka-0000007951 / ka-0000004158): a registry-write
+compromise that pushes a malicious controller:latest (or any promoted tag)
+would run UNVERIFIED today because nothing checks provenance at admission.
+
+WHERE SIGNATURES COME FROM
+  Release images are signed keyless (Fulcio/Rekor, public Sigstore) by the
+  GitHub Actions images.yml workflow, on calver tag pushes only: after the
+  build job pushes <image>:<calver> it runs `cosign sign` on the pushed DIGEST
+  with the job's GitHub OIDC identity. The signature covers every tag that
+  points at that digest. The Fulcio certificate identity is the workflow's:
+    issuer  = https://token.actions.githubusercontent.com
+    subject = https://github.com/mattbakerconsulting/gardenio/.github/workflows/images.yml@refs/tags/<calver>
+  keyed here via issuer + subjectRegExp so any calver tag ref matches. A fork
+  publishing its own images overrides certificateIdentityRegExp; blanking both
+  it and certificateIdentity fails the render.
+
+THREE LINES OF DEFENSE (this is the admission-time one)
+  1. images.yml sign step: signs each release image by digest, keyless.
+  2. Registry access controls: only the release CI role can push gardenio/*.
+  3. THIS ClusterPolicy: admission-time deny of any gardenio release image that
+     is not signed by the images.yml calver-tag identity.
+
+DEFAULT OFF. This is a Kyverno CRD (kyverno.io/v1 ClusterPolicy) AND it needs
+the Kyverno admission controller (with the image-verification webhook)
+installed in the cluster. prod-gardenio-eks does not run Kyverno today, so an
+unconditional render would break `helm upgrade` on a missing CRD — mirrors the
+sibling disallow-cover-images policy and the fleet-manager VAP's enabled gate.
+Enabling on prod is a two-step operator action: install Kyverno, then set
+global.imageSigning.verify.enabled=true (see docs/image-signing.md).
+The canonical cluster-agnostic source is policy/kyverno/verify-image-signatures.yaml.
+*/}}
+{{- if .Values.global.imageSigning.verify.enabled }}
+{{- $vs := .Values.global.imageSigning.verify }}
+{{- $registry := $vs.imageRegistry | default .Values.global.imageRegistry }}
+{{- if not (or $vs.certificateIdentity $vs.certificateIdentityRegExp) }}
+{{- fail "global.imageSigning.verify.enabled is true but no signer identity is set: set global.imageSigning.verify.certificateIdentity or certificateIdentityRegExp to the CI identity that signs your release images" }}
+{{- end }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ include "gardenio.fullname" . }}-verify-image-signatures
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supply-chain
+  annotations:
+    policies.kyverno.io/title: Require cosign keyless signature on gardenio release images
+    policies.kyverno.io/category: gardenio
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Every gardenio release image (registry.../gardenio/<name>:<tag>) must carry
+      a valid cosign keyless signature made by the GitHub Actions images.yml
+      workflow on a calver tag push (Fulcio issuer
+      https://token.actions.githubusercontent.com). Denies admission of any matching image that is unsigned or signed by an
+      unexpected identity — closing the "registry-write pushes a malicious
+      image, cluster runs it unverified" attack (A6, ka-0000007951). See
+      policy/kyverno/verify-image-signatures.yaml.
+spec:
+  # Enforce hard-denies unsigned images at admission (Audit = dry-run: report
+  # only, admit anyway — use for an initial rollout before flipping to Enforce).
+  validationFailureAction: {{ $vs.validationFailureAction | default "Enforce" }}
+  # If Kyverno itself is unreachable, FAIL CLOSED for a security control
+  # (an admission that skips verification is exactly the gap this policy exists
+  # to close). Overridable for a cautious rollout via failurePolicy.
+  webhookConfiguration:
+    failurePolicy: {{ $vs.failurePolicy | default "Fail" }}
+  background: false
+  rules:
+    - name: verify-gardenio-release-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      {{- if $vs.excludedNamespaces }}
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                {{- toYaml $vs.excludedNamespaces | nindent 16 }}
+      {{- end }}
+      verifyImages:
+        # Only gardenio release images are gated. Third-party images (postgres,
+        # nats, kyverno itself, coverage -cover variants in E2E, …) are NOT
+        # signed by our CI and MUST NOT be caught here, or the policy would deny
+        # every dependency. Scope tightly to our registry release repos.
+        - imageReferences:
+            {{- range $vs.imageReferences | default (list (printf "%s/*" $registry)) }}
+            - {{ . | quote }}
+            {{- end }}
+          # Exempt repos that co-locate under our registry but images.yml never
+          # signs — the pull-through mirror repo (<registry>/mirror/*: postgres,
+          # nats, vmagent, victoria-*, …) and the build caches plus the
+          # controller-base stage (<registry>/cache/*), which nothing deploys.
+          # Kyverno "*" matches "/", so the imageReferences glob above catches
+          # them too; without this skip an Enforce rollout DENIES every mirrored
+          # dependency (ka-0000008191).
+          skipImageReferences:
+            {{- range $vs.skipImageReferences | default (list (printf "%s/mirror/*" $registry) (printf "%s/cache/*" $registry)) }}
+            - {{ . | quote }}
+            {{- end }}
+          # Rewrite the admitted tag to its resolved digest and require images
+          # be pinned by digest — a moved tag can no longer swap the bytes
+          # after verification (TOCTOU).
+          mutateDigest: {{ $vs.mutateDigest | default true }}
+          verifyDigest: {{ $vs.verifyDigest | default true }}
+          required: {{ $vs.required | default true }}
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    # The images.yml workflow identity on a calver tag push.
+                    issuer: {{ $vs.oidcIssuer | default "https://token.actions.githubusercontent.com" | quote }}
+                    {{- if $vs.certificateIdentity }}
+                    subject: {{ $vs.certificateIdentity | quote }}
+                    {{- else }}
+                    subjectRegExp: {{ $vs.certificateIdentityRegExp | quote }}
+                    {{- end }}
+                    rekor:
+                      url: {{ $vs.rekorURL | default "https://rekor.sigstore.dev" | quote }}
+{{- end }}

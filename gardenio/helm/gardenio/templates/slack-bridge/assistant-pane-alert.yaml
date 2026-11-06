@@ -1,0 +1,139 @@
+{{- /*
+gardenio.slackBridge.assistantPaneSilentRule — the AssistantPaneSilent alerting
+rule body, as a single YAML list item. Shared by BOTH render paths so the rule
+cannot drift between them (ka-0000004766):
+  - the PrometheusRule CRD below (prometheus-operator / kube-prometheus-stack
+    clusters — e.g. the legacy-909 prod that originally ran this alert), and
+  - the vmalert rules-ConfigMap key (templates/vmalert/configmap.yaml) — the
+    ONLY rule path that fires on a VictoriaMetrics-operator cluster, where the VM
+    operator converts PrometheusRule CRDs to VMRules but no VMAlert evaluates
+    them (see the gap-alerts header there).
+Consumers re-indent via `include | nindent`.
+*/ -}}
+{{- define "gardenio.slackBridge.assistantPaneSilentRule" -}}
+{{- $cfg := .Values.slackBridge.metrics.prometheusRule.assistantPane -}}
+- alert: AssistantPaneSilent
+  # Opens are happening but zero typed messages are being handled over
+  # the window. The opens floor (>= minOpens) gates out quiet windows
+  # where nobody typed; the `== 0` on messages is the silent-bounce
+  # signature. Both halves use the same lookback so they line up.
+  expr: |
+    sum(increase(gardenio_assistant_event_total{event="thread_started"}[{{ $cfg.window }}])) >= {{ $cfg.minOpens }}
+    and
+    sum(increase(gardenio_assistant_event_total{event="message"}[{{ $cfg.window }}])) == 0
+  for: {{ $cfg.for | default "2h" | quote }}
+  labels:
+    severity: {{ $cfg.severity | quote }}
+    component: slack-bridge
+    subsystem: assistant_pane
+    {{- with $cfg.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    summary: "Slack agent pane is silently bouncing typed messages"
+    description: |
+      The gardenio Slack agent pane was opened
+      {{`{{ $value }}`}}+ times in the last {{ $cfg.window }}
+      (gardenio_assistant_event_total{event="thread_started"}) but
+      ZERO user messages were delivered over the same window
+      (event="message" flat). This is the ka-0000000892 signature:
+      Slack delivers the pane's lifecycle events but has stopped
+      delivering message.im, so every typed message bounces with
+      "Slack couldn't send this message" and there is no error log —
+      only this absence.
+
+      Recovery (operator-only — touches live Slack app config at
+      https://api.slack.com/apps): confirm message.im, app_home_opened,
+      and app_context_changed are subscribed under Event Subscriptions
+      and the Messages tab is writable (messages_tab_read_only_enabled
+      false), then REINSTALL the app to the workspace and hard-refresh
+      Slack — Slack only (re)activates message.im on a reinstall that
+      happens AFTER the agent_view manifest is applied. Verify the
+      metric moves: gardenio_assistant_event_total{event="message"}
+      should increment when you type in the pane. (agent_view migration
+      ka-0000004985 — the assistant_view->agent_view switch is one-way.)
+    runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/assistant-pane-smoke-check.md"
+    {{- with $cfg.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- if .Values.slackBridge.metrics.prometheusRule.assistantPane.enabled }}
+{{- $cfg := .Values.slackBridge.metrics.prometheusRule.assistantPane }}
+# PrometheusRule for the Slack agent-pane silent-delivery smoke check
+# (ka-0000000892). This is the codified version of NEXT STEP #3 on that bug:
+# "add a prod-log smoke check that a typed message is delivered."
+#
+# EVALUATION-PATH CAVEAT (ka-0000004766): this CRD only fires on clusters where
+# a prometheus-operator/kube-prometheus-stack Prometheus (or a VMAlert wired to
+# converted VMRules) evaluates PrometheusRules. On a VictoriaMetrics-operator
+# cluster there is none — the live path is the SAME rule rendered into the vmalert rules
+# ConfigMap (templates/vmalert/configmap.yaml, key assistant-pane-alert.yaml,
+# shared define above) whenever vmalert + a notifier are enabled alongside.
+#
+# agent_view migration (ka-0000004985): the surface migrated from the deprecated
+# assistant_view (AI-container thread) to agent_view (a DM-style Agent messaging
+# experience). The metric LABEL VALUES were held stable across the migration for
+# dashboard/alert continuity, but their sources changed — see the enum below.
+#
+# The failure mode: after the app is (re)enabled and the workspace reinstalled,
+# Slack can keep delivering the surface's LIFECYCLE events (agent_view:
+# app_home_opened / app_context_changed; legacy assistant_view:
+# assistant_thread_started / assistant_thread_context_changed) while silently
+# dropping the MESSAGE event (message.im) that carries the user's typed text.
+# The pane sets up fine — suggested prompts post — but every typed message
+# bounces with "Slack couldn't send this message" and no user DM is delivered.
+# There is no error log to grep for, only an absence, which is exactly what a
+# counter ratio makes alertable.
+#
+# The bridge exports gardenio_assistant_event_total{event=...} on :9093
+# (assistant_event_metrics.go) with a bounded event enum (values stable across
+# the agent_view migration):
+#   thread_started   — user opened the agent pane (agent_view: app_home_opened
+#                      tab=messages; legacy: assistant_thread_started)
+#   context_changed  — user's viewed context changed (agent_view:
+#                      app_context_changed; legacy: assistant_thread_context_changed)
+#   message          — a user DM was delivered (agent_view: message.im handled in
+#                      handleMessageEvent; legacy: handleAssistantMessage)
+#
+# Healthy invariant: if people are opening the pane, some are also typing in it.
+# When `message` flatlines while `thread_started` keeps climbing over the
+# window, inbound delivery is broken — fire. The minOpens floor suppresses the
+# benign "opened, read greeting, left" pattern; the `for:` hold rides out a
+# single genuinely-quiet window before alerting.
+#
+# TUNING FOR LOW-TRAFFIC WORKSPACES (ka-0000000664): pane opens are RARE — prod
+# observed ~0.3 thread_started/day (9 over 30d), while message ran ~26/day. The
+# window must therefore be WIDE enough that real opens clear the floor at that
+# rate: a 1h window at minOpens>=3 was effectively unfireable (expected ~0.01
+# opens/1h; it matched zero samples over 30d). The chart default is now a 24h
+# window with minOpens=1, so a single genuine open clears the floor, and the
+# `message == 0 over 24h` conjunct — normally ~26 handled messages — is the real
+# false-positive guard (a benign "peek and leave" cannot zero it out). Raising
+# minOpens buys almost no extra FP protection here (that conjunct already
+# dominates) while pushing detection latency out to 1-2 weeks, so keep it low.
+# NOTE (ka-0000004985): under agent_view, thread_started counts EVERY
+# app_home_opened(tab=messages) — every DM open/reload, not just new threads —
+# so the ~0.3 opens/day baseline predates the migration and the real rate will
+# be higher and noisier. The direction and the message==0 guard are unaffected,
+# but re-observe the open rate before re-tuning minOpens/window off that figure.
+#
+# See gardenio/docs/assistant-pane-smoke-check.md for the operator recovery
+# checklist (re-apply the agent_view manifest + reinstall + hard-refresh).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-slack-bridge-assistant-pane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: slack-bridge
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.assistant_pane
+      interval: 1m
+      rules:
+        {{- include "gardenio.slackBridge.assistantPaneSilentRule" . | nindent 8 }}
+{{- end }}

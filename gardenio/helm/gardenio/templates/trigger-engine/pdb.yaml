@@ -1,0 +1,31 @@
+{{- /*
+  WHY maxUnavailable, NOT minAvailable (ka-0000001453, gd-27vcHmrurh): on a
+  1-replica Deployment minAvailable:1 == maxUnavailable:0, which makes the
+  eviction API refuse the pod forever — a managed-nodegroup drain then hits
+  PodEvictionFailure and wedges. maxUnavailable:1 only blocks eviction while
+  the pod is currently unhealthy, so it is a safe drain guard here.
+
+  No topologySpreadConstraints/podAntiAffinity for trigger-engine (unlike
+  its siblings in this epic): it is architecturally a single-replica SSE
+  subscriber with no leader election (see the strategy:Recreate comment in
+  deployment.yaml, ka-0000006285) — running >1 replica risks double-spawn
+  races on bead-close events, so replicaCount must never exceed 1 in
+  practice and a spread/anti-affinity block would be structurally inert
+  dead YAML. This PDB is still a real drain guard at replicaCount=1.
+*/}}
+{{- if and .Values.triggerEngine.enabled .Values.triggerEngine.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "gardenio.fullname" . }}-trigger-engine
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trigger-engine
+spec:
+  maxUnavailable: {{ .Values.triggerEngine.pdb.maxUnavailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: trigger-engine
+{{- end }}

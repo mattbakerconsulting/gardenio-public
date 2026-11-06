@@ -1,0 +1,130 @@
+{{- /*
+  PUSH fallback — external OTLP ingest for vtsingle (epic ka-0000000598,
+  design docs/obs-perf-to-gardenio-victoria-traces.md §3).
+
+  The recommended transport for perf→gardenio traces is PULL/RELAY (an in-chart
+  relay reads perf's public, authed Jaeger query API and OTLP-replays into this
+  vtsingle — zero new inbound surface). This IngressRoute is the documented PUSH
+  fallback: it exposes ONLY vtsingle's OTLP insert paths through Traefik so an
+  out-of-cluster otel-collector (e.g. a perf env collector's second exporter)
+  could push spans into this gardenio vtsingle. It mirrors the vmsingle W1
+  remote-write receiver exactly (basicAuth + optional IP allow-list + rate-limit).
+
+  VictoriaTraces has no built-in auth and its select API (/select/jaeger,
+  /select/vmui) plus admin surface are sensitive, so — like vmsingle — we expose
+  ONLY the write/insert paths in vtsingle.ingest.pathPrefixes, fronted by
+  basicAuth. Queries stay in-cluster (Grafana → ClusterIP). Disabled by default
+  (vtsingle.ingest.enabled=false); the chart renders identically until an env
+  opts in.
+*/}}
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.vtsingle.enabled .Values.vtsingle.ingest.enabled }}
+{{- $fullname := include "gardenio.vtsingle.fullname" . -}}
+{{- $host := required "vtsingle.ingest.host is required when vtsingle.ingest.enabled" .Values.vtsingle.ingest.host -}}
+{{- $prefixes := .Values.vtsingle.ingest.pathPrefixes | default (list "/insert/opentelemetry/v1/traces") -}}
+{{- $auth := .Values.vtsingle.ingest.auth -}}
+{{- if and $auth.enabled (not $auth.secretName) -}}
+{{- fail "vtsingle.ingest.auth.secretName is required when vtsingle.ingest.auth.enabled (provision via externalSecrets.vtsingleIngest or out-of-band)" -}}
+{{- end -}}
+{{- $matchPrefixes := list -}}
+{{- range $prefixes }}
+{{- $matchPrefixes = append $matchPrefixes (printf "PathPrefix(`%s`)" .) -}}
+{{- end -}}
+{{- $pathMatch := join " || " $matchPrefixes -}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-ingest
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vtsingle.labels" . | nindent 4 }}
+spec:
+  # Default web/websecure preserves the legacy shape. Environments whose shared
+  # web/websecure entrypoints ride an INTERNAL load balancer (prod-gardenio-eks:
+  # internal-scheme NLB behind AWS Verified Access) are unreachable by an
+  # out-of-cluster otel-collector, so they bind the dedicated internet-facing
+  # entrypoint instead (e.g. `webhooks`). The host must ALSO be published on
+  # that edge's Service via terraform webhook_edge_hostname — external-dns
+  # sources only Service/Ingress, never IngressRoute CRDs, so an entrypoint flip
+  # alone yields NXDOMAIN. Mirrors the vmsingle fix (bug ka-0000005734); bug
+  # ka-0000004920.
+  entryPoints:
+    {{- range .Values.vtsingle.ingest.entryPoints | default (list "web" "websecure") }}
+    - {{ . }}
+    {{- end }}
+  routes:
+    - match: Host(`{{ $host }}`) && ({{ $pathMatch }})
+      kind: Rule
+      priority: 100
+      services:
+        - name: {{ $fullname }}
+          port: 10428
+      middlewares:
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if .Values.vtsingle.ingest.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ingest-ipwhitelist
+        {{- end }}
+        {{- if $auth.enabled }}
+        - name: {{ $fullname }}-ingest-auth
+        {{- end }}
+        {{- if .Values.vtsingle.ingest.rateLimit.enabled }}
+        - name: {{ $fullname }}-ingest-ratelimit
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if $auth.enabled }}
+---
+# basicAuth — the htpasswd blob lives in the referenced Secret under key `users`
+# (provision via externalSecrets.vtsingleIngest). The external otel-collector
+# authenticates with the plaintext user:password behind it.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ingest-auth
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vtsingle.labels" . | nindent 4 }}
+spec:
+  basicAuth:
+    secret: {{ $auth.secretName }}
+    removeHeader: true
+{{- end }}
+{{- if .Values.vtsingle.ingest.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ingest-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vtsingle.labels" . | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.vtsingle.ingest.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.vtsingle.ingest.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if .Values.vtsingle.ingest.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ingest-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vtsingle.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ .Values.vtsingle.ingest.rateLimit.average }}
+    burst: {{ .Values.vtsingle.ingest.rateLimit.burst }}
+{{- end }}
+{{- end }}

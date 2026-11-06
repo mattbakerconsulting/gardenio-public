@@ -1,0 +1,101 @@
+{{- if .Values.landing.enabled }}
+{{- if not (has .Values.landing.page (list "configmap" "image")) }}
+{{- fail (printf "landing.page must be configmap or image, got %q" .Values.landing.page) }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.landing.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.landing.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.landing.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.landing.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/nginx-config: {{ include "gardenio.contentChecksum" (include (print $.Template.BasePath "/landing/configmap.yaml") .) }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: nginx
+          {{- if eq .Values.landing.page "image" }}
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.landing.pageImage "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.landing.pageImage.pullPolicy "global" .Values.global) }}
+          {{- else }}
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.landing.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.landing.image.pullPolicy }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+            {{- if ne .Values.landing.page "image" }}
+            - name: nginx-config
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.landing.resources | nindent 12 }}
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: {{ include "gardenio.landing.fullname" . }}-nginx
+        - name: tmp
+          emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.landing.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.landing.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.landing.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,94 @@
+{{- /*
+  Stage 3 / W-B-12 (ka-0000007194): gardenio-edge-auth IngressRoute.
+
+  Mounts the shim at cli.gardenio.<env-suffix> on the same Traefik +
+  ACM cert as the rest of the gardenio surface (no new TLS work, per
+  plan section "Helm + ingress"). This is intentionally a separate
+  hostname from the AVA-fronted unified host so that CLI traffic does
+  not need to clear AVA's OIDC browser flow.
+
+  Optional ipWhitelist mirrors the jira-bridge webhook pattern for
+  envs that want defence-in-depth (e.g. lock cli.gardenio.<env> to
+  GitLab.com runners + the corporate VPN range while the auth shim
+  itself is bedding in).
+*/}}
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.edgeAuth.enabled }}
+{{- if and .Values.edgeAuth.ipWhitelist .Values.edgeAuth.ipWhitelist.enabled (empty .Values.edgeAuth.ipWhitelist.sourceRange) }}
+{{- fail "edgeAuth.ipWhitelist.enabled is true but edgeAuth.ipWhitelist.sourceRange is empty: provide source CIDRs or set edgeAuth.ipWhitelist.enabled=false." }}
+{{- end }}
+{{- $fullname := include "gardenio.edgeAuth.fullname" . -}}
+{{- $host := .Values.edgeAuth.host -}}
+{{- $port := .Values.edgeAuth.service.port | default 8096 -}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.edgeAuth.labels" . | nindent 4 }}
+spec:
+  # Entrypoints are configurable so the shim can be exposed on the
+  # internet-facing `webhooks` entrypoint (off-VPN CLI/PAT door, ka-0000002359)
+  # in addition to the internal `web`/`websecure` NLB. Defaults preserve the
+  # prior internal-only behaviour.
+  entryPoints:
+    {{- range (.Values.edgeAuth.entryPoints | default (list "web" "websecure")) }}
+    - {{ . }}
+    {{- end }}
+  routes:
+    - match: Host(`{{ $host }}`)
+      kind: Rule
+      services:
+        - name: {{ $fullname }}
+          port: {{ $port }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if and .Values.edgeAuth.ipWhitelist .Values.edgeAuth.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ipwhitelist
+        {{- end }}
+        {{- if and .Values.edgeAuth.rateLimit .Values.edgeAuth.rateLimit.enabled }}
+        - name: {{ $fullname }}-ratelimit
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if and .Values.edgeAuth.ipWhitelist .Values.edgeAuth.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.edgeAuth.labels" . | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.edgeAuth.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.edgeAuth.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if and .Values.edgeAuth.rateLimit .Values.edgeAuth.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.edgeAuth.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ .Values.edgeAuth.rateLimit.average | default 100 }}
+    burst: {{ .Values.edgeAuth.rateLimit.burst | default 200 }}
+{{- end }}
+{{- end }}

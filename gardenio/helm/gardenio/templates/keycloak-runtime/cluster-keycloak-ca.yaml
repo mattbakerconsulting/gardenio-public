@@ -1,0 +1,52 @@
+{{- /*
+The keycloak-runtime CA for the EDP operator's ClusterKeycloak (gd-PhU6jPtSxa).
+
+The operator resolves ClusterKeycloak spec.caCert in its OWN namespace
+(OPERATOR_NAMESPACE), as it does spec.secret (see admin-secret.yaml), so the
+CA must be there: a ConfigMap with ca.crt in
+keycloak.runtime.clusterKeycloak.operatorNamespace (the release namespace when
+that is empty).
+
+ca.crt is public, so a ConfigMap, not a Secret. It comes from, in order:
+clusterKeycloak.caCert; ca.crt of the runtime's leaf TLS Secret
+(<fullname>-keycloak-runtime-tls, written by cert-manager; never the CA's own
+Secret, which holds its key); ca.crt of this ConfigMap as already live. With
+none of those (helm template, a first install before cert-manager has issued)
+nothing is rendered: an empty CA would only make the operator fail TLS.
+
+resource-policy keep: the release deployer has no delete (or create) on it in
+a foreign namespace, and a render that skips it must not try to remove it.
+*/ -}}
+{{- if include "gardenio.keycloakRuntime.clusterKeycloakTLS" . }}
+{{- $runtime := .Values.keycloak.runtime -}}
+{{- $ns := $runtime.clusterKeycloak.operatorNamespace | default .Release.Namespace -}}
+{{- $name := include "gardenio.keycloakRuntime.caConfigMapName" . -}}
+{{- $ca := $runtime.clusterKeycloak.caCert | default "" -}}
+{{- if not $ca }}
+{{- $leaf := lookup "v1" "Secret" .Release.Namespace (include "gardenio.keycloakRuntime.tlsSecretName" .) }}
+{{- if and $leaf $leaf.data (index $leaf.data "ca.crt") }}
+{{- $ca = index $leaf.data "ca.crt" | b64dec }}
+{{- end }}
+{{- end }}
+{{- if not $ca }}
+{{- $live := lookup "v1" "ConfigMap" $ns $name }}
+{{- if and $live $live.data }}
+{{- $ca = index $live.data "ca.crt" | default "" }}
+{{- end }}
+{{- end }}
+{{- if $ca }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name | quote }}
+  namespace: {{ $ns | quote }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-runtime-tls
+  annotations:
+    "helm.sh/resource-policy": keep
+data:
+  ca.crt: |
+    {{- $ca | trim | nindent 4 }}
+{{- end }}
+{{- end }}

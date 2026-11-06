@@ -1,0 +1,131 @@
+# gardener-conditions-fan-in.toml
+#
+# Claudeless scenario: a gardener schedule's `triggers:` block fans in across
+# {cron, bead_event, decision_resolved, manual} sources, and the bead_event
+# entry carries the `throttle: 60s` field that drops bursts.
+#
+# Plan §T9: "gardener-conditions-fan-in: schedule fires on cron AND
+# bead_event; throttle drops a burst."
+#
+# The full throttle/debounce semantics live in the scheduler unit tests
+# (gardenio/controller/internal/scheduler/triggers_test.go). The E2E
+# claudeless surface asserts the persisted *shape* — i.e. that the fan-in
+# topology survives the round-trip through the daemon and is stored on the
+# schedule bead exactly as the §5.1 worked example specifies. If a future
+# change drops `throttle` from the bead_event entry or removes a kind, this
+# scenario fails fast.
+
+[claude]
+session_id = "e2e00000-0009-4000-a000-000000000003"
+username = "e2e-gardener-fan-in"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 30000
+
+[[responses]]
+on = "*"
+say = "Running gardener-conditions-fan-in: assert triggers shape (cron+bead_event+decision_resolved+manual, throttle=60s)."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+if ! gb gardener --help >/dev/null 2>&1; then
+  echo "SKIP: gb gardener not present (pre-T6)"
+  exit 0
+fi
+
+EPIC_ID=$(kd create "e2e-gardener-fan-in-$$-$(date +%s)" --type=epic --json 2>/dev/null | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+echo "epic: $EPIC_ID"
+
+cleanup() {
+  gb gardener stop "$EPIC_ID" --reason "e2e cleanup" >/dev/null 2>&1 || true
+  kd close "$EPIC_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+gb gardener start "$EPIC_ID" --i-read-the-gardener-instructions >/dev/null 2>&1 || { fail "gb gardener start"; exit 1; }
+TRIGGERS=$(gb gardener status "$EPIC_ID" --json 2>/dev/null | jq -c '.triggers // empty')
+if [ -z "$TRIGGERS" ] || [ "$TRIGGERS" = "null" ]; then
+  fail "triggers field present" "got=[$TRIGGERS]"
+  exit 1
+fi
+
+# ── Each kind present ──────────────────────────────────────────────
+for k in cron bead_event decision_resolved manual; do
+  if echo "$TRIGGERS" | jq -e --arg k "$k" '[ .[].kind ] | index($k) != null' >/dev/null 2>&1; then
+    pass "triggers contains kind=$k"
+  else
+    fail "triggers contains kind=$k" "triggers=$TRIGGERS"
+  fi
+done
+
+# ── Cron has a non-empty cron expression ────────────────────────────
+CRON_EXPR=$(echo "$TRIGGERS" | jq -r '.[] | select(.kind=="cron") | .cron' 2>/dev/null)
+if [ -n "$CRON_EXPR" ] && [ "$CRON_EXPR" != "null" ]; then
+  pass "cron entry has cron expression ($CRON_EXPR)"
+else
+  fail "cron entry has cron expression" "got=[$CRON_EXPR]"
+fi
+
+# ── Cron preflight references the parent epic ──────────────────────
+if echo "$TRIGGERS" | jq -e --arg e "$EPIC_ID" \
+    '.[] | select(.kind=="cron") | .preflight.all[]? | select(.parent==$e)' \
+    >/dev/null 2>&1; then
+  pass "cron preflight scoped to parent=$EPIC_ID"
+else
+  fail "cron preflight scoped to parent" "triggers=$TRIGGERS"
+fi
+
+# ── bead_event entry carries the throttle that drops bursts ─────────
+THROTTLE=$(echo "$TRIGGERS" | jq -r '.[] | select(.kind=="bead_event") | .throttle' 2>/dev/null)
+if [ "$THROTTLE" = "60s" ]; then
+  pass "bead_event throttle=60s"
+else
+  fail "bead_event throttle=60s" "got=[$THROTTLE]"
+fi
+
+# ── bead_event match scoped to children of the epic ────────────────
+if echo "$TRIGGERS" | jq -e --arg e "$EPIC_ID" \
+    '.[] | select(.kind=="bead_event") | .match.all[]? | select(.field=="parent" and .value==$e)' \
+    >/dev/null 2>&1; then
+  pass "bead_event match scoped to parent=$EPIC_ID"
+else
+  fail "bead_event match scoped to parent" "triggers=$TRIGGERS"
+fi
+
+# ── decision_resolved match scoped to subtree ───────────────────────
+if echo "$TRIGGERS" | jq -e --arg e "$EPIC_ID" \
+    '.[] | select(.kind=="decision_resolved") | .match.all[]? | select(.op=="in_subtree_of" and .value==$e)' \
+    >/dev/null 2>&1; then
+  pass "decision_resolved match in_subtree_of=$EPIC_ID"
+else
+  fail "decision_resolved match in_subtree_of" "triggers=$TRIGGERS"
+fi
+
+# ── Summary ─────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "gardener-conditions-fan-in: triggers fan-in shape OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-conditions-fan-in scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

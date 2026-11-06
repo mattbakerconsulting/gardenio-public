@@ -1,0 +1,1 @@
+/home/agent/bot/gasboat/repos/fics-helm-chart/.claude/commands/litellm-whitelist-ip.md

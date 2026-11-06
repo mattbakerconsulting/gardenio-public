@@ -1,0 +1,91 @@
+{{- if .Values.jiraBridge.metrics.prometheusRule.triggerStarved.enabled }}
+{{- $cfg := .Values.jiraBridge.metrics.prometheusRule.triggerStarved }}
+# PrometheusRule for the trigger cooldown-starvation SYMPTOM detector
+# (Alert B of epic ka-0000005107, task ka-0000000052 — the deferred follow-up
+# to Alert A / ServiceFieldForeignFleetWrite from MR !5055).
+#
+# The 2026-07-01 jira-bridge outage: a sandbox bridge misconfigured onto the
+# prod beads daemon stamped last_checked on prod trigger:jira beads ~10s
+# before every prod poll, permanently tripping prod's cooldown gate. The prod
+# TriggerEngine cooldown-skipped 414 consecutive cycles (~13h) with zero
+# evalOne outcomes (no fired / no-new-matches / dedup-suppressed lines — only
+# "skipped (cooldown)") while the triggers' JQL matched open issues, and
+# nothing paged. Alert A detects that specific ROOT CAUSE (a foreign fleet
+# writing service-managed fields); this alert detects the SYMPTOM, so it
+# catches ANY starvation cause — a future misconfig, clock skew, a new
+# cooldown bypass path — in ~15m instead of 13h.
+#
+# The TriggerEngine tracks per-trigger consecutive cooldown-skip streaks
+# (trigger_starve.go) and publishes on the jira-bridge's internal :9093
+# /metrics endpoint:
+#   gardenio_trigger_cooldown_skip_streak{source,trigger} — consecutive
+#     evaluation cycles that ended at the cooldown gate; resets to 0 whenever
+#     the engine gets past the gate.
+#   gardenio_trigger_starved{source,trigger} — 1 once the streak has outlived
+#     BOTH ~30 cycles AND max(15m, 3x the trigger's own cooldown), AND the
+#     trigger's own JQL ApproximateCount (the cheap endpoint the JQL-count
+#     exporter uses, commit 94a188743) still reports > 0 matching issues —
+#     i.e. work is sitting upstream while the trigger never evaluates.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-jira-bridge-trigger-starved
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jira-bridge
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.jira_trigger_starved
+      interval: 1m
+      rules:
+        - alert: JiraTriggerStarved
+          # The engine-side gauge already encodes the full verdict (streak
+          # thresholds + per-trigger upstream ApproximateCount > 0), so the
+          # expr is a plain ==1 with a short `for:` hold to ride out scrape
+          # gaps. The optional backlogQuery join adds a fleet-level
+          # gardenio_jira_issues floor for envs that run the JQL-count
+          # collector (leave empty otherwise — an absent series would
+          # silently suppress the page).
+          expr: |
+            max by (source, trigger) (gardenio_trigger_starved{source="jira"}) == 1
+            {{- if $cfg.backlogQuery }}
+            and on ()
+            sum(gardenio_jira_issues{query={{ $cfg.backlogQuery | quote }}}) > 0
+            {{- end }}
+          for: {{ $cfg.for | default "5m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: jira-bridge
+            subsystem: trigger_engine
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "JIRA trigger {{`{{ $labels.trigger }}`}} is cooldown-starved — it has not evaluated in 15m+ while its JQL still matches issues"
+            description: |
+              Trigger {{`{{ $labels.trigger }}`}} (source
+              {{`{{ $labels.source }}`}}) has ended every evaluation cycle at
+              the cooldown gate for longer than its own cooldown can explain
+              (~30+ cycles), while its JQL ApproximateCount still reports
+              matching issues upstream. Something keeps advancing the
+              trigger's last_checked so this engine never wins a fire window
+              — the 2026-07-01 outage signature (a sandbox bridge stamping
+              prod trigger beads), or clock skew, or a new cooldown bypass.
+              New matching JIRA issues are NOT spawning agents/beads while
+              this fires.
+
+              Triage: check the companion root-cause alert
+              (ServiceFieldForeignFleetWrite) and the bridge's
+              "last_checked advanced out-of-band" WARN logs to identify the
+              foreign writer; verify JIRA_TRIGGER_PROJECTS scoping and
+              BEADS_SERVICE_FIELD_FLEETS on the beads daemon; scale down or
+              re-point the offending environment. Full runbook on the epic.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000005107)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

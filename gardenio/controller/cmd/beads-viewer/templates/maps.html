@@ -1,0 +1,830 @@
+{{template "layout" .}}
+{{define "title"}}Maps · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+<style>
+  /* /maps — the gardeners-as-connected-cards board (epic ka-0000001644). Each
+     card reads left→right as a small connected unit: a TRIGGER node (what fires
+     this gardener) --edge--> an IDENTITY+verdict body (what it is, how healthy)
+     --edge--> a RECENT-RUN strip (how the last few runs went). The board reuses
+     the verdict colour pills (.gardener-verdict-*) and the per-run sparkline
+     bars (.gardener-spark-*) already defined in layout.html so /maps and the
+     gardener pages share one visual idiom; everything else is scoped here under
+     .maps-board. */
+  html[data-skin="baseline"] body:has(.maps-page) { background: #edf0f3; }
+  .maps-page { width: 100%; }
+  .maps-intro { color: #595959; font-size: 0.88em; margin: 0.2rem 0 0.6rem; max-width: 60rem; }
+  html[data-skin^="dark"] .maps-intro { color: #9aa0a6; }
+
+  /* Fleet-health summary strip — leads with signal, mirrors /gardeners. */
+  .maps-summary { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.4rem 0 0.8rem; }
+  .maps-summary-tile {
+    display: flex; flex-direction: column; gap: 0.05rem; min-width: 5.5rem;
+    padding: 0.3rem 0.65rem; border-radius: 6px; border: 1px solid rgba(128,128,128,0.28);
+    background: var(--bg, #fff); box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  }
+  html[data-skin^="dark"] .maps-summary-tile { background: #14181d; }
+  .maps-summary-num { font-size: 1.5rem; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .maps-summary-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; color: #595959; white-space: nowrap; }
+  html[data-skin^="dark"] .maps-summary-label { color: #9aa0a6; }
+  .maps-summary-tile.tile-running .maps-summary-num { color: #1a7f37; }
+  .maps-summary-tile.tile-attention .maps-summary-num { color: #b3261e; }
+  .maps-summary-tile.tile-attention.is-zero .maps-summary-num { color: #1a7f37; }
+  html[data-skin^="dark"] .maps-summary-tile.tile-running .maps-summary-num,
+  html[data-skin^="dark"] .maps-summary-tile.tile-attention.is-zero .maps-summary-num { color: #7ddb82; }
+  html[data-skin^="dark"] .maps-summary-tile.tile-attention .maps-summary-num { color: #ee7e7e; }
+  .maps-summary-dot { display: inline-block; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: #2e9b43; margin-right: 0.3rem; vertical-align: 0.05rem; animation: cap-running-pulse 1.6s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) { .maps-summary-dot { animation: none; } }
+
+  .maps-scope { font-size: 0.8rem; margin: 0 0 0.7rem; }
+  .maps-scope a { text-decoration: none; opacity: 0.7; }
+  .maps-scope a.is-active { font-weight: 700; opacity: 1; }
+
+  /* Filter rail (maps2 v2, ka-0000008126) — facet chip strip above the board.
+     Each facet group is a labeled row of toggle chips reusing the cross-filter
+     wire format (?filter=key:value,...). A selected chip is filled; clicking it
+     toggles that value off. Mirrors the /gardeners chip idiom + the trigger-node
+     palette so trigger facets read in the same colors as the cards. */
+  .maps-filter { margin: 0 0 0.9rem; display: flex; flex-direction: column; gap: 0.35rem; }
+  .maps-facet { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.3rem; }
+  .maps-facet-label {
+    font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 700;
+    color: #777; min-width: 4rem;
+  }
+  html[data-skin^="dark"] .maps-facet-label { color: #9aa0a6; }
+  .maps-chip {
+    display: inline-flex; align-items: center; gap: 0.3rem; text-decoration: none;
+    font-size: 0.74rem; padding: 0.12rem 0.5rem; border-radius: 999px;
+    border: 1px solid rgba(128,128,128,0.35); color: inherit; background: var(--bg, #fff);
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  html[data-skin^="dark"] .maps-chip { background: #14181d; }
+  .maps-chip:hover { border-color: rgba(33,150,243,0.55); background: rgba(33,150,243,0.07); }
+  .maps-chip .chip-count { font-variant-numeric: tabular-nums; color: #888; font-size: 0.68rem; }
+  .maps-chip.is-active {
+    background: #1565c0; border-color: #1565c0; color: #fff; font-weight: 600;
+  }
+  .maps-chip.is-active .chip-count { color: rgba(255,255,255,0.8); }
+  /* Trigger-facet chips echo the card trigger-node palette when not selected. */
+  .maps-facet[data-facet="trigger"] .maps-chip[data-val="cron"] { border-color: rgba(21,101,192,0.5); }
+  .maps-facet[data-facet="trigger"] .maps-chip[data-val="bead_query"] { border-color: rgba(198,40,40,0.5); }
+  .maps-facet[data-facet="trigger"] .maps-chip[data-val="event"] { border-color: rgba(106,78,163,0.5); }
+  .maps-facet[data-facet="trigger"] .maps-chip[data-val="schedule"] { border-color: rgba(138,97,22,0.5); }
+  .maps-filter-clear {
+    font-size: 0.72rem; text-decoration: none; color: #a83232; margin-left: 0.2rem;
+  }
+  .maps-filter-clear:hover { text-decoration: underline; }
+  .maps-filter-count { font-size: 0.72rem; color: #777; margin-left: 0.2rem; }
+
+  /* Search box (maps2 v2, ka-0000006434) — a client-side filter over the
+     rendered board. Typing narrows the standalone card grid to gardeners whose
+     name / bead title / goal / owner / id contains the query, and hides whole
+     workflow rails that have no matching gardener (the rail stays intact when it
+     does, so chains remain readable). Pure JS over each card's data-search
+     haystack — no server round-trip. */
+  .maps-search { margin: 0 0 0.7rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .maps-search input {
+    padding: 0.32rem 0.6rem; min-width: 16rem; max-width: 100%; font: inherit;
+    border: 1px solid rgba(128,128,128,0.45); border-radius: 6px;
+    background: var(--bg, #fff); color: inherit;
+  }
+  html[data-skin^="dark"] .maps-search input { background: #14181d; }
+  .maps-search input:focus { outline: 2px solid rgba(33,150,243,0.55); outline-offset: 0; }
+  .maps-search-count { font-size: 0.72rem; color: #777; font-variant-numeric: tabular-nums; }
+  html[data-skin^="dark"] .maps-search-count { color: #9aa0a6; }
+  /* JS hides non-matching cards / rails by toggling this class. */
+  .maps-search-hidden { display: none !important; }
+  .maps-search-empty { font-size: 0.85rem; color: #777; margin: 0.4rem 0; }
+  html[data-skin^="dark"] .maps-search-empty { color: #9aa0a6; }
+
+  .maps-scope-sep { opacity: 0.4; margin: 0 0.15rem; }
+
+  /* Responsive card grid — ~2 wide on desktop, 1 column narrow. */
+  .maps-board { display: grid; grid-template-columns: repeat(auto-fill, minmax(28rem, 1fr)); gap: 0.75rem; }
+  @media (max-width: 640px) { .maps-board { grid-template-columns: 1fr; } }
+
+  /* Owner grouping (maps2 v2, ka-0000002262) — per-owner collapsible sections.
+     Each <details> heads a card grid with the owner name + a count badge; the
+     native disclosure triangle drives collapse with no JS. */
+  .maps-owner-groups { display: flex; flex-direction: column; gap: 0.8rem; }
+  .maps-owner-group { border: 1px solid rgba(128,128,128,0.22); border-radius: 10px; padding: 0.2rem 0.6rem 0.6rem; }
+  html[data-skin^="dark"] .maps-owner-group { background: rgba(255,255,255,0.012); }
+  .maps-owner-summary {
+    display: flex; align-items: baseline; gap: 0.5rem; cursor: pointer; list-style-position: outside;
+    padding: 0.45rem 0.1rem; font-weight: 600; user-select: none;
+  }
+  .maps-owner-summary:hover { color: #1565c0; }
+  html[data-skin^="dark"] .maps-owner-summary:hover { color: #6aa9ff; }
+  .maps-owner-name { font-size: 0.95rem; }
+  .maps-owner-count {
+    font-size: 0.68rem; font-weight: 600; color: #777; font-variant-numeric: tabular-nums;
+    padding: 0.05rem 0.45rem; border-radius: 999px; background: rgba(128,128,128,0.16);
+  }
+  html[data-skin^="dark"] .maps-owner-count { color: #9aa0a6; }
+
+  .maps-card {
+    position: relative;
+    display: grid; grid-template-columns: auto 1fr auto; align-items: stretch; gap: 0;
+    border: 1px solid rgba(128,128,128,0.3); border-radius: 10px; overflow: hidden;
+    background: var(--bg, #fff); box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  html[data-skin^="dark"] .maps-card { background: #14181d; }
+  .maps-card.is-attention { border-color: rgba(214,69,69,0.65); box-shadow: 0 0 0 1px rgba(214,69,69,0.4); }
+  .maps-card.is-dim { opacity: 0.6; }
+
+  /* Card-graph AUTHORING affordance (task ka-0000005273 / "C3"): the
+     "+ successor" handle that draws a chain.to heir off this gardener. It sits
+     on the card's RIGHT EDGE, revealed on hover/focus so it never competes with
+     the card's signal but is one gesture away. Keyboard-reachable: focus-within
+     and :focus both reveal it. The handle overlays the top-right corner (the
+     card is overflow:hidden, so it stays inside the rounded frame). */
+  .maps-card-successor {
+    position: absolute; top: 0; right: 0; z-index: 3;
+    display: inline-flex; align-items: center; gap: 0.15rem;
+    font: inherit; font-size: 0.6rem; font-weight: 700; letter-spacing: 0.02em;
+    text-transform: uppercase; white-space: nowrap; cursor: pointer;
+    padding: 0.16rem 0.4rem; border: 0; border-bottom-left-radius: 8px;
+    color: #1565c0; background: rgba(33,150,243,0.12);
+    opacity: 0; transition: opacity 0.12s ease, background 0.12s ease;
+  }
+  .maps-card:hover .maps-card-successor,
+  .maps-card:focus-within .maps-card-successor,
+  .maps-card-successor:focus { opacity: 1; }
+  .maps-card-successor:hover { background: rgba(33,150,243,0.22); }
+  html[data-skin^="dark"] .maps-card-successor { color: #6aa9ff; background: rgba(33,150,243,0.16); }
+  @media (hover: none) { .maps-card-successor { opacity: 0.8; } }
+
+  /* Trigger node — the left lobe; colour by kind, dashed when disabled. */
+  .maps-trigger {
+    display: flex; flex-direction: column; justify-content: center; gap: 0.15rem;
+    padding: 0.55rem 0.6rem; min-width: 6.5rem; max-width: 9rem; text-decoration: none; color: inherit;
+    border-right: 1px solid rgba(128,128,128,0.22); background: rgba(128,128,128,0.05);
+  }
+  .maps-trigger:hover { background: rgba(33,150,243,0.08); }
+  .maps-trigger-kind { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 700; }
+  /* Sub-kind color: cron=blue, bead_query=red, event=purple, schedule=amber
+     (design.md §6 card-anatomy; ka-0000003781). kind-trigger kept as a purple
+     alias so a pre-projection fixture never renders an uncolored node. */
+  .maps-trigger.kind-cron .maps-trigger-kind { color: #1565c0; }
+  .maps-trigger.kind-bead_query .maps-trigger-kind { color: #c62828; }
+  .maps-trigger.kind-event .maps-trigger-kind { color: #6a4ea3; }
+  .maps-trigger.kind-trigger .maps-trigger-kind { color: #6a4ea3; }
+  .maps-trigger.kind-schedule .maps-trigger-kind { color: #8a6116; }
+  .maps-trigger.kind-bead_query:hover { background: rgba(198,40,40,0.08); }
+  .maps-trigger.kind-event:hover { background: rgba(106,78,163,0.08); }
+  .maps-trigger.is-disabled { border-left: 3px dashed rgba(128,128,128,0.6); }
+  .maps-trigger.is-disabled .maps-trigger-kind { color: var(--muted, #888); }
+  .maps-trigger-next { font-size: 0.72rem; font-variant-numeric: tabular-nums; }
+  .maps-trigger-next .meta { color: #777; }
+  .maps-trigger-err { font-size: 0.66rem; color: #a83232; }
+
+  /* Identity + verdict body — the centre lobe. */
+  .maps-body { display: flex; flex-direction: column; gap: 0.3rem; padding: 0.55rem 0.7rem; min-width: 0; }
+  .maps-name { display: flex; align-items: baseline; gap: 0.4rem; }
+  .maps-name a { font-weight: 600; text-decoration: none; color: inherit; }
+  .maps-name a:hover { text-decoration: underline; }
+  .maps-initials {
+    flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+    width: 1.3rem; height: 1.3rem; border-radius: 50%; font-size: 0.6rem; font-weight: 700;
+    background: rgba(128,128,128,0.18); color: var(--muted, #555);
+  }
+  .maps-bead-title { font-size: 0.7rem; color: #888; }
+  .maps-goal { font-size: 0.75rem; color: #595959; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  html[data-skin^="dark"] .maps-goal { color: #9aa0a6; }
+  .maps-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; font-size: 0.72rem; }
+  .maps-runs-count { font-variant-numeric: tabular-nums; color: #595959; }
+  .maps-owner { color: #777; font-size: 0.7rem; }
+  /* Owned-epic rollup chip (task ka-0000001266): a thin drain bar + label
+     linking to the epic the gardener drives. */
+  .maps-epic { display: flex; align-items: center; gap: 0.4rem; text-decoration: none; color: inherit; }
+  .maps-epic:hover .maps-epic-label { text-decoration: underline; }
+  .maps-epic-bar {
+    flex: 0 0 auto; width: 3.5rem; height: 0.4rem; border-radius: 999px; overflow: hidden;
+    background: rgba(128,128,128,0.22);
+  }
+  .maps-epic-fill { display: block; height: 100%; background: #2e9b43; border-radius: 999px; }
+  html[data-skin^="dark"] .maps-epic-fill { background: #3fae55; }
+  .maps-epic-label { font-size: 0.7rem; color: #595959; font-variant-numeric: tabular-nums; }
+  html[data-skin^="dark"] .maps-epic-label { color: #9aa0a6; }
+  /* Cost + context chips (maps2 v2, ka-0000001668): glanceable per-card spend +
+     live context occupancy, sitting inline in the meta row alongside the run
+     counters. Cost is tabular dollars (a stale roll-up dims + carries a "~");
+     context is a thin occupancy bar + token label, mirroring the /agents usage
+     strip idiom. */
+  .maps-cost { font-variant-numeric: tabular-nums; font-weight: 600; color: #57606a; }
+  html[data-skin^="dark"] .maps-cost { color: #c9c9c9; }
+  .maps-cost-stale { color: #999; font-weight: 500; }
+  .maps-ctx { display: inline-flex; align-items: center; gap: 0.3rem; color: #595959; font-variant-numeric: tabular-nums; }
+  html[data-skin^="dark"] .maps-ctx { color: #9aa0a6; }
+  .maps-ctx-bar {
+    flex: 0 0 auto; width: 2.6rem; height: 0.4rem; border-radius: 999px; overflow: hidden;
+    background: rgba(128,128,128,0.22);
+  }
+  .maps-ctx-fill { display: block; height: 100%; background: #2196f3; border-radius: 999px; }
+  html[data-skin^="dark"] .maps-ctx-fill { background: #4aa3f0; }
+  /* Turns (🔁) — the third triad metric. A quiet tabular figure matching the
+     cost/context tone; the emoji carries the meaning. */
+  .maps-turns { color: #595959; font-variant-numeric: tabular-nums; }
+  html[data-skin^="dark"] .maps-turns { color: #9aa0a6; }
+  .maps-running { color: #1a7f37; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  html[data-skin^="dark"] .maps-running { color: #7ddb82; }
+  .maps-live-agent { color: inherit; text-decoration: none; }
+  .maps-live-agent:hover { text-decoration: underline; }
+  .maps-running-dot { display: inline-block; width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #2e9b43; margin-right: 0.25rem; animation: cap-running-pulse 1.6s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) { .maps-running-dot { animation: none; } }
+  .maps-last-tldr { font-size: 0.72rem; color: #595959; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .maps-attention {
+    font-size: 0.72rem; padding: 0.2rem 0.4rem; border-radius: 5px;
+    background: rgba(214,69,69,0.1); border: 1px solid rgba(214,69,69,0.35); color: #a83232;
+  }
+  .maps-attention a { color: inherit; font-weight: 600; }
+  html[data-skin^="dark"] .maps-attention { color: #ee7e7e; }
+
+  /* Recent-run strip — the right lobe; reuses .gardener-spark-* bar colours. */
+  .maps-runs {
+    display: flex; flex-direction: column; justify-content: center; gap: 0.25rem;
+    padding: 0.55rem 0.6rem; min-width: 5rem; border-left: 1px solid rgba(128,128,128,0.22);
+  }
+  .maps-runs-strip { display: flex; align-items: flex-end; gap: 2px; height: 2rem; }
+  /* A phone has no room for three lobes side by side (the verdict pill ran
+     under "no run history"): the recent-run strip takes a row of its own
+     beneath the trigger and the body (Homestead 2.3). */
+  @media (max-width: 30rem) {
+    .maps-card { grid-template-columns: auto 1fr; }
+    .maps-runs { grid-column: 1 / -1; border-left: 0; border-top: 1px solid rgba(128,128,128,0.22); }
+  }
+  .maps-runs-empty { font-size: 0.68rem; color: #999; align-self: center; }
+
+  /* Verdict-over-time sparkline (task ka-0000001693) — the DEFAULT recent-run
+     display. A continuous line over the gardener's full bounded run trajectory,
+     tinted by health VerdictKind, with each run's vertex dotted in its outcome
+     colour (reusing the .gardener-spark-* palette). The discrete bar strip is the
+     fallback / toggle: hidden whenever a sparkline is present, revealed when the
+     board is in "pills" mode. */
+  .maps-runs-spark { display: block; width: 100%; height: 2rem; overflow: visible; }
+  .maps-spark-area { fill: rgba(128,128,128,0.12); stroke: none; }
+  .maps-spark-line { fill: none; stroke: #9aa0a6; stroke-width: 1.6; vector-effect: non-scaling-stroke; stroke-linejoin: round; stroke-linecap: round; }
+  .maps-spark-dot { stroke: var(--bg, #fff); stroke-width: 0.4; }
+  .maps-spark-dot.gardener-spark-ok   { fill: #43a047; }
+  .maps-spark-dot.gardener-spark-fail { fill: #d64545; }
+  .maps-spark-dot.gardener-spark-flat { fill: #b0b4b8; }
+  .maps-runs-spark.verdict-progress .maps-spark-line { stroke: #43a047; }
+  .maps-runs-spark.verdict-progress .maps-spark-area { fill: rgba(67,160,71,0.14); }
+  .maps-runs-spark.verdict-stalled .maps-spark-line  { stroke: #d69e2e; }
+  .maps-runs-spark.verdict-stalled .maps-spark-area  { fill: rgba(214,158,46,0.14); }
+  .maps-runs-spark.verdict-stuck .maps-spark-line    { stroke: #d64545; }
+  .maps-runs-spark.verdict-stuck .maps-spark-area    { fill: rgba(214,69,69,0.14); }
+  .maps-runs-spark.verdict-neutral .maps-spark-line  { stroke: #9aa0a6; }
+
+  /* Display switch: sparkline by default, discrete pills when toggled. When a
+     sparkline is present its sibling bar strip is hidden; "pills" mode flips
+     them. A card with no sparkline (too little history) shows its strip as the
+     automatic fallback regardless of mode. */
+  .maps-runs-spark + .maps-runs-strip { display: none; }
+  .maps-page[data-runs="pills"] .maps-runs-spark { display: none; }
+  .maps-page[data-runs="pills"] .maps-runs-spark + .maps-runs-strip { display: flex; }
+
+  /* The board-level Sparkline ⇄ Pills toggle, sitting on the scope line. */
+  .maps-runs-toggle { display: inline-flex; gap: 0; margin-left: 0.6rem; vertical-align: 0.05rem; }
+  .maps-runs-toggle button {
+    font: inherit; font-size: 0.74rem; cursor: pointer; padding: 0.08rem 0.5rem;
+    border: 1px solid rgba(128,128,128,0.4); background: var(--bg, #fff); color: #595959;
+  }
+  .maps-runs-toggle button:first-child { border-radius: 5px 0 0 5px; }
+  .maps-runs-toggle button:last-child { border-radius: 0 5px 5px 0; border-left: none; }
+  .maps-runs-toggle button.is-active { background: rgba(33,150,243,0.14); color: #1565c0; font-weight: 600; }
+  html[data-skin^="dark"] .maps-runs-toggle button { background: #1b1f24; color: #9aa0a6; }
+  html[data-skin^="dark"] .maps-runs-toggle button.is-active { color: #7db9ee; }
+
+  /* ── Gardener-chaining workflows (task ka-0000004778 / "C2") ───────────────
+     A WORKFLOW is the connected component of `chains_to` edges among gardeners,
+     rendered as a left→right RAIL of gardener cards joined by directed handoff
+     arrows. The arrow is dim while the predecessor is mid-loop and LIGHTS at
+     the handoff (predecessor reached its terminal goal); the heir's card then
+     ignites a halo. Design: docs/gardener-chaining-design-2026-06-18.md §3.5,§4. */
+  .maps-workflows { margin: 0.2rem 0 1.1rem; }
+  .maps-workflows-head { font-size: 0.8rem; color: #595959; margin: 0 0 0.5rem; }
+  html[data-skin^="dark"] .maps-workflows-head { color: #9aa0a6; }
+  .maps-workflows-head .pill {
+    display: inline-block; font-size: 0.66rem; padding: 0.05rem 0.4rem; border-radius: 999px;
+    background: rgba(128,128,128,0.16); margin-left: 0.3rem; vertical-align: 0.05rem;
+  }
+  .maps-workflows-head .pill.dangling { background: rgba(214,69,69,0.16); color: #a83232; border: 1px solid rgba(214,69,69,0.4); }
+
+  .maps-workflow {
+    border: 1px solid rgba(128,128,128,0.3); border-radius: 10px; padding: 0.6rem 0.7rem;
+    margin-bottom: 0.8rem; background: var(--bg, #fff); box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  html[data-skin^="dark"] .maps-workflow { background: #14181d; }
+  .maps-workflow-title { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.55rem; }
+  .maps-workflow-name { font-weight: 700; font-size: 0.92rem; }
+  .maps-workflow-phase { font-size: 0.72rem; color: #595959; font-variant-numeric: tabular-nums; }
+  .maps-workflow-dangling {
+    font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: 5px;
+    background: rgba(214,69,69,0.1); border: 1px solid rgba(214,69,69,0.35); color: #a83232;
+  }
+
+  /* The rail: cards and arrows on one horizontally-scrollable row. */
+  .maps-rail { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding-bottom: 0.2rem; }
+  .maps-rail-card { flex: 0 0 auto; max-width: 22rem; }
+  .maps-rail-card .maps-card { height: 100%; }
+  /* Heir halo ignition — a lit ring around a card whose predecessor handed off. */
+  .maps-rail-card.is-ignited .maps-card {
+    border-color: rgba(255,193,7,0.8);
+    box-shadow: 0 0 0 2px rgba(255,193,7,0.45), 0 0 12px rgba(255,193,7,0.35);
+    animation: maps-halo-ignite 1.4s ease-in-out infinite;
+  }
+  @keyframes maps-halo-ignite {
+    0%,100% { box-shadow: 0 0 0 2px rgba(255,193,7,0.4), 0 0 10px rgba(255,193,7,0.3); }
+    50%     { box-shadow: 0 0 0 2px rgba(255,193,7,0.6), 0 0 16px rgba(255,193,7,0.5); }
+  }
+  @media (prefers-reduced-motion: reduce) { .maps-rail-card.is-ignited .maps-card { animation: none; } }
+  .maps-rail-card.is-root .maps-card { border-left: 3px solid rgba(33,150,243,0.6); }
+  /* Ghost (dangling) heir — a referenced heir that never materialized. */
+  .maps-rail-ghost {
+    flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
+    min-width: 9rem; min-height: 4rem; padding: 0.6rem 0.8rem;
+    border: 1px dashed rgba(214,69,69,0.5); border-radius: 10px; opacity: 0.85;
+    color: #a83232; font-size: 0.78rem; text-align: center;
+  }
+
+  /* The directed handoff arrow between two rail cards. Dim by default; .is-lit
+     lights it at the handoff moment (predecessor goal achieved). */
+  .maps-arrow {
+    flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 0 0.4rem; min-width: 2.4rem; color: rgba(128,128,128,0.5); font-size: 1.3rem; line-height: 1;
+  }
+  .maps-arrow .glyph { transition: color 0.3s ease; }
+  .maps-arrow .label { font-size: 0.56rem; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 0.15rem; color: #9aa0a6; }
+  .maps-arrow.is-lit { color: #e0a800; }
+  .maps-arrow.is-lit .glyph {
+    color: #e0a800; text-shadow: 0 0 8px rgba(255,193,7,0.7);
+    animation: maps-arrow-pulse 1.4s ease-in-out infinite;
+  }
+  .maps-arrow.is-lit .label { color: #e0a800; font-weight: 700; }
+  @keyframes maps-arrow-pulse { 0%,100% { opacity: 0.85; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .maps-arrow.is-lit .glyph { animation: none; } }
+
+  /* ── Card-graph AUTHORING: pending successors (task ka-0000005273 / "C3") ──
+     A `chain.to` successor DRAWN off a card but not yet spawned by the engine.
+     It renders as a distinct, calm "pending" node (blue/authoring accent) —
+     NOT the red broken-link ghost — with a dashed "will chain to" arrow. */
+  .maps-workflows-head .pill.pending { background: rgba(33,150,243,0.14); color: #1565c0; border: 1px solid rgba(33,150,243,0.4); }
+  html[data-skin^="dark"] .maps-workflows-head .pill.pending { color: #6aa9ff; }
+  .maps-workflow-pending {
+    font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: 5px;
+    background: rgba(33,150,243,0.1); border: 1px solid rgba(33,150,243,0.35); color: #1565c0;
+  }
+  html[data-skin^="dark"] .maps-workflow-pending { color: #6aa9ff; }
+  .maps-rail-pending {
+    flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.15rem;
+    min-width: 9rem; min-height: 4rem; padding: 0.6rem 0.8rem;
+    border: 1px dashed rgba(33,150,243,0.55); border-radius: 10px;
+    color: #1565c0; font-size: 0.8rem; text-align: center; background: rgba(33,150,243,0.04);
+  }
+  html[data-skin^="dark"] .maps-rail-pending { color: #6aa9ff; background: rgba(33,150,243,0.06); }
+  .maps-rail-pending-mark { font-size: 1.1rem; }
+  .maps-rail-pending-label { font-weight: 700; }
+  .maps-rail-pending .meta { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.03em; color: #8aa; }
+  .maps-arrow.is-pending { color: rgba(33,150,243,0.6); }
+  .maps-arrow.is-pending .glyph { color: rgba(33,150,243,0.7); }
+  .maps-arrow.is-pending .label { color: #6aa9ff; }
+  /* Dark parity (Homestead 2.3, gd-3nQwIneabf): the light inks above that had
+     no dark override, lifted to this file's dark palette. Keyed on
+     html[data-skin^="dark"] so both Dark terminal and Homestead night get them
+     (TestHomesteadNight_SurfaceDarkCoverage). */
+  html[data-skin^="dark"] .maps-bead-title,
+  html[data-skin^="dark"] .maps-cost-stale,
+  html[data-skin^="dark"] .maps-filter-count,
+  html[data-skin^="dark"] .maps-last-tldr,
+  html[data-skin^="dark"] .maps-owner,
+  html[data-skin^="dark"] .maps-runs-count,
+  html[data-skin^="dark"] .maps-runs-empty,
+  html[data-skin^="dark"] .maps-workflow-phase { color: #9aa0a6; }
+  html[data-skin^="dark"] .maps-filter-clear,
+  html[data-skin^="dark"] .maps-rail-ghost,
+  html[data-skin^="dark"] .maps-trigger-err,
+  html[data-skin^="dark"] .maps-workflow-dangling { color: #ee7e7e; }
+  html[data-skin^="dark"] .maps-trigger.kind-cron .maps-trigger-kind { color: #6aa9ff; }
+  html[data-skin^="dark"] .maps-trigger.kind-bead_query .maps-trigger-kind { color: #ee7e7e; }
+  html[data-skin^="dark"] .maps-trigger.kind-event .maps-trigger-kind,
+  html[data-skin^="dark"] .maps-trigger.kind-trigger .maps-trigger-kind { color: #b9a3e8; }
+  html[data-skin^="dark"] .maps-trigger.kind-schedule .maps-trigger-kind { color: #e0b25a; }
+</style>
+
+<div class="maps-page">
+  <h1>Maps</h1>
+  <p class="maps-intro">
+    Every gardener as a connected card — what fires it, how healthy it is, and how its
+    recent runs went. Each card links to the gardener's life-thread; the trigger node
+    links to <a href="{{.BasePath}}/triggers">Triggers</a>.
+  </p>
+
+  {{if .Error}}<p class="empty">{{.Error}}</p>{{end}}
+
+  {{with .Board}}
+  <div class="maps-summary" aria-label="Fleet summary">
+    <div class="maps-summary-tile tile-total">
+      <span class="maps-summary-num">{{.Total}}</span>
+      <span class="maps-summary-label">gardeners</span>
+    </div>
+    <div class="maps-summary-tile tile-running">
+      <span class="maps-summary-num">{{if .Running}}<span class="maps-summary-dot" aria-hidden="true"></span>{{end}}{{.Running}}</span>
+      <span class="maps-summary-label">running now</span>
+    </div>
+    <div class="maps-summary-tile tile-attention{{if not .NeedsAttention}} is-zero{{end}}">
+      <span class="maps-summary-num">{{.NeedsAttention}}</span>
+      <span class="maps-summary-label">needs attention</span>
+    </div>
+  </div>
+  {{end}}
+
+  <p class="maps-scope">
+    {{- /* Scope toggle (Live fleet ⇄ All gardeners) lives in its own
+           .maps-scope-links span so the active-chip selector is unambiguous:
+           the group-by-owner and runs toggles below ALSO use `.is-active`, so
+           a bare `.maps-scope a.is-active` would match more than the scope
+           chip. Keep the scope anchors fenced (ka-0000002434). */ -}}
+    Scope:
+    <span class="maps-scope-links">
+      <a href="{{.BasePath}}/maps"{{if not .All}} class="is-active" aria-current="page"{{end}}>Live fleet</a> ·
+      <a href="{{.BasePath}}/maps?all=1"{{if .All}} class="is-active" aria-current="page"{{end}}>All gardeners</a>
+    </span>
+    <span class="maps-scope-sep">·</span>
+    {{- /* Group-by-owner toggle (maps2 v2, ka-0000002262): buckets the standalone
+           card grid into per-owner collapsible sections. Preserves scope+filter. */ -}}
+    Group:
+    <span class="maps-group-links">
+      <a href="{{.GroupToggleOff}}"{{if not .Grouped}} class="is-active" aria-current="page"{{end}}>None</a> ·
+      <a href="{{.GroupToggleOn}}"{{if .Grouped}} class="is-active" aria-current="page"{{end}}>By owner</a>
+    </span>
+    {{- /* Recent-run display toggle (task ka-0000001693): sparkline (default) ⇄
+           discrete pills. Pure client-side; persisted in localStorage. */ -}}
+    <span class="maps-runs-toggle" role="group" aria-label="Recent-run display">
+      <button type="button" data-runs-mode="spark" class="is-active" aria-pressed="true" title="Verdict-over-time trajectory line">Sparkline</button>
+      <button type="button" data-runs-mode="pills" aria-pressed="false" title="Discrete per-run pills">Pills</button>
+    </span>
+  </p>
+
+  {{- /* Search box (maps2 v2, ka-0000006434): a client-side filter over the
+         rendered board — narrows cards by name/title/goal/owner/id with no
+         server round-trip. Only shown when the board actually has gardeners to
+         search; progressively enhanced, so it stays inert (and hidden) without
+         JS. */ -}}
+  {{with .Board}}{{if or .Cards .Workflows}}
+  <div class="maps-search" hidden data-maps-search>
+    <label for="maps-search-input" class="maps-facet-label">Search</label>
+    <input id="maps-search-input" type="search" autocomplete="off" spellcheck="false"
+           placeholder="Filter gardeners by name, goal, owner…" aria-label="Filter gardeners">
+    <span class="maps-search-count" data-maps-search-count hidden></span>
+  </div>
+  {{end}}{{end}}
+
+  {{- /* Filter rail (maps2 v2, ka-0000008126): facet chips that narrow the
+         board. Each chip toggles a key:value pair in ?filter= (cross-filter wire
+         format); selecting facets ANDs across groups and ORs within a group.
+         Counts are over the scoped (live/all) set, before the filter. */ -}}
+  {{with .Rail}}{{if .Groups}}
+  <div class="maps-filter" aria-label="Filter gardeners">
+    {{range .Groups}}
+    <div class="maps-facet" data-facet="{{.Key}}">
+      <span class="maps-facet-label">{{.Label}}</span>
+      {{range .Options}}
+      <a class="maps-chip{{if .Active}} is-active{{end}}" data-val="{{.Value}}" href="{{.Href}}"
+         {{if .Active}}aria-pressed="true"{{else}}aria-pressed="false"{{end}}>
+        {{.Label}} <span class="chip-count">{{.Count}}</span>
+      </a>
+      {{end}}
+    </div>
+    {{end}}
+    {{if .Active}}
+    <div class="maps-facet">
+      <span class="maps-facet-label"></span>
+      <a class="maps-filter-clear" href="{{.ClearHref}}">✕ clear filters</a>
+      <span class="maps-filter-count">showing {{$.FilterCount}} of {{$.ScopedTotal}}</span>
+    </div>
+    {{end}}
+  </div>
+  {{end}}{{end}}
+
+  {{with .Board}}
+  {{- /* Workflows: chains_to connected components, rendered as handoff rails
+         ABOVE the standalone grid (task ka-0000004778 / "C2"). */ -}}
+  {{if .Workflows}}
+  <div class="maps-workflows">
+    <p class="maps-workflows-head">
+      {{.WorkflowCount}} workflow{{if ne .WorkflowCount 1}}s{{end}}
+      <span class="pill" title="gardeners chained predecessor→heir via chains_to edges">chained gardeners</span>
+      {{if .PendingChains}}<span class="pill pending" title="a chain.to successor drawn but not yet spawned by the engine">{{.PendingChains}} pending</span>{{end}}
+      {{if .DanglingChains}}<span class="pill dangling" title="a chain.to whose heir gardener never materialized">{{.DanglingChains}} dangling</span>{{end}}
+    </p>
+    {{range .Workflows}}
+    <div class="maps-workflow" id="wf-{{.ID}}">
+      <div class="maps-workflow-title">
+        <span class="maps-workflow-name">{{.Name}}</span>
+        <span class="maps-workflow-phase" title="current handoff frontier">{{.GardenerCount}} gardener{{if ne .GardenerCount 1}}s{{end}} · phase {{.Phase}}/{{.GardenerCount}}</span>
+        {{if .Pending}}<span class="maps-workflow-pending" title="a chain.to successor drawn but not yet spawned">✎ pending successor</span>{{end}}
+        {{if .Dangling}}<span class="maps-workflow-dangling" title="a chain.to whose heir never materialized">⚠ dangling chain</span>{{end}}
+      </div>
+      <div class="maps-rail">
+        {{range $i, $card := .Cards}}
+        {{if $i}}
+        {{- /* Handoff arrow between the previous card and this one. Lit when the
+               predecessor has reached its terminal goal (this card is ignited). A
+               PENDING heir (drawn but not yet spawned) shows a dashed "will chain
+               to" arrow instead of the live handoff. */ -}}
+        <div class="maps-arrow{{if $card.HaloIgnited}} is-lit{{end}}{{if $card.PendingHeir}} is-pending{{end}}" aria-hidden="true">
+          <span class="glyph">{{if $card.PendingHeir}}⇢{{else}}→{{end}}</span>
+          <span class="label">{{if $card.PendingHeir}}will chain to{{else if $card.HaloIgnited}}handoff{{else}}chains to{{end}}</span>
+        </div>
+        {{end}}
+        {{if $card.PendingHeir}}
+        {{- /* Pending heir — a drawn-but-not-yet-spawned chain.to successor
+               (task ka-0000005273 / "C3"). Renders as a distinct ghost from a
+               broken dangling link. */ -}}
+        <div class="maps-rail-pending" title="successor drawn via chain.to — the engine spawns it at handoff{{if $card.PendingFanOut}} (fan-out){{end}}">
+          <span class="maps-rail-pending-mark" aria-hidden="true">✎</span>
+          <span class="maps-rail-pending-label">{{$card.PendingLabel}}</span>
+          <span class="meta">pending successor{{if $card.PendingFanOut}} · fan-out{{end}}</span>
+        </div>
+        {{else if $card.DanglingHeir}}
+        <div class="maps-rail-ghost" title="heir gardener not found ({{$card.ID}})">⚠ heir not found<br><span class="meta">{{$card.ID}}</span></div>
+        {{else}}
+        <div class="maps-rail-card{{if $card.HaloIgnited}} is-ignited{{end}}{{if $card.IsRoot}} is-root{{end}}" title="phase {{$card.PhaseIndex}}/{{$card.PhaseTotal}}{{if $card.IsRoot}} · workflow root{{end}}">
+          {{template "maps_card" dict "Card" $card "BasePath" $.BasePath}}
+        </div>
+        {{end}}
+        {{end}}
+      </div>
+    </div>
+    {{end}}
+  </div>
+  {{end}}
+
+  {{if .Cards}}
+  {{- /* Owner grouping (maps2 v2, ka-0000002262): with ?group=owner the
+         standalone grid renders as per-owner collapsible <details> sections
+         instead of one flat grid. The workflow rails above are left flat. */ -}}
+  {{if .Grouped}}
+  <div class="maps-owner-groups">
+    {{range .OwnerGroups}}
+    <details class="maps-owner-group" open>
+      <summary class="maps-owner-summary">
+        <span class="maps-owner-name">{{.Label}}</span>
+        <span class="maps-owner-count">{{.Count}} gardener{{if ne .Count 1}}s{{end}}</span>
+      </summary>
+      <div class="maps-board">
+        {{range .Cards}}
+        {{template "maps_card" dict "Card" . "BasePath" $.BasePath}}
+        {{end}}
+      </div>
+    </details>
+    {{end}}
+  </div>
+  {{else}}
+  <div class="maps-board">
+    {{range .Cards}}
+    {{template "maps_card" dict "Card" . "BasePath" $.BasePath}}
+    {{end}}
+  </div>
+  {{end}}
+  {{else if not .Workflows}}
+  {{if and $.Rail $.Rail.Active}}
+  <p class="empty">No gardeners match these filters — <a href="{{$.Rail.ClearHref}}">clear filters</a>.</p>
+  {{else}}
+  <p class="empty">No gardeners{{if not $.All}} in the live fleet — try <a href="{{$.BasePath}}/maps?all=1">All gardeners</a>{{end}}.</p>
+  {{end}}
+  {{end}}
+  {{end}}
+
+  {{- /* No-search-match empty state (maps2 v2, ka-0000006434): shown by the
+         search JS when a query hides every card. Hidden by default. */ -}}
+  <p class="maps-search-empty" data-maps-search-empty hidden>No gardeners match “<span data-maps-search-term></span>”.</p>
+
+  {{with .Hidden}}{{if .Total}}
+  <p class="maps-intro" style="margin-top:0.8rem;">
+    {{.Total}} gardener bead{{if ne .Total 1}}s{{end}} hidden (fixtures / schedule-mirror artifacts).
+  </p>
+  {{end}}{{end}}
+</div>
+
+{{- /* Recent-run display toggle (task ka-0000001693). Pure client-side: flips
+       the .maps-page[data-runs] attribute the CSS keys off, persisted in
+       localStorage so the operator's sparkline-vs-pills choice sticks across
+       loads. No-ops gracefully if the page or buttons are absent. */ -}}
+<script>
+(function () {
+  var page = document.querySelector('.maps-page');
+  var toggle = document.querySelector('.maps-runs-toggle');
+  if (!page || !toggle) return;
+  var KEY = 'maps.runsMode';
+  function apply(mode) {
+    if (mode === 'pills') { page.setAttribute('data-runs', 'pills'); }
+    else { page.removeAttribute('data-runs'); mode = 'spark'; }
+    toggle.querySelectorAll('button[data-runs-mode]').forEach(function (b) {
+      var on = b.getAttribute('data-runs-mode') === mode;
+      b.classList.toggle('is-active', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  }
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  apply(saved === 'pills' ? 'pills' : 'spark');
+  toggle.addEventListener('click', function (ev) {
+    var btn = ev.target.closest('button[data-runs-mode]');
+    if (!btn) return;
+    var mode = btn.getAttribute('data-runs-mode');
+    apply(mode);
+    try { localStorage.setItem(KEY, mode); } catch (e) {}
+  });
+})();
+</script>
+
+{{- /* Client-side /maps search (maps2 v2, ka-0000006434). Progressive
+       enhancement: the search box ships hidden and this script reveals it, so
+       no-JS clients still see the full board. Filtering is a substring test of
+       the lowercased query against each card's data-search haystack
+       (name/title/goal/owner/id, built in maps_view.go). A whole workflow rail
+       is hidden only when none of its cards match — a partial match keeps the
+       rail so chains stay readable. The query persists in ?q= (history.replaceState,
+       no reload) so a filtered board is a shareable/back-button-safe link, and
+       is restored on load. */ -}}
+<script>
+(function () {
+  var box = document.querySelector('[data-maps-search]');
+  if (!box) return;
+  var input = box.querySelector('#maps-search-input');
+  var count = box.querySelector('[data-maps-search-count]');
+  var empty = document.querySelector('[data-maps-search-empty]');
+  var emptyTerm = empty ? empty.querySelector('[data-maps-search-term]') : null;
+  var cards = Array.prototype.slice.call(document.querySelectorAll('.maps-card[data-search]'));
+  var rails = Array.prototype.slice.call(document.querySelectorAll('.maps-workflow'));
+  box.removeAttribute('hidden');
+
+  function cardMatches(card, q) {
+    return q === '' || (card.getAttribute('data-search') || '').indexOf(q) !== -1;
+  }
+
+  function apply(q) {
+    q = (q || '').trim().toLowerCase();
+    var shown = 0;
+    // Standalone grid cards toggle individually.
+    cards.forEach(function (card) {
+      if (card.closest('.maps-workflow')) return; // rail cards handled below
+      var hit = cardMatches(card, q);
+      card.classList.toggle('maps-search-hidden', !hit);
+      if (hit) shown++;
+    });
+    // Workflow rails are all-or-nothing: a rail shows in full (chain + arrows
+    // intact) if ANY gardener in it matches, else the whole rail hides. Matching
+    // rail cards count toward the shown total.
+    rails.forEach(function (rail) {
+      var railCards = rail.querySelectorAll('.maps-card[data-search]');
+      var anyHit = false;
+      for (var i = 0; i < railCards.length; i++) {
+        if (cardMatches(railCards[i], q)) { anyHit = true; shown++; }
+      }
+      rail.classList.toggle('maps-search-hidden', q !== '' && !anyHit);
+    });
+    if (count) {
+      if (q === '') { count.setAttribute('hidden', ''); }
+      else { count.removeAttribute('hidden'); count.textContent = shown + (shown === 1 ? ' match' : ' matches'); }
+    }
+    if (empty) {
+      if (q !== '' && shown === 0) {
+        if (emptyTerm) emptyTerm.textContent = input.value;
+        empty.removeAttribute('hidden');
+      } else {
+        empty.setAttribute('hidden', '');
+      }
+    }
+    // Reflect the query in the URL (?q=) without a reload.
+    try {
+      var url = new URL(window.location.href);
+      if (q === '') url.searchParams.delete('q'); else url.searchParams.set('q', input.value);
+      window.history.replaceState(null, '', url.toString());
+    } catch (e) { /* URL unsupported — filtering still works */ }
+  }
+
+  // Restore an initial ?q= from the URL.
+  try {
+    var initial = new URL(window.location.href).searchParams.get('q');
+    if (initial) { input.value = initial; apply(initial); }
+  } catch (e) { /* ignore */ }
+
+  input.addEventListener('input', function () { apply(input.value); });
+  // Escape clears the box.
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && input.value !== '') { input.value = ''; apply(''); }
+  });
+})();
+</script>
+{{end}}
+
+{{- /* maps_card — one gardener card, shared by the standalone grid and the
+       workflow rail (task ka-0000004778 / "C2"). Receives a dict {Card,
+       BasePath} so both call sites render an identical card. */ -}}
+{{define "maps_card"}}
+{{- $b := .BasePath -}}
+{{- with .Card -}}
+<div class="maps-card{{if .NeedsAttention}} is-attention{{end}}{{if or .IsClosed (not .Enabled)}} is-dim{{end}}" data-search="{{.SearchText}}">
+  {{- /* Card-graph AUTHORING affordance (task ka-0000005273 / "C3"): draw a
+         successor gardener off this card's RIGHT EDGE. Opens the authoring sheet
+         which serializes the drawn heir to this gardener's chain.to. Operator-
+         gated at the route; a roleless viewer who clicks gets the operator note.
+         Rendered on real gardener cards only (dangling ghosts render their own
+         node in the rail, not via this partial). */ -}}
+  {{if not .IsClosed}}
+  <button type="button"
+          class="maps-card-successor"
+          title="Draw a successor gardener (chain.to) off {{.Name}}"
+          aria-label="Draw a successor gardener off {{.Name}}"
+          hx-get="{{$b}}/gardener/{{.ID}}/successor"
+          hx-target="#quick-spawn-host"
+          hx-swap="innerHTML">+&#8199;successor</button>
+  {{end}}
+  {{- /* Trigger node */ -}}
+  <a class="maps-trigger kind-{{.TriggerKind}}{{if not .Enabled}} is-disabled{{end}}" href="{{$b}}/triggers" title="{{.TriggerKindLabel}} trigger{{if not .Enabled}} (disabled){{end}}">
+    <span class="maps-trigger-kind">{{.TriggerKindLabel}}</span>
+    {{if .NextFireError}}<span class="maps-trigger-err" title="cron parse error">cron error</span>
+    {{else if .NextFire}}<span class="maps-trigger-next">{{.NextFireRelative}}<br><span class="meta">{{.NextFire}}</span></span>
+    {{else if not .Enabled}}<span class="maps-trigger-next meta">disabled</span>
+    {{else if eq .TriggerKind "bead_query"}}<span class="maps-trigger-next meta">on bead state</span>
+    {{else}}<span class="maps-trigger-next meta">event</span>{{end}}
+  </a>
+
+  {{- /* Identity + verdict body */ -}}
+  <div class="maps-body">
+    <div class="maps-name">
+      <span class="maps-initials" aria-hidden="true">{{.Initials}}</span>
+      <a href="{{.Href}}">{{.Name}}</a>
+    </div>
+    {{if .NameDivergesFromTitle}}<div class="maps-bead-title" title="bead title (differs from configured name)">{{.Title}}</div>{{end}}
+    {{if .TerminalGoal}}<div class="maps-goal" title="{{.TerminalGoal}}">🎯 {{.TerminalGoal}}</div>{{end}}
+    {{if .Verdict}}<span class="gardener-verdict gardener-verdict-{{.VerdictKind}}" title="health: {{.Verdict}}{{if .VerdictDetail}} ({{.VerdictDetail}}){{end}}">{{.Verdict}}{{if .VerdictDetail}} <span class="gardener-verdict-detail">· {{.VerdictDetail}}</span>{{end}}</span>{{end}}
+    <div class="maps-meta">
+      <span class="maps-runs-count" title="runs spawned / completed">{{if .RunsDerived}}~{{end}}{{.RunsSpawned}} spawned · {{.RunsCompleted}} done</span>
+      {{- /* Cost + context chips (maps2 v2, ka-0000001668). Cost is the
+             controller-maintained gardener_spend_usd roll-up (this gardener's runs
+             + the crew they spawned); a stale roll-up shows a "~" hint. Context
+             is the live agent's context-window occupancy as a thin mini-bar +
+             label, present only while a live agent is reporting it. Both ride on
+             the row with no new daemon fan-out. */ -}}
+      {{if .HasSpend}}<span class="maps-cost{{if .SpendStale}} maps-cost-stale{{end}}" title="Total agent spend across this gardener's runs and the crew they spawned{{if .SpendStale}} (roll-up is stale — controller may be behind){{end}}.">{{if .SpendStale}}~{{end}}{{.SpendLabel}}</span>{{end}}
+      {{if .HasContext}}<span class="maps-ctx" title="{{.ContextTitle}}"><span class="maps-ctx-bar" aria-hidden="true"><span class="maps-ctx-fill" style="width: {{.ContextPct}}%"></span></span>{{.ContextLabel}}</span>{{end}}
+      {{if .HasTurns}}<span class="maps-turns" title="Server round-trips (turns) on the last run — the multiplier on cache-read cost">🔁 {{.TurnsLabel}}</span>{{end}}
+      {{if eq .GoalState "achieved"}}<span title="reached its terminal goal">🏁</span>{{end}}
+    </div>
+    {{if .HasOwnedEpic}}
+    <a class="maps-epic" href="{{$b}}/{{.OwnedEpicID}}" title="owned epic {{.OwnedEpicID}}: {{.OwnedEpicClosed}} of {{.OwnedEpicTotal}} issues closed ({{.OwnedEpicOpen}} open)">
+      <span class="maps-epic-bar" aria-hidden="true"><span class="maps-epic-fill" style="width: {{.OwnedEpicPct}}%"></span></span>
+      <span class="maps-epic-label">{{.OwnedEpicClosed}}/{{.OwnedEpicTotal}} done · {{.OwnedEpicPct}}%</span>
+    </a>
+    {{end}}
+    {{- /* Live-agent overlay (maps2 v2, ka-0000000595): when a run is in flight,
+           name and link the working agent instead of a bare "running now". The
+           pulsing dot lights only when the agent is genuinely alive (LiveAgentAlive,
+           the /agents liveness predicate); a not-yet-closed-but-stale shell shows
+           the agent name without the dot. Falls back to "running now" when the
+           live agent's identity could not be resolved. */ -}}
+    {{if .IsRunning}}
+    <div class="maps-running" title="currently-live agent on this gardener">
+      {{if .LiveAgentAlive}}<span class="maps-running-dot" aria-hidden="true"></span>{{end}}
+      {{if .LiveAgentName}}{{if .LiveAgentHref}}<a class="maps-live-agent" href="{{.LiveAgentHref}}">{{.LiveAgentName}}</a>{{else}}<span class="maps-live-agent">{{.LiveAgentName}}</span>{{end}} working{{else}}running now{{end}}
+    </div>
+    {{else if .LastRunTLDR}}<div class="maps-last-tldr" title="last run: {{.LastRunTLDR}}">{{if .LastCompletedAgo}}<span class="meta">{{.LastCompletedAgo}}:</span> {{end}}{{.LastRunTLDR}}</div>{{end}}
+    {{if and .NeedsAttention .AttentionSignal}}
+    <div class="maps-attention" title="{{.AttentionKind}}">
+      {{if .AttentionDecisionID}}<a href="{{$b}}/{{.AttentionDecisionID}}">⚠ {{.AttentionSignal}}</a>{{else}}⚠ {{.AttentionSignal}}{{end}}
+    </div>
+    {{end}}
+    {{if .OwnerDisplay}}<div class="maps-owner">{{.OwnerDisplay}}</div>{{end}}
+  </div>
+
+  {{- /* Recent-run lobe (task ka-0000001693). The verdict-over-time SPARKLINE is
+         the default: one continuous line over the gardener's full bounded run
+         trajectory, tinted by VerdictKind, each vertex dotted by that run's
+         outcome. The discrete bar STRIP is kept behind the board's "pills" toggle
+         (.maps-board[data-runs="pills"]) and is also the automatic fallback when
+         there is too little history to draw a line (Sparkline.HasData false). */ -}}
+  <div class="maps-runs" aria-label="Recent runs, oldest to newest">
+    {{if .Sparkline.HasData}}
+    <svg class="maps-runs-spark verdict-{{.VerdictKind}}" viewBox="0 0 {{.Sparkline.ViewW}} {{.Sparkline.ViewH}}" preserveAspectRatio="none" role="img"
+         aria-label="Trajectory: {{if .Verdict}}{{.Verdict}}{{else}}recent runs{{end}}">
+      <title>Trajectory over the last {{len .Sparkline.Dots}} runs{{if .Verdict}} · {{.Verdict}}{{end}}</title>
+      <polygon class="maps-spark-area" points="{{.Sparkline.Area}}"></polygon>
+      <polyline class="maps-spark-line" points="{{.Sparkline.Points}}"></polyline>
+      {{range .Sparkline.Dots}}<circle class="maps-spark-dot gardener-spark-{{.Outcome}}" cx="{{.X}}" cy="{{.Y}}" r="1.6"><title>{{.Title}}</title></circle>{{end}}
+    </svg>
+    {{end}}
+    {{if .Runs}}
+    <div class="maps-runs-strip"{{if .Sparkline.HasData}} aria-hidden="true"{{end}}>
+      {{range .Runs}}<span class="gardener-spark-bar gardener-spark-{{.Outcome}}" style="height: {{if .Height}}{{.Height}}{{else}}30{{end}}%" title="{{.Title}}"></span>{{end}}
+    </div>
+    {{else if not .Sparkline.HasData}}
+    <span class="maps-runs-empty">no run history</span>
+    {{end}}
+  </div>
+</div>
+{{- end -}}
+{{end}}

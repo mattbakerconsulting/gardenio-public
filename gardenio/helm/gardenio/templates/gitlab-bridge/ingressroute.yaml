@@ -1,0 +1,94 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.gitlabBridge.enabled .Values.gitlabBridge.ingress.enabled }}
+{{- if and .Values.gitlabBridge.ingress.ipWhitelist.enabled (empty .Values.gitlabBridge.ingress.ipWhitelist.sourceRange) }}
+{{- fail "gitlabBridge.ingress.ipWhitelist.enabled is true but gitlabBridge.ingress.ipWhitelist.sourceRange is empty: set GitLab webhook source CIDRs (see values.yaml comments) or set gitlabBridge.ingress.ipWhitelist.enabled=false." }}
+{{- end }}
+{{- $fullname := printf "%s-gitlab-bridge" (include "gardenio.fullname" .) -}}
+{{- $host := .Values.gitlabBridge.ingress.host -}}
+{{- $port := .Values.gitlabBridge.service.port | default 8092 -}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gitlab-bridge
+spec:
+  # Default web/websecure preserves the legacy shape (dedicated-host webhook
+  # ingress on the shared edge). Environments whose shared edge cannot accept
+  # unauthenticated SaaS deliveries (e.g. AVA-fronted prod) point this at a
+  # dedicated public entrypoint instead (e.g. `webhooks`).
+  entryPoints:
+    {{- range .Values.gitlabBridge.ingress.entryPoints | default (list "web" "websecure") }}
+    - {{ . }}
+    {{- end }}
+  routes:
+    - match: Host(`{{ $host }}`) && Path(`/webhook`)
+      kind: Rule
+      priority: 100
+      services:
+        - name: {{ $fullname }}
+          port: {{ $port }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if .Values.gitlabBridge.ingress.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ipwhitelist
+        {{- end }}
+        {{- if .Values.gitlabBridge.ingress.rateLimit.enabled }}
+        - name: {{ $fullname }}-ratelimit
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if .Values.gitlabBridge.ingress.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gitlab-bridge
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.gitlabBridge.ingress.ipWhitelist.sourceRange | nindent 6 }}
+    {{- if gt (int .Values.gitlabBridge.ingress.ipWhitelist.depth) 0 }}
+    # depth >= 1 reads the Nth X-Forwarded-For entry from the right — only for
+    # edges that prepend a TRUSTED XFF chain (an L7 proxy hop).
+    ipStrategy:
+      depth: {{ .Values.gitlabBridge.ingress.ipWhitelist.depth }}
+    {{- else }}
+    # depth 0 (or unset): no ipStrategy → Traefik matches the DIRECT remote IP.
+    # Correct for an L4 NLB edge that preserves the true client IP in the
+    # connection (PROXY protocol v2 → Traefik ClientHost) and injects no XFF,
+    # e.g. the gardenio public `webhooks` entrypoint. An XFF depth there would
+    # find no header and silently drop every delivery.
+    {{- end }}
+{{- end }}
+{{- if .Values.gitlabBridge.ingress.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gitlab-bridge
+spec:
+  rateLimit:
+    average: {{ .Values.gitlabBridge.ingress.rateLimit.average }}
+    burst: {{ .Values.gitlabBridge.ingress.rateLimit.burst }}
+{{- end }}
+{{- end }}

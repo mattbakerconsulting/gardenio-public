@@ -1,0 +1,333 @@
+{{define "type_decision"}}
+<section class="decision-card" id="decision-card"
+         data-bead-id="{{with .Decision}}{{.BeadID}}{{end}}"
+         data-decision-title="{{.Bead.Title}}">
+  <h3>Decision</h3>
+
+  {{with .Decision}}
+    {{if .PromptHTML}}
+      <div class="decision-prompt">{{.PromptHTML}}</div>
+    {{end}}
+
+    {{if .Origin.Agent}}
+      <p class="meta decision-origin">Requested by <strong><a href="{{$.BasePath}}/{{.Origin.Agent.ID}}" class="agent-link" data-agent="{{.Origin.Agent.Label}}" title="requesting agent {{.Origin.Agent.ID}}">{{.Origin.Agent.Label}}</a></strong>
+        {{if or .Origin.Task .Origin.Plan}}&middot; {{template "request_origin" (dict "Origin" .Origin.WithoutAgent "BasePath" $.BasePath)}}{{end}}
+        {{if .DetailURL}}&middot; <a href="{{.DetailURL}}">decision page &rsaquo;</a>{{end}}</p>
+    {{else if .RequestedBy}}
+      <p class="meta decision-origin">Requested by <strong>{{.RequestedBy}}</strong>
+        {{if or .Origin.Task .Origin.Plan}}&middot; {{template "request_origin" (dict "Origin" .Origin.WithoutAgent "BasePath" $.BasePath)}}{{end}}
+        {{if .DetailURL}}&middot; <a href="{{.DetailURL}}">decision page &rsaquo;</a>{{end}}</p>
+    {{end}}
+
+    {{/* The context the agent wrote, above the options and expanded: a
+         decision is never answered without it (gd-hmwSI9lwKe). */}}
+    {{.Context.Block}}
+    {{/* Screenshots from the beads the decision is about (its requesting
+         task, its --evidence beads), under the context (gd-Pi7C83262N). */}}
+    {{.Evidence}}
+
+    {{if .Error}}
+      <p class="decision-error" role="alert">{{.Error}}</p>
+    {{end}}
+
+    {{if .Resolved}}
+      <div class="banner banner-resolved">
+        {{if .Resolution.Canceled}}
+          <strong>Dismissed</strong>
+          {{if .Resolution.ResolvedBy}} by <strong>{{.Resolution.ResolvedBy}}</strong>{{end}}
+          {{if .Resolution.ResolvedAt}} at {{.Resolution.ResolvedAt}}{{end}}
+          {{if .Resolution.CancelReason}}
+            <div class="decision-response">{{.Resolution.CancelReason}}</div>
+          {{end}}
+        {{else}}
+          <strong>Resolved</strong>
+          {{if .Resolution.OptionID}} &mdash; chose <code>{{.Resolution.OptionID}}</code>{{end}}
+          {{if .Resolution.ResolvedBy}} by <strong>{{.Resolution.ResolvedBy}}</strong>{{end}}
+          {{if .Resolution.ResolvedAt}} at {{.Resolution.ResolvedAt}}{{end}}
+          {{if .Resolution.ResponseText}}
+            <div class="decision-response">{{.Resolution.ResponseText}}</div>
+          {{end}}
+        {{end}}
+      </div>
+    {{end}}
+
+    {{if .Options}}
+      <h4>Options</h4>
+      {{if and .CanResolve (not .Resolved)}}
+        <p class="decision-resolve-hint">Pick an option to resolve, or dismiss to close without choosing.</p>
+      {{end}}
+      <ul class="decision-options">
+        {{range .Options}}
+          <li class="opt opt-{{.ID}}{{if and $.Decision.Resolved (eq $.Decision.Resolution.OptionID .ID)}} opt-chosen{{end}}">
+            <code class="opt-id">{{.ID}}</code>
+            {{if .Short}}<span class="opt-short">{{.Short}}</span>{{end}}
+            {{if .Label}}<span class="opt-label">{{.Label}}</span>{{end}}
+            {{if .ArtifactType}}<span class="opt-artifact">&rarr; {{.ArtifactType}}</span>{{end}}
+            {{if .Description}}<span class="opt-desc">{{.Description}}</span>{{end}}
+            {{if and $.Decision.Resolved (eq $.Decision.Resolution.OptionID .ID)}}
+              <span class="opt-chosen-badge">chosen</span>
+            {{end}}
+          </li>
+        {{end}}
+      </ul>
+
+      {{if and .CanResolve (not .Resolved)}}
+        <div class="chip-strip" aria-label="Resolve actions">
+          {{range .Options}}
+            <button type="button"
+                    class="chip chip-type decision-resolve-chip"
+                    data-bead-id="{{$.Decision.BeadID}}"
+                    data-option-id="{{.ID}}"
+                    data-option-label="{{if .Short}}{{.Short}}{{else}}{{.ID}}{{end}}"
+                    title="Resolve with option {{.ID}}">{{if .Short}}{{.Short}}{{else}}{{.ID}}{{end}}</button>
+          {{end}}
+          <button type="button"
+                  class="chip chip-type decision-other-chip"
+                  data-bead-id="{{$.Decision.BeadID}}"
+                  title="Resolve with a free-text response that doesn't fit the listed options">Other&hellip;</button>
+          <button type="button"
+                  class="chip chip-type decision-dismiss-chip decision-dismiss-btn"
+                  data-bead-id="{{$.Decision.BeadID}}"
+                  title="Dismiss this decision without choosing an option">Dismiss</button>
+        </div>
+      {{end}}
+    {{else}}
+      <p class="empty">No options&mdash;</p>
+    {{end}}
+  {{else}}
+    <p class="empty">Decision metadata unavailable.</p>
+  {{end}}
+</section>
+
+{{with .Decision}}{{if and .CanResolve (not .Resolved)}}
+<dialog id="decision-resolve-dialog" class="decision-resolve-dialog">
+  <form id="decision-resolve-form" method="dialog">
+    <h3 id="decision-resolve-title">Resolve decision</h3>
+    <p class="decision-resolve-summary">
+      <span id="decision-resolve-verb">Choosing</span> <code id="decision-resolve-option"></code>
+      <span id="decision-resolve-bead" class="meta"></span>
+    </p>
+    <label for="decision-resolve-reason">Reason (optional)</label>
+    <textarea id="decision-resolve-reason" name="response_text" rows="4"
+              maxlength="10000"
+              placeholder="Optional reason or response&hellip; included with the resolution."></textarea>
+    <p id="decision-resolve-error" class="decision-error" role="alert" hidden></p>
+    <menu class="decision-resolve-actions">
+      <button type="button" id="decision-resolve-cancel" value="cancel">Cancel</button>
+      <button type="submit" id="decision-resolve-submit" value="confirm">Resolve</button>
+    </menu>
+  </form>
+</dialog>
+
+<style>
+  .decision-card .chip-strip { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.75rem 0 0; }
+  .decision-resolve-chip { cursor: pointer; font: inherit; }
+  .decision-resolve-chip:hover { background: rgba(128,128,128,0.30); }
+  .decision-resolve-chip:focus-visible { outline: 2px solid #4a9eff; outline-offset: 1px; }
+  .decision-dismiss-chip { cursor: pointer; font: inherit; background: rgba(198,40,40,0.12); border-color: rgba(198,40,40,0.4); }
+  .decision-dismiss-chip:hover { background: rgba(198,40,40,0.22); }
+  .decision-dismiss-chip:focus-visible { outline: 2px solid #c62828; outline-offset: 1px; }
+  .decision-other-chip { cursor: pointer; font: inherit; font-style: italic; background: rgba(128,128,128,0.10); border-color: rgba(128,128,128,0.45); }
+  .decision-other-chip:hover { background: rgba(128,128,128,0.22); }
+  .decision-other-chip:focus-visible { outline: 2px solid #4a9eff; outline-offset: 1px; }
+  .decision-resolve-dialog { border: 1px solid rgba(128,128,128,0.4); border-radius: 6px; padding: 1rem 1.25rem; max-width: 36rem; width: 90vw; color: inherit; background: Canvas; }
+  .decision-resolve-dialog::backdrop { background: rgba(0,0,0,0.45); }
+  .decision-resolve-dialog h3 { margin: 0 0 0.5rem; }
+  .decision-resolve-dialog .decision-resolve-summary { margin: 0 0 0.75rem; font-size: 0.95em; }
+  .decision-resolve-dialog label { display: block; font-size: 0.85em; opacity: 0.8; margin-bottom: 0.25rem; }
+  .decision-resolve-dialog textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 0.4rem 0.5rem; border-radius: 4px; border: 1px solid rgba(128,128,128,0.35); background: Canvas; color: inherit; resize: vertical; }
+  .decision-resolve-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin: 0.75rem 0 0; padding: 0; }
+  .decision-resolve-actions button { font: inherit; padding: 0.35rem 0.9rem; border-radius: 4px; border: 1px solid rgba(128,128,128,0.35); background: rgba(128,128,128,0.1); color: inherit; cursor: pointer; }
+  .decision-resolve-actions button[type=submit] { background: rgba(76,175,80,0.18); border-color: rgba(76,175,80,0.5); }
+  .decision-resolve-actions button:disabled { opacity: 0.5; cursor: default; }
+  .decision-error { color: #c62828; margin: 0.5rem 0 0; font-size: 0.9em; }
+</style>
+
+<script>
+(function() {
+  // Guard against double-bind: this partial may be re-rendered after a failed
+  // resolve, but the document-level click listener only needs to be installed
+  // once. The dialog itself is re-queried at click time so it works against
+  // both the initial-page-load element and a swap-replaced element.
+  if (window.__beadDecisionResolveBound) return;
+  window.__beadDecisionResolveBound = true;
+
+  var basePath = window.BEADS_VIEWER_BASE_PATH || "";
+  var pending = null; // { mode, beadId, optionId, rowEl }
+
+  function getDialog() { return document.getElementById("decision-resolve-dialog"); }
+
+  function openResolveDialog(beadId, optionId, optionLabel, cardEl) {
+    var dialog = getDialog();
+    if (!dialog || typeof dialog.showModal !== "function") return;
+    pending = { mode: "resolve", beadId: beadId, optionId: optionId, cardEl: cardEl };
+    var beadTitle = cardEl ? cardEl.getAttribute("data-decision-title") || "" : "";
+    document.getElementById("decision-resolve-title").textContent =
+      beadTitle ? "Resolve: " + beadTitle : "Resolve decision";
+    document.getElementById("decision-resolve-verb").textContent = "Choosing";
+    document.getElementById("decision-resolve-option").textContent = optionId;
+    document.getElementById("decision-resolve-bead").textContent = beadId ? "(" + beadId + ")" : "";
+    document.getElementById("decision-resolve-reason").value = "";
+    var errEl = document.getElementById("decision-resolve-error");
+    errEl.hidden = true; errEl.textContent = "";
+    var submitBtn = document.getElementById("decision-resolve-submit");
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Resolve";
+    dialog.showModal();
+    setTimeout(function() { document.getElementById("decision-resolve-reason").focus(); }, 0);
+  }
+
+  function openDismissDialog(beadId, cardEl) {
+    var dialog = getDialog();
+    if (!dialog || typeof dialog.showModal !== "function") return;
+    pending = { mode: "dismiss", beadId: beadId, cardEl: cardEl };
+    var beadTitle = cardEl ? cardEl.getAttribute("data-decision-title") || "" : "";
+    document.getElementById("decision-resolve-title").textContent =
+      beadTitle ? "Dismiss: " + beadTitle : "Dismiss decision";
+    document.getElementById("decision-resolve-verb").textContent = "Dismissing";
+    document.getElementById("decision-resolve-option").textContent = "dismissed";
+    document.getElementById("decision-resolve-bead").textContent = beadId ? "(" + beadId + ")" : "";
+    document.getElementById("decision-resolve-reason").value = "";
+    var errEl = document.getElementById("decision-resolve-error");
+    errEl.hidden = true; errEl.textContent = "";
+    var submitBtn = document.getElementById("decision-resolve-submit");
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Dismiss";
+    dialog.showModal();
+    setTimeout(function() { document.getElementById("decision-resolve-reason").focus(); }, 0);
+  }
+
+  function openOtherDialog(beadId, cardEl) {
+    var dialog = getDialog();
+    if (!dialog || typeof dialog.showModal !== "function") return;
+    pending = { mode: "other", beadId: beadId, cardEl: cardEl };
+    var beadTitle = cardEl ? cardEl.getAttribute("data-decision-title") || "" : "";
+    document.getElementById("decision-resolve-title").textContent =
+      beadTitle ? "Other: " + beadTitle : "Resolve with other response";
+    document.getElementById("decision-resolve-verb").textContent = "Resolving with";
+    document.getElementById("decision-resolve-option").textContent = "free-text response";
+    document.getElementById("decision-resolve-bead").textContent = beadId ? "(" + beadId + ")" : "";
+    document.getElementById("decision-resolve-reason").value = "";
+    var errEl = document.getElementById("decision-resolve-error");
+    errEl.hidden = true; errEl.textContent = "";
+    var submitBtn = document.getElementById("decision-resolve-submit");
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Resolve";
+    dialog.showModal();
+    setTimeout(function() { document.getElementById("decision-resolve-reason").focus(); }, 0);
+  }
+
+  function closeDialog() {
+    var dialog = getDialog();
+    if (dialog && dialog.open) dialog.close();
+    pending = null;
+  }
+
+  document.addEventListener("click", function(ev) {
+    var dismissBtn = ev.target.closest(".decision-dismiss-chip");
+    if (dismissBtn) {
+      ev.preventDefault();
+      var dBeadId = dismissBtn.getAttribute("data-bead-id");
+      openDismissDialog(dBeadId, document.getElementById("decision-card"));
+      return;
+    }
+    var otherBtn = ev.target.closest(".decision-other-chip");
+    if (otherBtn) {
+      ev.preventDefault();
+      var oBeadId = otherBtn.getAttribute("data-bead-id");
+      openOtherDialog(oBeadId, document.getElementById("decision-card"));
+      return;
+    }
+    var btn = ev.target.closest(".decision-resolve-chip");
+    if (!btn) return;
+    ev.preventDefault();
+    var beadId = btn.getAttribute("data-bead-id");
+    var optionId = btn.getAttribute("data-option-id");
+    var optionLabel = btn.getAttribute("data-option-label") || optionId;
+    openResolveDialog(beadId, optionId, optionLabel, document.getElementById("decision-card"));
+  });
+
+  document.addEventListener("click", function(ev) {
+    if (ev.target && ev.target.id === "decision-resolve-cancel") closeDialog();
+  });
+
+  document.addEventListener("submit", function(ev) {
+    if (!ev.target || ev.target.id !== "decision-resolve-form") return;
+    ev.preventDefault();
+    if (!pending) { closeDialog(); return; }
+    var p = pending;
+    var submitBtn = document.getElementById("decision-resolve-submit");
+    var errEl = document.getElementById("decision-resolve-error");
+    var reasonEl = document.getElementById("decision-resolve-reason");
+    submitBtn.disabled = true;
+    errEl.hidden = true; errEl.textContent = "";
+
+    var url, body;
+    if (p.mode === "dismiss") {
+      url = basePath + "/b/" + encodeURIComponent(p.beadId) + "/decision/dismiss";
+      body = new URLSearchParams();
+      body.set("reason", reasonEl.value);
+    } else if (p.mode === "other") {
+      // "Other" resolves with no preselected option; the free-text response
+      // is the answer. Backend rejects when both option_id and response_text
+      // are empty, so guard client-side for a clearer error.
+      if (!reasonEl.value.trim()) {
+        errEl.textContent = "Write a response to resolve with Other.";
+        errEl.hidden = false;
+        submitBtn.disabled = false;
+        return;
+      }
+      url = basePath + "/b/" + encodeURIComponent(p.beadId) + "/decision/resolve";
+      body = new URLSearchParams();
+      body.set("option_id", "");
+      body.set("response_text", reasonEl.value);
+    } else {
+      url = basePath + "/b/" + encodeURIComponent(p.beadId) + "/decision/resolve";
+      body = new URLSearchParams();
+      body.set("option_id", p.optionId);
+      body.set("response_text", reasonEl.value);
+    }
+    var failVerb = p.mode === "dismiss" ? "Dismiss" : "Resolve";
+
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      credentials: "same-origin",
+    }).then(function(resp) {
+      return resp.text().then(function(txt) {
+        return { ok: resp.ok, status: resp.status, text: txt };
+      });
+    }).then(function(r) {
+      if (!r.ok) {
+        var msg = (r.text && r.text.length < 500) ? r.text : (failVerb + " failed (" + r.status + ")");
+        throw new Error(msg);
+      }
+      // Replace the card with the freshly-rendered partial. The new card
+      // shows the resolved banner; chips/dialog are no longer needed.
+      var card = document.getElementById("decision-card");
+      if (card && r.text) {
+        var tmp = document.createElement("div");
+        tmp.innerHTML = r.text;
+        var newCard = tmp.querySelector("#decision-card");
+        if (newCard) {
+          card.replaceWith(newCard);
+        } else {
+          card.outerHTML = r.text;
+        }
+      }
+      closeDialog();
+    }).catch(function(err) {
+      errEl.textContent = (err && err.message) ? err.message : (failVerb + " failed.");
+      errEl.hidden = false;
+      submitBtn.disabled = false;
+    });
+  });
+
+  document.addEventListener("cancel", function(ev) {
+    if (ev.target && ev.target.id === "decision-resolve-dialog") pending = null;
+  }, true);
+})();
+</script>
+{{end}}{{end}}
+{{end}}

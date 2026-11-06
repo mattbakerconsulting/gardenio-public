@@ -1,0 +1,289 @@
+# Runner scale set "gardenio-k3s-light" for mattbakerconsulting/gardenio.
+# Chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+# Namespace: arc-runners. The Helm release NAME is the `runs-on:` label.
+# Sibling of arc-runners-values.yaml (the "gardenio-k3s" / heavy pool) -- same
+# repo, same node pool, same GitHub credential secret, DIFFERENT resource shape.
+#
+# Auth: reuses the SAME secret as the heavy pool (gardenio-github in
+# arc-runners, the `gardenio-ci` App's three keys) -- one App, one repo, two
+# scale sets. See arc-runners-values.yaml's header for its provenance.
+githubConfigUrl: https://github.com/mattbakerconsulting/gardenio
+githubConfigSecret: gardenio-github
+
+# ── WHY THIS POOL EXISTS ─────────────────────────────────────────────────────
+# gd-GYMPi3NqGP-era data (kubectl top sampling, 241 container-seconds across an
+# 18-minute window) showed the heavy pool's runner container median CPU near
+# its own 3-vCPU request and memory spanning 136Mi-9.6Gi -- the pool is sized
+# correctly for jobs that compile, lint, or docker-build. But job-duration
+# data across 8 sampled runs also showed several jobs finishing in 6-33s next
+# to others taking 84-573s, all sharing the same 3-CPU/12Gi runner shape. A
+# multi-agent classify+adversarially-verify pass (2026-09-21) went through
+# every job in ci.yml/checks.yml/images.yml individually rather than trusting
+# the duration sample alone, and confirmed only TWO jobs are safe at a much
+# smaller resource shape:
+#   - script-selftests (checks.yml): shellcheck + ~40 tiny bash/python
+#     self-tests, verified line-by-line -- no compilation, no docker, and the
+#     scripts that call kubectl/helm/terraform/docker do so only against
+#     hermetic stubs or inert fixture heredocs, never the real tools.
+#   - changes (images.yml): a `dorny/paths-filter` + jq matrix-selection step.
+#     No docker despite living in the docker-heavy file.
+#
+# Every OTHER job the classifier first flagged light (conflict-markers,
+# terraform, quench, dictation-corpus, internal-strings-audit) was
+# REJECTED on adversarial re-verification -- each had a real cost the
+# duration sample alone missed (terraform: 4x fresh ~100MB+ AWS provider
+# downloads with no plugin cache; quench: a whole-repo cloc/regex/docs-TOC/
+# docs-links static-analysis pass over 7,500+ tracked files; dictation-corpus:
+# a real `go vet`/`go test` whose warm-cache 6-33s sample doesn't bound the
+# cold-cache case -- measured locally at ~55 CPU-seconds / ~275Mi RSS, and
+# this cluster's ci pool is scale-to-zero spot, so cold starts are routine,
+# not an edge case; conflict-markers: a fallback path that forks ~15,000
+# subprocesses over every tracked file; internal-strings-audit: the script it
+# runs, scripts/sanitize/no-internal-strings.sh, does not exist anywhere in
+# this tree -- likely stripped by the export redaction -- so its real cost is
+# unverifiable and it defaults to staying on the heavy pool until that's
+# resolved). Those five stay on gardenio-k3s. Do not move them here without
+# re-running the same verify-don't-trust-the-summary pass.
+#
+# UPDATE 2026-09-22: four of those five now run on gardenio-k3s-MEDIUM, not
+# here and not on the heavy pool -- see arc-runners-medium-values.yaml. Every
+# rejection above still stands exactly as written: each of those four really
+# does carry a cost this tier's 250m/512Mi request and 1536Mi limit cannot
+# absorb, which is why they went to a tier sized from those measured costs
+# rather than to this one. The fifth, internal-strings-audit, keeps its heavy
+# slot: its script is still missing (re-checked 2026-09-22), so its 5 s
+# duration measures the pipeline failing fast rather than the job. The
+# "verify, don't trust the summary" rule that produced these rejections is
+# what made the medium tier sizeable at all -- keep applying it.
+#
+# THIRD TENANT, 2026-09-22: checks.yml gained a `changes` job of its own. It
+# qualifies here by identity, not by re-argument: it is the same shape as the
+# images.yml `changes` job already verified above -- a fetch-depth:0 checkout,
+# one dorny/paths-filter step, and a short jq/shell step that builds the
+# lint-go matrix. No compilation, no docker, no whole-repo scan. Note the
+# consequence for sizing, spelled out at maxRunners below: this job is now on
+# the critical path of every heavy job in checks.yml.
+#
+# ── EXTENSIBILITY: this is tier 2 of N, not "the light pool" ────────────────
+# Naming convention: the Helm release name IS the runs-on label IS the ARC
+# scale-set name. The original/heavy pool keeps its bare name (gardenio-k3s)
+# unchanged rather than being renamed to e.g. gardenio-k3s-heavy, because
+# renaming it would require touching runs-on on all the heavy job
+# definitions for no functional gain. Every tier ADDED beyond the original
+# gets an explicit suffix: gardenio-k3s-<tier> -- this file is
+# gardenio-k3s-light. A future medium/GPU/network-heavy tier is: copy this
+# file (or arc-runners-values.yaml) to arc-runners-<tier>-values.yaml sized
+# for that category, `helm install gardenio-k3s-<tier>` as its own
+# independent release, then repoint runs-on only on the specific jobs that
+# belong to it. No other tier's values file, release, node pool, or job
+# definitions get touched -- additive by construction.
+
+minRunners: 0
+# RAISED 4 -> 10 on 2026-09-22, when checks.yml gained its own `changes` gate
+# job (the third tenant here, after script-selftests and images.yml/changes).
+#
+# The raise is not optional padding, it is a prerequisite for that gate. Every
+# heavy job in checks.yml now sits behind `needs: changes`, so a light runner
+# that cannot start is a heavy job that cannot start -- this tier moved from
+# "some cheap jobs live here" to "the critical path of the expensive ones runs
+# through here". At 4, three light claims per event meant two concurrent
+# pushes already saturated the pool, and the 16-pushes-in-50-minutes bursts
+# this cluster actually sees (measured 2026-09-21) would have serialised the
+# whole heavy fan-out behind a queue of 20-second gate jobs. That would have
+# turned a latency improvement into a latency regression.
+#
+# 10 is affordable because of the request, not in spite of it: 10 x 250m =
+# 2.5 CPU and 5Gi of requests spread across the WHOLE ci pool, not per node. A
+# ci node reports allocatable cpu "4" (4000m flat) and carries ~10m of
+# DaemonSet requests; a node already running a heavy runner (3000m) still has
+# ~990m free, which is three light runners, and a node running heavy+medium
+# (3760m) still has room for none but does not need to. Measured live
+# 2026-09-22: 8 ci nodes, 5 holding a heavy runner, 3 holding nothing -- this
+# tier's whole 2.5 CPU fits in the existing free space with no new node.
+# Raising it does NOT raise the pool's node ceiling, which is ci_max_nodes
+# (fimba-e6, terraform) and is the real constraint.
+maxRunners: 10
+
+# No containerMode -- no dind sidecar. Adversarial verification of both jobs
+# confirmed neither invokes docker anywhere in its steps; the chart's default
+# (no containerMode) is a plain runner pod, which drops dind's container,
+# its work/dind-sock volumes, and its (small but nonzero) idle footprint
+# entirely rather than sizing around a sidecar these jobs never use.
+
+template:
+  spec:
+    # Same node pool as the heavy runners -- these are small enough (250m of
+    # a 4-vCPU node) to pack alongside heavy runners and each other rather
+    # than needing a dedicated pool. See ci_max_nodes (fimba-e6, terraform)
+    # for the pool's actual node ceiling; this scale set's maxRunners is tiny
+    # relative to that ceiling by design.
+    nodeSelector:
+      gardenio.io/role: ci
+    tolerations:
+      - key: ci
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    # Fail fast if this node cannot do cluster DNS. A k3s agent can boot with
+    # kube-proxy's first iptables sync failed and never retried (it races
+    # flannel's iptables bootstrap), leaving the node with zero KUBE-SERVICES
+    # rules while reporting Ready=True -- pod-to-pod and egress fine, every
+    # ClusterIP a black hole, so cluster DNS dead. A runner that lands there
+    # never resolves GitHub, so it never claims its job: the pod sits Running
+    # holding a maxRunners slot while GitHub shows the job `queued`. That cost
+    # 35+ minutes on 2026-09-22 (ip-10-90-19-145) and reads as congestion with
+    # idle capacity. 20x3s because coredns is a single replica here; a healthy
+    # node exits on attempt 1. Full rationale in arc-runners-values.yaml.
+    #
+    # This is the light tier's only init container -- it has no build cache to
+    # prepare -- so the whole initContainers block exists for this check.
+    initContainers:
+      - name: dns-preflight
+        image: ghcr.io/actions/actions-runner:latest
+        command:
+          - sh
+          - -c
+          - |
+            i=1
+            while [ $i -le 20 ]; do
+              if getent hosts github.com >/dev/null 2>&1; then
+                echo "cluster dns ok on $NODE_NAME (attempt $i)"
+                exit 0
+              fi
+              sleep 3
+              i=$((i + 1))
+            done
+            echo "FATAL: cluster dns unusable on node $NODE_NAME after 60s." >&2
+            echo "This node likely has no kube-proxy service rules; confirm with" >&2
+            echo "  iptables-save | grep -c KUBE-SERVICES   (0 == broken)" >&2
+            exit 1
+        env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        resources:
+          requests: { cpu: 10m, memory: 32Mi }
+    containers:
+      - name: runner
+        image: ghcr.io/actions/actions-runner:latest
+        command: ["/home/runner/run.sh"]
+        resources:
+          # Sized off measured local worst cases for script-selftests
+          # (static analysis over ~3.3k lines of shell, all hermetic) and
+          # changes (fetch-depth:0 checkout of a 120M/~340-commit repo + a
+          # 132-line jq/shell matrix step) -- both comfortably bounded, no
+          # compilation, no docker. No CPU limit, mirroring the heavy pool's
+          # own request-only-CPU pattern so a job can still burst without a
+          # hard ceiling; memory IS bounded since these are the resource this
+          # tier is actually saving.
+          requests: { cpu: "250m", memory: 512Mi }
+          limits: { memory: 1536Mi }
+
+# Ephemeral runners; nothing persists between jobs (same as the heavy pool).
+
+# ── NO NODE-LOCAL BUILD CACHE HERE, ON PURPOSE ──────────────────────────────
+# The heavy and medium tiers both mount /var/lib/gardenio-ci-cache (see
+# gardenio/helm/ci/README.md and the long note in
+# arc-runners-medium-values.yaml). This tier deliberately does not, and the
+# asymmetry is a decision rather than an oversight:
+#
+# Neither job on this tier compiles anything. `script-selftests` is shellcheck
+# plus shell self-tests; `changes` is a checkout and a jq/shell matrix. There
+# is no GOCACHE to warm, so mounting the volume would add an init container
+# and a hostPath to up to 10 concurrent pods in exchange for nothing
+# measurable -- and it would put ten more writers on a directory a heavy cargo
+# build is using on the same node.
+#
+# Add it the moment a job that compiles lands here -- copy the medium tier's
+# block, including its list of the env vars that must stay out. Until then,
+# "light" also means "does not touch the shared cache".
+
+# ── LISTENER PLACEMENT ──────────────────────────────────────────────────────
+# Same fix as arc-runners-values.yaml, applied from day one instead of
+# discovered after an outage: every Ready node in this cluster carries a
+# NoSchedule taint, so the listener needs the control-plane toleration or it
+# is permanently unschedulable the moment it has to be (re-)placed. This is
+# the exact failure mode that left gascity-hq-k3s/gascity-packs-hq-k3s
+# listeners Pending for 13-19 hours on 2026-09-17 through 2026-09-21 -- do
+# not launch a new scale set without this block.
+listenerTemplate:
+  spec:
+    containers:
+      - name: listener   # required by the ARS CRD even when only tolerations change
+        # requests == limits => Guaranteed QoS => oom_score_adj -997.
+        # Listeners ran BestEffort (adj ~1000) until 2026-09-22, making the CI
+        # dispatch path the kernel's first victim when a k3s server runs out of
+        # memory -- which happened: a crew pod OOM'd ip-10-90-10-77 and took the
+        # heavy listener with it, stopping dispatch ~26 min (gd-V0I09YuV8K
+        # comment 2389). Burstable is no help on a 1.86 GiB node (a 128Mi
+        # request only reaches adj ~967), so the QoS class is the fix, not the
+        # size. Measured usage 8-18Mi / 0-1m; CPU 200m -> 50m on 2026-10-23
+        # (gd-TEP4ygX3dq). Full rationale in arc-runners-values.yaml.
+        resources:
+          requests: { cpu: 50m, memory: 128Mi }
+          limits:   { cpu: 50m, memory: 128Mi }
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      # Home off the servers (gd-ybTutceJpn). The 2 GiB servers ran out of memory
+      # one after another on 2026-10-14 because a server drain piled the ARC
+      # listeners onto the survivors. Tolerate the platform pool's taint and
+      # PREFER those nodes; the control-plane toleration above stays as the
+      # fallback, so a listener is never stranded Pending.
+      - key: gardenio.agent
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: gardenio.io/role
+                  operator: In
+                  values: ["platform"]
+
+    # Keep the listeners off one another's node. All six tolerate only the
+    # control-plane taint above, so they all compete for the same three k3s
+    # servers; left alone they pile up (3/2/1 on 2026-09-22, with every
+    # gardenio tier on one node), which turns a single node loss into a
+    # TIER-BLIND dispatch outage.
+    #
+    # ScheduleAnyway is deliberate and must stay: six listeners over three
+    # nodes means a hard constraint can strand one Pending, the failure this
+    # file already has a scar from. The selector here is NOT the same as in the
+    # three mirror values files in this directory -- the note on the constraint
+    # says why. Full rationale in arc-runners-values.yaml.
+    topologySpreadConstraints:
+      #
+      # WHY THIS SELECTS ON repository AND NOT part-of, UNLIKE THE THREE MIRROR
+      # VALUES FILES IN THIS DIRECTORY. The obvious form -- keep the all-six
+      # constraint AND add a gardenio-only one -- IS REJECTED BY THE API:
+      #
+      #   duplicate entries for key
+      #     [topologyKey="kubernetes.io/hostname",whenUnsatisfiable="ScheduleAnyway"]
+      #
+      # topologySpreadConstraints is a listType=map keyed on exactly that pair,
+      # so a pod can hold only ONE soft hostname constraint. Two is not merely
+      # discouraged, it fails server-side apply and the helm upgrade errors out.
+      # The only way to have both would be to make one DoNotSchedule, which is
+      # precisely what must never happen here (six listeners, three schedulable
+      # nodes, and a history of listeners stranded Pending for 13-19 hours).
+      #
+      # So the one constraint each file gets is spent where it buys most.
+      # For gardenio that is actions.github.com/repository -- the one label the
+      # three gardenio tiers share and no mirror scale set carries -- which
+      # spreads heavy, medium and light 1/1/1 over the three servers. A single
+      # node loss then costs ONE tier rather than stopping dispatch for all of
+      # them at once. The mirrors keep the all-six selector, so they balance
+      # against gardenio's placement and the cluster still lands near 2/2/2.
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            actions.github.com/repository: gardenio
+            app.kubernetes.io/component: runner-scale-set-listener

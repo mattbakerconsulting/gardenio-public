@@ -1,0 +1,88 @@
+{{- /*
+Internet-facing TSDB/trace ingest exposure guard (bug ka-0000001172).
+
+vmsingle (VictoriaMetrics) and vtsingle (VictoriaTraces) both have NO auth of
+their own. Their `ingest` blocks expose a write/insert surface through Traefik,
+and both carry the same SECURITY note in values.yaml:
+
+  > `webhooks` is internet-facing. <store> has no auth of its own, so when you
+  > bind it, auth.enabled MUST stay true and ipWhitelist.enabled SHOULD be true
+  > — pathPrefixes + basicAuth + rateLimit are then the only things in front of
+  > an unauthenticated <write|insert> API.
+
+That guidance was prose only, so an overlay could bind the internet-facing
+entrypoint with the allow-list left at its permissive default and nothing would
+notice (W1 devel/qa flip, MR !7664 / task ka-0000002025 — the case this guard
+comes from). Note that DNS is NOT a control here: the IngressRoute matches on
+Host + SNI, so any client sending that Host/SNI to the public edge IP reaches
+the route whether or not external-dns published an A record.
+
+This file turns the guidance into a render-time invariant. Dropping the allow-list
+on a world-reachable, unauthenticated-at-the-origin write API stays POSSIBLE — the
+devel/qa MVP transport is basicAuth + write-only pathPrefixes + rateLimit — but it
+becomes an EXPLICIT, reviewed acknowledgment (`ipWhitelist.allowPublicWithoutSourceRange`,
+which records the decision reference) instead of a default that falls out of an
+unanswered question.
+
+DEFAULT OFF: both `ingest` blocks default to enabled=false, so this file renders
+nothing and a normal deploy is byte-identical. It is also scoped to the same
+condition as the ingest IngressRoutes themselves, so a chart render with Traefik
+routes off never trips it.
+*/}}
+{{- if eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true" }}
+{{- /* The list is the single source of truth: values.yaml ships ["webhooks"],
+       and an edge with no public entrypoints clears it (null / []) to opt every
+       route out. No hardcoded fallback here — a `| default` would silently
+       re-arm the guard on an edge that deliberately emptied the list. */}}
+{{- $internetEPs := .Values.traefik.internetFacingEntryPoints }}
+{{- $targets := list
+      (dict "key" "vmsingle" "store" "vmsingle (VictoriaMetrics)" "api" "TSDB write" "componentEnabled" .Values.vmsingle.enabled "ingest" .Values.vmsingle.ingest)
+      (dict "key" "vtsingle" "store" "vtsingle (VictoriaTraces)" "api" "trace insert" "componentEnabled" .Values.vtsingle.enabled "ingest" .Values.vtsingle.ingest)
+}}
+{{- range $t := $targets }}
+{{- $ing := $t.ingest }}
+{{- if and $t.componentEnabled $ing.enabled }}
+{{- $wl := $ing.ipWhitelist }}
+
+{{- /* An allow-list with no ranges is not a control — it is a middleware that
+       either admits nothing or admits everything depending on the Traefik
+       version. Catch the half-configured shape regardless of entrypoint. */}}
+{{- if and $wl.enabled (not $wl.sourceRange) }}
+{{- fail (printf "%s.ingest.ipWhitelist.enabled=true but sourceRange is empty — an allow-list with no CIDRs is not a control. Set %s.ingest.ipWhitelist.sourceRange to the sender's egress CIDRs, or set enabled=false and acknowledge the exposure via allowPublicWithoutSourceRange." $t.key $t.key) }}
+{{- end }}
+
+{{- /* Is any bound entrypoint internet-facing? Empty entryPoints means the
+       shared web/websecure pair, which this chart's edges front with AVA on an
+       internal-scheme NLB — not part of the public set by default. */}}
+{{- $effEPs := $ing.entryPoints | default (list "web" "websecure") }}
+{{- $public := false }}
+{{- range $ep := $effEPs }}
+{{- if has $ep $internetEPs }}
+{{- $public = true }}
+{{- end }}
+{{- end }}
+
+{{- if $public }}
+{{- $eps := join "," $effEPs }}
+
+{{- /* Zero controls in front of an unauthenticated store on a public edge.
+       No acknowledgment makes this acceptable, so there is no escape hatch. */}}
+{{- if and (not $ing.auth.enabled) (not $wl.enabled) }}
+{{- fail (printf "%s.ingest binds the internet-facing entrypoint(s) [%s] with BOTH auth.enabled=false and ipWhitelist.enabled=false — that publishes %s's unauthenticated %s API to the internet with no control in front of it. Enable %s.ingest.auth (Traefik basicAuth) and/or ipWhitelist with a sourceRange." $t.key $eps $t.store $t.api $t.key) }}
+{{- end }}
+
+{{- /* The MR !7664 shape: basicAuth on, allow-list left at its default off.
+       Defensible for a devel/qa MVP (strong random credential over TLS,
+       write-only pathPrefixes, rateLimit) — but it must be a recorded decision,
+       not a default. */}}
+{{- if and (not $wl.enabled) (not $wl.allowPublicWithoutSourceRange) }}
+{{- fail (printf "%s.ingest binds the internet-facing entrypoint(s) [%s] with ipWhitelist.enabled=false — %s has no auth of its own, so the source allow-list is the only thing keeping its %s API off the open internet independently of one static credential (bug ka-0000001172). Either set %s.ingest.ipWhitelist.enabled=true with the sender's egress sourceRange, or, if a credential-only transport is a deliberate call, record it: %s.ingest.ipWhitelist.allowPublicWithoutSourceRange=\"<decision/bead ref>\"." $t.key $eps $t.store $t.api $t.key $t.key) }}
+{{- end }}
+
+{{- /* basicAuth off but IP-locked is a legitimate posture (the allow-list is
+       then the control), so it is allowed — but only with real CIDRs, which the
+       empty-sourceRange check above already guarantees. */}}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,155 @@
+# gardener-trigger-throttle-burst.toml
+#
+# Live-flow scenario for ka-0000002765 §7: throttle drops a burst of
+# events arriving inside the wall-clock window from the previous fire.
+#
+# Engine code covered:
+#   - gardenio/controller/internal/scheduler/triggers.go:374-386
+#     (inThrottleWindow: lastFire+throttle > now → drop).
+#   - gardenio/controller/internal/scheduler/triggers.go:454-461
+#     (Throttle gate: dropped fires never reach evaluate*Entry).
+#
+# Shape: 3 child closures within ~5s. With throttle=300s and the in-cluster
+# scheduler running at default 60s reconcile interval, the first matching
+# event in the burst causes one fire; the next two reconcile ticks (each
+# evaluating events from the buffer that arrived within the throttle
+# window since the last fire) drop their candidates silently. End state:
+# runs_spawned == 1, NOT 2 or 3.
+#
+# Why live-flow: shape tests pass even if the throttle map's keying scheme
+# regresses (e.g. drops the entryIndex segment and throttles across all
+# entries, or never persists the lastFire time after restart). Only an
+# end-to-end "burst → exactly one fire" assertion catches it.
+
+[claude]
+session_id = "e2e00000-000c-4000-a000-000000000007"
+username = "e2e-gardener-throttle"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 300000
+
+[[responses]]
+on = "*"
+say = "Running gardener-trigger-throttle-burst: 3-event burst inside throttle window → 1 fire."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if [ -z "${BEADS_HTTP_URL:-}" ] || [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL/BEADS_TOKEN unset"; exit 0
+fi
+
+TAG="e2e-cthr-$$-$(date +%s)"
+
+EPIC_ID=$(kd create "gardener-throttle-epic-$TAG" --type=epic -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+
+# Three children up-front; close them in a tight burst below.
+C1=$(kd create "burst-c1-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+C2=$(kd create "burst-c2-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+C3=$(kd create "burst-c3-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$C1" ] || [ -z "$C2" ] || [ -z "$C3" ]; then fail "create children"; exit 1; fi
+for c in "$C1" "$C2" "$C3"; do
+  kd dep add "$c" "$EPIC_ID" --type parent-child >/dev/null 2>&1 || true
+done
+echo "children: $C1 $C2 $C3"
+
+# Throttle=300s ensures all three events fall within the window after the
+# first fire — they MUST be dropped by inThrottleWindow.
+TRIGGERS=$(cat <<JSON
+[
+  {"kind":"cron","cron":"0 0 1 1 *","timezone":"UTC"},
+  {"kind":"bead_event","events":["closed"],
+   "match":{"all":[{"field":"parent","op":"==","value":"$EPIC_ID"}]},
+   "throttle":"300s"}
+]
+JSON
+)
+# Keep max_runs high enough to NOT be the limiting factor; the only thing
+# stopping a second fire should be the throttle gate.
+STOP='{"loop_end":{"any":[{"kind":"max_runs"}]},"run_end":{"any":[{"kind":"no_actionable_state"}]},"hard_stop":{"any":[{"kind":"manual_force","field":"force_close","value":"true"}]}}'
+
+SCHED_ID=$(kd create "gardener-sched-$TAG" --type=schedule \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "role:gardener" -l "project:gardenio" \
+  -f "enabled=true" -f "role=gardener" -f "assign_bead=$EPIC_ID" -f "project=gardenio" \
+  -f "prompt=gardener test prompt" -f "max_runs=10" \
+  -f "cron=0 0 1 1 *" -f "timezone=UTC" \
+  -f "triggers=$TRIGGERS" -f "stop=$STOP" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$SCHED_ID" ]; then fail "create schedule"; exit 1; fi
+echo "schedule: $SCHED_ID (throttle=300s)"
+
+cleanup() {
+  kd update "$SCHED_ID" -f "enabled=false" -f "force_close=true" >/dev/null 2>&1 || true
+  AGENT=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.last_agent_id // empty')
+  [ -n "$AGENT" ] && kd close "$AGENT" >/dev/null 2>&1 || true
+  for id in "$SCHED_ID" "$C1" "$C2" "$C3" "$EPIC_ID"; do
+    kd close "$id" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+sleep 5
+
+# ── Burst: close 3 children within ~5 seconds ─────────────────────
+kd close "$C1" >/dev/null 2>&1 || true
+sleep 2
+kd close "$C2" >/dev/null 2>&1 || true
+sleep 2
+kd close "$C3" >/dev/null 2>&1 || true
+echo "closed burst $C1, $C2, $C3 at $(date -u +%FT%TZ)"
+
+# Wait for first reconcile tick to observe the first fire.
+FIRST_FIRE_DEADLINE=$(( $(date +%s) + 150 ))
+GOT_FIRST=0
+while [ "$(date +%s)" -lt "$FIRST_FIRE_DEADLINE" ]; do
+  RS=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.runs_spawned // "0"')
+  if [ "${RS:-0}" -ge 1 ] 2>/dev/null; then
+    GOT_FIRST=1
+    pass "first fire observed (runs_spawned=$RS)"
+    break
+  fi
+  sleep 5
+done
+if [ "$GOT_FIRST" = "0" ]; then
+  fail "no fire within 150s of burst"
+  kd show "$SCHED_ID" 2>/dev/null | head -40 || true
+  exit 1
+fi
+
+# Wait one more reconcile cycle (60s) so the scheduler would have
+# re-evaluated the trigger if throttle were broken.
+echo "waiting 75s for second reconcile tick (throttle should hold)..."
+sleep 75
+
+RS_FINAL=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.runs_spawned // "0"')
+if [ "${RS_FINAL:-0}" = "1" ]; then
+  pass "throttle held — runs_spawned stayed at 1 across follow-up tick"
+else
+  fail "throttle did not hold burst" "runs_spawned=$RS_FINAL (expected 1)"
+  kd show "$SCHED_ID" 2>/dev/null | head -40 || true
+  exit 1
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "gardener-trigger-throttle-burst OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-trigger-throttle-burst scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

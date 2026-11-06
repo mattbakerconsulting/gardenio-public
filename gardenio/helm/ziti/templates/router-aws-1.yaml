@@ -1,0 +1,210 @@
+{{- if and .Values.ziti.enabled .Values.ziti.routerAws.enabled }}
+# router-aws-1 -- OpenZiti edge router inside the gardenio VPC.
+#
+# Why: the controller and the only other router (router-instance-1, #public)
+# live on Vultr. Without this router every HQ<->k3s dial hairpins
+# us-east-1 -> Vultr -> us-east-1 (~130-400 ms per round trip). With it both
+# ends attach to a router in-region and the path stays in the VPC.
+#
+# Not public: role attribute `private-aws` only, no link listener
+# (ZITI_BOOTSTRAP_CONFIG_ARGS=--private, so the Vultr router never dials in --
+# this one dials out), and SG ingress on 3022 is VPC-CIDR only
+# (terraform/modules/k3s `aws_vpc_security_group_ingress_rule.ziti_router`).
+#
+# The identity lives on a local-path PVC so a restart re-uses the enrolment.
+# Enrolment token (one-shot, ~3 h TTL) comes from Secret `router-aws-1-jwt`;
+# after the first successful start the Secret is dead weight and the JWT is
+# already spent -- to re-enrol, delete the PVC, re-run
+# `ziti edge create edge-router ... -o router-aws-1.jwt` on the controller and
+# recreate the Secret. See docs/ziti-routers.md.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: router-aws-1-identity
+  namespace: ziti
+  labels:
+    app: router-aws-1
+    app.kubernetes.io/part-of: gas-city
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: router-aws-1
+  namespace: ziti
+  labels:
+    app: router-aws-1
+    app.kubernetes.io/part-of: gas-city
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # RWO identity volume + a fixed host port
+  selector:
+    matchLabels:
+      app: router-aws-1
+  template:
+    metadata:
+      labels:
+        app: router-aws-1
+    spec:
+      # hostNetwork so the edge listener is reachable at the node's private IP;
+      # pinned to the on-demand server, which is also where the local-path
+      # identity volume and the dolt PVCs live.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        gardenio.io/lifecycle: on-demand
+      # The on-demand selector above is deliberate (a ziti edge router should not
+      # be spot-reclaimed mid-circuit), but on-demand nodes are NOT untainted:
+      # the two agent-pool ones carry gardenio.agent=true:NoSchedule, and the
+      # on-demand server carries node-role.kubernetes.io/control-plane:NoSchedule.
+      # With no toleration the selector and the taints intersect to nothing and
+      # the pod simply sits Pending.
+      #
+      # That is exactly what happened 2026-09-20: the control-plane nodes were
+      # tainted (to keep 2Gi agent pods off 1.95Gi etcd nodes) and this router
+      # was stranded for 3h20m, because the untainted on-demand server had been
+      # its only remaining home. Same stranding hit the ARC CI listener the same
+      # hour. Every Ready node in this cluster is NoSchedule-tainted by design,
+      # so ANY pod here needs a toleration that matches its selector.
+      #
+      # Tolerating gardenio.agent rather than control-plane puts the router on
+      # the agent pool, which is for workloads, and keeps it off the etcd nodes.
+      #
+      # BOTH tolerations are required, and the second is not belt-and-braces.
+      # This router's identity PVC (router-aws-1-identity) is local-path, i.e.
+      # node-bound: its PV was provisioned on ip-10-90-5-163 and Kubernetes will
+      # schedule the pod nowhere else ("node(s) didn't match PersistentVolume's
+      # node affinity"). That node is an on-demand SERVER, so the router needs
+      # the control-plane toleration to return to its own data. Tolerating only
+      # gardenio.agent left it Pending exactly as before.
+      #
+      # Allowing it there is acceptable for the same reason as the ARC listener:
+      # this pod requests 50m CPU / 64Mi. The control-plane taint exists to keep
+      # 2Gi-limit AGENT pods off 1.95Gi etcd nodes, not 50m infrastructure pods.
+      #
+      # The deeper problem is the local-path PVC itself: it pins a supposedly
+      # rescheduleable router to ONE node, so any taint, drain or node loss
+      # strands it until that exact node returns. That belongs to the HA plan.
+      tolerations:
+        - key: gardenio.agent
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsUser: 2171 # ziggy, the image's user
+        runAsGroup: 2171
+        fsGroup: 2171
+      containers:
+        - name: router
+          image: openziti/ziti-router:2.0.4 # must match the controller's major.minor (ziti v2.0.4 on Vultr)
+          args: ["run", "/ziti-router/config.yml"]
+          env:
+            - name: ZITI_HOME
+              value: /ziti-router
+            - name: ZITI_BOOTSTRAP
+              value: "true"
+            - name: ZITI_BOOTSTRAP_CONFIG
+              value: "true"
+            - name: ZITI_BOOTSTRAP_ENROLLMENT
+              value: "true"
+            - name: ZITI_BOOTSTRAP_CONFIG_ARGS
+              value: "--private" # no link listener: dial out to the public router, never in
+            - name: ZITI_AUTO_RENEW_CERTS
+              value: "true"
+            - name: ZITI_ROUTER_NAME
+              value: router-aws-1
+            - name: ZITI_ROUTER_TYPE
+              value: edge
+            - name: ZITI_ROUTER_MODE
+              value: none # the router is not tunneler-enabled on the controller
+            - name: ZITI_ROUTER_PORT
+              value: "3022"
+            - name: ZITI_ROUTER_BIND_ADDRESS
+              value: 0.0.0.0
+            # The node's private IP. There is no private DNS zone in
+            # modules/network, so this is set per node; if the on-demand server
+            # is replaced, update it (and re-enrol) -- docs/ziti-routers.md.
+            - name: ZITI_ROUTER_ADVERTISED_ADDRESS
+              value: "10.90.5.163"
+            # Without this the enrolment CSR gets no IP SAN (only the node
+            # hostname) and the router refuses to start: "identity is not valid
+            # for provided host". Must equal the advertised address.
+            - name: ZITI_ROUTER_IP_OVERRIDE
+              value: "10.90.5.163"
+            - name: ZITI_CTRL_ADVERTISED_ADDRESS
+              value: 45-77-68-134.nip.io
+            - name: ZITI_CTRL_ADVERTISED_PORT
+              value: "8440"
+            - name: ZITI_ENROLL_TOKEN
+              value: /jwt/router.jwt
+          ports:
+            - name: edge
+              containerPort: 3022
+              protocol: TCP
+          volumeMounts:
+            - name: identity
+              mountPath: /ziti-router
+            - name: jwt
+              mountPath: /jwt
+              readOnly: true
+          # Not tcpSocket: a bare TCP open against the edge listener is not a
+          # TLS handshake, so the router logs "handshake failed: EOF" on every
+          # poll. Not pgrep either -- the image has no procps. The router
+          # exposes no health endpoint, so check that the listener is up. (If
+          # the router itself dies, PID 1 exits and the container restarts.)
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "ss -ltn | grep -q ':3022'"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "ss -ltn | grep -q ':3022'"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: "1", memory: 512Mi }
+      volumes:
+        - name: identity
+          persistentVolumeClaim:
+            claimName: router-aws-1-identity
+        - name: jwt
+          secret:
+            secretName: router-aws-1-jwt
+            optional: true
+---
+# PDB only (gd-27vcHmrurh) — no topologySpreadConstraints/podAntiAffinity:
+# the identity PVC above is local-path (node-bound, see the header comment),
+# so this pod is pinned to one exact node and runs strategy:Recreate; a
+# spread/anti-affinity block would be dead YAML — there is no "spread" to
+# have with a PV-node-pinned singleton. maxUnavailable, NOT minAvailable
+# (ka-0000001453): on a 1-replica Deployment minAvailable:1 ==
+# maxUnavailable:0, which makes the eviction API refuse the pod forever and
+# wedges a managed-nodegroup drain (moot for THIS node, which is control-plane
+# and never drained by a managed nodegroup roll, but a real hazard for any
+# future EKS-side router on a rolled nodegroup, so keep the same safe shape).
+# maxUnavailable:1 only blocks eviction while the pod is currently unhealthy.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: router-aws-1
+  namespace: ziti
+  labels:
+    app: router-aws-1
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: router-aws-1
+{{- end }}

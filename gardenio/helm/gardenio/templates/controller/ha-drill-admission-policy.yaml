@@ -1,0 +1,132 @@
+{{/*
+ValidatingAdmissionPolicy that narrows the gardenio-ha-drill-operator SA's
+cluster-scoped `nodes patch`/`update` verb (templates/controller/
+ha-drill-rbac.yaml) down to exactly the mutation the HA-drill script needs:
+flipping `spec.unschedulable` on a spot node.
+
+BLOCKING GATE this closes (gd-JKXEwmGns8, raised by fimba-40 on
+gd-JCLx5RLG1I and reaffirmed in decision gd-KmJX79f3ff, chosen=keep-gated):
+RBAC alone cannot scope `nodes patch` to `spec.unschedulable` — as granted
+(PR #140/#156), this SA can also rewrite arbitrary node labels/annotations
+(including the pool and node-role labels every scheduling pin reads, e.g.
+`gardenio.io/lifecycle`, `gardenio.io/role`) and node taints (a NoExecute
+taint write bypasses PDBs entirely). Only an admission-time policy can close
+that gap. This is a NEW safety control layered on top of PR #140/#156's RBAC
+grant — it does not revert or replace it.
+
+Two independent checks, both required:
+
+  1. field-scope: an UPDATE by this SA may change `spec.unschedulable` and
+     nothing else. Every other `spec` key must be unchanged (not just
+     `taints`), and `metadata.labels`, `metadata.annotations`,
+     `metadata.ownerReferences`, and `metadata.finalizers` must all be
+     byte-identical to the prior object. Without the ownerReferences/
+     finalizers checks, this SA's `nodes patch` verb could add a dangling
+     ownerReference (the garbage collector then deletes the Node -- a
+     delete this SA is never granted, bypassing PDBs) or a finalizer that
+     wedges Node deletion during a real spot reclaim.
+
+  2. node-scope: the target node must already carry
+     `gardenio.io/lifecycle: spot` (the IMDS-derived capacity-type label
+     every node self-applies at boot, deploy-values/gardenio-k3s.yaml) and
+     must NOT carry `node-role.kubernetes.io/control-plane` (the label/taint
+     k3s applies to its 3 etcd/API-server nodes,
+     gardenio/terraform/modules/k3s/templates/node.sh.tftpl). This is
+     defense-in-depth on top of check 1 alone using the label present at
+     request time (oldObject) — drills target spot worker nodes only, never
+     on-demand or control-plane nodes, per the #156 review thread.
+
+Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA), same requirement
+as the other VAPs in this directory. Off whenever haDrillOperator itself is
+off; operators on older clusters can also disable just the policy via
+`agents.haDrillOperator.admissionPolicy.enabled=false` (the RBAC grant above
+becomes fully load-bearing in that case — do not disable this without also
+re-reviewing the not-yet-safe-to-spawn note on the ha-drill-operator role
+bead).
+*/}}
+{{- if and .Values.agents.enabled .Values.agents.haDrillOperator.enabled .Values.agents.haDrillOperator.admissionPolicy.enabled }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-ha-drill
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes"]
+  matchConditions:
+    # Only apply this policy to the ha-drill-operator SA. Cluster admins,
+    # the cloud controller manager, and other SAs that legitimately mutate
+    # node labels/taints are unaffected.
+    - name: only-ha-drill-operator-sa
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:{{ .Release.Namespace }}:{{ .Values.agents.haDrillOperator.name }}'
+  validations:
+    # Check 1 (field-scope): every NodeSpec field other than
+    # `unschedulable` (podCIDR, podCIDRs, providerID, taints -- the full
+    # v1.NodeSpec field set on Kubernetes 1.30+, matching this policy's own
+    # version floor) must be unchanged, plus metadata.labels,
+    # metadata.annotations, metadata.ownerReferences, and
+    # metadata.finalizers. ownerReferences/finalizers are checked, not just
+    # labels/annotations/taints, because a dangling ownerReference lets the
+    # garbage collector delete the Node (a delete this SA is never granted,
+    # bypassing PDBs) and an added finalizer can wedge Node deletion during
+    # a real spot reclaim -- both reachable through this SA's `nodes patch`
+    # verb without this check.
+    - expression: >-
+        (has(object.metadata.labels) == has(oldObject.metadata.labels)) &&
+        (!has(object.metadata.labels) ||
+         object.metadata.labels == oldObject.metadata.labels) &&
+        (has(object.metadata.annotations) == has(oldObject.metadata.annotations)) &&
+        (!has(object.metadata.annotations) ||
+         object.metadata.annotations == oldObject.metadata.annotations) &&
+        (has(object.metadata.ownerReferences) == has(oldObject.metadata.ownerReferences)) &&
+        (!has(object.metadata.ownerReferences) ||
+         object.metadata.ownerReferences == oldObject.metadata.ownerReferences) &&
+        (has(object.metadata.finalizers) == has(oldObject.metadata.finalizers)) &&
+        (!has(object.metadata.finalizers) ||
+         object.metadata.finalizers == oldObject.metadata.finalizers) &&
+        object.spec.podCIDR == oldObject.spec.podCIDR &&
+        object.spec.providerID == oldObject.spec.providerID &&
+        (has(object.spec.podCIDRs) == has(oldObject.spec.podCIDRs)) &&
+        (!has(object.spec.podCIDRs) ||
+         object.spec.podCIDRs == oldObject.spec.podCIDRs) &&
+        (has(object.spec.taints) == has(oldObject.spec.taints)) &&
+        (!has(object.spec.taints) ||
+         object.spec.taints == oldObject.spec.taints)
+      message: >-
+        gardenio-ha-drill-operator may only patch node spec.unschedulable
+        (cordon/uncordon). This request also changes another spec field, or
+        metadata.labels, metadata.annotations, metadata.ownerReferences, or
+        metadata.finalizers, which is out of scope for this SA
+        (gd-JKXEwmGns8).
+    # Check 2 (node-scope): the target node must be labeled
+    # gardenio.io/lifecycle=spot and must not carry the control-plane label.
+    # Evaluated against oldObject (the node's actual state), independent of
+    # check 1's label-immutability guarantee.
+    - expression: >-
+        has(oldObject.metadata.labels) &&
+        ('gardenio.io/lifecycle' in oldObject.metadata.labels) &&
+        oldObject.metadata.labels['gardenio.io/lifecycle'] == 'spot' &&
+        !('node-role.kubernetes.io/control-plane' in oldObject.metadata.labels)
+      message: >-
+        gardenio-ha-drill-operator may only cordon/patch nodes labeled
+        gardenio.io/lifecycle=spot. On-demand and control-plane nodes are
+        protected; HA drills target spot worker nodes only (gd-JKXEwmGns8).
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-ha-drill
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "gardenio.agents.fullname" . }}-ha-drill
+  validationActions: ["Deny"]
+{{- end }}

@@ -1,0 +1,336 @@
+# Quench configuration for gardenio monorepo
+# Run `quench config` for reference documentation
+version = 1
+
+[git]
+# Ratchet baseline is a COMMITTED FILE, not git notes (ka-0000002621).
+# Why file, not notes: `quench check --ci` resolves the ratchet base to the
+# exact base-branch commit SHA and looks up the baseline for THAT sha with no
+# ancestor walk. A git note on one main tip therefore goes stale the instant
+# main advances, and a default `git clone` does not fetch refs/notes/quench at
+# all (the CI `code` task clones a single commit). A committed file travels
+# with the tree, so it is valid at every commit and every fresh clone with no
+# per-commit note maintenance and no CI write-back. It is also reviewable in
+# the diff.
+#
+# Regenerating after an intentional ceiling change: the baseline was seeded
+# from a git-LESS tree (the pre-Actions CI exported one), so quench could not
+# diff-scope and the escapes ratchet counts WHOLE-REPO occurrences. checks.yml
+# now runs `quench check --ci` in a shallow actions/checkout; keep seeding with
+# the recipe below unless you have checked that quench scopes the same way
+# there. From the repo root:
+#   D=$(mktemp -d); git archive HEAD | tar -x -C "$D"; rm -rf "$D/.quench"
+#   (cd "$D" && quench check --ci --fix --no-cache --no-docs --no-cloc)
+#   cp "$D/.quench/baseline.json" .quench/baseline.json
+# Do NOT run `quench check --ci --fix` inside the working tree — with .git
+# present it diff-scopes to changed files and writes an all-zero baseline that
+# fails CI (whole-repo count > 0).
+baseline = ".quench/baseline.json"
+
+[git.commit]
+check = "error"
+# Pin the conventional-commit type set (documented in coop/CLAUDE.md:163 and
+# the root "Commits" convention). Include the extended types — perf/ci/build/
+# style/revert are legitimate here — or `[git.commit] types` would newly reject
+# them. An empty array would accept ANY type (structure-only); this allowlist is
+# the intentional, closed set. (Phase 3.4, ka-0000003893.)
+types = ["feat", "fix", "chore", "docs", "test", "refactor", "perf", "ci", "build", "style", "revert"]
+
+# Ratchet: freeze the current whole-repo escape-hatch counts as a CEILING so no
+# MR may push them higher. Escape hatches counted at repo root (Shell-only
+# detection): shell `set +e`/`eval` and Go `panic(`. The frozen ceiling in
+# .quench/baseline.json is source {eval:20, panic:10, set_plus_e:8},
+# test {eval:54, panic:16, set_plus_e:14} — the total occurrences on green main
+# aa38bbb (the metric counts ALL occurrences, justified or not; the separate
+# absolute [check.escapes] gate is what flags UNJUSTIFIED ones). Add one and CI
+# fails; removing them is always allowed and should be paired with a re-seed to
+# tighten the ceiling. Activated only under `quench check --ci` (see the `quench
+# quality gate` job in .github/workflows/checks.yml). NOTE: the baseline stores escapes only — cloc is NOT
+# ratcheted by quench 0.4.3, and `coverage` has no data source here (the go
+# test-suite runner was removed in ka-0000003622 because go.work has no root
+# go.mod). `coverage` is left declared for when a runner is wired up; inert
+# until then.
+[ratchet]
+check = "error"
+coverage = true
+escapes = true
+
+# --- Checks ---
+
+[check.cloc]
+# Phase 2.1 (ka-0000002511): cloc was doubly-off — `--no-cloc` in the CI
+# invocation AND severity=warn. This block turns it into a real repo-wide
+# ERROR gate at a REALISTIC ceiling for this codebase (bridge / podmanager /
+# beads-viewer units legitimately run 1000-1500 lines). Removing --no-cloc
+# from the CI invocation (checks.yml) + Makefile is what actually arms it.
+#
+# GRANDFATHERING MECHANISM — read before touching the exclude list:
+# quench 0.4.3 offers exactly ONE lever for pre-existing large files: flat
+# max_lines + `exclude` globs. It does NOT ratchet cloc (the [ratchet]
+# baseline stores ESCAPE counts only — verified twice, see ka-0000002621 and
+# this task's bead comment), it does NOT diff-scope cloc (`--base`/`--ci`
+# leave cloc whole-repo), and it REJECTS [check.cloc.package.*] per-package
+# overrides (unknown-field error). So the ONLY way to arm the gate without a
+# (deliberately out-of-scope) cleanup sprint is to grandfather today's
+# offenders by explicit path. The gate still fires on every NEW file over the
+# ceiling; cleaning up a grandfathered file lets you delete its line here.
+# Cleanup of the grandfathered debt is tracked under epic ka-0000005566.
+#
+# Token-count sizing (max_tokens) is a SEPARATE axis with its own offender
+# set and is intentionally deferred out of Phase 2.1 (line-count only) —
+# hence max_tokens = false.
+#
+# Regenerate the grandfather list after an intentional cleanup or a ceiling
+# change (run from repo root, mirrors the git-less whole-repo CI scan):
+#   quench check --cloc --no-limit 2>&1 | grep "file_too_large (lines"
+check = "error"
+max_lines = 1500
+max_lines_test = 1200
+max_tokens = false
+exclude = [
+  "docs/archive/**",     # archived pipeline specs and docs: reference copies, not code
+  # Non-source / vendored / out-of-scope trees.
+  "gardenio/helm/**",
+  "gardenio/images/**",
+  "gardenio/tests/e2e/**",
+  "coop/target/**",
+  "**/gen/**",           # generated protobuf (kbeads/gen)
+  "kbeads/internal/heraldry/library.go", # generated heraldry library table (genlibrary); grows with each Noto Emoji re-pin
+  "kbeads/internal/heraldry/tones.go", # generated heraldry charge tones (gentones); one row per library charge
+  "lands/contract/landsv1/*.gen.go", # generated Lands contract Go binding (oapi-codegen)
+  "lands/contract/ts/*.ts", # generated Lands contract TS binding + fixture check (openapi-typescript)
+  "usr/**",              # Swift/Xcode apps (Gardenio/Gasvoice/Porthole) — separate products
+  "**/*.min.js",         # vendored minified JS (e.g. mermaid.min.js)
+
+  # --- GRANDFATHERED pre-existing offenders (Phase 2.1, ka-0000002511) ---
+  # 87 files over the ceiling on green main as of 2026-08-29. Cleanup: ka-0000005566.
+  "coop/crates/cli/src/run.rs",
+  "coop/crates/cli/src/s3_tests.rs",
+  "coop/crates/mux/tests/http.rs",
+  "gardenio/controller/cmd/beads-viewer/agents.go",
+  "gardenio/controller/cmd/beads-viewer/agents_test.go",
+  "gardenio/controller/cmd/beads-viewer/bead_show_test.go",
+  "gardenio/controller/cmd/beads-viewer/gardeners_test.go",
+  "gardenio/controller/cmd/beads-viewer/constellation.go",
+  "gardenio/controller/cmd/beads-viewer/constellation_test.go",
+  "gardenio/controller/cmd/beads-viewer/costs_test.go",
+  "gardenio/controller/cmd/beads-viewer/feed.go",
+  "gardenio/controller/cmd/beads-viewer/inbox_test.go",
+  "gardenio/controller/cmd/beads-viewer/people_test.go",
+  "gardenio/controller/cmd/beads-viewer/plans.go",
+  "gardenio/controller/cmd/beads-viewer/plans_crew.go",
+  "gardenio/controller/cmd/beads-viewer/plans_index_test.go",
+  "gardenio/controller/cmd/beads-viewer/plans_test.go",
+  "gardenio/controller/cmd/beads-viewer/server.go",
+  "gardenio/controller/cmd/beads-viewer/server_test.go",
+  "gardenio/controller/cmd/beads-viewer/user_home_test.go",
+  "gardenio/controller/cmd/beads-viewer/widgets_htmx_test.go",
+  "gardenio/controller/cmd/controller/podspec.go",
+  "gardenio/controller/cmd/controller/podspec_test.go",
+  "gardenio/controller/cmd/gb/bundle_test.go",
+  "gardenio/controller/cmd/gb/gardener.go",
+  "gardenio/controller/cmd/gb/gardener_test.go",
+  "gardenio/controller/cmd/gb/decision.go",
+  "gardenio/controller/cmd/gb/init_agent.go",
+  "gardenio/controller/cmd/gb/init_agent_test.go",
+  "gardenio/controller/cmd/gb/mr.go",
+  "gardenio/controller/cmd/gb/news.go",
+  "gardenio/controller/cmd/gb/setup_test.go",
+  "gardenio/controller/cmd/gb/trigger_reconcile_test.go",
+  "gardenio/controller/cmd/jira-conv-probe/main.go",
+  "gardenio/controller/cmd/slack-bridge/helpers_test.go",
+  "gardenio/controller/cmd/trigger-engine/main.go",
+  "gardenio/controller/cmd/trigger-engine/main_test.go",
+  "gardenio/controller/internal/beadsapi/client.go",
+  "gardenio/controller/internal/bridge/agents_card_test.go",
+  "gardenio/controller/internal/bridge/agentstream.go",
+  "gardenio/controller/internal/bridge/agentstream_test.go",
+  "gardenio/controller/internal/bridge/bot.go",
+  "gardenio/controller/internal/bridge/bot_agent_kill.go",
+  "gardenio/controller/internal/bridge/bot_agents.go",
+  "gardenio/controller/internal/bridge/bot_agents_notify_test.go",
+  "gardenio/controller/internal/bridge/bot_mentions.go",
+  "gardenio/controller/internal/bridge/bot_mentions_test.go",
+  "gardenio/controller/internal/bridge/gardener_evaluator.go",
+  "gardenio/controller/internal/bridge/gardener_evaluator_test.go",
+  "gardenio/controller/internal/bridge/decisions_test.go",
+  "gardenio/controller/internal/bridge/escalation_reaper_test.go",
+  "gardenio/controller/internal/bridge/gitlab_mentions_test.go",
+  "gardenio/controller/internal/bridge/gitlab_sync.go",
+  "gardenio/controller/internal/bridge/gitlab_sync_test.go",
+  "gardenio/controller/internal/bridge/jira_mentions_test.go",
+  "gardenio/controller/internal/bridge/jira_webhook_test.go",
+  "gardenio/controller/internal/bridge/trigger_source_bead_test.go",
+  "gardenio/controller/internal/bridge/trigger_source_schedule_test.go",
+  "gardenio/controller/internal/bridge/triggers.go",
+  "gardenio/controller/internal/bridge/triggers_test.go",
+  "gardenio/controller/internal/config/config.go",
+  "gardenio/controller/internal/podmanager/freezethaw.go",
+  "gardenio/controller/internal/podmanager/freezethaw_node.go",
+  "gardenio/controller/internal/podmanager/freezethaw_thaw_test.go",
+  "gardenio/controller/internal/podmanager/manager.go",
+  "gardenio/controller/internal/reconciler/reconciler.go",
+  "gardenio/controller/internal/reconciler/reconciler_test.go",
+  "gardenio/controller/internal/statusreporter/stalereaper.go",
+  "gardenio/controller/internal/statusreporter/stalereaper_test.go",
+  "gardenio/tests/beads-viewer-e2e/seed/fixtures.mjs",
+  "gardenio/tests/beads-viewer-screenshots/tools/measure-users-camp.py",
+  "kbeads/cmd/kd/formula_apply_test.go",
+  "kbeads/internal/client/http.go",
+  "kbeads/internal/server/audit.go",
+  "kbeads/internal/server/auto_close.go",
+  "kbeads/internal/server/auto_close_test.go",
+  "kbeads/internal/server/beads.go",
+  "kbeads/internal/server/charts_catalog.go",
+  "kbeads/internal/server/config.go",
+  "kbeads/internal/server/config_test.go",
+  "kbeads/internal/server/http_test.go",
+  "kbeads/internal/store/postgres/postgres_test.go",
+  "kbeads/internal/store/postgres/queries.go",
+  "kbeads/internal/store/store.go",
+  "scripts/inbox/tarboat-validate.sh",
+  "scripts/release_test.sh",
+]
+
+[check.escapes]
+check = "error"
+# Users-FLAT (and any future viewer) audit runs commit Playwright-captured DOM
+# snapshots under docs/**/captures/ as evidence. Those files inline the rendered
+# page's own JS and, worse, arbitrary bead *display text* — so quench's Shell
+# escape-hatch detector matches things like the word "re-eval" inside a bead
+# title and counts a phantom `eval`, pushing the whole-repo escapes ratchet over
+# its ceiling and reding EVERY MR branched off that main (ka-0000004491, and the
+# concrete break introduced by the 2026-07-03 users-flat audit merge d240aa648:
+# a "re-eval complete" bead title in xop-user-home.html). These captures are
+# third-party page dumps, not code we author — exclude them from the escapes
+# scan.
+exclude = ["docs/**/captures/**"]
+
+[[check.escapes.patterns]]
+name = "panic"
+pattern = "\\bpanic\\("
+action = "comment"
+comment = "// PANIC:"
+in_tests = "allow"
+advice = "Add a // PANIC: comment explaining why panic is acceptable here."
+
+[check.agents]
+check = "warn"
+files = ["CLAUDE.md"]
+required = ["CLAUDE.md"]
+max_lines = false
+max_tokens = false
+sync = false
+# Lock in the two structural sections every top-level CLAUDE.md already carries
+# (all 4 satisfy this today — 0 cleanup, this just freezes the structure so a
+# future edit can't silently drop them). Matched case-insensitively. NOTE: the
+# agents check is root-scoped in quench 0.4.3, so this guards the ROOT CLAUDE.md
+# only; per-package size caps / tables=forbid would need real work and are
+# deferred (audit §3.4, ka-0000003893).
+sections.required = ["Directory Structure", "Landing the Plane"]
+
+[check.docs]
+check = "warn"
+
+# TOC check runs repo-wide at error (ka-0000006098, Phase 2.2). The Phase-2.2
+# fence-tagging sweep (decision ka-0000006728 -> "sweep") tagged every
+# illustrative ASCII-diagram / path-map / prompt / code fence with an explicit
+# language (```text etc.) so quench no longer reads them as directory trees.
+# With those fences tagged, no diagram-heavy dir-excludes are needed — the check
+# guards real directory trees / TOCs across the whole repo.
+[check.docs.toc]
+check = "error"
+include = ["**/*.md"]
+exclude = [
+  "gardenio/helm/**",
+]
+
+[check.docs.links]
+check = "error"
+include = ["**/*.md"]
+# Generated snapshot report trees (dated CDQR / gardeners-camp / maps-beauty /
+# grade / density report dirs) are auto-captured agent-run artifacts, not
+# maintained docs: each REPORT.md links to per-run `captures/…` screenshots that
+# are never committed. Validating those links is pure noise, so the generated
+# trees are scoped out of the link check (ka-0000006098, Phase 2.2). Real docs
+# stay in scope — their genuine broken links were fixed in the sweep.
+exclude = [
+  "gardenio/helm/**",
+  "docs/gardener-cdqr/**",
+  "docs/gardeners-camp/**",
+  "docs/people-cdqr/**",
+  "docs/users-cdqr/**",
+  "docs/users-flat/**",
+  "docs/formula-ux/**",
+  "docs/grafana-grade/**",
+  "docs/maps-beauty/**",
+  "docs/info-density/**",
+  # This doc is the DESIGN SPEC for the typed-mention `[label](ka-X)` markdown-link
+  # syntax, so its worked examples (`[parent](ka-123)`, `[parent](ka-X)`) are
+  # deliberate illustrations of the link FORM, not real links to files — and they
+  # already sit inside inline code spans. quench's link detector flags them anyway
+  # (ka-0000006098, Phase 2.2). Excluding the one syntax-reference doc keeps the
+  # lesson intact rather than corrupting the examples it exists to teach.
+  "kbeads/docs/research-typed-mention-syntax.md",
+  # The beads viewer embeds a byte-for-byte copy of gardenio/docs/lands/legal/
+  # (TestLandsLegalMirrorsDocs, Lands step 7.5). Its relative links resolve next
+  # to the originals, which this check covers; the served pages rewrite or drop
+  # them (lands.go landsLinkRewriter).
+  "gardenio/controller/cmd/beads-viewer/lands/legal/**",
+]
+
+# Area mappings: when source in a high-churn subsystem changes, require its docs
+# to be touched in the same commit. Forward-looking gate — surfaces 0 violations
+# today. Only fires under `--ci` mode once [check.docs] is enabled at error
+# (Phase 2.2); inert while docs runs at warn / behind `--no-docs`. Keep the doc
+# globs generous so refactor-only commits aren't over-constrained (audit §3.5,
+# ka-0000003893).
+[check.docs.area.bridge]
+source = "gardenio/controller/internal/bridge/**"
+docs = "gardenio/docs/*bridge*.md"
+
+[check.tests]
+check = "warn"
+auto = true
+
+[check.tests.commit]
+check = "warn"
+scope = "branch"
+exclude = ["**/main.go", "gardenio/helm/**", "gardenio/images/**"]
+
+# NOTE: no [[check.tests.suite]] runner. This is a go.work workspace with no
+# root go.mod, so quench's `go` runner probes for a root module, finds none,
+# and reports "runner not available" -> test_count=0, passed=true (a false
+# green) even under --ci. Real Go/Rust tests run in dedicated CI tasks
+# (make test / test-gardenio / test-kbeads), not via quench. The commit check
+# above still enforces tests-with-code and works without a runner (ka-0000003622).
+
+[check.tests.time]
+check = "warn"
+
+[check.license]
+check = "off"
+
+# --- Languages ---
+
+[golang]
+source = ["**/*.go"]
+tests = ["**/*_test.go"]
+ignore = ["vendor/"]
+
+[golang.cloc]
+check = "error"
+
+[golang.suppress]
+check = "comment"
+
+[golang.suppress.test]
+check = "allow"
+
+[rust]
+source = ["**/*.rs"]
+tests = ["**/*_test.rs", "**/tests/**/*.rs"]
+ignore = ["target/"]
+
+[shell]
+cloc.check = "error"

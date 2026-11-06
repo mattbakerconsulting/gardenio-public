@@ -1,0 +1,57 @@
+{{- /*
+Read-only verification identity for crews (agent access programme P9.2,
+gd-6ujfeTZfNL). A dedicated ServiceAccount bound to the infra-reader
+ClusterRole and release-namespace Role (infra-reader-rbac.yaml), so its reads
+are exactly infra-reader's: no secrets (so no `helm get manifest`), no
+serviceaccounts/token, no exec/attach/portforward and no write verb. A token
+reaches a pod only through a ROLE bead with needs_k8s_api=true and
+service_account=<this SA>. Own SA rather than sharing gardenio-infra-reader so
+the audit log tells a crew's reads from the infra role's.
+*/ -}}
+{{- if and .Values.agents.enabled .Values.agents.verifier.enabled }}
+{{- if not .Values.agents.infraReader.enabled }}
+{{- fail "agents.verifier.enabled needs agents.infraReader.enabled: the verifier binds the infra-reader roles" }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.agents.verifier.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: verifier
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.agents.verifier.name }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: verifier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.agents.infraReader.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.agents.verifier.name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.agents.verifier.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: verifier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.agents.infraReader.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.agents.verifier.name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

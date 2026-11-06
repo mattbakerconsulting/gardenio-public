@@ -1,0 +1,92 @@
+{{define "plan_narrative"}}
+{{/* The plan NARRATIVE — the epic-description summary plus the plan bundle's
+     doc cards (S3 of Plans v1, task ka-0000002473; Q2 decision ka-0000005051:
+     bundle-first). Read-only in-page: the manual textarea editor is retired —
+     nudging the plan agent is the edit path (it rewrites the bundle
+     type=doc children via kd and keeps the epic description as a short
+     summary), and kd is the out-of-page escape hatch.
+
+     Wrapped in #plan-narrative so the /plans/{id}/events SSE stream can swap
+     the whole section's outerHTML under the `plan-narrative-updated` event
+     the moment the epic description or a bundle doc's content changes — the
+     plan agent's edit lands on-page in ~1s, no reload. UpdatedBy (the acting
+     agent from the triggering event) renders as an attribution chip on those
+     SSE re-renders; it is empty on the initial page render.
+
+     In-cockpit direct editing (3e, ka-0000007445): the narrative SUMMARY (the
+     epic description) and each bundle-doc body get a write-through inline
+     editor gated on IsOperator. Each editor is a native <details> disclosure
+     whose form POSTs and re-renders this whole #plan-narrative fragment (which
+     collapses the disclosure) — no separate GET-editor route, because the
+     fragment always re-renders authoritative from live beads. Called with a
+     data bag: PlanID, ProseHTML, Description, Prose (bundle view or nil),
+     ProseBeadID, IsOperator, UpdatedBy, Error, BasePath. */}}
+<section id="plan-narrative" class="plan-narrative">
+  {{if .Error}}
+  <p class="bead-actions-error" role="alert">{{.Error}}</p>
+  {{end}}
+  <section class="plan-prose">
+    <div class="plan-prose-head">
+      <h3 aria-level="2">Plan narrative</h3>
+      {{if .UpdatedBy}}<span class="chip plan-narrative-attribution" title="last edited by {{.UpdatedBy}}">updated by {{agentLink .UpdatedBy}}</span>{{end}}
+    </div>
+    {{if .ProseHTML}}
+    <div class="description">{{.ProseHTML}}</div>
+    {{else if .Description}}
+    <pre>{{.Description}}</pre>
+    {{else}}
+    <p class="empty empty-yet">No narrative yet.{{if .IsOperator}} Ask the plan agent to draft the plan — it writes the summary here and the full narrative into the plan bundle — or edit the summary directly below.{{end}}</p>
+    {{end}}
+    {{if .IsOperator}}
+    <details class="plan-prose-edit">
+      <summary class="bead-action plan-prose-edit-toggle" title="Edit the plan narrative summary">Edit summary</summary>
+      <form class="plan-prose-edit-form"
+            hx-post="{{.BasePath}}/plans/{{.PlanID}}/narrative"
+            hx-target="#plan-narrative" hx-swap="outerHTML"
+            hx-disabled-elt="find textarea, find button">
+        <textarea name="narrative" class="plan-prose-edit-input" rows="6"
+                  aria-label="Plan narrative summary" placeholder="A short framing summary — the full narrative lives in the bundle docs below.">{{.Description}}</textarea>
+        <button type="submit" class="bead-action">Save summary</button>
+      </form>
+    </details>
+    {{end}}
+  </section>
+
+  {{with .Prose}}
+  <section class="plan-bundle">
+    <div class="plan-prose-head">
+      <h3 aria-level="2">Plan bundle{{if .Title}} · {{.Title}}{{end}}</h3>
+      <a class="bead-action" href="{{$.BasePath}}/bundle/{{.BundleID}}" title="Open the full bundle">Open bundle &rarr;</a>
+    </div>
+    {{if .Docs}}
+    <div class="plan-bundle-docs">
+      {{range .Docs}}
+      <article class="bundle-doc{{if not .RenderedHTML}} bundle-doc-placeholder{{end}}" data-doc-format="{{.Format}}" data-doc-id="{{.BeadID}}">
+        {{if .Headline}}<header class="bundle-doc-header"><span class="bundle-doc-headline">{{.Headline}}</span></header>{{end}}
+        <div class="bundle-doc-body">
+          {{if .RenderedHTML}}{{.RenderedHTML}}{{else if .Content}}<pre class="bundle-doc-content">{{.Content}}</pre>{{else}}<p class="empty">No content.</p>{{end}}
+        </div>
+        {{/* Per-doc write-through body edit (3e, ka-0000007445). Only text-body
+             docs are editable (image/link docs carry a content_url, not a body —
+             the server rejects those, and their format is excluded here). */}}
+        {{if and $.IsOperator (ne .Format "image") (ne .Format "link")}}
+        <details class="plan-doc-edit">
+          <summary class="bead-action plan-doc-edit-toggle" title="Edit this doc">Edit doc</summary>
+          <form class="plan-doc-edit-form"
+                hx-post="{{$.BasePath}}/plans/{{$.PlanID}}/docs/{{.BeadID}}"
+                hx-target="#plan-narrative" hx-swap="outerHTML"
+                hx-disabled-elt="find textarea, find button">
+            <textarea name="content" class="plan-doc-edit-input" rows="10"
+                      aria-label="Doc content" spellcheck="false">{{.Content}}</textarea>
+            <button type="submit" class="bead-action">Save doc</button>
+          </form>
+        </details>
+        {{end}}
+      </article>
+      {{end}}
+    </div>
+    {{end}}
+  </section>
+  {{end}}
+</section>
+{{end}}

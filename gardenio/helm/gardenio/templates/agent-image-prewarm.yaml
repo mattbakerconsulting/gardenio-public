@@ -1,0 +1,105 @@
+{{- /*
+Agent-image prewarm DaemonSet(s) — eliminate cold-pull spawn latency
+(task ka-0000000861, epic ka-0000007417 Phase 4 gVisor productionization).
+
+PROBLEM: a freshly-scheduled agent on a cold node pays the first-image-pull cost
+before it can start. Measured spawn-to-ready: ~135s for a runc agent, but ~4–5
+min for a runsc (gVisor) agent — dominated by the first agent-image pull into the
+new node. Karpenter scales agent pools up and down, so "cold node, no agent image
+cached" is the common case, not the exception.
+
+SOLUTION: a DaemonSet per target pool that runs the SAME agent image
+(agents.agentImage, resolved via gardenio.imageRef so a release bump re-pulls the
+new layers) as a `sleep infinity` no-op. One pod lands on every node of the pool
+(DaemonSet semantics) and forces the kubelet to pull + cache the image layers
+BEFORE any agent is scheduled there. A subsequently-spawned agent pod then pulls
+from the local layer cache instead of the registry. Mirrors the gvisor-probe
+DaemonSet pattern (templates/gvisor-namespace.yaml).
+
+The prewarm pod runs under the node's DEFAULT runtime (runc) even on gVisor
+nodes — it carries NO runtimeClassName. The image layers it caches are shared by
+the node's containerd content store regardless of which runtime ultimately runs
+them, so a runsc agent benefits from a runc-launched prewarm pull. The pod
+carries no credentials and reaches no services.
+
+Both DaemonSets render into .Release.Namespace (the restricted-PSA main
+namespace, NOT the gVisor privileged namespace): the prewarm pod needs only a
+restricted-compliant securityContext (agent image UID 1000, drop ALL caps), and
+namespace does not constrain which node a pod schedules onto — only the
+nodeSelector + tolerations do. .Values.imagePullSecrets (the same secret the
+agent pods use) is attached so the private registry pull succeeds.
+
+DEFAULT OFF (agents.prewarmImage.enabled=false). ROLLBACK: set enabled=false —
+the DaemonSet(s) are removed; already-warmed nodes keep their cached layers until
+normal kubelet image GC, and new nodes fall back to cold-pull-on-first-agent.
+*/ -}}
+{{- if .Values.agents.prewarmImage.enabled }}
+{{- $root := . }}
+{{- $pw := .Values.agents.prewarmImage }}
+{{- $imageRef := include "gardenio.imageRef" (dict "image" .Values.agents.agentImage "global" .Values.global "Chart" .Chart) }}
+{{- $pullPolicy := include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.agents.agentImage.pullPolicy "global" .Values.global) }}
+{{- range $pool, $cfg := $pw.pools }}
+{{- if $cfg.enabled }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "gardenio.fullname" $root }}-agent-prewarm-{{ $pool }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $root | nindent 4 }}
+    app: gardenio-agent-prewarm
+    gardenio.io/prewarm-pool: {{ $pool | quote }}
+spec:
+  selector:
+    matchLabels:
+      app: gardenio-agent-prewarm
+      gardenio.io/prewarm-pool: {{ $pool | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.labels" $root | nindent 8 }}
+        app: gardenio-agent-prewarm
+        gardenio.io/prewarm-pool: {{ $pool | quote }}
+    spec:
+      # No K8s API access, no credentials — this pod only caches image layers.
+      automountServiceAccountToken: false
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $cfg.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $cfg.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Lowest priority — never displace or block real agent workloads.
+      terminationGracePeriodSeconds: 0
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.agent.name }}
+      {{- end }}
+      containers:
+        - name: prewarm
+          image: {{ $imageRef | quote }}
+          imagePullPolicy: {{ $pullPolicy }}
+          command: ["sleep", "infinity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          {{- with $pw.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}{{/* end if pool enabled */}}
+{{- end }}{{/* end range pools */}}
+{{- end }}{{/* end if prewarmImage.enabled */}}

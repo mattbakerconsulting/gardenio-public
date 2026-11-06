@@ -1,0 +1,247 @@
+{{define "plan_steps"}}
+{{/* The plan STEP TIMELINE — a Cursor-plan-mode-style ordered build sequence
+     (epic ka-0000001409, Matt's ask ka-0000001134: "i dont like the
+     constellation for this; we need a better kind of view, and it should be
+     after the bundle"). This is the plan's PRIMARY graph now — the constellation
+     is gone from the cockpit. It renders the epic's issue children as a numbered,
+     vertically-connected timeline: done steps get a ✓ node and strike-through,
+     the in-progress step is highlighted, remaining steps show their step number.
+     A linear plan reads far better as a timeline than as a force graph, and every
+     operator affordance (Done / Reopen / Add) lives inline.
+
+     PHASES (ka-0000005926, decision ka-0000001034): when the plan epic declares
+     phase sub-epics (fields.phase_order), the timeline groups into ordered phase
+     sections — each an ordinary child epic with its own steps + per-phase
+     progress — rendered ABOVE any unphased loose steps. Operators reorder phases
+     with the ▲▼ arrows (rewrites phase_order). A plan with no phases renders
+     exactly as before: one flat <ol>. Membership = presence in phase_order.
+
+     Wrapped in #plan-steps so add/close/reorder re-render it via
+     hx-swap=outerHTML AND so the live-progress SSE stream (task ka-0000001793:
+     GET /plans/{id}/events) can swap the whole section's outerHTML the moment any
+     child bead changes — a step flips to done as soon as a crew agent closes it,
+     with no reload. Operator-only mutating controls are gated on $.IsOperator
+     (matched by the operatorOnly POST routes). Called with a data bag: PlanID,
+     Steps, Phases, HasPhases, StepsTotal/Closed/Open, PctDone, IsOperator, Error,
+     BasePath. */}}
+<section id="plan-steps" class="plan-steps" data-plan-id="{{.PlanID}}">
+  <div class="plan-steps-head">
+    {{/* aria-level 2 on the cockpit, under the plan's h1; the peek drawer passes
+         InPeek, and there the h3 sits under its h2 (gd-ddw0WBzm9S). */ -}}
+    <h3{{if not .InPeek}} aria-level="2"{{end}}>Build steps
+      {{if .StepsTotal}}<span class="meta">{{.StepsClosed}}/{{.StepsTotal}} done · {{.PctDone}}%</span>{{end}}
+    </h3>
+    {{if .StepsTotal}}
+    <div class="plan-progress" title="{{.StepsClosed}} of {{.StepsTotal}} steps done">
+      <div class="plan-progress-bar"><span style="width: {{.PctDone}}%"></span></div>
+      <span class="plan-progress-label">{{.PctDone}}%</span>
+    </div>
+    {{end}}
+  </div>
+
+  {{if .Notice}}
+  <p class="plan-steps-notice" role="status">{{.Notice}}</p>
+  {{end}}
+
+  {{if .Error}}
+  <p class="bead-actions-error" role="alert">{{.Error}}</p>
+  {{end}}
+
+  {{/* Phase-mislabel hint (ka-0000002630): flat steps titled "Phase N" that were
+       probably meant to be phase sub-epics. A phase is a child epic listed in
+       phase_order; a task merely titled "Phase N" renders as an ungrouped step,
+       which is what Matt saw. We name the offending steps and point at the fix
+       rather than silently reinterpreting them.
+
+       Operators are looking at this IN the viewer, so we NEVER hand them a shell
+       command (ka-0000004472, Matt: "we should never tell operators to use 'kd'
+       directly when we're in beads viewer" — the same applies to `gb`). For an
+       operator we point at the in-page GUI: the ＋ New phase button and the plan
+       agent. The CLI form is shown ONLY to a non-operator viewer (an agent /
+       headless caller), for whom the command IS the actionable path. */}}
+  {{if .PhaseHint}}
+  <p class="plan-phase-hint" role="note">
+    <strong>These steps look like phases, not tasks:</strong>
+    {{range $i, $t := .PhaseHint}}{{if $i}}, {{end}}“{{$t}}”{{end}}.
+    A phase is a child <em>epic</em> listed in the plan’s <code>phase_order</code>; a task titled “Phase N” renders as one more ungrouped step.
+    {{if .IsOperator}}Add a real phase with the <strong>＋ New phase</strong> button below, then ask the plan agent to move these steps into it.{{else}}Re-create each with <code>gb plan add-phase {{.PlanID}} --title "…"</code>, then move its steps into it.{{end}}
+  </p>
+  {{end}}
+
+  {{/* Ordered phase groups (each a sub-epic listed in phase_order). */}}
+  {{range $phase := .Phases}}
+  <section class="plan-phase{{if $phase.Closed}} is-done{{end}}" data-phase-id="{{$phase.ID}}">
+    <header class="plan-phase-head">
+      <span class="plan-phase-num" aria-hidden="true">{{if $phase.Closed}}✓{{else}}{{$phase.Number}}{{end}}</span>
+      {{/* The phase's arms, or "no arms yet" for an epic phase without them
+           (gd-YvWv4mR4fu); a poured molecule cannot bear arms and shows neither. */}}
+      {{if $phase.Heraldry}}<span class="heraldry-slot">{{heraldry $phase.Heraldry 24}}</span>{{else if $phase.ArmsBearer}}<span class="heraldry-slot"><span class="chip arms-none" title="No arms yet: the plan gardener chooses them">no arms yet</span></span>{{end}}
+      <a class="plan-phase-title" href="{{$.BasePath}}/plans/{{$phase.ID}}" title="open this phase as its own plan">{{$phase.Title}}</a>
+      <span class="chip chip-status chip-status-{{$phase.Status}}">{{$phase.Status}}</span>
+      {{if $phase.Assignee}}<span class="plan-tl-assignee" title="phase owner">{{agentLiveIcon $phase.Assignee}}{{agentLink $phase.Assignee}}</span>{{end}}
+      {{if $phase.StepsTotal}}<span class="plan-phase-progress meta" title="{{$phase.StepsClosed}} of {{$phase.StepsTotal}} steps done">{{$phase.StepsClosed}}/{{$phase.StepsTotal}} · {{$phase.PctDone}}%</span>{{end}}
+      {{/* Poured-phase provenance chip (ka-0000002220): a phase whose container is
+           a poured molecule links back to the recipe it was poured from and lists
+           its applied vars. Rendered INLINE on this header row — the info-density
+           gate forbids a new card row. Suppressed for a hand-authored epic phase
+           (no FormulaID). The chip's title shows the applied var bindings on hover;
+           the linked recipe id/title is the deep-link. */}}
+      {{if $phase.FormulaID}}
+      <a class="chip plan-phase-provenance" href="{{$.BasePath}}/{{$phase.FormulaID}}"
+         title="Poured from formula {{$phase.FormulaID}}{{if $phase.FormulaTitle}} — {{$phase.FormulaTitle}}{{end}}{{if $phase.AppliedVars}} · applied vars: {{range $i, $v := $phase.AppliedVars}}{{if $i}}, {{end}}{{$v.Name}}={{$v.Value}}{{end}}{{end}}">
+        ⚗ {{if $phase.FormulaTitle}}{{$phase.FormulaTitle}}{{else}}{{$phase.FormulaID}}{{end}}{{if $phase.AppliedVars}} · {{len $phase.AppliedVars}} var{{if ne (len $phase.AppliedVars) 1}}s{{end}}{{end}}
+      </a>
+      {{end}}
+      {{if $.IsOperator}}
+      <span class="plan-phase-reorder">
+        <button type="button" class="bead-action plan-phase-up" title="Move phase up"
+                {{if $phase.IsFirst}}disabled{{else}}hx-post="{{$.BasePath}}/plans/{{$.PlanID}}/phases/{{$phase.ID}}/reorder?dir=up" hx-target="#plan-steps" hx-swap="outerHTML"{{end}}>▲</button>
+        <button type="button" class="bead-action plan-phase-down" title="Move phase down"
+                {{if $phase.IsLast}}disabled{{else}}hx-post="{{$.BasePath}}/plans/{{$.PlanID}}/phases/{{$phase.ID}}/reorder?dir=down" hx-target="#plan-steps" hx-swap="outerHTML"{{end}}>▼</button>
+      </span>
+      {{end}}
+    </header>
+    {{if $phase.Steps}}
+    <ol class="plan-timeline plan-phase-steps">
+      {{range $step := $phase.Steps}}{{template "plan_step_row" (dict "step" $step "PlanID" $.PlanID "IsOperator" $.IsOperator "BasePath" $.BasePath)}}{{end}}
+    </ol>
+    {{else}}
+    <p class="empty plan-phase-empty">No steps in this phase yet.</p>
+    {{end}}
+  </section>
+  {{end}}
+
+  {{/* Unphased loose steps (all direct issue children when the plan has no
+       phases; the leftover direct children when it does). */}}
+  {{if .Steps}}
+  {{if .HasPhases}}<h4 class="plan-unphased-head"{{if not .InPeek}} aria-level="3"{{end}}>Other steps</h4>{{end}}
+  <ol class="plan-timeline">
+    {{range $step := .Steps}}{{template "plan_step_row" (dict "step" $step "PlanID" $.PlanID "IsOperator" $.IsOperator "BasePath" $.BasePath)}}{{end}}
+  </ol>
+  {{else if not .HasPhases}}
+  <p class="empty empty-yet">No steps yet.{{if .IsOperator}} Add the first one below, or nudge the plan agent to draft them.{{end}}</p>
+  {{end}}
+
+  {{if .IsOperator}}
+  <form class="plan-step-add"
+        hx-post="{{.BasePath}}/plans/{{.PlanID}}/steps"
+        hx-target="#plan-steps"
+        hx-swap="outerHTML"
+        hx-on::after-request="if(event.detail.successful) this.reset()"
+        hx-disabled-elt="find input, find button">
+    <input type="text" name="title" class="plan-step-add-input"
+           placeholder="Add a step…" aria-label="New step title" maxlength="500" required>
+    <button type="submit" class="bead-action plan-step-add-btn">Add step</button>
+  </form>
+  {{/* Create-phase: the phase_order GROW verb (3e, ka-0000007445). Mints a new
+       phase sub-epic and appends it to the plan's phase_order so the timeline
+       grows a new (empty) phase section; the operator then moves steps into it
+       via the ▲▼ reorder controls. A native disclosure keeps the form out of
+       the way until wanted. */}}
+  <details class="plan-newphase">
+    <summary class="bead-action plan-newphase-toggle" title="Add a phase to group steps">+ New phase</summary>
+    <form class="plan-newphase-form"
+          hx-post="{{.BasePath}}/plans/{{.PlanID}}/phases"
+          hx-target="#plan-steps"
+          hx-swap="outerHTML"
+          hx-on::after-request="if(event.detail.successful) this.reset()"
+          hx-disabled-elt="find input, find button">
+      <input type="text" name="title" class="plan-newphase-input"
+             placeholder="Phase name (e.g. Research & design)…" aria-label="New phase title" maxlength="500" required>
+      <button type="submit" class="bead-action plan-newphase-btn">Add phase</button>
+    </form>
+  </details>
+  {{/* "⚗ Pour a formula" — drop a reusable formula in as a phase (epic
+       ka-0000000759, Phase 3). Self-contained disclosure; its own hx-targets
+       (#plan-pour-panel / #plan-pour-body) keep the pour flow — including the
+       dry-run Preview (ka-0000001848) — out of the #plan-steps swap, so a
+       preview never disturbs the timeline. */}}
+  {{template "plan_pour" (dict "PlanID" .PlanID "IsOperator" .IsOperator "BasePath" .BasePath)}}
+  {{end}}
+</section>
+{{end}}
+
+{{/* plan_step_row — one timeline <li>. Extracted so flat steps and phase-group
+     steps render identically (ka-0000005926). Called with a dict: step (a
+     planStepView), PlanID, IsOperator, BasePath.
+
+     Full-row contract (S4 ka-0000001060, Q3 ka-0000000700): each row carries its
+     stable creation-order Number (never reshuffles as steps close — the marker
+     shows it even on done steps via the ✓ swap), assignee (agent-linkified), the
+     linked MR pill, open blocked-by chips, the § bundle-section cross-ref chip
+     (ask 2), and created/closed stamps. */}}
+{{define "plan_step_row"}}
+{{$step := .step}}
+<li id="step-{{$step.ID}}" class="plan-tl-step{{if $step.Closed}} is-done{{else if eq $step.Status "in_progress"}} is-active{{end}}" data-bead-id="{{$step.ID}}"{{if $step.SectionRef.Slug}} data-section-slug="{{$step.SectionRef.Slug}}"{{end}}>
+  <span class="plan-tl-marker" aria-hidden="true">{{if $step.Closed}}✓{{else}}{{$step.Number}}{{end}}</span>
+  {{if .IsOperator}}
+  {{/* Reorder ▲▼ within this step's group (flat list or one phase) — rewrites
+       the parent epic's fields.step_order (3e, ka-0000007445). Disabled at the
+       group boundary; the whole #plan-steps swaps so numbers re-flow. */}}
+  <span class="plan-tl-reorder">
+    <button type="button" class="bead-action plan-step-up" title="Move step up"
+            {{if $step.IsFirst}}disabled{{else}}hx-post="{{.BasePath}}/plans/{{.PlanID}}/steps/{{$step.ID}}/reorder?dir=up" hx-target="#plan-steps" hx-swap="outerHTML"{{end}}>▲</button>
+    <button type="button" class="bead-action plan-step-down" title="Move step down"
+            {{if $step.IsLast}}disabled{{else}}hx-post="{{.BasePath}}/plans/{{.PlanID}}/steps/{{$step.ID}}/reorder?dir=down" hx-target="#plan-steps" hx-swap="outerHTML"{{end}}>▼</button>
+  </span>
+  {{end}}
+  <div class="plan-tl-body">
+    <div class="plan-tl-line">
+      <a class="plan-tl-title" href="{{.BasePath}}/{{$step.ID}}">{{displayTitle $step.ShortTitle $step.Title}}</a>
+      {{if .IsOperator}}
+      <span class="plan-tl-actions">
+        {{/* Reword the step in place (3e, ka-0000007445): a native disclosure
+             reveals the edit form; Save POSTs the new title write-through and
+             re-renders #plan-steps (which closes the disclosure). No separate
+             GET-editor route — the fragment always re-renders authoritative. */}}
+        <details class="plan-step-reword">
+          <summary class="bead-action plan-step-reword-toggle" title="Reword this step">Edit</summary>
+          <form class="plan-step-reword-form"
+                hx-post="{{.BasePath}}/plans/{{.PlanID}}/steps/{{$step.ID}}/title"
+                hx-target="#plan-steps" hx-swap="outerHTML"
+                hx-disabled-elt="find input, find button">
+            <input type="text" name="title" value="{{$step.Title}}" class="plan-step-reword-input"
+                   aria-label="Step title" maxlength="500" required>
+            <button type="submit" class="bead-action">Save</button>
+          </form>
+        </details>
+        {{if $step.Closed}}
+        <button type="button" class="bead-action plan-step-reopen"
+                hx-post="{{.BasePath}}/plans/{{.PlanID}}/steps/{{$step.ID}}/reopen"
+                hx-target="#plan-steps" hx-swap="outerHTML"
+                title="Reopen this step">Reopen</button>
+        {{else}}
+        {{/* Dispatch — hand THIS step to the plan's gardener (spawning one if
+             none is bound). Routes through promptPlanAssistant, the same
+             nudge-live / wake-parked / spawn-if-none primitive the plan-agent
+             message box uses, so no second unwatched agent is minted; the
+             gardener then dispatches a crew agent onto the step. Open steps
+             only (Matt's ask, thread ka-0000002484). */}}
+        <button type="button" class="bead-action plan-step-dispatch"
+                hx-post="{{.BasePath}}/plans/{{.PlanID}}/steps/{{$step.ID}}/dispatch"
+                hx-target="#plan-steps" hx-swap="outerHTML"
+                hx-confirm="Hand this step to the plan gardener (spawning one if needed)? It will dispatch a crew agent onto it."
+                title="Hand this step to the plan gardener — it dispatches a crew agent onto it, spawning a gardener if none is bound">Dispatch</button>
+        <button type="button" class="bead-action plan-step-close"
+                hx-post="{{.BasePath}}/plans/{{.PlanID}}/steps/{{$step.ID}}/close"
+                hx-target="#plan-steps" hx-swap="outerHTML"
+                title="Mark this step done">Done</button>
+        {{end}}
+      </span>
+      {{end}}
+    </div>
+    <div class="plan-tl-meta">
+      <span class="chip chip-type plan-step-type">{{$step.Type}}</span>
+      <span class="chip chip-status chip-status-{{$step.Status}}">{{$step.Status}}</span>
+      {{if $step.Assignee}}<span class="plan-tl-assignee" title="assignee">{{agentLiveIcon $step.Assignee}}{{agentLink $step.Assignee}}</span>{{end}}
+      {{if $step.MRState}}<a class="chip-mr chip-mr-{{$step.MRState}}"{{if $step.MRURL}} href="{{$step.MRURL}}" target="_blank" rel="noopener"{{end}} title="merge request: {{$step.MRState}}">mr: {{$step.MRState}}</a>{{end}}
+      {{if $step.SectionRef.Label}}<a class="chip plan-tl-section" href="{{.BasePath}}/{{$step.SectionRef.Href}}" title="plan section: {{$step.SectionRef.Label}}">§ {{$step.SectionRef.Label}}</a>{{end}}
+      {{range $step.BlockedBy}}{{if .IsEscalation}}<a class="chip plan-tl-blocked plan-tl-blocked-esc" href="{{$.BasePath}}/{{.ID}}" title="blocked by escalation {{.ID}}{{if .Title}}: {{.Title}}{{end}} — a privileged operator must act">⛔ escalation{{if .OperationType}}: {{.OperationType}}{{end}}</a>{{else}}<a class="chip plan-tl-blocked" href="{{$.BasePath}}/{{.ID}}" title="blocked by {{.ID}}{{if .Title}}: {{.Title}}{{end}}">⛔ {{.ID}}</a>{{end}}{{end}}
+      <span class="plan-tl-stamps meta">
+        {{if $step.CreatedAgo}}<span title="created {{$step.CreatedAtRFC}}">created {{$step.CreatedAgo}}</span>{{end}}
+        {{if $step.ClosedAgo}}<span title="closed {{$step.ClosedAtRFC}}"> · closed {{$step.ClosedAgo}}</span>{{end}}
+      </span>
+    </div>
+  </div>
+</li>
+{{end}}

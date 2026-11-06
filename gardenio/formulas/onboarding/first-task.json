@@ -1,0 +1,97 @@
+{
+  "description": "Give a local agent its first task and watch one loop from bead to PR: pick something small, kd create it with the project label, hand it to the agent, and review the PR. The manual form is the First task section of .claude/skills/gardenio/SKILL.md.",
+  "phase": "liquid",
+  "vars": [
+    {
+      "name": "project",
+      "required": true,
+      "description": "Project the task belongs to (the type:project bead name)"
+    },
+    {
+      "name": "role",
+      "default": "local",
+      "description": "Role of the agent that does the task. `crew` stands in until the local role lands (gd-SzPJDNTBXS)"
+    }
+  ],
+  "steps": [
+    {
+      "id": "suggest",
+      "title": "Suggest two small, checkable first tasks in the {{project}} repo",
+      "short_title": "suggest two first tasks",
+      "type": "task",
+      "description": "Read the repo and find two small tasks whose result is easy to check: a typo, a missing test, a README section. Comment both on the pick-task step, each with a one-line title and a sentence on what done looks like."
+    },
+    {
+      "id": "pick-task",
+      "title": "Pick the first task for {{project}}",
+      "short_title": "pick the first task",
+      "gate": {
+        "type": "decision",
+        "prompt": "Which first task should the agent do?",
+        "options": [
+          {
+            "id": "first",
+            "label": "The first suggestion"
+          },
+          {
+            "id": "second",
+            "label": "The second suggestion"
+          },
+          {
+            "id": "own",
+            "label": "My own task (describe it in the answer)"
+          }
+        ],
+        "timeout": "72h"
+      },
+      "needs": [
+        "suggest"
+      ],
+      "description": "Decision for the person. The suggestions are on this step's comments."
+    },
+    {
+      "id": "create-bead",
+      "title": "Create the first task bead in {{project}}",
+      "short_title": "create the task bead",
+      "type": "task",
+      "needs": [
+        "pick-task"
+      ],
+      "description": "Create the task chosen at pick-task, labelled to the project so it shows in `gb ready`:\n\n```sh\nkd create \"<imperative title>\" --type task -l project:{{project}} \\\n  --short-title \"<40 characters or fewer>\" \\\n  -d '<what done looks like, in one or two sentences>'\n```\n\nComment the new bead id on this step."
+    },
+    {
+      "id": "assign",
+      "title": "Hand the first task to the {{project}} agent",
+      "short_title": "hand the task to the agent",
+      "type": "task",
+      "needs": [
+        "create-bead"
+      ],
+      "description": "Either start an agent pre-assigned to it:\n\n```sh\ngb agent start --local --role {{role}} --project {{project}} --task <bead-id>\n```\n\nor let a running agent find it with `gb ready` and then `kd claim <bead-id>`. Close this step once `kd show <bead-id>` is in_progress with the agent as assignee."
+    },
+    {
+      "id": "confirm-loop",
+      "title": "Confirm the agent opened and linked a PR for the first task",
+      "short_title": "confirm the PR is linked",
+      "type": "task",
+      "needs": [
+        "assign"
+      ],
+      "description": "The agent works on a branch, opens a PR, links it with `gb mr link <bead-id> <url>`, closes the bead and runs `gb stop`. Check:\n\n```sh\nkd show <bead-id>    # closed, with the PR linked\n```\n\nComment the PR URL on this step."
+    },
+    {
+      "id": "review-pr",
+      "title": "Review the first PR and look at it in Slack",
+      "short_title": "review the PR in Slack",
+      "type": "task",
+      "gate": {
+        "type": "manual",
+        "timeout": "72h"
+      },
+      "needs": [
+        "confirm-loop"
+      ],
+      "description": "Human step. Review and merge (or close) the PR on the git host. In Slack, look at the task's thread and the agent card at its top; the bead is also in the viewer. Then pick a next step: add a second agent, trigger a decision with `gb decision create` and answer it in Slack, or try an escalation."
+    }
+  ]
+}

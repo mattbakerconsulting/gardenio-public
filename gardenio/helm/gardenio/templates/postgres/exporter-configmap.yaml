@@ -1,0 +1,228 @@
+{{- /*
+postgres_exporter config (gd-cawNAc0iU7): setup.sql, run by the
+exporter-setup container as the postgres superuser, and queries.yaml, the
+exporter's custom queries (--extend.query-path).
+
+The exporter connects to postgres.database (beads, which has
+pg_stat_statements) and auto-discovers every other database. `master: true`
+queries read cluster-wide views and run once, on beads; the rest run once
+per database, so they label by current_database().
+
+Series bound with the defaults (50 statements, 20+10 tables, 3 databases):
+  pg_top_statements  6 x <=50                       <=  300
+  pg_active_statements 2 x <=10                       <=   20
+  pg_top_tables     12 x <=30 tables x 3 databases  <= 1080
+  pg_activity        3 x (db, app, state, wait) groups, ~20-60 in practice
+  pg_cpu             6
+  built-in collectors (database, stat_database, locks, stat_activity,
+  bgwriter, wal, roles, ...) ~300, measured on PG 17 with 5 databases.
+The noisy built-ins (settings, stat_user_tables, statio_user_tables) are off.
+*/ -}}
+{{- if and .Values.postgres.enabled .Values.postgres.exporter.enabled }}
+{{- $e := .Values.postgres.exporter }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.postgres.fullname" . }}-exporter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.postgres.labels" . | nindent 4 }}
+data:
+  # EXPORTER_PASSWORD=... psql -v role=... -f setup.sql. Idempotent. The
+  # password comes from the environment (\getenv, psql 15+), never psql's
+  # argv. Utility statements are not normalized, so without the SETs the ALTER
+  # ROLE below would record the password in pg_stat_statements, and in the
+  # server log if it ran logged, slow, or failed (log_min_error_statement).
+  setup.sql: |
+    \getenv password EXPORTER_PASSWORD
+    SET pg_stat_statements.track_utility = off;
+    SET log_statement = 'none';
+    SET log_min_duration_statement = -1;
+    SET log_min_error_statement = panic;
+    SELECT format('CREATE ROLE %I LOGIN', :'role')
+     WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role') \gexec
+    ALTER ROLE :"role" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+      CONNECTION LIMIT 8 PASSWORD :'password';
+    GRANT pg_monitor TO :"role";
+    ALTER ROLE :"role" SET default_transaction_read_only = on;
+    ALTER ROLE :"role" SET statement_timeout = '10s';
+    ALTER ROLE :"role" SET lock_timeout = '1s';
+    {{- if .Values.postgres.pgStatStatements.enabled }}
+
+    CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+    {{- end }}
+
+    -- k3s scrapes no kubelet or cAdvisor CPU series, so the database reports
+    -- its own: the container cgroup's cpu.stat and the node's /proc/stat
+    -- (procfs is not namespaced). SECURITY DEFINER reads exactly these two
+    -- files; the role gets EXECUTE, never pg_read_server_files.
+    CREATE SCHEMA IF NOT EXISTS gardenio_monitor;
+    REVOKE ALL ON SCHEMA gardenio_monitor FROM PUBLIC;
+    GRANT USAGE ON SCHEMA gardenio_monitor TO :"role";
+    CREATE OR REPLACE FUNCTION gardenio_monitor.cpu_counters(
+        OUT container_usage_seconds float8,
+        OUT container_throttled_seconds float8,
+        OUT container_throttled_periods float8,
+        OUT node_busy_seconds float8,
+        OUT node_steal_seconds float8,
+        OUT node_seconds float8)
+      LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+    AS $fn$
+    DECLARE
+      cg text := pg_read_file('/sys/fs/cgroup/cpu.stat', true);
+      t float8[];
+    BEGIN
+      container_usage_seconds := (regexp_match(cg, '(?:^|\n)usage_usec (\d+)'))[1]::float8 / 1e6;
+      container_throttled_seconds := (regexp_match(cg, '(?:^|\n)throttled_usec (\d+)'))[1]::float8 / 1e6;
+      container_throttled_periods := (regexp_match(cg, '(?:^|\n)nr_throttled (\d+)'))[1]::float8;
+      -- cpu user nice system idle iowait irq softirq steal, in USER_HZ (100/s)
+      t := (regexp_split_to_array(trim(split_part(pg_read_file('/proc/stat'), E'\n', 1)), '\s+'))[2:9]::float8[];
+      node_seconds := (t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7] + t[8]) / 100;
+      node_busy_seconds := node_seconds - (t[4] + t[5]) / 100;
+      node_steal_seconds := t[8] / 100;
+    END
+    $fn$;
+    REVOKE ALL ON FUNCTION gardenio_monitor.cpu_counters() FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION gardenio_monitor.cpu_counters() TO :"role";
+
+  queries.yaml: |
+    {{- if .Values.postgres.pgStatStatements.enabled }}
+    pg_top_statements:
+      master: true
+      cache_seconds: 30
+      # Every string literal in the label becomes '?': DML is already
+      # normalized to $n, but utility statements (ALTER ROLE ... PASSWORD)
+      # are stored verbatim. Stripped before truncating, so none is cut open.
+      query: |
+        SELECT datname, queryid,
+               left(regexp_replace(regexp_replace(query, '''[^'']*''', '''?''', 'g'), '\s+', ' ', 'g'), 120) AS query,
+               calls, exec_seconds, mean_exec_seconds, rows, shared_blks_hit, shared_blks_read
+          FROM (SELECT d.datname,
+                       s.queryid::text AS queryid,
+                       min(s.query) AS query,
+                       sum(s.calls) AS calls,
+                       sum(s.total_exec_time) / 1000 AS exec_seconds,
+                       sum(s.total_exec_time) / nullif(sum(s.calls), 0) / 1000 AS mean_exec_seconds,
+                       sum(s.rows) AS rows,
+                       sum(s.shared_blks_hit) AS shared_blks_hit,
+                       sum(s.shared_blks_read) AS shared_blks_read
+                  FROM pg_stat_statements s
+                  JOIN pg_database d ON d.oid = s.dbid
+                 WHERE s.queryid IS NOT NULL
+                 GROUP BY d.datname, s.queryid
+                 ORDER BY sum(s.total_exec_time) DESC
+                 LIMIT {{ $e.topStatements | int }}) top
+      metrics:
+        - datname: {usage: LABEL, description: Database}
+        - queryid: {usage: LABEL, description: pg_stat_statements queryid}
+        - query: {usage: LABEL, description: Normalized statement, first 120 characters}
+        - calls: {usage: COUNTER, description: Times executed}
+        - exec_seconds: {usage: COUNTER, description: Total execution time in seconds}
+        - mean_exec_seconds: {usage: GAUGE, description: Mean execution time since the stats reset}
+        - rows: {usage: COUNTER, description: Rows retrieved or affected}
+        - shared_blks_hit: {usage: COUNTER, description: Shared buffer hits}
+        - shared_blks_read: {usage: COUNTER, description: Shared blocks read from disk or OS cache}
+
+    # Copies of one statement running at once, for the pile-up budget
+    # (gd-ylgk1jBhLi): pg_activity groups by app and state, not by statement.
+    # query_id is pg_stat_statements' queryid (compute_query_id=auto computes
+    # it once the module is loaded). The top 10 groups only.
+    pg_active_statements:
+      master: true
+      query: |
+        SELECT coalesce(datname, '') AS datname,
+               query_id::text AS queryid,
+               coalesce(nullif(left(application_name, 48), ''), 'unset') AS application_name,
+               count(*) AS backends,
+               max(extract(epoch FROM now() - query_start)) AS max_age_seconds
+          FROM pg_stat_activity
+         WHERE backend_type = 'client backend' AND state = 'active'
+           AND query_id IS NOT NULL AND pid <> pg_backend_pid()
+         GROUP BY 1, 2, 3
+         ORDER BY count(*) DESC, min(query_start) ASC
+         LIMIT 10
+      metrics:
+        - datname: {usage: LABEL, description: Database}
+        - queryid: {usage: LABEL, description: pg_stat_statements queryid}
+        - application_name: {usage: LABEL, description: Client application_name, first 48 characters}
+        - backends: {usage: GAUGE, description: Active backends running this statement}
+        - max_age_seconds: {usage: GAUGE, description: Age of the oldest of them}
+    {{- end }}
+
+    pg_activity:
+      master: true
+      query: |
+        SELECT coalesce(datname, '') AS datname,
+               coalesce(nullif(left(application_name, 48), ''), 'unset') AS application_name,
+               coalesce(state, 'unknown') AS state,
+               coalesce(wait_event_type, 'none') AS wait_event_type,
+               count(*) AS connections,
+               coalesce(max(extract(epoch FROM now() - query_start)) FILTER (WHERE state = 'active'), 0) AS max_query_age_seconds,
+               coalesce(max(extract(epoch FROM now() - xact_start)), 0) AS max_xact_age_seconds
+          FROM pg_stat_activity
+         WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+         GROUP BY 1, 2, 3, 4
+      metrics:
+        - datname: {usage: LABEL, description: Database}
+        - application_name: {usage: LABEL, description: Client application_name, first 48 characters}
+        - state: {usage: LABEL, description: Backend state}
+        - wait_event_type: {usage: LABEL, description: What the backend waits on}
+        - connections: {usage: GAUGE, description: Client backends}
+        - max_query_age_seconds: {usage: GAUGE, description: Age of the oldest active query}
+        - max_xact_age_seconds: {usage: GAUGE, description: Age of the oldest open transaction}
+
+    pg_cpu:
+      master: true
+      query: SELECT * FROM gardenio_monitor.cpu_counters()
+      metrics:
+        - container_usage_seconds: {usage: COUNTER, description: CPU seconds used by the postgres container}
+        - container_throttled_seconds: {usage: COUNTER, description: Seconds the postgres container was CFS-throttled}
+        - container_throttled_periods: {usage: COUNTER, description: CFS periods in which the postgres container was throttled}
+        - node_busy_seconds: {usage: COUNTER, description: Node CPU seconds not idle or iowait, all CPUs}
+        - node_steal_seconds: {usage: COUNTER, description: Node CPU seconds stolen by the hypervisor}
+        - node_seconds: {usage: COUNTER, description: Node CPU seconds, all CPUs and states}
+
+    pg_top_tables:
+      cache_seconds: 60
+      query: |
+        WITH t AS (
+          SELECT s.relid,
+                 s.n_tup_ins + s.n_tup_upd + s.n_tup_del AS writes,
+                 pg_total_relation_size(s.relid) AS total_bytes
+            FROM pg_stat_user_tables s
+        ), picked AS (
+          (SELECT relid FROM t ORDER BY total_bytes DESC LIMIT {{ $e.topTablesBySize | int }})
+          UNION
+          (SELECT relid FROM t ORDER BY writes DESC LIMIT {{ $e.topTablesByWrites | int }})
+        )
+        SELECT current_database() AS datname,
+               s.schemaname, s.relname,
+               t.total_bytes,
+               pg_indexes_size(s.relid) AS index_bytes,
+               coalesce(pg_total_relation_size(nullif(c.reltoastrelid, 0)), 0) AS toast_bytes,
+               s.n_tup_ins, s.n_tup_upd, s.n_tup_del,
+               s.n_live_tup, s.n_dead_tup,
+               s.seq_scan, coalesce(s.idx_scan, 0) AS idx_scan,
+               s.autovacuum_count,
+               extract(epoch FROM now() - s.last_autovacuum) AS last_autovacuum_age_seconds
+          FROM picked p
+          JOIN t USING (relid)
+          JOIN pg_stat_user_tables s USING (relid)
+          JOIN pg_class c ON c.oid = p.relid
+      metrics:
+        - datname: {usage: LABEL, description: Database}
+        - schemaname: {usage: LABEL, description: Schema}
+        - relname: {usage: LABEL, description: Table}
+        - total_bytes: {usage: GAUGE, description: Table size including indexes and TOAST}
+        - index_bytes: {usage: GAUGE, description: Size of the table's indexes}
+        - toast_bytes: {usage: GAUGE, description: Size of the table's TOAST relation}
+        - n_tup_ins: {usage: COUNTER, description: Rows inserted}
+        - n_tup_upd: {usage: COUNTER, description: Rows updated}
+        - n_tup_del: {usage: COUNTER, description: Rows deleted}
+        - n_live_tup: {usage: GAUGE, description: Estimated live rows}
+        - n_dead_tup: {usage: GAUGE, description: Estimated dead rows}
+        - seq_scan: {usage: COUNTER, description: Sequential scans}
+        - idx_scan: {usage: COUNTER, description: Index scans}
+        - autovacuum_count: {usage: COUNTER, description: Autovacuum runs}
+        - last_autovacuum_age_seconds: {usage: GAUGE, description: Seconds since the last autovacuum, NaN if never}
+{{- end }}

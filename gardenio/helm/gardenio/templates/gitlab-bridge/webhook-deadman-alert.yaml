@@ -1,0 +1,156 @@
+{{- if and .Values.gitlabBridge.enabled .Values.gitlabBridge.metrics.prometheusRule.webhookDeadman.enabled }}
+{{- $cfg := .Values.gitlabBridge.metrics.prometheusRule.webhookDeadman }}
+# PrometheusRule for the gitlab-bridge INBOUND-WEBHOOK dark-hook deadman alert
+# (GAP-C of the non-AVA webhook carve-out ka-0000005632; the GitLab twin of the
+# jira-bridge webhook-deadman-alert.yaml).
+#
+# THE GITLAB DOOR OF THE CARVE-OUT. Inbound Jira and GitLab webhooks are a named,
+# permanent NON-AVA exception (operator decision, Matt 2026-06-03) accepted only
+# because it is compensated by logs + metrics. gitlab_webhook_metrics.go already
+# emits gardenio_gitlab_webhook_deliveries_total{outcome} — the raw receive-path
+# COUNTER — but a counter alone cannot tell "receiving nothing because the hook
+# is dark" from "receiving nothing because upstream is genuinely quiet": in the
+# fully-dark case (deregistered / mis-secreted hook) nothing increments it, so
+# there is no sample to alert on. The Jira side of this same carve-out went 100%
+# dark in prod for 8 days while every dashboard stayed green (bug ka-0000000426).
+# This gives the GitLab door the same deadman the Jira door already has.
+#
+# THE UNFIREABLE-ALERT TRAP (see the jira-bridge sibling for the lesson). The
+# alert must stay QUIET when upstream is genuinely quiet — no MR activity in the
+# window => no page — and fire only on "matter existed upstream and we received
+# nothing." So the gitlab-bridge Go-computes the whole verdict into a single 0/1
+# gauge on its :9092 /metrics endpoint (gitlab_webhook_deadman.go):
+#   gardenio_gitlab_webhook_dark — 1 while NO authenticated, well-formed inbound
+#     delivery has arrived within the deadman window AND an independent scan of
+#     the group's recently-updated merge requests still reports activity. The
+#     "authenticated" keying is what makes the wrong-secret case page: a bad
+#     X-Gitlab-Token produces only token_failed deliveries, which never refresh
+#     the liveness clock, so a live-but-mis-secreted hook reads as dark, not
+#     healthy.
+#   gardenio_gitlab_webhook_deliveries_total{outcome} — receive-path liveness by
+#     terminal outcome (processed|ignored|token_failed|bad_request|error); a
+#     still-arriving-but-rejected stream is visible here rather than as silence.
+#   gardenio_gitlab_webhook_evaluations_total{result} — completed monitor cycles;
+#     the deadman signal for the monitor loop itself.
+#   gardenio_gitlab_webhook_upstream_matches — context/observability, not paged on.
+#
+# The verdict is folded entirely into the gauge (not a multi-term PromQL join)
+# so the dark expr is a trivial ==1 — a set-per-cycle gauge cannot silently
+# suppress the page via an absent series inside an `and`, the failure mode the
+# sibling Helm tests explicitly guard against. A companion deadman leg catches
+# the OTHER failure shape — the monitor not evaluating at all (pod down / hung
+# goroutine), which would freeze the dark gauge at its last value — via
+# increase()==0 or absent() on the evaluation heartbeat. Both OFF by default;
+# per-env overlays opt in. Requires the monitoring.coreos.com/v1 PrometheusRule
+# CRD. NOTE: the monitor only runs when GITLAB_GROUP_ID is set (the upstream-
+# activity confirmation arm needs a group scope) — enable this rule only where
+# the bridge has a group configured.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-gitlab-bridge-webhook-deadman
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gitlab-bridge
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.gitlab_webhook_deadman
+      interval: 1m
+      rules:
+        - alert: GitLabWebhookDark
+          # The monitor Go-computes the full verdict (no authenticated delivery
+          # in the window + upstream MR activity > 0) into the gauge, so the expr
+          # is a plain ==1 with a max_over_time window so a single flapping scrape
+          # does not clear it prematurely; the `for:` hold rides out scrape gaps.
+          # window and for are configurable via values.
+          expr: |
+            max_over_time(gardenio_gitlab_webhook_dark[{{ $cfg.window | default "15m" }}]) == 1
+          for: {{ $cfg.for | default "10m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gitlab-bridge
+            subsystem: inbound_webhook
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "GitLab inbound webhook is dark — 0 authenticated deliveries received while MR activity exists upstream"
+            description: |
+              The gitlab-bridge received NO authenticated, well-formed inbound
+              webhook delivery within the deadman window while an independent
+              scan of the group's recently-updated merge requests
+              (gardenio_gitlab_webhook_upstream_matches) still reports recent
+              activity. The whole webhook surface — @gardenio mentions, MR review
+              comments, F3 re-spawn, merge/pipeline sync — is silently dark:
+              matter is happening in GitLab that the bridge is not receiving.
+              This is the GitLab door of the non-AVA webhook carve-out; the Jira
+              door has the same deadman (it went 100% dark in prod for 8 days
+              while every dashboard stayed green before it was added).
+
+              IMPORTANT: token failures do NOT clear this alert — a wrong secret
+              in the GitLab webhook console looks like a working hook from
+              GitLab's side but only ever produces token_failed deliveries, which
+              never refresh the receive-liveness clock. So this fires on both
+              "hook unregistered" and "hook registered but mis-secreted."
+
+              Triage: check gardenio_gitlab_webhook_deliveries_total{outcome} — a
+              nonzero token_failed with zero processed means a wrong secret
+              (rotate/realign GITLAB_WEBHOOK_SECRET vs the GitLab webhook
+              console); all outcomes flat at zero means the webhook is not
+              registered at all (register it: GitLab project/group Settings ->
+              Webhooks, URL https://<gitlab-bridge webhook host>/webhook).
+              Confirm the traefik webhooks entryPoint + DNS + route are healthy
+              (the sibling jira-bridge receives on the same entryPoint). Full
+              runbook: task ka-0000005632 / bug ka-0000000426.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000005632)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        - alert: GitLabWebhookMonitorDeadman
+          # The dark gauge only speaks when the monitor is RUNNING. This leg
+          # catches the opposite shape — the monitor loop not evaluating at all
+          # (pod down, hung goroutine, crash-loop) — which would otherwise freeze
+          # the dark gauge at its last value and silently suppress the page.
+          # evaluations_total is incremented on every monitor cycle (ok|
+          # scan_error) and baselined to 0 at startup, so a live-but-erroring
+          # monitor keeps this quiet while a dead/absent monitor fires. absent()
+          # covers the never-scraped / crash-before-first-scrape case an
+          # increase() alone would miss.
+          expr: |
+            increase(gardenio_gitlab_webhook_evaluations_total[{{ $cfg.deadmanWindow | default "15m" }}]) == 0
+            or absent(gardenio_gitlab_webhook_evaluations_total)
+          for: {{ $cfg.deadmanFor | default "10m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gitlab-bridge
+            subsystem: inbound_webhook
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "GitLab webhook deadman monitor is not evaluating — the dark detector itself is down"
+            description: |
+              gardenio_gitlab_webhook_evaluations_total has not increased over the
+              deadman window (or the series is absent) — the gitlab-bridge
+              inbound-webhook deadman monitor is not completing evaluation cycles.
+              This is the dead/hung-monitor shape the dark gauge cannot see (the
+              gauge only updates while the monitor runs): a down pod, a hung
+              goroutine, or a crash-loop. While this fires, the GitLabWebhookDark
+              detector is blind — treat it as "webhook liveness is unmonitored,"
+              not "webhook is healthy."
+
+              Triage: check the gitlab-bridge pod is Running and not
+              crash-looping (kubectl get pods -l
+              app.kubernetes.io/component=gitlab-bridge); check its logs for a
+              panic; confirm the :9092 /metrics endpoint is scrapeable; confirm
+              GITLAB_GROUP_ID is set (the monitor does not run without it). Full
+              runbook: task ka-0000005632 / bug ka-0000000426.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000005632)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

@@ -1,0 +1,1981 @@
+name: ci
+
+on:
+  push:
+    # THE RELEASE TAG, NOT MAIN (owner 2026-11-03: "we don't care for ci on
+    # main, rather on the release branch"; "Logically we should get rid of
+    # most main head testing for this exact reason; it will never finish").
+    # Main moves every few minutes, so a main push run was nearly always
+    # replaced before it finished: of the last 30 ci.yml main push runs 19
+    # were cancelled and 9 succeeded. release-cut.sh, which tagged only a
+    # commit with a green main run, kept cutting commits hours old. Now the
+    # cut tags main's head, this workflow runs on that tag push, and
+    # release-deploy.sh rule 4 rolls the tag only once this run (beside
+    # checks.yml's and images.yml's) is green. The nightly `schedule` below is
+    # the one full main-head run a day.
+    #
+    # A tag push is a full run everywhere below: its own concurrency group,
+    # never cancelled, and every path gate open, exactly like
+    # workflow_dispatch and schedule -- except the gardenhub browser suite,
+    # which a tag runs only when a UI path changed since the newest earlier
+    # tag whose suite passed (gd-rmHsVjmKse; the `gate` job's outputs and
+    # .github/actions/last-tag-base). `before` means nothing on a tag push,
+    # and .github/actions/{superseded,last-run-base} answer false / empty for
+    # a ref that is not a branch. scripts/check-main-concurrency.py and
+    # scripts/check-ci-draft-gate.py prove it.
+    #
+    # The `paths-ignore` list that sat here went with the main trigger: path
+    # filters are not evaluated for tag pushes, and a release tests the whole
+    # tree. Notes below that cite it describe main-push history.
+    tags: ['20*'] # calver release tags, e.g. 2026.307.1, as images.yml
+  pull_request:
+    # PULL REQUESTS RUN THE LIGHT TIER ONLY (owner rule 2026-10-31; Task 7.3
+    # part B, gd-19ECZxvFQw; root CLAUDE.md "CI on pull requests"). Every
+    # heavy job below ANDs `github.event_name != 'pull_request'` into its
+    # `if:`, so a PR push, draft or ready, runs only the gate jobs and
+    # `draft-light`. The heavy jobs run on a release tag push, the nightly
+    # and dispatch.
+    # `ready_for_review` and `converted_to_draft` are deliberately absent: a
+    # PR's draft state no longer changes what runs, so flipping it needs no
+    # run, and the head's synchronize run is the one the merge desk reads.
+    # scripts/check-ci-draft-gate.py guards all of this.
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+  # NIGHTLY FULL RUN (gd-2kZxn16TaS). The PR-side savings in this plan
+  # (gd-WFMvg9sDKE: the PR light tier, path gates, supersession) all decide NOT to
+  # run something; this is where everything they skip still runs, once a day,
+  # on main. `schedule` is treated exactly like `workflow_dispatch` everywhere
+  # below: its own concurrency group per run, and every path gate's
+  # dispatch arm also lets `schedule` through, because paths-filter has no
+  # base to diff a scheduled run against. scripts/check-ci-draft-gate.py
+  # guards that every heavy job runs on it.
+  #
+  # 10:43Z: an odd minute (on-the-hour crons queue behind every other repo's),
+  # clear of the 09:17Z e2e nightly (e2e.yml) and of the ~04:00Z / ~16:00Z
+  # release windows. Same cron in checks.yml.
+  schedule:
+    - cron: '43 10 * * *'
+
+# ONE GROUP PER RUN FOR A RELEASE TAG (owner 2026-11-03). Main pushes no
+# longer run this workflow (see `on.push`), so the shared "<workflow>-main"
+# group of gd-RZopn9lf5I, which batched them by letting the newest push
+# replace the waiting one, is gone with them. That batching is why most
+# main runs never finished: under a steady stream of merges the waiting run
+# was usually replaced (19 of the last 30 ci.yml main push runs cancelled).
+#
+# How a group behaves: it holds at most one RUNNING and one PENDING run, and a
+# new run always replaces the PENDING one (GitHub cancels it) whatever
+# cancel-in-progress says; cancel-in-progress governs only the RUNNING one.
+#
+# Keys, per event:
+#   pull_request        per PR (github.ref): a newer push cancels the older
+#                       run. From gd-gw9mSq9Qtm to part B (gd-19ECZxvFQw) the
+#                       key was split by draft state, because a draft run and
+#                       a ready_for_review run did different work and, with
+#                       one slot, the draft run cancelled the ready one on PR
+#                       #1503. Every PR run is now the light tier and
+#                       `ready_for_review` starts none, so one slot per PR is
+#                       right again. scripts/check-ci-draft-gate.py guards
+#                       the PR arm.
+#   workflow_dispatch / schedule / a tag push
+#                       per run (github.run_id): a deliberate run, the nightly
+#                       and a release tag are never evicted, nor evict one.
+#                       The tag used to fall through to per-commit
+#                       (github.sha), so a second tag on the same commit could
+#                       share its slot; release-deploy.sh reads this run, so
+#                       nothing may replace it.
+#   anything else       per commit (github.sha). No other event reaches it.
+#
+# cancel-in-progress is TRUE only for pull_request; a tag run is never
+# cancelled. scripts/check-main-concurrency.py evaluates this block for each
+# event.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')) && github.run_id || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # go.work pins 1.25.12; keep CI on the same minor as the Dockerfiles.
+  #
+  # EXACT PATCH, deliberately. "1.25" makes setup-go resolve to the newest
+  # patch at job time, which is how this pool was running go1.25.14 against a
+  # go.work that says 1.25.12. That is harmless for the language version, but
+  # not for the build cache: the Go release patch is part of every action ID
+  # in GOCACHE, so the day upstream ships 1.25.15 every entry on every CI node
+  # becomes unreachable at once, and the whole pool goes cold in the same
+  # hour. With the cache now node-local and load-bearing for queue depth
+  # (gardenio/helm/ci/README.md), that is a cliff worth not falling off by
+  # accident.
+  #
+  # Bumping is therefore a normal reviewed change, and the cost is one cold
+  # build per module per node. Bump here and in checks.yml together.
+  GO_VERSION: "1.25.14"
+
+jobs:
+  # ── Is this run already obsolete? ───────────────────────────────────────────
+  # Measured 2026-09-22 03:05Z: of 34 heavy jobs queued, 26 belonged to nine
+  # pushes to main whose shas were ALREADY ANCESTORS OF THE MAIN TIP. ci.yml is
+  # the single biggest block of that -- 427 wasted heavy node-minutes per 24h
+  # (gd-Y0nPTua3Gj) -- because the per-sha concurrency group of the time
+  # never superseded a main push, so main taking nine commits in 22 minutes
+  # buys nine full non-cancellable build matrices of which one matters. Raising
+  # the ceiling does not touch this: ci_max_nodes 8->11 with heavy maxRunners
+  # 7->10 pinned at 10/10 within seconds and the queue stayed 34 deep.
+  #
+  # ── WHY THIS IS A GATE JOB AS WELL AS A CONCURRENCY GROUP ───────────────────
+  # This job was written when main pushes had per-sha groups, because a shared
+  # group had caused gd-jrNLZaVGhb. Main pushes now share one group again
+  # (gd-RZopn9lf5I; see the comment above `concurrency:` for why that is safe
+  # now). The group alone is not enough: it stops a third run from starting,
+  # but the one that does start may already have a newer push waiting behind
+  # it, and only this check notices that and skips the heavy work the waiting
+  # run will do anyway. Keep both.
+  #
+  # ── WHY IT ASKS "DOES A NEWER RUN EXIST", NOT "HAS THE TIP MOVED" ───────────
+  # A tip-of-main staleness guard is the obvious spelling and it silently loses
+  # coverage. `paths-ignore` above stops a run from being CREATED at all, not
+  # merely from doing work -- measured: zero ci.yml runs on main carry
+  # conclusion `skipped`, and 9 of the last 25 main commits have no ci.yml run
+  # record whatsoever. So: push A touches kbeads, push B touches only docs and
+  # creates no run, A's tip-guard sees the tip has moved and exits, and NOBODY
+  # EVER BUILDS A'S CHANGE. Asking whether a newer *run* exists closes that in
+  # both directions for `build + test (go)`, which every push run that exists
+  # runs over the whole tree, so a newer one genuinely covers every
+  # predecessor. It does NOT hold for the jobs path-gated per push (rust,
+  # gardenhub-browser, lands-conformance): a newer run whose own filter said
+  # no never runs them. Those ignore this job's verdict and re-check with
+  # `job:` instead (gd-025MCE7PhK; the note on the `rust` job's `if:`).
+  #
+  # ── FAILING OPEN IS THE WHOLE DESIGN ────────────────────────────────────────
+  # This gate can only ever SKIP work it has positively proven redundant: a
+  # newer push run exists for this branch AND `compare` says its commit is
+  # strictly `ahead` of ours. Every other path -- API error, unparseable
+  # response, ambiguous history, non-branch ref, anything but `push` -- returns
+  # false and builds. The dependent jobs use `!cancelled()` rather than the
+  # default needs-succeeded, so even this job FAILING or being unschedulable
+  # leaves `superseded` empty and lets the build proceed. ci.yml is main's only
+  # build signal; a guard that can withhold it is not worth 427 node-minutes.
+  #
+  # Cost: one light-tier pod on every ci run, including PRs where the answer is
+  # always false. Measured on the first live run (#409, job 106605678678): 6s
+  # wall-clock, `success`. Worth it against heavy jobs that measure 39-752s
+  # (median 218s) over the last 40 push runs -- NOT the "20/45-minute matrix"
+  # an earlier revision claimed here, which is a pre-hostPath-GOCACHE figure
+  # and now stale by ~5x. Cache state is per node, so a cold node still runs
+  # long; see .github/actions/superseded/action.yml for the full distribution.
+  #
+  # ── THIS JOB IS THE CHEAP HALF, NOT THE EFFECTIVE HALF ──────────────────────
+  # It answers ~6s after the run is created, and the heavy jobs then wait for a
+  # slot: p90 41-46 min, max 50.8 min over 40 push runs. (An earlier revision
+  # said "MEDIAN OF 10 MINUTES". Do not restore a median here -- the same
+  # metric over the same rolling window read 10.0 min and then 2.9 min hours
+  # apart, because our own guard-development pushes contaminated the sample.
+  # action.yml records the full story.) On its own this job is therefore blind
+  # to every supersession that arrives during the wait -- which is where the
+  # waste is, and measurably so: all 10 observed supersessions were caught by
+  # the in-job check and none by this job. The same check runs again as step 0
+  # of each heavy job, from the shared composite action. This job is kept
+  # because skipping here avoids QUEUEING the heavy jobs at all, which the
+  # in-job check cannot do. Read .github/actions/superseded/action.yml before
+  # changing either half.
+  #
+  # ── HOW TO ASK "DID MAIN ACTUALLY BUILD?" -- NEITHER CONCLUSION ANSWERS IT ──
+  # A ci.yml run can conclude `success` having compiled nothing, and so can a
+  # `build + test` job. There are THREE outcomes wearing two labels:
+  #
+  #   job      step `heavy work starting`   meaning
+  #   skipped  null (steps absent)          gate fired: no heavy slot was ever
+  #                                         claimed.  NOT YET OBSERVED on a
+  #                                         real run -- inferred from the `if:`
+  #                                         on the job, not measured.
+  #   success  skipped                      in-job guard fired: the node was
+  #                                         held through the whole queue wait,
+  #                                         then given back unused.  MEASURED,
+  #                                         run #416; see below.
+  #   success  success                      it really built.
+  #   success  null                         ran a ci.yml older than b5ba4f06,
+  #                                         which had no sentinel.
+  #                                         UNCLASSIFIABLE on the build axis.
+  #
+  # READ BOTH COLUMNS. `null` is two different things and only the job
+  # conclusion separates them, so a reader keyed on the sentinel alone maps the
+  # entire pre-sentinel cohort onto "the gate skipped it" -- and that cohort is
+  # nearly everything today: of the 14 most recent ci.yml push runs, 13 carry
+  # `built: null` (e8966662 through 2ec83274) and only b5ba4f06's own run
+  # 35684942471 has the step. Such a reader concludes main built once in
+  # fourteen pushes, which is a worse error than the one this sentinel fixes.
+  # Cohort measured by fimba-a6.
+  #
+  # A pre-sentinel run is still a valid QUEUE-WAIT sample. It is only the build
+  # axis that is unknowable for it.
+  #
+  # The middle row is why the job conclusion is not enough: every step after
+  # the in-job check carries `if: ... != 'true'`, and a job whose steps all
+  # skip individually still concludes `success`. And that row is the COMMON
+  # one -- the gate job answers ~6s after run creation while the heavy jobs
+  # wait for a slot (p90 41-46 min; do not cite a median, see the gate
+  # job above), so real supersessions are caught in-job, not at the gate: 10 of
+  # 10 observed, with the gate missing them by 5-97s. Reading job conclusions
+  # therefore fails exactly where the guard does its work. Proven live on run
+  # #416 (35684471028): gate said false at 03:48:09Z, the successor was pushed
+  # 5s later, all three in-job checks said true at 03:49:00-03:49:53Z, and all
+  # three jobs reported `success` with every build step `skipped`.
+  #
+  # So discriminate on the SENTINEL STEP. It exists only to be read:
+  #
+  #   gh run view <id> --json jobs --jq '
+  #     .jobs[] | select(.name|startswith("build + test"))
+  #     | {job: .name, conclusion: .conclusion,
+  #        built: ([.steps[]|select(.name=="heavy work starting")|.conclusion]|first)}'
+  #
+  # built == "success" is the only thing that means the tree compiled. Pair it
+  # with `.conclusion` to tell the two `null`s apart, per the table above. Each
+  # job also logs `superseded=<bool> -- <reason>` and `supersession guard:
+  # superseded='<v>'`, which is the human-readable form.
+  #
+  # One consequence for cost/queue arithmetic, which the two-outcome version of
+  # this note hid: the two superseded shapes are NOT interchangeable samples.
+  # An in-job-superseded job queued like any other heavy job, so it is a valid
+  # QUEUE-WAIT sample and dropping it understates contention -- but it is not a
+  # valid BUILD-TIME sample. Only the gate-skipped shape is excludable from
+  # both.
+  #
+  # Nothing in the repo reads ci.yml conclusions programmatically today
+  # (checked: retry-lost-runners.yml gates on `conclusion == 'failure'` in both
+  # places, and neither a skipped job nor a skipped step is a failure, so this
+  # generates no retry load) -- this note exists so the next thing that wants to does it
+  # correctly. The two-outcome version of it was wrong; both the original
+  # hazard and the correction are fimba-a6's.
+  #
+  # The supersession check is the `superseded` step of the `gate` job below,
+  # which also computes the changed-path outputs (gd-LjoM6ipXQX).
+
+  # ── The path half of `gate` ─────────────────────────────────────────────────
+  # Gates `rust`, `gardenhub-browser` and `lands-conformance` on every event,
+  # and the `go` matrix on pull_request only. It used to be its own `changes`
+  # job, running in parallel with a separate `supersession` job; see "ONE GATE
+  # JOB" just above `gate:` for why they are one job now.
+  #
+  # WHY THIS IS WORTH A JOB. Measured over the 487 commits on origin/main in
+  # the 14 days to 2026-09-22 (80 of which paths-ignore above already drops,
+  # leaving 404 that reach CI):
+  #
+  #   touch no coop/ at all  395   97.8 %   <- rust cannot change result
+  #   touch only coop/         2    0.5 %
+  #   touch both               7    1.7 %
+  #
+  # coop is the most expensive of the three heavy tenants (340 s mean vs
+  # controller 309 s and kbeads 103 s, per the `rust` job's own note), so
+  # those 395 runs are ~28 heavy slot-claims and ~2.7 heavy node-hours a day
+  # spent re-proving an unchanged Rust build.
+  #
+  # WHY ONLY rust, AND NOT THE go MATRIX -- do not "complete the symmetry"
+  # here. Two independent reasons, either one sufficient:
+  #
+  #   1. It would buy 0.5 %. Only 2 commits in 14 days were coop-only.
+  #   2. THE TWO GO LEGS ARE NOT SEPARABLE FROM EACH OTHER. kbeads tests read
+  #      gardenio/controller SOURCES off disk -- internal/beadsapi/
+  #      {projects,roles}.go, internal/bridge/init.go -- so
+  #      a controller-only commit can legitimately turn the kbeads leg red. A
+  #      per-module gate on that matrix would be a coverage regression, not an
+  #      optimisation. (They are separable from coop: no Go file in the repo
+  #      reads anything under coop/. The single grep hit is a string literal
+  #      in a path-traversal test, not a file read.)
+  #
+  # The go matrix was gated on pull_request only from gd-HN1i92sY0h until
+  # gd-whdmfznixO retired that gate: since Task 7.3 part B (gd-19ECZxvFQw) `go`
+  # never runs on a PR, and every other event runs every arm. Reason 2 above
+  # still stands if a per-module gate is ever proposed for another event; the
+  # cross-module reads it audited are on gd-HN1i92sY0h.
+  #
+  # WHY THE FILTER CANNOT BE NARROWER THAN THE JOB -- the same argument as
+  # checks.yml's `changes` header. rust is hardcoded to `working-directory:
+  # coop`, so a new Rust workspace appearing elsewhere is already not built by
+  # this job, filter or no filter. What did have to be audited by hand is what
+  # rust reads from OUTSIDE coop/, since that does not follow from its scope:
+  #
+  #   .github/actions/superseded/**  the job's in-run re-check is this local
+  #                                  composite action; changing it changes the
+  #                                  job's behaviour.
+  #   .github/workflows/ci.yml       a change to CI re-runs CI.
+  #
+  # and two coop path literals that LOOK like they escape the crate and do
+  # not -- both resolve back inside coop/, verified by resolving them against
+  # their own file's directory:
+  #
+  #   coop/crates/cli/build.rs           "../../proto"   -> coop/proto
+  #   coop/crates/mux/.../transport/mod.rs
+  #     include_str!("../../../web/dist/mux.html") -> coop/crates/web/dist/...
+  #
+  # Nothing else under coop/ reaches out: rustup takes its pin from
+  # coop/rust-toolchain.toml and cargo from coop/{Cargo.lock,.cargo/config.toml}.
+  #
+  # THE ABOVE WAS CHECKED AGAINST HISTORY, NOT JUST BY READING. If coop really
+  # depended on something outside coop/, the rust job would sometimes fail for
+  # a real reason on a commit that touched no coop file. Over the last 100
+  # completed ci runs it concluded 92 success / 6 failure / 2 cancelled, and
+  # all 6 failures were on commits touching ZERO coop files -- so each one was
+  # a candidate refutation. Every one turned out to be infrastructure:
+  #
+  #   3x "The runner has received a shutdown signal" + exit 130, mid-compile
+  #      (runner loss -- spot reclaim or scale-down under a running job)
+  #   2x exit 127 in the `rustup` step (missing binary; tracked separately)
+  #   1x log already expired (BlobNotFound); it failed in `superseded`, before
+  #      any Rust step ran, so it cannot be a coop source failure either
+  #
+  # Not one was a cargo build or test failure. A side effect worth naming: the
+  # longest-running job is the most exposed to losing its runner, so skipping
+  # 97.8 % of this one's executions also removes 97.8 % of its false reds on
+  # main -- the gate buys reliability, not only queue time.
+  #
+  # SAFE ON pull_request, UNLIKE THE paths-ignore ABOVE. That one is push-only
+  # because a workflow skipped by a path filter reports NO status at all. A
+  # job skipped by `if:` still reports a check run with conclusion `skipped`,
+  # which required-check config accepts -- already demonstrated in this repo
+  # by checks.yml, where `cargo audit + deny (coop)` shows up skipped on
+  # docs-only PRs. (Moot today regardless: branch protection is not enabled on
+  # this repo -- the API returns 403 "Upgrade to GitHub Pro".)
+  #
+  # ── ONE GATE JOB, AND IT CHECKS OUT ALMOST NOTHING (gd-LjoM6ipXQX) ──────────
+  # Measured 2026-10-29 over 50 runs (Task 4.1, comment on gd-WFMvg9sDKE): the
+  # old `changes` job cost 116 s a run, and 72 s of the median was a
+  # `fetch-depth: 0` checkout of the whole history. paths-filter needs none of
+  # it. On pull_request it reads the PR's files through the API. On a push it
+  # diffs `before..main` and fetches `before` at depth 1 itself when the clone
+  # lacks it (dorny/paths-filter src/git.ts, ensureRefAvailable). So the
+  # checkout is the sparse one `supersession` already used: the superseded
+  # action's directory, at depth 1, with no blobs. That took 4 s. A push
+  # diffed that way gave the same file list as a full clone (checked on
+  # origin/main~3..c81ef03e).
+  #
+  # The two gates were also two light pods per run for ~3 s of real work.
+  # One job pays for setup, teardown and the checkout once.
+  #
+  # FAILS OPEN, as both halves did alone. `superseded` is continue-on-error,
+  # so a broken supersession check leaves the path outputs in place (empty
+  # `superseded` != 'true', so everything builds), exactly as when it was a
+  # separate job. A failed paths-filter step fails the job, so every
+  # path-gated job sees `needs.gate.result != 'success'` and runs.
+  gate:
+    name: "gate: superseded? + changed paths"
+    runs-on: gardenio-k3s-light # never heavy: the point is to not claim a node
+    timeout-minutes: 10
+    permissions:
+      actions: read # the superseded check lists this workflow's runs
+      contents: read # ...and compares two commits
+      pull-requests: read # dorny/paths-filter reads the PR's changed files via the API; without this it fails with "Resource not accessible by integration" on every PR
+    outputs:
+      superseded: ${{ steps.superseded.outputs.superseded }}
+      # A tag push (a release, owner 2026-11-03) and a push with no proven
+      # base (empty `base`, see the `base` step) fail open: every path-gated
+      # job runs. The only push left is a tag, whose `base` is always empty,
+      # so the tag term is belt and braces. scripts/check-main-concurrency.py.
+      coop: ${{ (startsWith(github.ref, 'refs/tags/') || github.event_name == 'push' && steps.base.outputs.base == '') && 'true' || steps.filter.outputs.coop }}
+      # The one exception (gd-rmHsVjmKse): on a tag, the browser suite is
+      # skipped only when `tagbase` found the newest earlier calver tag whose
+      # suite passed, the filter diffed against it and said 'false'. Anything
+      # else -- no base, the filter failing or skipped -- is 'true'.
+      gardenhub_browser: ${{ startsWith(github.ref, 'refs/tags/') && (steps.tagbase.outputs.base != '' && steps.filter.outcome == 'success' && steps.filter.outputs.gardenhub_browser == 'false' && 'false' || 'true') || (github.event_name == 'push' && steps.base.outputs.base == '') && 'true' || steps.filter.outputs.gardenhub_browser }}
+      lands_conformance: ${{ (startsWith(github.ref, 'refs/tags/') || github.event_name == 'push' && steps.base.outputs.base == '') && 'true' || steps.filter.outputs.lands_conformance }}
+    steps:
+      # A local composite action needs the repo on disk. Sparse + no cone mode
+      # fetches just the action directory (and, via sparse-checkout's implied
+      # blob:none filter, no other file's contents). paths-filter needs no
+      # tree; see above. Do not go back to fetch-depth: 0 here;
+      # scripts/check-ci-draft-gate.py refuses it.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/actions/superseded
+            .github/actions/last-run-base
+            .github/actions/last-tag-base
+          sparse-checkout-cone-mode: false
+      - id: superseded
+        continue-on-error: true
+        uses: ./.github/actions/superseded
+      # Makes "the gate fired" visible in the jobs API: this step concludes
+      # `success` only when the run-wide verdict skipped `go`. The path-gated
+      # jobs (rust, gardenhub-browser, lands-conformance) ignore that verdict
+      # (gd-025MCE7PhK) and can still build in such a run and leave a sentinel
+      # `success`, which alone would read as green. release-deploy.sh refuses
+      # to roll a tag whose ci.yml run has this step succeeded
+      # (SUPERSESSION_FIRED_STEP; release-cut.sh until 2026-11-03); do not
+      # rename it. scripts/check-ci-draft-gate.py pins it.
+      - name: superseded -- run-wide skip
+        if: steps.superseded.outputs.superseded == 'true'
+        run: echo "a newer ci.yml push run covers this one; build + test (go) is skipped"
+      # What a push diffs against (gd-RZopn9lf5I). Main pushes share one
+      # concurrency group (see `concurrency:` above), so a waiting run can be
+      # evicted by a newer push; diffing only `before..after` would then drop
+      # the evicted push's coop / gardenhub / lands changes from every path
+      # gate below. The base is the newest earlier push run that actually ran.
+      # Empty means fail open, which the `outputs:` above turn into 'true'.
+      - id: base
+        continue-on-error: true
+        uses: ./.github/actions/last-run-base
+        with:
+          workflow: ci.yml
+      # A calver tag's browser base: the newest earlier calver tag whose
+      # `gardenhub browser (chromium)` job passed (gd-rmHsVjmKse). Empty on
+      # every other event and whenever in doubt, which the `outputs:` above
+      # turn into 'true'. Read .github/actions/last-tag-base/action.yml.
+      - id: tagbase
+        continue-on-error: true
+        uses: ./.github/actions/last-tag-base
+      # On a tag push only with a tag base: without one every output above is
+      # 'true' anyway, and paths-filter would diff main against the tag,
+      # fetching and deepening in this depth-1 sparse clone for an answer
+      # nobody reads. With a sha base it fetches that one commit at depth 1
+      # and diffs the two trees. continue-on-error on a tag, so a failure
+      # there reads as "run the suite" instead of failing the release's run.
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: ${{ !startsWith(github.ref, 'refs/tags/') || steps.tagbase.outputs.base != '' }}
+        continue-on-error: ${{ startsWith(github.ref, 'refs/tags/') }}
+        with:
+          # Empty (every event but a push, or no proven base) keeps
+          # paths-filter's own default.
+          base: ${{ steps.base.outputs.base || steps.tagbase.outputs.base }}
+          filters: |
+            coop:
+              - '.github/workflows/ci.yml'
+              - '.github/actions/superseded/**'
+              - 'coop/**'
+            # The whole gardenhub package, not just web/ and *_browser_test.go:
+            # the browser test drives /garden as the package's Go handlers and
+            # layout render it, so a change to either can turn it red.
+            gardenhub_browser:
+              - '.github/workflows/ci.yml'
+              - 'Makefile'
+              - 'scripts/ci-fetch-*' # the `node` step's fetch
+              - 'gardenio/controller/internal/gardenhub/**'
+              - 'gardenio/controller/internal/golden/**'
+              - 'gardenio/tests/gardenhub-browser/**'
+              - '.claude/skills/commons-ux-acceptance/**'
+              # TestComposerGoldens: the thread composer, the shell CSS around
+              # it, and the golden test itself (gd-5e6xgIOH6B).
+              - 'gardenio/controller/cmd/beads-viewer/templates/layout.html'
+              - 'gardenio/controller/cmd/beads-viewer/templates/thread_detail.html'
+              - 'gardenio/controller/cmd/beads-viewer/templates/partials/thread_composer.html'
+              - 'gardenio/controller/cmd/beads-viewer/composer_golden_test.go'
+              - 'gardenio/controller/cmd/beads-viewer/testdata/composer_golden_browser.js'
+              - 'gardenio/controller/cmd/beads-viewer/testdata/golden/**'
+              # TestWindowLandUnderChromium: a land window's page (LW.4 gd-OJOsIH52NE).
+              - 'gardenio/controller/cmd/beads-viewer/window*.go'
+              - 'gardenio/controller/cmd/beads-viewer/templates/window.html'
+              - 'gardenio/controller/cmd/beads-viewer/templates/static/window-world.js'
+              - 'gardenio/controller/cmd/beads-viewer/testdata/window_land_browser.js'
+              - 'gardenio/controller/internal/planwindow/**'
+              # TestLandsGoldens: the Lands front of house (gd-WFIUrR8dZA), its
+              # template, handlers, documents and the meadow stylesheet it loads.
+              - 'gardenio/controller/cmd/beads-viewer/templates/lands.html'
+              - 'gardenio/controller/cmd/beads-viewer/templates/static/meadow/**'
+              - 'gardenio/controller/cmd/beads-viewer/lands.go'
+              - 'gardenio/controller/cmd/beads-viewer/lands/**'
+              - 'gardenio/controller/cmd/beads-viewer/lands_golden_test.go'
+              - 'gardenio/controller/cmd/beads-viewer/testdata/lands_golden_browser.js'
+              # TestComposerGoldens renders thread_detail.html, which pulls in
+              # the other partials (mr_pill, thread_timeline).
+              - 'gardenio/controller/cmd/beads-viewer/templates/partials/**'
+              # internal/gardenhub imports it; the /garden arms goldens
+              # (facearms, commonsfacearms, armsgate, faceepic, faceplan) draw
+              # through it.
+              - 'gardenio/controller/internal/heraldry/**'
+            # The Lands conformance suite (D.11): gl and the contract against
+            # a real kd serve. kbeads/go.mod replaces clicreds and the contract,
+            # and lands/gl's go.mod replaces both, so all three trees reach it.
+            lands_conformance:
+              - '.github/workflows/ci.yml'
+              - 'Makefile'
+              - 'lands/**'
+              - 'kbeads/**'
+              - 'gardenio/clicreds/**'
+      # The tag-side proof (gd-rmHsVjmKse): every tag run's log names the
+      # browser base and the verdict the `outputs:` above give.
+      - name: browser suite on this tag?
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        env:
+          BASE_TAG: ${{ steps.tagbase.outputs.tag }}
+          BASE: ${{ steps.tagbase.outputs.base }}
+          FILTER: ${{ steps.filter.outcome }}
+          CHANGED: ${{ steps.filter.outputs.gardenhub_browser }}
+        run: |
+          if [ -n "$BASE" ] && [ "$FILTER" = success ] && [ "$CHANGED" = false ]; then
+            echo "gardenhub_browser=false -- no gardenhub_browser path changed since ${BASE_TAG} (${BASE}), whose suite passed; skipping it"
+          else
+            echo "gardenhub_browser=true -- base tag '${BASE_TAG:-none}', filter ${FILTER:-not run}, changed '${CHANGED}'; running it"
+          fi
+  # ── Pull requests: the light tier ──────────────────────────────────────────
+  # On 2026-10-27, 99 PRs took 218 pushes and every push ran ~81 runner-minutes
+  # of ci + checks + images. Crews iterate against CI, so most of those pushes
+  # were to unfinished work. A PR now runs only this job (plus the gate
+  # jobs): build + vet + `go test` of only the packages whose files changed,
+  # and `cargo check` for coop. Until part B (gd-19ECZxvFQw) that held for
+  # DRAFT PRs only and a ready PR still ran the full suite; the owner's rule
+  # of 2026-10-31 (root CLAUDE.md "CI on pull requests") made it every PR,
+  # draft or not. The full suite runs on a release tag push, the nightly
+  # and dispatch; the tag's run is the proof. Every heavy job carries the matching
+  # `github.event_name != 'pull_request'` conjunct, and
+  # scripts/check-ci-draft-gate.py keeps all of it true. Plan: gd-WFMvg9sDKE,
+  # tasks gd-JGkmjFfv3B and gd-19ECZxvFQw.
+  #
+  # The name starts with `light:` on purpose, so the checks list says this is
+  # not the full suite. The id stays `draft-light` (the peak-memory labels and
+  # the guards key on it). Budget 15 minutes, target 10: changed-package tests
+  # are a subset of the `go` job's ~100 s warm controller test, and cargo check
+  # against the node-local CARGO_HOME is a fraction of the rust job's build.
+  #
+  # Medium tier: no docker, 4Gi limit. The `go` job's kbeads arm already runs
+  # here; the controller arm does not (anonmax 2864Mi on a FULL test run), but
+  # this job tests a handful of packages, not ./.... The peak-memory probes
+  # below are what to read if that assumption ever needs re-checking.
+  #
+  # Sized to fit that runner (gd-gVmmpG3sTc): it builds and vets only the
+  # changed packages, vets their direct importers (type-check, no link),
+  # tests one package at a time under GOMAXPROCS=2, and lints the changed
+  # packages for new issues (gd-PIpG448LlP). A module-wide
+  # `go build ./...` links all 38 controller binaries, ~220 CPU-s even warm,
+  # which a 750m pod on a busy node cannot finish in 15 minutes.
+  draft-light:
+    name: "light: build + vet + changed-package tests"
+    runs-on: gardenio-k3s-medium # medium ARC scale set (gardenio/helm/ci); see arc-runners-medium-values.yaml
+    timeout-minutes: 15
+    needs: gate
+    # Every pull_request, whatever its draft state; no other event (main
+    # pushes, the nightly and dispatch run the full suite instead).
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.gate.outputs.superseded != 'true'
+    permissions:
+      contents: read
+    env:
+      CGO_ENABLED: 0
+      JOB_BUDGET_S: 900 # timeout-minutes above, in seconds; keep the two equal
+    steps:
+      # As in the `go` job: the clock `quarantined tests (advisory)` bounds
+      # itself by.
+      - name: job clock
+        run: echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
+
+      # Full history: `git diff base...HEAD` needs the merge-base, which a
+      # shallow clone does not have. (The `gate` job needs no history; this does.)
+      # Blobless (scripts/check-ci-blobless.py): the merge-base and a name-only
+      # diff need commits and trees, not old blobs. The full clone was 120-672 s
+      # of this job on 2026-11-03; blob:none is 15 MB.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - uses: ./.github/actions/peak-memory
+        with: { label: "draft-light-baseline" }
+
+      # Which modules and which packages did this PR touch? Files are mapped
+      # to the nearest ancestor directory holding .go files, so a change to
+      # x/testdata/y.json tests package x. go.work and this workflow select
+      # every Go module. Anything the mapping cannot place (a deleted
+      # directory, a file outside every module) just does not add a package.
+      # A module-level file (go.work, a module's go.mod/go.sum, this
+      # workflow) can break any package, so it marks the module whole and
+      # the module gets `go vet ./...`.
+      - name: changed files -> modules and packages
+        id: changed
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch -q --no-tags origin "+refs/heads/${BASE}:refs/remotes/origin/${BASE}"
+          changed="$RUNNER_TEMP/changed.txt"
+          git diff --name-only "origin/${BASE}...HEAD" > "$changed"
+          echo "$(wc -l < "$changed") changed files vs origin/${BASE}:"
+          sed 's/^/  /' "$changed"
+
+          mods=""
+          whole=""
+          coop=false
+          sel() { case " $mods " in *" $1 "*) ;; *) mods="${mods:+$mods }$1" ;; esac; }
+          all() { sel "$1"; case " $whole " in *" $1 "*) ;; *) whole="${whole:+$whole }$1" ;; esac; }
+          while IFS= read -r f; do
+            case "$f" in
+              go.work|go.work.sum|.github/workflows/ci.yml)
+                all kbeads; all gardenio/controller; all gardenio/clicreds ;;
+              kbeads/go.mod|kbeads/go.sum)                           all kbeads ;;
+              gardenio/controller/go.mod|gardenio/controller/go.sum) all gardenio/controller ;;
+              gardenio/clicreds/go.mod|gardenio/clicreds/go.sum)     all gardenio/clicreds ;;
+              kbeads/*)             sel kbeads ;;
+              gardenio/controller/*) sel gardenio/controller ;;
+              gardenio/clicreds/*)  sel gardenio/clicreds ;;
+              coop/*)               coop=true ;;
+            esac
+          done < "$changed"
+
+          # Packages per module: ./rel/dir, deduplicated, one line per module
+          # as `module=./a ./b` in $RUNNER_TEMP/pkgs.txt.
+          : > "$RUNNER_TEMP/pkgs.txt"
+          for mod in $mods; do
+            # `|| true`: a module selected by go.work or this workflow may have
+            # no changed file of its own, and under pipefail grep's 1 would
+            # abort the step (it did, on the first probe run of PR #1470).
+            pkgs=$({ grep "^$mod/" "$changed" || true; } | while IFS= read -r f; do
+              d=$(dirname "$f")
+              # testdata is never a package, even when it holds .go fixtures.
+              case "$d" in */testdata|*/testdata/*) d=${d%%/testdata/*}; d=${d%/testdata} ;; esac
+              while [ "$d" != "$mod" ] && [ "$d" != "." ] && ! ls "$d"/*.go >/dev/null 2>&1; do
+                d=$(dirname "$d")
+              done
+              if ls "$d"/*.go >/dev/null 2>&1; then
+                if [ "$d" = "$mod" ]; then echo "."; else echo "./${d#"$mod"/}"; fi
+              fi
+            done | sort -u | tr '\n' ' ')
+            printf '%s=%s\n' "$mod" "${pkgs% }" >> "$RUNNER_TEMP/pkgs.txt"
+          done
+
+          echo "go modules: ${mods:-(none)}"
+          echo "whole modules (go vet ./...): ${whole:-(none)}"
+          echo "coop: $coop"
+          echo "packages:"; sed 's/^/  /' "$RUNNER_TEMP/pkgs.txt"
+          {
+            printf 'go_modules=%s\n' "$mods"
+            printf 'whole_modules=%s\n' "$whole"
+            printf 'coop=%s\n' "$coop"
+            printf 'controller=%s\n' "$(case " $mods " in *" gardenio/controller "*) echo true ;; *) echo false ;; esac)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Golden screenshots change only in the window bless PR, on a
+      # bless/goldens-* branch (gd-fedEoEGC9i): bless-goldens.yml re-shoots
+      # them on main twice a day. Here because checks.yml runs no job on a pull
+      # request; the `changed` step above fetched origin/<base>.
+      - name: no golden screenshots outside a bless PR
+        env:
+          BASE: ${{ github.base_ref }}
+        run: python3 scripts/check-no-pr-goldens.py --base "origin/${BASE}"
+
+      # The whole-tree 3 MiB scan runs in checks.yml's `quench`, which skips
+      # pull requests, so a PR could merge a 25 MB build output unseen (PR
+      # #2215, gd-Uff8fB4llo). This scans the PR's changed files only; a
+      # deleted path is not a file and is skipped by the script.
+      - name: no changed file over 3 MiB
+        run: |
+          set -euo pipefail
+          mapfile -t files < "$RUNNER_TEMP/changed.txt"
+          [ "${#files[@]}" -eq 0 ] || bash scripts/check-large-tracked-files.sh "${files[@]}"
+
+      # The per-package line budget runs in checks.yml's `quench`, which skips
+      # pull requests, so PRs merged growth with no grant and the next release
+      # tag went red on it (#2345, #2346 on 11-05). The checkout is the merge
+      # ref, so this measures the PR on top of today's base. Shell only, ~2 s.
+      - name: no Go package past its line budget
+        run: bash scripts/ratchets/line-budget.sh check
+
+      # cache: false -- see the `go` job; GOCACHE is the node-local /cache.
+      - uses: actions/setup-go@v5
+        if: steps.changed.outputs.go_modules != ''
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # The controller's *UnderNode tests t.Skip() without node; see the `go`
+      # job. Same pinned tarball, same mirror fallback.
+      - name: node (pinned tarball, sha256-verified)
+        if: steps.changed.outputs.controller == 'true'
+        run: |
+          set -euo pipefail
+          scripts/ci-fetch-node.sh tar.gz /tmp/node.tar.gz
+          sudo tar -xz --strip-components=1 -C /usr/local -f /tmp/node.tar.gz
+          node --version
+
+      # beads-viewer's mermaid.min.js and echarts.min.js are fetched, not
+      # committed (gd-wNQzR9ptZI); see the `go` job's fetch step. The asset
+      # tests read and serve them, so a changed beads-viewer package needs them.
+      - name: fetch beads-viewer vendored JS (pinned, sha256-verified)
+        if: steps.changed.outputs.controller == 'true'
+        run: gardenio/controller/cmd/beads-viewer/fetch-vendored.sh
+
+      - name: go build + vet + changed-package tests
+        if: steps.changed.outputs.go_modules != ''
+        env:
+          GO_MODULES: ${{ steps.changed.outputs.go_modules }}
+          WHOLE_MODULES: ${{ steps.changed.outputs.whole_modules }}
+          # The pod requests 750m with no CPU limit, so Go would size -p, the
+          # compiler's backend and test binaries to the node's vCPUs and
+          # thrash under contention (same trap as gd-NlDOhwIvRF).
+          GOMAXPROCS: "2"
+        # The -skip list is the `go` job's: the one named test plus the `go`
+        # rows of main's .github/quarantine.d, so a quarantined test never
+        # reds this job either (gd-7LA3uMEpsL). They run in the advisory step
+        # below.
+        run: |
+          set -euo pipefail
+          echo "GOCACHE=$(go env GOCACHE) GOMODCACHE=$(go env GOMODCACHE) GOMAXPROCS=$GOMAXPROCS"
+          q=$(scripts/quarantine.sh fetch "$RUNNER_TEMP/quarantine.tsv")
+          re=$(scripts/quarantine.sh regex go "$q")
+          echo "quarantined: ${re:-none}"
+          : > "$RUNNER_TEMP/go-test.log"
+          failed=""
+          for mod in $GO_MODULES; do
+            case " $WHOLE_MODULES " in *" $mod "*)
+              echo "::group::$mod: go vet ./... (module-level file changed)"
+              (cd "$mod" && go vet ./...)
+              echo "::endgroup::" ;;
+            esac
+            pkgs=$(sed -n "s|^$mod=||p" "$RUNNER_TEMP/pkgs.txt")
+            if [ -z "$pkgs" ]; then
+              echo "$mod: no package with Go sources changed"
+              continue
+            fi
+            # Direct importers (prod, test and xtest imports) inside this
+            # module catch a changed signature; vet type-checks them without
+            # linking. Transitive importers are left to the full CI on main.
+            # shellcheck disable=SC2086 # $pkgs is a space-separated package list
+            want=$(cd "$mod" && go list -e $pkgs | tr '\n' ' ')
+            # go build refuses a test-only package; vet and test take it.
+            # shellcheck disable=SC2086
+            build=$(cd "$mod" && go list -e -f '{{if .GoFiles}}{{.ImportPath}}{{end}}' $pkgs | tr '\n' ' ')
+            importers=$(cd "$mod" && go list -e -f '{{.ImportPath}} {{join .Imports " "}} {{join .TestImports " "}} {{join .XTestImports " "}}' ./... |
+              awk -v want="$want" 'BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) W[w[i]] = 1 }
+                { if ($1 in W) next; for (i = 2; i <= NF; i++) if ($i in W) { print $1; break } }' | tr '\n' ' ')
+            echo "::group::$mod: go build $pkgs; go vet + $(wc -w <<< "$importers") direct importers"
+            echo "importers: ${importers:-(none)}"
+            # shellcheck disable=SC2086 # space-separated package lists
+            (cd "$mod" && { [ -z "${build// }" ] || go build -o /dev/null $build; } && go vet $want $importers)
+            echo "::endgroup::"
+            # One test binary at a time: two heavy ones (internal/bridge with
+            # cmd/beads-viewer) together can pass the pod's 4Gi limit.
+            # GARDENIO_NODE_REQUIRED and the -skip list match the `go` job.
+            if [ "$mod" = gardenio/controller ]; then export GARDENIO_NODE_REQUIRED=1; else unset GARDENIO_NODE_REQUIRED; fi
+            for p in $pkgs; do
+              echo "::group::$mod: go test $p"
+              if ! (cd "$mod" && go test "$p" -skip "TestRealCatalogSnapshotFreshness${re:+|$re}" 2>&1 | tee -a "$RUNNER_TEMP/go-test.log"); then
+                failed="${failed:+$failed }$mod/${p#./}"
+              fi
+              echo "::endgroup::"
+            done
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::go test failed: $failed"
+            exit 1
+          fi
+
+      # As in the `go` job: a failure above prints the rows that would
+      # quarantine each failing test (.github/known-failures.md, "Quarantine").
+      - name: quarantine rows for the failures
+        if: failure() && steps.changed.outputs.go_modules != ''
+        run: '[ ! -s "$RUNNER_TEMP/go-test.log" ] || scripts/quarantine.sh rows "$RUNNER_TEMP/go-test.log" || true'
+
+      # The quarantined tests in the changed packages, run so their logs say
+      # whether they still fail; continue-on-error, so they never fail the job.
+      # -v: a --- PASS line per test, for scripts/quarantine.sh verdicts.
+      # Bounded like the `go` job's (gd-wFIO4HZjgy): only what is left of
+      # JOB_BUDGET_S after RESERVE_S, which covers the lint install and its
+      # 5-minute box below; a package with under a minute left is not run.
+      - name: quarantined tests (advisory)
+        if: steps.changed.outputs.go_modules != '' && !cancelled()
+        continue-on-error: true
+        env:
+          GO_MODULES: ${{ steps.changed.outputs.go_modules }}
+          GOMAXPROCS: "2"
+          RESERVE_S: 420
+        run: |
+          set -euo pipefail
+          [ -s "$RUNNER_TEMP/quarantine.tsv" ] || { echo "quarantine list not fetched"; exit 0; }
+          re=$(scripts/quarantine.sh regex go "$RUNNER_TEMP/quarantine.tsv")
+          [ -n "$re" ] || { echo "no go tests quarantined"; exit 0; }
+          # Only a package that declares one of them: a -run that matches
+          # nothing still links a test binary, which this budget cannot spare.
+          decl="^func ${re:1:${#re}-2}\\("
+          deadline=$(( JOB_T0 + JOB_BUDGET_S - RESERVE_S ))
+          rc=0
+          for mod in $GO_MODULES; do
+            if [ "$mod" = gardenio/controller ]; then export GARDENIO_NODE_REQUIRED=1; else unset GARDENIO_NODE_REQUIRED; fi
+            pkgs=$(sed -n "s|^$mod=||p" "$RUNNER_TEMP/pkgs.txt")
+            for p in $pkgs; do
+              grep -qE "$decl" "$mod/${p#./}"/*_test.go 2>/dev/null || continue
+              left=$(( deadline - $(date +%s) ))
+              if [ "$left" -lt 60 ]; then
+                echo "::notice::quarantined tests: job budget spent, $mod/${p#./} not run"
+                continue
+              fi
+              echo "::group::$mod: go test $p -run (quarantined)"
+              (cd "$mod" && timeout -k 10 "$left" go test -v "$p" -run "$re") && prc=0 || prc=$?
+              echo "::endgroup::"
+              case "$prc" in
+                0) ;;
+                124|137) echo "::warning::quarantined tests: $mod/${p#./} cut off after ${left}s, to keep the job inside its timeout"; rc=1 ;;
+                *) rc=1 ;;
+              esac
+            done
+          done
+          exit "$rc"
+
+      # golangci-lint of the changed packages, reporting only issues on lines
+      # this PR changed (--new-from-merge-base), with each module's own
+      # .golangci.yml, so a lint finding is red here rather than on the next
+      # tag or nightly lint-go run (gd-PIpG448LlP). Only the changed packages,
+      # never ./...: a whole-controller lint is anonmax 5889Mi, over this
+      # runner's 4Gi (see checks.yml lint-go). Not covered here, left to
+      # lint-go: findings at an unchanged line, such as funlen when only a
+      # func's body grew.
+      #
+      # Sized on gd-PIpG448LlP: internal/bridge, the largest package, is
+      # 1-6 min cold (idle node vs loadavg 22) at 3.6Gi RSS, 2.5Gi under
+      # GOMEMLIMIT at no extra time. The 5-minute box keeps the job inside its
+      # 15-minute budget on a busy node: a lint that runs out of time warns
+      # and passes.
+      - name: golangci-lint (changed packages, new issues only)
+        if: steps.changed.outputs.go_modules != ''
+        env:
+          BASE: ${{ github.base_ref }}
+          GO_MODULES: ${{ steps.changed.outputs.go_modules }}
+          GOLANGCI_LINT_VERSION: 2.13.2
+          GOMAXPROCS: "2"
+          GOMEMLIMIT: 2500MiB
+        run: |
+          set -euo pipefail
+          # Same exact-version check as checks.yml lint-go: the node bindir is shared.
+          BIN="${GOTOOLS_BIN:-$(go env GOPATH)/bin}"
+          mkdir -p "$BIN"
+          have=$("$BIN/golangci-lint" version 2>/dev/null \
+                 | sed -n 's/.*has version \([0-9][0-9.]*\).*/\1/p') || true
+          if [ "$have" != "$GOLANGCI_LINT_VERSION" ]; then
+            echo "installing golangci-lint $GOLANGCI_LINT_VERSION into $BIN (found: ${have:-none})"
+            GOBIN="$BIN" go install \
+              "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v${GOLANGCI_LINT_VERSION}"
+          fi
+          deadline=$(( $(date +%s) + 300 ))
+          failed=""
+          for mod in $GO_MODULES; do
+            pkgs=$(sed -n "s|^$mod=||p" "$RUNNER_TEMP/pkgs.txt")
+            [ -n "$pkgs" ] || continue
+            left=$(( deadline - $(date +%s) ))
+            if [ "$left" -le 0 ]; then
+              echo "::warning::golangci-lint: 5-minute box spent, $mod not linted here; lint-go covers it"
+              continue
+            fi
+            echo "::group::$mod: golangci-lint $pkgs"
+            # GOWORK=off as in lint-go: the exclusion paths in .golangci.yml
+            # are module-relative.
+            # shellcheck disable=SC2086 # $pkgs is a space-separated package list
+            (cd "$mod" && GOWORK=off timeout -k 10 "$left" "$BIN/golangci-lint" run \
+              --new-from-merge-base "origin/${BASE}" $pkgs) && rc=0 || rc=$?
+            echo "::endgroup::"
+            case "$rc" in
+              0) ;;
+              124|137) echo "::warning::golangci-lint: $mod ran out of the 5-minute box, not linted here; lint-go covers it" ;;
+              *) failed="${failed:+$failed }$mod" ;;
+            esac
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::golangci-lint found new issues in: $failed (run it locally: cd <module> && GOWORK=off golangci-lint run --new-from-merge-base origin/main <pkgs>)"
+            exit 1
+          fi
+
+      # coop: `cargo check` only. protoc and the C toolchain are still needed:
+      # build.rs runs tonic_prost_build, and ring/openssl-sys compile C in
+      # their build scripts, under check as under build.
+      - name: apt deps (coop)
+        if: steps.changed.outputs.coop == 'true'
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends build-essential protobuf-compiler libprotobuf-dev pkg-config libssl-dev
+
+      # Same step as the `rust` job: CARGO_HOME-relative, never curl | sh.
+      - name: rustup (coop)
+        if: steps.changed.outputs.coop == 'true'
+        run: |
+          set -euo pipefail
+          CH="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CH/bin/rustup" ]; then
+            init="$(mktemp)"
+            curl -sSfL --retry 5 --retry-delay 2 --retry-connrefused \
+                 --max-time 180 -o "$init" https://sh.rustup.rs
+            [ -s "$init" ] || { echo "::error::rustup-init downloaded empty"; exit 1; }
+            sh "$init" -y --no-modify-path --profile minimal --default-toolchain none
+            rm -f "$init"
+          fi
+          echo "$CH/bin" >> "$GITHUB_PATH"
+          cd coop
+          "$CH/bin/rustup" show active-toolchain || "$CH/bin/rustup" toolchain install
+
+      - name: cargo check (coop)
+        if: steps.changed.outputs.coop == 'true'
+        working-directory: coop
+        run: cargo check --workspace --all-targets
+
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "draft-light-end" }
+
+  go:
+    name: build + test (${{ matrix.module }})
+    # PER-ARM TIER. Measured from the peak-memory probes over 2026-09-22
+    # 18:22Z-22:57Z, both arms, baseline + end probe (a lone end probe reports
+    # the seed it just wrote, so it measures nothing):
+    #
+    #   arm          n   anonmax p50   anonmax max   vs medium's 4096Mi limit
+    #   kbeads      29        1053Mi        1153Mi   28%  -> fits, 3.5x headroom
+    #   controller  25        2864Mi        3074Mi   75%  -> too tight, stays
+    #
+    # `controller` is also the single largest consumer of heavy slot-seconds
+    # (29.1% of the tier over that window), which is exactly where an OOM is
+    # most expensive: an OOM-killed runner is indistinguishable from a spot
+    # reclaim, so it burns three `retry-lost-runners` attempts before going red.
+    # 75% of the limit is not headroom. Do not demote it on the anonmax number
+    # alone -- re-measure if the controller test suite shrinks.
+    #
+    # `kbeads` is 8.8% of heavy slot-seconds at p50 97s. It needs no dind: this
+    # job has no `services:`, no container and no docker step (CGO_ENABLED=0,
+    # see the env note below), so nothing ties it to the heavy tier.
+    # cpuavg p50 is 1871m against medium's 750m request, and that is fine --
+    # NO TIER SETS A CPU LIMIT, so a request is a scheduling weight, not a
+    # ceiling (gitleaks already runs on medium at cpuavg 3239m). It costs
+    # contention on a packed node, not a failure.
+    #
+    # Precedent: `c6773cbb` split lint-go's two arms exactly this way and was
+    # verified live on run 35812658892. The fallback side of the ternary is the
+    # EXPENSIVE tier on purpose, so a matrix arm added later fails safe toward
+    # more memory rather than less.
+    #
+    # `clicreds` (gd-nS1qtIMUcG) is a stdlib + go-keyring module of four
+    # packages; its whole vet + test is seconds and a fraction of kbeads'
+    # footprint, so it rides the medium tier with kbeads.
+    runs-on: ${{ (matrix.module == 'kbeads' || matrix.module == 'clicreds') && 'gardenio-k3s-medium' || 'gardenio-k3s' }}
+    timeout-minutes: 20
+    needs: gate
+    # `!cancelled()` and not the default needs-succeeded: a gate that fails or
+    # cannot be scheduled must not withhold main's build signal. Empty output
+    # != 'true', so the build runs. Not `always()`, which would also start
+    # these jobs while a superseded PR run is being cancelled.
+    #
+    # No path gate: it never runs on a pull_request, and every other event
+    # runs every arm (gd-whdmfznixO retired the PR-only matrix builder).
+    if: >-
+      !cancelled() &&
+      needs.gate.outputs.superseded != 'true' &&
+      github.event_name != 'pull_request'
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { module: kbeads, dir: kbeads }
+          - { module: controller, dir: gardenio/controller }
+          - { module: clicreds, dir: gardenio/clicreds }
+    # Match what we ship. Every production build of both modules is
+    # CGO_ENABLED=0 (Makefile:33-45, every Dockerfile), and neither has a
+    # third-party cgo dependency, so building with cgo here tested a variant
+    # of `net`/`os/user` that no release contains -- and cost an apt install
+    # per job to do it. See the long note where `apt deps` used to be.
+    env:
+      CGO_ENABLED: 0
+      JOB_BUDGET_S: 1200 # timeout-minutes above, in seconds; keep the two equal
+    steps:
+      # Depth 2 on a PR: the checkout is the merge ref, and `coverage / patch`
+      # below diffs it against its first parent (the base it was merged onto).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
+
+      # ── Re-ask the supersession question HERE, after the queue wait ─────────
+      # The `gate` job's `superseded` step answered this ~6s after the run was
+      # created. Measured over the last 40 ci.yml push runs, this job then
+      # waited p90 41-46 min, max 50.8 min for a heavy slot (no median: that
+      # statistic was self-contaminated, see the comments above the `gate` job), so that
+      # answer can be the better part of an hour stale by the time we get here
+      # -- and a supersession burst (nine main pushes in 22 minutes) lands
+      # entirely inside the window the gate job cannot see. This check runs
+      # once the node is ours, which is the only point where the remaining
+      # node time -- a mean 340s for coop, 309s for controller, more on a cold
+      # node -- can still be given back. All 10 observed supersessions were
+      # caught here; none at the gate.
+      #
+      # ADDING A STEP BELOW? Guard it with the same `if:`. An unguarded
+      # expensive step silently restores the full build on superseded runs,
+      # which is the exact waste this exists to stop and is invisible in a
+      # green run. The cheap steps above are deliberately unguarded: they must
+      # run for this check to exist on disk at all.
+      #
+      # That rule protects the node-minutes. It does NOT protect the readers:
+      # an unguarded expensive step added below would also leave the `heavy
+      # work starting` sentinel reporting `skipped` while real work ran, so
+      # anything measuring this workflow would quietly undercount. Both
+      # failure modes have the same fix -- guard the step.
+      - id: superseded
+        uses: ./.github/actions/superseded
+
+      # Make the guard's decision visible, and make its silent failure loud.
+      # The `if:` on every step below guards on `!= 'true'`, which means a
+      # BROKEN composite-action output hop reads empty, passes every guard, and
+      # rebuilds the whole tree exactly as if nothing were wrong -- a fail-open
+      # that costs the node-minutes this guard exists to save while looking
+      # perfectly green. Deliberately unguarded so it reports either way.
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+
+      # ── THE SENTINEL. THIS STEP IS AN API CONTRACT, NOT A BUILD STEP ────────
+      # It does nothing. Its only product is its own conclusion, which is the
+      # one reliable answer to "did this job actually build the tree?":
+      #
+      #   success  -> the guard let the heavy steps run
+      #   skipped  -> the in-job guard fired; no compilation happened
+      #
+      # It exists because the JOB conclusion cannot answer that. A job whose
+      # every remaining step skips individually still concludes `success`, so
+      # `success` on a build job stopped meaning "it built" the moment the
+      # in-job check landed -- and by measurement the in-job check is the
+      # ONLY supersession path observed so far (10 of 10; the gate job is
+      # blind to the whole queue wait, and missed those 10 by 5-97s), so the
+      # job conclusion is wrong precisely where it matters. Same shape as the
+      # `anon` memory trap in
+      # gardenio/helm/ci/README.md: the cheap read clears the case it should
+      # refuse. Raised by fimba-a6.
+      #
+      # It is a DEDICATED step, and the FIRST guarded one, for two reasons
+      # that are both load-bearing:
+      #   * Uniform across jobs. The obvious alternative was to key on a step
+      #     that happens to exist in both matrices -- `apt deps` was the only
+      #     candidate, and it sat 2nd in one job and 1st in the other, so
+      #     keying on it meant keying on an accident of package installation.
+      #     That argument has since been settled the hard way: `apt deps` no
+      #     longer exists in the `go` job at all (it installed a C toolchain
+      #     for cgo that neither Go module uses -- see the note where it was).
+      #     Any monitor keyed on it would now silently report nothing for half
+      #     the matrix. A dedicated step cannot be deleted as a side effect of
+      #     a build change, which is exactly the property wanted here.
+      #   * FIRST, not last. A guarded step with no always()/failure() also
+      #     skips when an earlier step FAILED, so a sentinel at the bottom
+      #     reports `skipped` for a job that built and then failed `test` --
+      #     indistinguishable from supersession. Being first means it is
+      #     downstream of nothing but the guard itself.
+      #
+      # Keep the name identical in the `go` and `rust` jobs. Monitors key on
+      # it; see the discriminator block above the `gate` job.
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; building ${{ matrix.module }}"
+
+      # When the job's clock started, near enough (checkout and the re-check
+      # above take seconds; RESERVE_S absorbs them): `quarantined tests
+      # (advisory)` bounds itself by what is left of JOB_BUDGET_S.
+      - name: job clock
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
+
+      # TEMPORARY DIAGNOSTIC (gd-iW6lkpTi7W) -- baseline + end probes size
+      # heavy's 1900m CPU and 12Gi memory REQUESTS. CPU is the binding axis,
+      # not memory: measured 2026-09-22 18:0xZ across 8 ci nodes, 3 had CPU
+      # free for another heavy runner and 5 had memory, and the memory-short
+      # set was a strict subset of the CPU-short set. The baseline is
+      # load-bearing: it starts the anon sampler, and an end probe alone
+      # reports its own seed. Delete both once the ruling is in
+      # gardenio/helm/ci/README.md.
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: "go-${{ matrix.module }}-baseline" }
+
+      # GOCACHE/GOMODCACHE persist on the node, via a hostPath mounted into
+      # the runner pod at /cache (gardenio/helm/ci/arc-runners-values.yaml).
+      #
+      # This comment used to say the same thing and be WRONG: it claimed the
+      # cache persisted merely because the runner is self-hosted. The runner
+      # POD is ephemeral and every volume on it was an emptyDir, so the cache
+      # died with the pod and every Go build here was cold. Measured over 20
+      # runs on 2026-09-22, that cost the controller job 190s of `build` +
+      # 46s of `vet` + 209s of `test` -- 95% of its 7.9-minute runtime -- and
+      # made these two jobs 215 of the 384 heavy slot-minutes in the sample.
+      # Do not re-assert node persistence without checking the pod's volumes.
+      #
+      # `cache: false` stays: it disables actions/cache, not the node cache.
+      # The actions cache upload took 18 minutes over a home uplink and timed
+      # out an otherwise green job, and it is redundant now that the real
+      # cache is node-local.
+      - uses: actions/setup-go@v5
+        if: steps.superseded.outputs.superseded != 'true'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # ── THERE IS NO `apt deps` STEP HERE ANY MORE. DO NOT ADD ONE BACK ─────
+      # This job used to install `build-essential` (+ `libicu-dev` for kbeads)
+      # on every run, 252 MB of packages for 11-21s of node time per job, twice
+      # per run, on a pool whose queue is the thing we are trying to shorten.
+      # It bought nothing. Measured on 2026-09-22:
+      #
+      #   go list -deps -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./...
+      #     controller -> net, os/user, runtime/cgo
+      #     kbeads     -> net, os/user, runtime/cgo
+      #
+      # Stdlib only. Neither module has a third-party cgo dependency, neither
+      # contains `import "C"`, and kbeads has no ICU dependency at all -- no
+      # `icu` in go.mod, no reference in any .go file. The `libicu-dev` matrix
+      # entry and its "kbeads needs cgo for libicu (unicode normalization)"
+      # comment were stale, inherited from a codebase we no longer build.
+      #
+      # So the C toolchain existed only to satisfy the cgo variants of `net`
+      # and `os/user` -- which is worse than useless here, because it made CI
+      # build and test a configuration that is NEVER SHIPPED. Every production
+      # build of both modules is CGO_ENABLED=0: Makefile:33-45 and every
+      # Dockerfile under gardenio/images/ and gardenio/controller/. CI was
+      # exercising the cgo resolver and cgo os/user; releases ship the pure-Go
+      # ones. Setting CGO_ENABLED=0 at the job level (see `env:` above) makes
+      # CI test what we release and drops the apt step as a side effect.
+      #
+      # Verified before removal, locally, at that commit:
+      #   CGO_ENABLED=0 go build ./...  clean, both modules
+      #   CGO_ENABLED=0 go vet ./...    clean, both modules
+      #   CGO_ENABLED=0 go test ./...   kbeads exit 0; controller's only
+      #     failure is TestWriteGitCredentialsSurvivesReject, which fails
+      #     identically under CGO_ENABLED=1 and passes in CI -- pre-existing
+      #     and local-only, see .github/known-failures.md.
+      #
+      # If you ever add a dependency that genuinely needs cgo, the `go list`
+      # command above is the check: it must print something outside stdlib
+      # BEFORE this step comes back. Adding the step because a build failed
+      # with "gcc: not found" is the wrong order -- production builds with
+      # CGO_ENABLED=0, so a cgo dependency breaks the release, not just CI.
+      #
+      # `-race` would need cgo, but this job does not use it. If it ever does,
+      # that is the one legitimate reason to reintroduce a C toolchain, and it
+      # should be scoped to a race job rather than the whole matrix.
+
+      # The node-local build cache is MEASURED, not assumed. Paired cold/warm
+      # numbers for the same module on 2026-09-22, from a temporary diagnostic
+      # that ran `go build ./...` twice in the same job so the second run's
+      # cache was warm by construction:
+      #
+      #   controller, node with 695 MB of cache   build 186s, warm floor 63s
+      #   controller, node with 3391 MB of cache  build  59s, warm floor 53s
+      #   kbeads,     warm node                   build   6s, warm floor  2-3s
+      #
+      # So the cache is worth ~123s per controller job and nearly the whole
+      # build for kbeads, and a warm controller build at 59s is already within
+      # 6s of its floor -- there is nothing further to win here by caching. The
+      # remaining cost in this job is `test` (100s warm on controller, 225s on
+      # coop), which is where to look next.
+      #
+      # This replaces an earlier note claiming the cache was NOT hitting. That
+      # was wrong and the error is worth recording: every controller run I had
+      # measured happened to be the first build of that module on its node, so
+      # I was comparing cold against cold and reading the noise as failure. A
+      # per-node cache makes "was this warm?" a question you must answer before
+      # any timing means anything -- hence NODE_NAME in the pod env
+      # (gardenio/helm/ci/arc-runners-values.yaml).
+      #
+      # (Job logs are readable, contrary to another note that has since been
+      # corrected: `gh api .../jobs/<id>/logs` returns 0 bytes because it 302s
+      # to Azure blob storage. `curl -sL -H "Authorization: Bearer $(gh auth
+      # token)"` on the same URL returns the log in full. Use curl, not gh api.)
+      - name: build
+        if: steps.superseded.outputs.superseded != 'true'
+        working-directory: ${{ matrix.dir }}
+        run: go build ./...
+
+      - name: vet
+        if: steps.superseded.outputs.superseded != 'true'
+        working-directory: ${{ matrix.dir }}
+        run: go vet ./...
+
+      # The podmanager freeze/thaw suite is uid-sensitive; printing the
+      # runner's identity keeps that premise verifiable rather than assumed.
+      - name: runner identity
+        if: steps.superseded.outputs.superseded != 'true'
+        run: id -u && id -g && id -un
+
+      # Node for the controller's *UnderNode tests (gd-8V9KodoXNf): about a
+      # hundred gardenhub, beads-viewer, tunes and gb tests run web/*.js and
+      # testdata scripts under node, and each one t.Skip()s when node is not on
+      # PATH. Nothing installed it here, so all of them skipped silently in this
+      # job -- the world frame budget among them, which is how a deterministic
+      # world_frame_test.js failure (gd-ZnKiMMTpko) went green on two PRs. The
+      # `gardenhub-browser` job does not cover them: it runs only -run
+      # 'UnderChromium$' and the goldens, and is path-gated to gardenhub.
+      #
+      # Here rather than in that job because these tests already run here, on
+      # every controller change; the added cost is the download (~3s) and the
+      # tests' own time (gardenhub +11s on a laptop-class pod, packages in
+      # parallel). The .tar.gz, not the agent image's .tar.xz: the runner image
+      # has no xz, and an apt step for it is the cost this job removed (see the
+      # `apt deps` note above). Same NODE_FULL_VERSION pin as the agent image.
+      # The download is the one place this step has failed: nodejs.org has
+      # served cold nodes under 10 KB/s, so ci-fetch-node.sh falls over to a
+      # byte-identical mirror under the same sha256 (gd-zEF9GEEgkp).
+      # The *UnderChromium tests still skip here (no playwright-core); they are
+      # `gardenhub-browser`'s.
+      - name: node (pinned tarball, sha256-verified)
+        if: steps.superseded.outputs.superseded != 'true' && matrix.module == 'controller'
+        run: |
+          set -euo pipefail
+          scripts/ci-fetch-node.sh tar.gz /tmp/node.tar.gz
+          sudo tar -xz --strip-components=1 -C /usr/local -f /tmp/node.tar.gz
+          node --version
+
+      # beads-viewer's mermaid.min.js and echarts.min.js are fetched, not
+      # committed (gd-wNQzR9ptZI); the build and vet steps above compile without
+      # them (`//go:embed templates/static` is a directory), but the asset tests
+      # read and serve them.
+      - name: fetch beads-viewer vendored JS (pinned, sha256-verified)
+        if: steps.superseded.outputs.superseded != 'true' && matrix.module == 'controller'
+        run: gardenio/controller/cmd/beads-viewer/fetch-vendored.sh
+
+      - name: test
+        if: steps.superseded.outputs.superseded != 'true'
+        working-directory: ${{ matrix.dir }}
+        # GARDENIO_NODE_REQUIRED: the controller's TestNodeOnPathWhenRequired
+        # guards fail instead of skip when node is missing, so losing the step
+        # above goes red rather than quietly skipping every *UnderNode test.
+        env:
+          GARDENIO_NODE_REQUIRED: ${{ matrix.module == 'controller' && '1' || '' }}
+        # Excluded tests are documented in .github/known-failures.md: the one
+        # named here has a specific, understood cause; the rest are the `go`
+        # rows of .github/quarantine.d as MAIN has it (not this checkout), so
+        # a row pushed to main stops the test failing every open PR at once.
+        # They still run, in the step below, which never fails the job.
+        #
+        # -coverprofile feeds `coverage / patch` below (gd-roE5roXBKQ). Each
+        # package counts only its own tests (no -coverpkg, which is the
+        # ~60-min reachability.yml run). Measured on a pod, three kbeads
+        # packages, warm cache: 114s plain, 135s with the profile (+18%); the
+        # first cover build on a node cost ~145s more, once.
+        run: |
+          set -euo pipefail
+          q=$("$GITHUB_WORKSPACE/scripts/quarantine.sh" fetch "$RUNNER_TEMP/quarantine.tsv")
+          re=$("$GITHUB_WORKSPACE/scripts/quarantine.sh" regex go "$q")
+          echo "quarantined: ${re:-none}"
+          go test -coverprofile="$RUNNER_TEMP/cover.out" ./... -skip "TestRealCatalogSnapshotFreshness${re:+|$re}" 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+
+      # A failure above: the rows that would quarantine each failing test, to
+      # push to main if the failure has nothing to do with this change
+      # (.github/known-failures.md, "Quarantine").
+      - name: quarantine rows for the failures
+        if: failure() && steps.superseded.outputs.superseded != 'true'
+        run: scripts/quarantine.sh rows "$RUNNER_TEMP/go-test.log" || true
+
+      # The quarantined tests, run so their logs say whether they still fail;
+      # continue-on-error, so they never fail the job. -v prints a --- PASS
+      # line per test: the quarantine warden's dequarantine evidence
+      # (scripts/quarantine.sh verdicts, docs/quarantine-warden.md).
+      #
+      # continue-on-error does not cover the job's timeout-minutes: a slow
+      # node that runs this step past it cancels the job and reds the run
+      # (gd-wFIO4HZjgy). So it gets only what is left of JOB_BUDGET_S after
+      # RESERVE_S for the coverage steps below, and skips under 2 minutes.
+      - name: quarantined tests (advisory)
+        if: steps.superseded.outputs.superseded != 'true' && !cancelled()
+        continue-on-error: true
+        working-directory: ${{ matrix.dir }}
+        env:
+          GARDENIO_NODE_REQUIRED: ${{ matrix.module == 'controller' && '1' || '' }}
+          RESERVE_S: 180
+        run: |
+          set -euo pipefail
+          re=$("$GITHUB_WORKSPACE/scripts/quarantine.sh" regex go "$RUNNER_TEMP/quarantine.tsv")
+          [ -n "$re" ] || { echo "no go tests quarantined"; exit 0; }
+          left=$(( JOB_T0 + JOB_BUDGET_S - RESERVE_S - $(date +%s) ))
+          if [ "$left" -lt 120 ]; then
+            echo "::notice::quarantined tests not run: ${left}s of the job's budget left after the ${RESERVE_S}s reserve"
+            exit 0
+          fi
+          timeout -k 10 "$left" go test -v ./... -run "$re" && rc=0 || rc=$?
+          case "$rc" in
+            124|137) echo "::warning::quarantined tests cut off after ${left}s, to keep the job inside its timeout" ;;
+          esac
+          exit "$rc"
+
+      # ── Coverage / Patch (gd-roE5roXBKQ), ADVISORY ──────────────────────────
+      # The patch-coverage ratchet: of the lines this PR adds to a gated
+      # component (controller, kbeads, coop), the share its tests run must
+      # reach the threshold in scripts/ratchets/coverage-baselines.json. Old
+      # untested code never counts, so it fails only on new lines, like the
+      # ratchets in checks.yml. Per arm, on that arm's LCOV: a component with
+      # no lines in it is exempt there and judged in its own arm. Rule and
+      # rollout: gardenio/docs/code-reduction-targets.md, "Ratchets".
+      #
+      # The test step's profile -> LCOV with repo-relative paths, through the
+      # same scripts `make lcov-go` uses. Ready PRs (drafts never get here),
+      # and release-tag pushes and the nightly run, whose LCOV is the baseline
+      # window (gd-X7nrzthzhp). gcov2lcov goes in
+      # the node-local bindir under a versioned name, so a node never runs a
+      # stale one: install 11s cold, conversion ~13s.
+      - name: coverage lcov
+        id: lcov
+        if: >-
+          steps.superseded.outputs.superseded != 'true' && matrix.module != 'clicreds' &&
+          (github.event_name == 'pull_request' || github.event_name == 'schedule' ||
+           (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/20')))
+        continue-on-error: true
+        working-directory: ${{ matrix.dir }}
+        env:
+          GCOV2LCOV_VERSION: 1.1.1
+        run: |
+          set -euo pipefail
+          BIN="${GOTOOLS_BIN:-$(go env GOPATH)/bin}"
+          tool="$BIN/gcov2lcov-$GCOV2LCOV_VERSION"
+          if [ ! -x "$tool" ]; then
+            mkdir -p "$BIN"
+            GOBIN="$RUNNER_TEMP/gcov2lcov" go install "github.com/jandelgado/gcov2lcov@v$GCOV2LCOV_VERSION"
+            mv "$RUNNER_TEMP/gcov2lcov/gcov2lcov" "$tool"
+          fi
+          mkdir -p "$RUNNER_TEMP/bin" "$RUNNER_TEMP/coverage"
+          ln -sf "$tool" "$RUNNER_TEMP/bin/gcov2lcov"
+          PATH="$RUNNER_TEMP/bin:$PATH" "$GITHUB_WORKSPACE/scripts/coverage/go-to-lcov.sh" "$RUNNER_TEMP/cover.out" "$RUNNER_TEMP/raw.lcov"
+          python3 "$GITHUB_WORKSPACE/scripts/coverage/normalize-paths.py" --workspace-root "$GITHUB_WORKSPACE" \
+            -i "$RUNNER_TEMP/raw.lcov" -o "$RUNNER_TEMP/coverage/${{ matrix.module }}.lcov"
+
+      # Under threshold (exit 1 with "pass": false in the result) is a
+      # warning, not a red step, while the gate is advisory. Any other failure
+      # (missing input or baselines, which also exit 1 but write no result; a
+      # panic, exit 2) reds the step and continue-on-error keeps the job green. To make it required, drop
+      # the `|| ...` arm and continue-on-error, and wire the Coverage-Bypass
+      # trailer (--commits-json) first. The verdict is in the job summary.
+      - name: coverage / patch (advisory)
+        if: >-
+          steps.superseded.outputs.superseded != 'true' && matrix.module != 'clicreds' &&
+          github.event_name == 'pull_request' && steps.lcov.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          (cd gardenio/controller && go build -o "$RUNNER_TEMP/coverage-patch" ./cmd/coverage-patch)
+          res="$RUNNER_TEMP/patch-cov-result.json"
+          rm -f "$res"
+          args=(--output "$res" --summary "$GITHUB_STEP_SUMMARY"
+                --summary-title "Coverage / Patch (${{ matrix.module }}, advisory)")
+          if ! git rev-parse -q --verify 'HEAD^1' >/dev/null; then
+            "$RUNNER_TEMP/coverage-patch" "${args[@]}" --synthetic-bypass=tooling-broken \
+              --synthetic-detail="the checkout has no first parent to diff against"
+            exit 0
+          fi
+          git diff --unified=0 'HEAD^1' HEAD >"$RUNNER_TEMP/patch.diff"
+          rc=0
+          "$RUNNER_TEMP/coverage-patch" "${args[@]}" --lcov "$RUNNER_TEMP/coverage/${{ matrix.module }}.lcov" \
+            --diff "$RUNNER_TEMP/patch.diff" --baselines scripts/ratchets/coverage-baselines.json || rc=$?
+          if [ "$rc" = 1 ] && grep -q '^  "pass": false' "$res" 2>/dev/null; then
+            echo "::warning title=Coverage / Patch (${{ matrix.module }})::the lines this PR adds are under the patch-coverage threshold; see the job summary. Advisory: the job stays green."
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+
+      # The baseline window: scripts/coverage/regen-baselines.sh takes these
+      # from the newest green release-tag and nightly runs (main pushes no
+      # longer run ci.yml). Upload failure never reds the run.
+      - name: upload coverage lcov (release, nightly)
+        if: >-
+          steps.superseded.outputs.superseded != 'true' && matrix.module != 'clicreds' &&
+          (github.event_name == 'schedule' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/20'))) &&
+          steps.lcov.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov-${{ matrix.module }}
+          path: ${{ runner.temp }}/coverage/${{ matrix.module }}.lcov
+          retention-days: 14
+
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: "go-${{ matrix.module }}-end" }
+
+  rust:
+    name: build + test (coop)
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci)
+    timeout-minutes: 45
+    needs: gate
+    # See the `go` job: fail-open by design. This is still the heaviest tenant
+    # (mean 340s over the last 40 push runs vs controller 309s and kbeads
+    # 103s), so it benefits most from not running nine times -- though the
+    # margin over controller is now thin, and "45-minute tenant", as this said
+    # before hostPath GOCACHE landed, overstates it by ~5x. timeout-minutes
+    # below stays at 45 deliberately: it is a ceiling for a cold node, not a
+    # description of the typical run.
+    #
+    # A release tag push (owner 2026-11-03) rides the workflow_dispatch arm
+    # below: a release builds coop whatever the gate says.
+    #
+    # Three ways to run, and only one way to skip. The workflow_dispatch arm is
+    # not belt-and-braces: paths-filter diffs a dispatch against the DEFAULT
+    # BRANCH, so on a main dispatch it sees an empty changeset and reports
+    # every filter false -- without this arm, "re-run CI by hand" would
+    # silently stop building coop. `schedule` rides the same arm for the same
+    # reason: the nightly run is on main with nothing to diff against. The `result != 'success'` arm means a
+    # broken or errored gate costs runner time, never coverage.
+    #
+    # NO RUN-WIDE SUPERSESSION CONJUNCT, deliberately (gd-025MCE7PhK): this
+    # job is path-gated per push, so a newer run need not run it. Push R edits
+    # coop/, push P edits only kbeads: P diffs from R (.github/actions/
+    # last-run-base), its coop filter says no, and if R's rust deferred to P
+    # nobody would ever build R's coop change on a push. So rust ignores
+    # `needs.gate.outputs.superseded`, and its in-job re-check passes `job:`:
+    # it skips only when a newer descendant run's `build + test (coop)` is
+    # live or finished success/failure, i.e. that run's coop filter said yes
+    # and it builds the whole coop tree, ours included. checks.yml's lint-go,
+    # helm and cargo-security work the same way (gd-BCyDxqofKe).
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
+       startsWith(github.ref, 'refs/tags/') ||
+       needs.gate.result != 'success' ||
+       needs.gate.outputs.coop == 'true')
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs
+      contents: read
+    defaults:
+      run:
+        working-directory: coop
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same re-check as the `go` job, and it matters most here: this is the
+      # heaviest tenant, so a superseded run that exits at this step instead of
+      # building gives back a mean 340s of a whole node -- up to 752s measured,
+      # and more on a cold one. Exiting here costs 8-11s. The gate job's
+      # verdict can be the better part of an hour old by the time this job gets
+      # a slot; this one is current.
+      #
+      # `job:` makes it job-aware (see the `if:` above); it must equal this
+      # job's `name:` exactly. With one main slot per workflow a newer run
+      # has no jobs while this one holds the slot, so on main this rarely
+      # fires; it is the sound form, not the saving one. On main the saving
+      # is `go`'s, which keeps the run-wide verdict (a pending run counts).
+      #
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the `heavy work starting` sentinel keeps telling
+      # the truth about whether coop compiled.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: ci.yml
+          job: build + test (coop)
+
+      # Make the guard's decision visible, and make its silent failure loud.
+      # The `if:` on every step below guards on `!= 'true'`, which means a
+      # BROKEN composite-action output hop reads empty, passes every guard, and
+      # rebuilds the whole tree exactly as if nothing were wrong -- a fail-open
+      # that costs the node-minutes this guard exists to save while looking
+      # perfectly green. Deliberately unguarded so it reports either way.
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+
+      # The sentinel. Same contract, same name, same position as in the `go`
+      # job -- read the long comment there before touching either. Its
+      # conclusion, NOT this job's, is what says whether coop compiled.
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; building coop"
+
+      # TEMPORARY DIAGNOSTIC (gd-iW6lkpTi7W) -- baseline + end probes size
+      # heavy's 1900m CPU and 12Gi memory REQUESTS. CPU is the binding axis,
+      # not memory: measured 2026-09-22 18:0xZ across 8 ci nodes, 3 had CPU
+      # free for another heavy runner and 5 had memory, and the memory-short
+      # set was a strict subset of the CPU-short set. The baseline is
+      # load-bearing: it starts the anon sampler, and an end probe alone
+      # reports its own seed. Delete both once the ruling is in
+      # gardenio/helm/ci/README.md.
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: "rust-baseline" }
+
+      # protoc is for tonic-build in crates/cli/build.rs; the rest mirrors the
+      # old .rwx/ci.yml system-deps step.
+      - name: apt deps
+        if: steps.superseded.outputs.superseded != 'true'
+        # build-essential: the runner image ships no C toolchain and cargo's
+        # build scripts need a linker ("linker `cc` not found" on the first run).
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends build-essential protobuf-compiler libprotobuf-dev pkg-config libssl-dev tmux
+
+      # CARGO_HOME, RUSTUP_HOME and CARGO_TARGET_DIR point into the node-local
+      # hostPath (gardenio/helm/ci/arc-runners-values.yaml), so rustup and the
+      # toolchain survive between jobs on a node and this step is a no-op
+      # after the first run. Paths are derived from CARGO_HOME rather than
+      # $HOME/.cargo, which is where rustup actually installs when CARGO_HOME
+      # is set -- hardcoding $HOME/.cargo/bin here would look fine and then
+      # not find rustup at all. The fallback keeps this working anywhere the
+      # env is not set.
+      - name: rustup
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -euo pipefail
+          CH="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CH/bin/rustup" ]; then
+            # DO NOT collapse this back to `curl -sSf https://sh.rustup.rs | sh`.
+            # That shape cannot fail correctly: on a transient failure curl
+            # writes nothing to the pipe, `sh` reads EOF and exits 0, so the
+            # install "succeeds" and the job dies 3 lines later at exit 127 on
+            # a rustup that was never written. That is not hypothetical -- it
+            # burned a heavy node twice in the last 100 ci runs (35677818290,
+            # 35677545945), each time as a false red on main. A partial
+            # download is worse still: `sh` would execute a truncated
+            # installer. Landing it in a file and checking it first removes
+            # both. `set -o pipefail` above is belt to this braces.
+            init="$(mktemp)"
+            curl -sSfL --retry 5 --retry-delay 2 --retry-connrefused \
+                 --max-time 180 -o "$init" https://sh.rustup.rs
+            [ -s "$init" ] || { echo "::error::rustup-init downloaded empty"; exit 1; }
+            sh "$init" -y --no-modify-path --profile minimal --default-toolchain none
+            rm -f "$init"
+          fi
+          echo "$CH/bin" >> "$GITHUB_PATH"
+          # Reads coop/rust-toolchain.toml (channel + components); a no-op
+          # when RUSTUP_HOME already has that toolchain.
+          #
+          # This is also the repair path for a toolchain left half-installed by
+          # a runner-loss kill: CARGO_HOME/RUSTUP_HOME are a node-local
+          # hostPath SHARED BETWEEN JOBS on a node, so a job killed mid-install
+          # (3 of the 6 recent rust failures were exactly that -- "received a
+          # shutdown signal", exit 130) leaves that state behind for whoever
+          # lands on the node next.
+          "$CH/bin/rustup" show active-toolchain || "$CH/bin/rustup" toolchain install
+
+      # Two integration tests locate the binary at <workspace>/target/debug/coop
+      # (crates/cli/tests/rendering_support.rs, rendering_attach.rs). That path
+      # is wrong as soon as CARGO_TARGET_DIR moves, and both fall back to a
+      # bare "coop" on PATH rather than failing loudly, so the breakage would
+      # surface as a confusing test error and not as "binary not found". Both
+      # check COOP_BIN first, so set it.
+      #
+      # The guard is shell, not `if: env.CARGO_TARGET_DIR != ''`. The `env`
+      # context only sees variables declared in the workflow, not ones the
+      # runner container was started with, so that condition reads empty and
+      # the step silently never runs.
+      - name: locate coop binary
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+            echo "COOP_BIN=$CARGO_TARGET_DIR/debug/coop" >> "$GITHUB_ENV"
+          fi
+
+      # No rust-cache / actions cache: the node-local hostPath above replaces
+      # it, and the GitHub cache would cost more than the minutes (the Go side
+      # measured an 18-minute cache upload over this uplink).
+
+      - name: fmt
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cargo fmt --all --check
+
+      - name: clippy
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cargo clippy --all -- -D warnings
+
+      - name: build
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cargo build --workspace
+
+      - name: test
+        if: steps.superseded.outputs.superseded != 'true'
+        # Skip set mirrors the Makefile's test-coop target: claude_, attach_
+        # and coop_vs_tmux_ need a live Claude session / tmux server.
+        # crates/cli/tests/pty_backend.rs spawns children with forkpty, which
+        # forks the whole test process: a child of one test inherits every other
+        # concurrent test's pty fds and holds their slave ends open, so their
+        # EOF never arrives. With 12 test threads that overlap is certain. Run
+        # the rest of the workspace in parallel and that one binary serialized.
+        # Real fix (coop code): CLOEXEC the pty fds / close inherited fds in the
+        # forkpty child before exec. See .github/known-failures.md.
+        run: |
+          cargo test --workspace -- --skip claude_ --skip attach_ --skip coop_vs_tmux_ \
+            --skip pty_trace_file_records_writes_and_reads --skip ring_buffer_integration \
+            --skip screen_integration --skip spawn_and_capture
+          cargo test -p coop --test pty_backend -- --test-threads=1
+
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: "rust-end" }
+
+  # ── /garden in a real Chromium (gd-DWQGQx9iep) ─────────────────────────────
+  # TestCardUnderChromium (gardenio/controller/internal/gardenhub/
+  # card_browser_test.go) hovers and taps plots on /garden under playwright-core.
+  # The `go` job above runs it too, and it SKIPS there: nothing installs
+  # gardenio/tests/gardenhub-browser/node_modules or a browser, so a green
+  # `build + test (controller)` says nothing about the info card. This job is
+  # the one place it really runs, and GARDENHUB_BROWSER_REQUIRED=1 turns each
+  # of the test's skips (no node, no playwright-core, no Chromium) into a
+  # failure, so a broken install here goes red instead of green-on-skip.
+  # The same browser runs the golden-screenshot gate (TestGardenGoldens,
+  # gd-D953GccBTY), which skips everywhere else for want of GARDENHUB_GOLDENS=1.
+  #
+  # Medium tier: no dind, no `services:`, two Go packages (gardenhub, beads-viewer) plus a headless
+  # Chromium. Path-gated on every event (dorny diffs a push against its
+  # `before`), with the same two fail-open arms as `rust`: a dispatch always
+  # runs, and an errored gate runs rather than drops the check.
+  #
+  # No in-job supersession re-check: that exists to hand back a heavy node
+  # after a long queue wait, and this job is short and on the medium tier.
+  gardenhub-browser:
+    name: gardenhub browser (chromium)
+    runs-on: gardenio-k3s-medium # medium ARC scale set (gardenio/helm/ci) -- no docker; see arc-runners-medium-values.yaml
+    # Setup (~2m) + the Makefile's go test -timeouts (walk 25m, splash walks
+    # 25m, goldens 30m), so a slow runner fails on go test's own message, not a
+    # bare job cancel (gd-AteqeWk2or: on main this job already took 15 of the
+    # old 20; gd-JWgIQDt4Yr: 31 of the old 40, the goldens 1063s of their old
+    # 20m; gd-rAAWVP4qOj: the walk 820s of its old 15m with the splash's
+    # controls; gd-RWh73aIIGW: the splash walks split out of the walk's 25m).
+    timeout-minutes: 85
+    needs: gate
+    # Path-gated per push, so NO run-wide supersession conjunct: a newer run
+    # whose own gardenhub_browser filter said no would never run this, and
+    # deferring to it would leave this push's change untested (gd-025MCE7PhK).
+    # The in-job re-check below passes `job:` instead; see the `rust` job.
+    # NO tag arm (gd-rmHsVjmKse): on a calver tag the gate's output is
+    # 'false' only when no UI path changed since the last tag whose suite
+    # passed, and 'true' on any doubt; a failed gate still runs this.
+    # scripts/check-ci-draft-gate.py (TAG_GATED) and
+    # scripts/check-main-concurrency.py pin both halves.
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
+       needs.gate.result != 'success' ||
+       needs.gate.outputs.gardenhub_browser == 'true')
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    env:
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      # The job-aware re-check, as in `rust`; read the note there. ADDING A
+      # STEP BELOW? Guard it with the same `if:`. scripts/check-ci-draft-gate.py
+      # refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: ci.yml
+          job: gardenhub browser (chromium)
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running gardenhub browser (chromium)"
+
+      # cache: false -- see the `go` job; GOCACHE is the node-local /cache.
+      - uses: actions/setup-go@v5
+        if: steps.superseded.outputs.superseded != 'true'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # xz-utils: the Node tarball is .tar.xz. make: the runner image has none,
+      # and the test step runs the Makefile target so CI and laptops share one
+      # recipe.
+      - name: apt deps
+        if: steps.superseded.outputs.superseded != 'true'
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends xz-utils make
+
+      - name: node (pinned tarball, sha256-verified)
+        # Same pins as the agent image and e2e.yml's viewer-e2e job.
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -euo pipefail
+          scripts/ci-fetch-node.sh tar.xz /tmp/node.tar.xz
+          sudo tar -xJ --strip-components=1 -C /usr/local -f /tmp/node.tar.xz
+          node --version
+
+      # Split from the test step so each cost is timed on its own. NO CHROMIUM
+      # CACHE, on purpose. First run (39192237134, node ip-10-90-1-5) measured:
+      #
+      #   npm ci 2s   install-deps (apt) 28s   Chromium download 10s (622M)
+      #   whole job 67s, of which the test step 4s
+      #
+      # A browser cache could save at most the 10s download, and would cost
+      # 622M per playwright version on every node's /cache, on a pool where
+      # node-local caches have not reliably hit. The 28s is apt, which a
+      # browser cache does not touch. Re-measure from the TIMING line before
+      # adding one. The make target below repeats `npm install` and
+      # `install chromium`; both are no-ops by then.
+      - name: playwright-core + Chromium (timed)
+        if: steps.superseded.outputs.superseded != 'true'
+        working-directory: gardenio/tests/gardenhub-browser
+        run: |
+          set -euo pipefail
+          echo "node=${NODE_NAME:-unknown}"
+          t0=$(date +%s)
+          npm ci --no-audit --no-fund
+          t1=$(date +%s)
+          sudo env "PATH=$PATH" DEBIAN_FRONTEND=noninteractive node_modules/.bin/playwright-core install-deps chromium
+          t2=$(date +%s)
+          node_modules/.bin/playwright-core install chromium
+          t3=$(date +%s)
+          echo "TIMING npm-ci=$((t1-t0))s install-deps=$((t2-t1))s chromium-download=$((t3-t2))s"
+          du -sh "${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}" || true
+
+      # Asserts a PASS line as well as a zero exit: `-run` matching nothing
+      # also exits 0, so a renamed test would otherwise go green here.
+      - name: make test-gardenhub-browser
+        if: steps.superseded.outputs.superseded != 'true'
+        env:
+          GARDENHUB_BROWSER_REQUIRED: "1"
+        # The quarantined `go` rows of main's .github/quarantine.d are skipped
+        # here too: the UnderChromium tests run only in this job.
+        run: |
+          set -euo pipefail
+          q=$(scripts/quarantine.sh fetch "$RUNNER_TEMP/quarantine.tsv")
+          export GARDENHUB_BROWSER_SKIP=$(scripts/quarantine.sh regex go "$q")
+          echo "quarantined: ${GARDENHUB_BROWSER_SKIP:-none}"
+          make test-gardenhub-browser 2>&1 | tee /tmp/gardenhub-browser.log
+          grep -E -- '^--- PASS: Test[A-Za-z]*UnderChromium' /tmp/gardenhub-browser.log
+
+      # The golden-screenshot gate for /garden (gd-D953GccBTY): every surface at
+      # a 390 px phone and a 1280 px desktop, light and dark, pixel-diffed
+      # against gardenio/controller/internal/gardenhub/testdata/golden/. A shot
+      # over its surface's tolerance, a missing golden or a stale one fails the
+      # job. Runs even when the walk above failed, so one red run shows both.
+      # TestComposerGoldens rides along: the beads viewer's empty thread
+      # composer (the house voice, gd-5e6xgIOH6B) in the light and dark skins,
+      # against gardenio/controller/cmd/beads-viewer/testdata/golden/, plus a
+      # 4.5:1 placeholder-contrast check in every skin. TestLandsGoldens does
+      # the same for the Lands front of house (gd-WFIUrR8dZA) against that
+      # directory's lands/ subdirectory. Each test has its own PASS line. How
+      # to update a golden:
+      # gardenio/tests/gardenhub-browser/GOLDENS.md.
+      - name: make test-garden-goldens
+        id: goldens
+        if: steps.superseded.outputs.superseded != 'true' && !cancelled()
+        env:
+          GARDENHUB_BROWSER_REQUIRED: "1"
+          GARDENHUB_GOLDEN_ARTIFACTS: ${{ runner.temp }}/garden-goldens
+        # GARDENIO_QUARANTINE: the `golden` rows of main's .github/quarantine.d
+        # still render and diff, log "QUARANTINED <shot>: N of M pixels differ",
+        # keep their diff PNGs, and do not fail the test.
+        run: |
+          set -euo pipefail
+          export GARDENIO_QUARANTINE=$(scripts/quarantine.sh fetch "$RUNNER_TEMP/quarantine.tsv")
+          make test-garden-goldens 2>&1 | tee /tmp/garden-goldens.log
+          grep -E -- '^--- PASS: TestGardenGoldens' /tmp/garden-goldens.log
+          grep -E -- '^--- PASS: TestComposerGoldens' /tmp/garden-goldens.log
+          grep -E -- '^--- PASS: TestLandsGoldens' /tmp/garden-goldens.log
+
+      - name: quarantine rows for the golden failures
+        if: failure() && steps.goldens.outcome == 'failure' && steps.superseded.outputs.superseded != 'true'
+        run: scripts/quarantine.sh rows /tmp/garden-goldens.log || true
+
+      # The commons-ux-acceptance skill's DOM probes (gd-vzsNYKoGNX) fire on a
+      # page built to trip each one and stay quiet on one built to pass; same
+      # Chromium as above. The skill's grades lean on them, so they must not rot.
+      - name: commons-ux probes self-test
+        if: steps.superseded.outputs.superseded != 'true' && !cancelled()
+        env:
+          GARDENHUB_BROWSER_REQUIRED: "1"
+        run: node --test .claude/skills/commons-ux-acceptance/scripts/test/probes.test.js
+
+      # actual/expected/diff PNG per failing or quarantined shot. gardenio/scripts/
+      # garden-goldens-from-ci.sh copies the actuals into testdata/golden/ for
+      # a laptop that cannot render Linux goldens itself.
+      - name: upload golden diffs
+        # Also on a pass: a quarantined shot's diff PNGs are there too.
+        if: steps.superseded.outputs.superseded != 'true' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: garden-goldens
+          path: ${{ runner.temp }}/garden-goldens
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
+  # The Lands conformance suite (Door D.11, gd-oQdHmmwZFW; contract design
+  # gd-EWSKPH7pa5 §8 step 9). lands/gl/conformance_test.go (build tag
+  # `conformance`) starts an OIDC issuer, the kd binary built here on a real
+  # Postgres, and the edge's land door as code (public-edge.yaml
+  # `location ^~ /land/`, rule for rule), seeds two lands, and replays every
+  # contract request fixture and gl's commands through each land's door. It
+  # asserts the contract's types, the hygiene denylist on every Lands API
+  # answer, and the cross-land matrix: a member of one land never reads,
+  # changes or streams the other.
+  #
+  # Heavy tier: `services:` needs the dind scale set (docs/ci-e2e-postgres-
+  # recipe.md, RECIPE-SERVICES; the medium tier has no docker). Path-gated
+  # like gardenhub-browser: a dispatch always runs, and an errored gate runs
+  # rather than drops the check.
+  #
+  # Then the strings tripwire (build tag `tripwire`): the printable strings of
+  # gl built the way a release is, against the same denylist. ADVISORY: a hit
+  # is a ::warning:: on the run, never a failure (shared code carries "daemon"
+  # and "bead", and gzipped descriptors and reflection hide strings anyway;
+  # lands/gl/deps_test.go is the guard). The step still fails when it cannot
+  # have scanned gl (no binary, too few strings, no contract version), so it
+  # can never go green on nothing.
+  lands-conformance:
+    name: lands conformance (gl + contract vs kd serve)
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci); dind for services:
+    timeout-minutes: 20
+    needs: gate
+    # Path-gated per push: no run-wide supersession conjunct, and a job-aware
+    # re-check below, as in `gardenhub-browser` (gd-025MCE7PhK).
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
+       startsWith(github.ref, 'refs/tags/') ||
+       needs.gate.result != 'success' ||
+       needs.gate.outputs.lands_conformance == 'true')
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    env:
+      CGO_ENABLED: 0
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: beads
+          POSTGRES_PASSWORD: beads
+          POSTGRES_DB: beads
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U beads"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The job-aware re-check, as in `rust`; read the note there. ADDING A
+      # STEP BELOW? Guard it with the same `if:`.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: ci.yml
+          job: lands conformance (gl + contract vs kd serve)
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running lands conformance"
+
+      # cache: false -- see the `go` job; GOCACHE is the node-local /cache.
+      - uses: actions/setup-go@v5
+        if: steps.superseded.outputs.superseded != 'true'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # postgresql-client: for the CREATE EXTENSION below. make: the runner
+      # image has none, and the suite runs through the Makefile target so CI
+      # and laptops share one recipe.
+      - name: apt deps
+        if: steps.superseded.outputs.superseded != 'true'
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends postgresql-client make
+
+      - name: create the vector extension
+        # migrate_preflight.go refuses to migrate without it.
+        if: steps.superseded.outputs.superseded != 'true'
+        env:
+          PGPASSWORD: beads
+        run: |
+          set -euo pipefail
+          psql -h localhost -U beads -d beads -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+      # Asserts a PASS line as well as a zero exit: `-run` matching nothing
+      # also exits 0, so a renamed test would otherwise go green here.
+      - name: make test-lands-conformance
+        if: steps.superseded.outputs.superseded != 'true'
+        env:
+          LANDS_CONFORMANCE_DATABASE_URL: postgres://beads:beads@localhost:5432/beads?sslmode=disable
+          LANDS_CONFORMANCE_LOG_DIR: ${{ runner.temp }}/lands-conformance
+        run: |
+          set -euo pipefail
+          make test-lands-conformance 2>&1 | tee /tmp/lands-conformance.log
+          grep -E -- '^--- PASS: TestConformance' /tmp/lands-conformance.log
+
+      - name: strings tripwire over the release gl build (advisory)
+        if: steps.superseded.outputs.superseded != 'true' && !cancelled()
+        run: |
+          set -euo pipefail
+          make lands-gl-tripwire 2>&1 | tee /tmp/lands-gl-tripwire.log
+          grep -E -- '^--- PASS: TestStringsTripwire' /tmp/lands-gl-tripwire.log
+
+      - name: upload the kd serve log
+        if: failure() && steps.superseded.outputs.superseded != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lands-conformance-kd-serve
+          path: ${{ runner.temp }}/lands-conformance
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
+
+  # ── THE REQUIRED CHECK `ci` (gd-UqzOTRj6cX) ────────────────────────────────
+  # A ruleset's required status check matches a CHECK-RUN (job) name, not a
+  # workflow name, so this job is the one name the main ruleset requires for
+  # all of ci.yml. Adding, renaming or path-gating a job then never touches
+  # the ruleset. It needs EVERY other job and fails when any of them did not
+  # end `success` or `skipped`: a failure, a cancel, a timeout. Skipped is
+  # fine, so path gates, the PR light tier and the supersession skip still pass.
+  #
+  # `if: always()`, not `!cancelled()`: a cancelled run must still report a
+  # FAILED `ci`. A skipped check satisfies a required check, so a skipped
+  # `ci` would read as green.
+  #
+  # The name is `ci` on every event. From gd-UqzOTRj6cX to part B
+  # (gd-19ECZxvFQw) a draft run reported `ci (draft)`, because its heavy
+  # jobs skipped and a ready_for_review run was still to come. Every PR run
+  # is now the light tier, draft or not, and `gh pr ready` starts no run,
+  # so the head's own run must report the check the ruleset requires.
+  #
+  # ADVISORY lists the job ids whose failure must not fail `ci`: a job that
+  # carries job-level `continue-on-error`. It is empty because no job here
+  # does. The advisory scans swallow their findings inside their own steps, so
+  # when one of those jobs fails, something real broke.
+  #
+  # scripts/check-ci-required-checks.py keeps `needs:` equal to every other
+  # job, the name, the `if:` and ADVISORY, and runs the step below on fixtures.
+  ci:
+    name: ci
+    needs:
+      - gate
+      - draft-light
+      - go
+      - rust
+      - gardenhub-browser
+      - lands-conformance
+    if: always()
+    runs-on: gardenio-k3s-light # never heavy: it only reads `needs`
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: every job passed or skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          ADVISORY: ""
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          n=$(jq 'length' <<<"$NEEDS")
+          if [ "$n" -eq 0 ]; then
+            echo "::error::no needs results to judge; failing closed"
+            exit 1
+          fi
+          bad=$(jq -r --arg adv "$ADVISORY" '
+            ($adv | split(" ") | map(select(length > 0))) as $a
+            | to_entries[]
+            | select(.value.result != "success" and .value.result != "skipped")
+            | if (.key as $k | $a | index($k)) != null
+              then "+advisory \(.key) \(.value.result)"
+              else "\(.key) \(.value.result)" end' <<<"$NEEDS")
+          rc=0
+          while read -r a b c; do
+            case "$a" in
+              "") ;;
+              +advisory) echo "::warning::$b ended $c (advisory, does not fail ci)" ;;
+              *) echo "::error::$a ended $b"; rc=1 ;;
+            esac
+          done <<<"$bad"
+          exit "$rc"

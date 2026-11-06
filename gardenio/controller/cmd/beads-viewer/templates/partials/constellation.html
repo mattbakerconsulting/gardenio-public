@@ -1,0 +1,223 @@
+{{define "constellation"}}
+{{with .Constellation}}{{if .HasAnything}}
+<figure class="constellation" data-bead-id="{{.Center.ID}}" data-tree-level="{{.TreeLevel}}" aria-label="Bead context constellation: similar beads, parents, and children">
+  <svg class="constellation-svg"
+       viewBox="0 0 {{.Width}} {{.Height}}"
+       preserveAspectRatio="xMidYMid meet"
+       role="group"
+       aria-label="Bead constellation: similar beads, parents (top), children (bottom)"
+       xmlns="http://www.w3.org/2000/svg">
+    {{/* role="group", not "img": an img's children are presentational, and
+         the nodes are links you can tab to (axe nested-interactive,
+         gd-ddw0WBzm9S). A group keeps the name and exposes the links.
+         No SVG <title>: a root <title> renders a native browser tooltip on
+         hover over ANY descendant node, which pops up on top of the rich
+         bead-preview popover (preview_popover.js) and obscures it. The
+         accessible name lives in aria-label instead — screen-reader exposed,
+         no visible tooltip (ka-0000000817). */}}
+    <defs>
+      <radialGradient id="goldenCenter" cx="50%" cy="50%" r="50%">
+        <stop offset="0%"   stop-color="#fff7d8"/>
+        <stop offset="55%"  stop-color="#f1c84a"/>
+        <stop offset="100%" stop-color="#b9851b"/>
+      </radialGradient>
+      <radialGradient id="goldenHalo" cx="50%" cy="50%" r="50%">
+        <stop offset="0%"   stop-color="rgba(244,200,80,0.55)"/>
+        <stop offset="60%"  stop-color="rgba(244,200,80,0.15)"/>
+        <stop offset="100%" stop-color="rgba(244,200,80,0)"/>
+      </radialGradient>
+    </defs>
+
+    {{/* --- Edges first so nodes paint over them. --- */}}
+    <g class="constellation-edges">
+      {{range .Edges}}
+      <line x1="{{printf "%.1f" .X1}}" y1="{{printf "%.1f" .Y1}}"
+            x2="{{printf "%.1f" .X2}}" y2="{{printf "%.1f" .Y2}}"
+            stroke="{{.Stroke}}"
+            stroke-width="1.6"
+            stroke-opacity="{{printf "%.2f" .Opacity}}"
+            stroke-linecap="round"
+            {{if .Dash}}stroke-dasharray="{{.Dash}}"{{end}}
+            {{if .Origin}}data-origin="{{.Origin}}"{{end}}
+            {{if .RelationshipType}}data-relationship-type="{{.RelationshipType}}"{{end}}
+            {{if .SourceBead}}data-source-bead="{{.SourceBead}}"{{end}}
+            {{if .TargetBead}}data-target-bead="{{.TargetBead}}"{{end}}>
+        {{if .TitleText}}<title>{{.TitleText}}</title>{{end}}
+      </line>
+      {{end}}
+    </g>
+
+    {{/* --- Center bead: golden glow + disk + glyph + labels. --- */}}
+    <g class="constellation-center">
+      <circle cx="{{printf "%.1f" .Center.X}}" cy="{{printf "%.1f" .Center.Y}}"
+              r="{{printf "%.1f" .Center.HaloR}}" fill="url(#goldenHalo)"/>
+      <a href="{{.Center.Href}}" aria-label="{{.Center.TitleAttr}}">
+        <circle cx="{{printf "%.1f" .Center.X}}" cy="{{printf "%.1f" .Center.Y}}"
+                r="{{printf "%.1f" .Center.Radius}}"
+                fill="url(#goldenCenter)"
+                stroke="{{.Center.Stroke}}"
+                stroke-width="2.5"/>
+        <text x="{{printf "%.1f" .Center.X}}" y="{{printf "%.1f" .Center.GlyphY}}"
+              text-anchor="middle"
+              font-size="22" font-weight="700" fill="#3a2a05">{{.Center.Glyph}}</text>
+      </a>
+      <text x="{{printf "%.1f" .Center.X}}" y="{{printf "%.1f" .Center.IDLabelY}}"
+            text-anchor="middle"
+            font-size="13" fill="currentColor"
+            class="constellation-center-label">{{.Center.LabelText}}</text>
+      <text x="{{printf "%.1f" .Center.X}}" y="{{printf "%.1f" .Center.TopY}}"
+            text-anchor="middle"
+            font-size="10" fill="currentColor" opacity="0.65"
+            font-family="ui-monospace, Menlo, Consolas, monospace">{{.Center.ID}}</text>
+    </g>
+
+    {{/* --- Orbit nodes --- */}}
+    <g class="constellation-nodes">
+      {{range .Forward}}{{template "constellation_node" .}}{{end}}
+      {{range .Reverse}}{{template "constellation_node" .}}{{end}}
+      {{range .Similar}}{{template "constellation_node" .}}{{end}}
+      {{range .Outer}}{{template "constellation_node" .}}{{end}}
+      {{if .HasAssignee}}{{template "constellation_node" .Assignee}}{{end}}
+      {{if .HasPredecessor}}{{template "constellation_node" .Predecessor}}{{end}}
+    </g>
+
+    {{/* --- Section labels: top = parents, bottom = children, right = similar --- */}}
+    <g class="constellation-section-labels"
+       font-size="11"
+       font-family="ui-monospace, Menlo, monospace"
+       fill="currentColor"
+       opacity="0.55">
+      {{if .HasForward}}<text x="500" y="36" text-anchor="middle">↑ depends on (parents)</text>{{end}}
+      {{if .HasReverse}}<text x="500" y="488" text-anchor="middle">↓ depended on by (children)</text>{{end}}
+      {{if .HasSimilar}}<text x="970" y="252" text-anchor="end">similar →</text>{{end}}
+    </g>
+
+    {{/* --- Legend (lower-left corner) --- */}}
+    <g class="constellation-legend"
+       transform="translate(16, 316)"
+       font-size="11"
+       font-family="ui-monospace, Menlo, monospace"
+       fill="currentColor">
+      <rect x="-6" y="-14" width="220" height="182" rx="6" ry="6"
+            fill="rgba(255,255,255,0.55)" stroke="rgba(0,0,0,0.15)"/>
+      {{range .Legend}}
+      <g transform="translate(0, {{.OffsetY}})">
+        {{if eq .Shape "node"}}
+          <circle cx="8" cy="0" r="6" fill="{{.Color}}" stroke="{{.Stroke}}" stroke-width="1.2"/>
+        {{else if eq .Shape "mr"}}
+          {{/* ka-0000004604: diamond + optional state-tinted ↗ overlay. */}}
+          <path d="M8,-6 L 14,0 L 8,6 L 2,0 Z"
+                fill="{{.Color}}" stroke="{{.Stroke}}" stroke-width="1.2"/>
+          {{if .Overlay}}
+          <circle cx="13" cy="-5" r="3.4" fill="{{.Overlay}}" stroke="#ffffff" stroke-width="0.8"/>
+          <text x="13" y="-5" text-anchor="middle" dominant-baseline="central"
+                font-size="5" font-weight="700" fill="#ffffff">↗</text>
+          {{end}}
+        {{else}}
+          <line x1="0" y1="0" x2="16" y2="0" stroke="{{.Stroke}}" stroke-width="1.8"
+                {{if .Dash}}stroke-dasharray="{{.Dash}}"{{end}}/>
+        {{end}}
+        <text x="22" y="3.5" fill="currentColor">{{.Label}}</text>
+      </g>
+      {{end}}
+    </g>
+  </svg>
+  <figcaption class="constellation-caption">
+    Constellation:
+    <span class="constellation-counts">
+      {{if .HasForward}}{{len .Forward}} parent{{if ne (len .Forward) 1}}s{{end}}{{end}}
+      {{if and .HasForward (or .HasReverse .HasSimilar)}} · {{end}}
+      {{if .HasReverse}}{{len .Reverse}} child{{if ne (len .Reverse) 1}}ren{{end}}{{end}}
+      {{if and .HasReverse .HasSimilar}} · {{end}}
+      {{if .HasSimilar}}{{len .Similar}} similar{{end}}
+      {{if .HasOuter}} · {{len .Outer}} transitive{{end}}
+    </span>
+    <label class="constellation-tree-level"
+           title="Tree depth: how many levels of dependencies to show. 1 = direct parents/children only.">
+      tree level
+      <input type="range" min="1" max="{{.MaxTreeLevel}}" value="{{.TreeLevel}}"
+             class="constellation-tree-level-input"
+             aria-label="Constellation tree depth"/>
+      <span class="constellation-tree-level-value">{{.TreeLevel}}</span>
+    </label>
+    <label class="constellation-toggle"
+           title="Hide untyped (gray dashed) mention edges. Persisted in localStorage.">
+      <input type="checkbox" class="constellation-hide-untyped"/>
+      hide untyped mentions
+    </label>
+    <label class="constellation-toggle"
+           title="Show closed agent beads. Hidden by default to keep the graph readable; reload required when toggled. Session beads stay hidden regardless.">
+      <input type="checkbox" class="constellation-show-closed-agents"
+             {{if .ShowClosedAgents}}checked{{end}}/>
+      show closed agents
+    </label>
+  </figcaption>
+</figure>
+{{end}}{{end}}
+{{end}}
+
+{{define "constellation_node"}}
+<g class="constellation-node constellation-node-{{.Role}}{{if .IsMR}} constellation-node-mr{{end}}{{if .IsExternal}} constellation-node-external{{end}}{{if .Emphasis}} constellation-node-emphasis{{end}}{{if .Ghost}} constellation-node-ghost{{end}}{{if .MutedLabel}} constellation-node-label-muted{{end}}"
+   {{if .IsMR}}data-mr-state="{{.MRState}}"{{end}}{{if .IsExternal}} data-external="1"{{end}}
+   {{if .Emphasis}}data-overlay-emphasis="1"{{end}}{{if .Ghost}}data-overlay-ghost="1"{{end}}>
+  {{if .Emphasis}}
+  {{/* Maps Phase 4 overlay — emphasis halo behind the disk so a heat /
+       needs-attention node pulls the eye regardless of its status color. */}}
+  <circle cx="{{printf "%.1f" .X}}" cy="{{printf "%.1f" .Y}}"
+          r="{{printf "%.1f" .EmphasisHaloR}}"
+          fill="none" stroke="#f4c84a" stroke-width="2.4" stroke-opacity="0.85"
+          pointer-events="none"/>
+  {{end}}
+  <a href="{{.Href}}"
+     aria-label="{{.TitleAttr}}"
+     hx-get="{{.Href}}"
+     hx-trigger="mouseover once"
+     hx-target="none"
+     hx-swap="none">
+    {{if .IsMR}}
+    {{/* ka-0000004604 — type=merge-request renders as a diamond, not a
+         circle. Centroid is the same so force-layout collision math is
+         unchanged; the bounding box equals the equivalent circle's. */}}
+    <path d="{{.DiamondPath}}"
+          transform="translate({{printf "%.1f" .X}},{{printf "%.1f" .Y}})"
+          fill="{{.Color}}"
+          fill-opacity="{{printf "%.2f" .Opacity}}"
+          stroke="{{.Stroke}}"
+          stroke-width="{{printf "%.1f" .OverlayStrokeWidth}}"
+          {{if .Ghost}}stroke-dasharray="3 3"{{else if .IsExternal}}stroke-dasharray="4 2"{{end}}/>
+    {{else}}
+    <circle cx="{{printf "%.1f" .X}}" cy="{{printf "%.1f" .Y}}"
+            r="{{printf "%.1f" .Radius}}"
+            fill="{{.Color}}"
+            fill-opacity="{{printf "%.2f" .Opacity}}"
+            stroke="{{.Stroke}}"
+            stroke-width="{{printf "%.1f" .OverlayStrokeWidth}}"
+            {{if .Ghost}}stroke-dasharray="3 3"{{end}}/>
+    {{end}}
+    <text x="{{printf "%.1f" .X}}" y="{{printf "%.1f" .GlyphY}}"
+          text-anchor="middle"
+          font-size="13" font-weight="700"
+          fill="#1a1a1a" pointer-events="none">{{.Glyph}}</text>
+    {{if and .IsMR .MROverlay}}
+    {{/* State-tinted ↗ corner badge — purple/blue/gray for merged/opened/closed. */}}
+    <circle cx="{{printf "%.1f" .OverlayCX}}" cy="{{printf "%.1f" .OverlayCY}}"
+            r="{{printf "%.1f" .OverlayR}}"
+            fill="{{.MROverlay}}"
+            stroke="#ffffff"
+            stroke-width="1.2"
+            pointer-events="none"/>
+    <text x="{{printf "%.1f" .OverlayCX}}" y="{{printf "%.1f" .OverlayCY}}"
+          text-anchor="middle"
+          dominant-baseline="central"
+          font-size="9" font-weight="700"
+          fill="#ffffff" pointer-events="none">↗</text>
+    {{end}}
+  </a>
+  <text x="{{printf "%.1f" .X}}" y="{{printf "%.1f" .IDLabelY}}"
+        class="constellation-node-label"
+        text-anchor="middle"
+        font-size="10"
+        font-family="ui-monospace, Menlo, Consolas, monospace"
+        fill="currentColor" opacity="0.75">{{.ID}}</text>
+</g>
+{{end}}

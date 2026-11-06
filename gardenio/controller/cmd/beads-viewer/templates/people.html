@@ -1,0 +1,708 @@
+{{template "layout" .}}
+{{define "title"}}Users · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+<style>
+  /* /people layout — responsive card grid (ka-0000005531) + long-token wrap
+     (ka-0000002686). CSS only: the row markup, classes, and stat-chip content
+     are unchanged — this reshapes how the existing rows lay out and wrap. */
+
+  /* Density fix: render the directory as a responsive multi-column card grid
+     so wide viewports carry 2-3 columns of content instead of one tall column
+     with a permanent right gutter (near_white_ratio 0.87, 6664px scroll for
+     42 people). The min(17rem, 100%) track floor collapses cleanly to a single
+     full-width column on narrow viewports. Mirrors the .user-home-grid idiom.
+
+     ka-0000000172: the first grid pass halved the height but left density
+     capped at 4/10 — desktop near_white_ratio stuck at ~0.69 (>= the 0.55
+     anchor). Two things kept the page near-white: the min-card-width floored
+     at 22rem (only ~3 columns, so acres of dead gutter between chip strips),
+     and the card fill rgba(128,128,128,0.04) composited to ~250 over white —
+     above the audit's R,G,B>=240 "near-white" cutoff, so every card interior
+     still scored as blank pixels. Drop the track floor to 17rem (4 columns of
+     content per row on a 1280px desktop) and tighten the gaps so more rows are
+     visible per vertical inch. */
+  /* Equal-height cards (ka-0000000689): let each card stretch to the tallest in
+     its grid row instead of sizing to its own content. `align-items: start`
+     shrink-wrapped every card to its content, so a person with fewer signals
+     (no status line, no email, no recent-requests strip — e.g. Pat Stone,
+     Jamie Cole) rendered a shorter card and the 4-column grid bottoms came out
+     ragged. `stretch` is grid's own default for align-items; restoring it makes
+     the card border + fill extend to a uniform row height (content still flows
+     from the top, so the extra space is quiet card fill, not a layout shift). */
+  .people-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(17rem, 100%), 1fr));
+    gap: 0.4rem 0.55rem;
+    align-items: stretch;
+    margin: 0.35rem 0;
+  }
+  /* Each row becomes a self-contained card: a box border replaces the generic
+     .bead-row flat bottom-rule, and inter-row vertical padding is tightened so
+     each card stays compact. Scoped under .people-list so the card border wins
+     over the generic .bead-row:last-child { border-bottom: none }. The 0.14
+     surface tint (up from 0.04) gives the card a real, legible fill that reads
+     as a card instead of a barely-there outline — and composites below the
+     near-white cutoff so the audit no longer counts the card body as blank. */
+  .people-list .people-row {
+    margin: 0;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid rgba(128,128,128,0.30);
+    border-radius: 8px;
+    background: rgba(128,128,128,0.14);
+  }
+  .people-list .people-row:last-child { border-bottom: 1px solid rgba(128,128,128,0.30); }
+  /* Tighten the internal chip-strip rhythm inside a card. */
+  .people-row .chip-strip { margin: 0.25rem 0 0; }
+
+  /* Signal-per-pixel: de-emphasize near-empty cards (ka-0000005627). An
+     operator with no activity signal at all — every stat is the em-dash
+     placeholder, no recent beads/requests, no status message (server-computed
+     peopleRow.IsQuiet → data-quiet) — carries ~equal visual weight to a rich
+     card, so the eye can't triage at a glance. Dim the card's CONTENT and
+     lighten its border so a scan lands on the high-activity colleagues first.
+
+     This is a WEIGHTING change, not a hide/collapse: the card stays in place,
+     fully reachable, and hover/focus-within restores full weight so every row
+     is legible on demand.
+
+     Density note (ka-0000000172): the de-emphasis dims .bead-row-text (the
+     content) and lightens the border only — it deliberately does NOT touch the
+     card's rgba(128,128,128,0.14) fill. Whole-card `opacity` would multiply
+     that fill toward white (0.14 → ~0.087 composited ≈ 244, above the audit's
+     R,G,B>=240 near-white cutoff) and re-open the density regression; keeping
+     the fill intact holds the interior at ~237, below the cutoff. The base
+     .people-row rule (which the density guardrail asserts on) is untouched. */
+  .people-list .people-row[data-quiet="true"] {
+    border-color: rgba(128,128,128,0.18);
+  }
+  .people-list .people-row[data-quiet="true"] .bead-row-text {
+    opacity: 0.6;
+    transition: opacity 0.12s ease;
+  }
+  .people-list .people-row[data-quiet="true"]:hover .bead-row-text,
+  .people-list .people-row[data-quiet="true"]:focus-within .bead-row-text {
+    opacity: 1;
+  }
+
+  /* Dormant strip (ka-0000000623, replacing the collapsed <details> of
+     ka-0000004086). The lane's north star is that gardenio is FLAT — every human
+     is visible without a click. So the fully-dormant operators (server IsQuiet)
+     no longer hide behind a disclosure control: the server partitions them into
+     an ALWAYS-VISIBLE strip below the active grid, de-emphasized (lighter
+     heading + the per-card data-quiet treatment) so an at-a-glance scan still
+     lands on active colleagues first, but "every human is visible" is now
+     literally true with zero interaction. They stay counted in the header
+     totals — this is a reorder + de-emphasis, never a hide or a collapse.
+     A quiet top rule + generous top margin set the strip apart from the active
+     grid without a heavy box that would compete with the active cards. */
+  .people-dormant {
+    margin: 0.7rem 0 0.2rem;
+    border-top: 1px solid rgba(128,128,128,0.18);
+    padding-top: 0.5rem;
+  }
+  /* A plain (non-interactive) heading — NOT a clickable summary. Lighter than
+     the active-grid chrome (muted, small-caps, reduced weight) so the whole
+     strip reads as secondary to the active directory above it. */
+  .people-dormant-heading {
+    margin: 0 0 0.1rem;
+    font-size: 0.82rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    opacity: 0.72;
+  }
+  .people-dormant-hint { font-weight: 400; }
+  /* A touch of top margin so the strip's grid separates from its heading. */
+  .people-dormant-list { margin-top: 0.5rem; }
+
+  /* Service & machine accounts section (ka-0000002163) — a collapsed <details>
+     below the dormant strip. Machines are non-humans, so they sit one level
+     further down than dormant humans and stay collapsed by default. Rows use a
+     distinct .machine-* class family (never .people-row) so the Users-CAMP
+     audit never counts or flags them. */
+  .people-machines {
+    margin: 0.7rem 0 0.2rem;
+    border-top: 1px solid rgba(128,128,128,0.18);
+    padding-top: 0.5rem;
+  }
+  .people-machines-summary {
+    font-size: 0.82rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    opacity: 0.72;
+    cursor: pointer;
+  }
+  .people-machines-hint { font-weight: 400; }
+  .people-machines-list {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(22rem, 100%), 1fr));
+    gap: 0.3rem 0.5rem;
+  }
+  .machine-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.35rem 0.55rem;
+    border: 1px solid rgba(128,128,128,0.22);
+    border-radius: 8px;
+    background: rgba(128,128,128,0.08);
+    min-width: 0;
+  }
+  .machine-row-main {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .machine-row-name { font-weight: 600; flex: 0 0 auto; }
+  .machine-handle {
+    font-size: 0.78rem;
+    opacity: 0.7;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .machine-open { flex: 0 0 auto; white-space: nowrap; }
+
+  /* Quality fix: long unbreakable identity tokens (gitlab bot emails, long
+     oidc subjects) must not force horizontal page overflow (1126px rendered at
+     a 480px viewport). The identity + recent chips are flex items of
+     .chip-strip; the generic .chip-type sets flex-shrink:0, which pins them at
+     their unbreakable max-content width and blows out the page. Let both chip
+     kinds shrink (min-width:0 + flex-shrink:1) so the flex item can actually
+     collapse below its content width. Short stat chips keep the default
+     no-shrink — they carry no long tokens.
+
+     Recent-bead chips WRAP their free-text title (overflow-wrap:anywhere lowers
+     the intrinsic min-content width so a long unbreakable title still can't push
+     the page wide). The identity chip does NOT wrap — see the rule below. */
+  .people-row-recent .people-recent-bead {
+    flex-shrink: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  /* Identity chip "<kind> <handle> /u/<slug>" (ka-0000005472). The <handle> is
+     an oidc subject / email / handle and is the card's widest token; on the
+     ~273px 4-column desktop card the old overflow-wrap:anywhere let the WHOLE
+     chip wrap to 2–3 lines (the widest email, alex.novak@contractor-b.example,
+     wrapped even though the heading email above it is one line per ka-0000007547).
+
+     Mirror that heading-email one-line treatment, but ellipsize ONLY the handle:
+     a whole-chip nowrap+ellipsis would clip the trailing /u/<slug> dashboard
+     link off the widest cards, making it unclickable. Lay the chip out as an
+     inline-flex row so the leading kind label and the trailing /u/<slug> link
+     stay pinned at their natural width (flex:0 0 auto) while the handle is the
+     only element that shrinks and clips (min-width:0 + overflow:hidden +
+     text-overflow:ellipsis). min-width:0 on the chip itself keeps it shrinkable
+     inside .chip-strip, so a pathological unbreakable handle (a 143-char email)
+     still cannot force horizontal page overflow at the 480px narrow viewport —
+     the recurring /people unbreakable-token regression (ka-0000002686) stays
+     fixed. The full handle is never lost: it stays in the chip's title= hover. */
+  .people-row-identities .people-identity {
+    flex-shrink: 1;
+    min-width: 0;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.3rem;
+    max-width: 100%;
+    white-space: nowrap;
+    overflow-wrap: normal;
+    word-break: normal;
+  }
+  .people-row-identities .people-identity > .people-identity-kind,
+  .people-row-identities .people-identity > a { flex: 0 0 auto; }
+  .people-row-identities .people-identity-handle {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* Canonical email line (ka-0000007547). The email is a block child of
+     .bead-row-text. In the 4-column desktop grid each card content box is only
+     ~273px wide, so a full-length address (sam.rivers@acme.example is
+     290px at the 16px body font) wrapped to a SECOND line — an ungainly card
+     heading/identity block, and the named reason Polish was held at 9/10.
+
+     Fix: keep the email to ONE line and ellipsize the overflow rather than
+     wrap. A slightly smaller line font (0.8rem) fits every current roster
+     address (the longest, balagopal.unnikrishnan@acme.example at 34 chars,
+     lands at ~272px inside the 273px box) on one line at ≥1280px, and reads as
+     the quiet secondary identifier it is (the resolved display name above is
+     the primary heading). white-space:nowrap + overflow:hidden +
+     text-overflow:ellipsis clip a pathological ultra-long unbreakable address
+     cleanly instead of wrapping — .bead-row-text already carries min-width:0,
+     so the clip cannot force horizontal page overflow at the 480px narrow
+     viewport (the recurring /people unbreakable-token regression, ka-0000002686,
+     stays fixed). The full address is never lost even when ellipsized: it stays
+     in the mailto: href, the title="Canonical email" hover, and the primary
+     oidc identity chip below (which keeps overflow-wrap:anywhere). */
+  .people-row-email {
+    font-size: 0.8rem;
+    line-height: 1.35;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* The anchor must not re-introduce a break opportunity that lets the line
+     wrap — it inherits the nowrap box; keep its intrinsic width unbroken so the
+     ellipsis (not a mid-word wrap) is what trims a residual over-long address. */
+  .people-row-email a { overflow-wrap: normal; word-break: normal; }
+
+  /* Card heading (ka-0000007601): when the resolved Display is still a raw
+     email/op-id (name resolution couldn't shorten it), the single unbreakable
+     token wraps MID-WORD at narrow widths (e.g. 'sam.rivers@acme.'
+     / 'ai') — an ungainly two-line heading. overflow-wrap:anywhere lets it
+     break at any point so it wraps cleanly instead of splitting a word, and a
+     two-line clamp keeps a residual long token from ballooning the card.
+     Complementary to the Accuracy name-resolution fixes, which reduce how many
+     headings are raw emails/op-ids in the first place. */
+  .people-row-name {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  /* "recent requests" strip (ka-0000005614): a few preview lines of the
+     human's most-recent thread-request messages so a glance at the card shows
+     what they're up to. Each line is the truncated ask + a recency tag, and
+     the whole line links to /threads/{id}. Kept visually quiet (muted, small)
+     so it reads as context under the stat chips, not another chip row. */
+  .people-row-requests { margin: 0.3rem 0 0; }
+  .people-requests-label { display: block; margin-bottom: 0.1rem; }
+  .people-requests-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+  }
+  .people-request { min-width: 0; }
+  .people-request-link {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    text-decoration: none;
+    color: inherit;
+    border-radius: 4px;
+    padding: 0.05rem 0.15rem;
+  }
+  .people-request-link:hover { background: rgba(128,128,128,0.14); }
+  .people-request-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    /* Deliver the "muted, small" the strip promises: the text otherwise
+       inherits the 16px body font, so in a ~17rem card even a short ask spills
+       past two lines and the clamp below has to truncate it (ka-0000003211).
+       A smaller preview font both reads as quiet context and lets a
+       word-boundary-truncated ask (peopleMessagePreviewLen) fit two lines. */
+    font-size: 0.82rem;
+    line-height: 1.4;
+    /* Only break a token that truly can't fit (a bare URL) — NOT normal words.
+       word-break:break-word is intentionally absent: the server truncates the
+       ask on a word boundary, so the visible ellipsis must be that word-safe
+       cut, not a mid-word chop. */
+    overflow-wrap: anywhere;
+    /* Two-line clamp is now a SAFETY NET, not the primary truncator: the
+       server cap fits two lines at this font, so `-webkit-line-clamp` clips
+       (mid-word, at a character boundary) only in the rare case a preview
+       still overflows — e.g. an unbreakable URL. Keeping the cap ≤ two lines
+       (see peopleMessagePreviewLen) is what keeps this from re-truncating a
+       word-boundary-truncated ask a second time. */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .people-request-link:hover .people-request-text { text-decoration: underline; }
+  .people-request-ago { flex: 0 0 auto; white-space: nowrap; }
+
+  /* Directory-scoped filter box (ka-0000000978) — a snappy per-keystroke filter
+     over the rendered rows so an operator can jump to a colleague by typing.
+     Mirrors the /extern search-box styling. Flex-wrap + a shrinkable input keep
+     it inside a 480px viewport with no horizontal overflow (the input's
+     min-width:0 lets it collapse below its placeholder's intrinsic width). */
+  .people-filter {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin: 0.6rem 0 0.4rem;
+  }
+  .people-filter-label {
+    font-size: 0.8em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.6;
+  }
+  .people-filter input {
+    flex: 1 1 18rem;
+    min-width: 0;
+    max-width: 30rem;
+    padding: 0.35rem 0.55rem;
+    border: 1px solid rgba(128,128,128,0.4);
+    border-radius: 6px;
+    font: inherit;
+  }
+  html[data-skin="dark-terminal"] .people-filter input { background: #14181d; }
+  .people-filter input:focus {
+    outline: 2px solid rgba(33,150,243,0.55);
+    outline-offset: 0;
+  }
+  .people-filter-count {
+    font-size: 0.72rem;
+    color: #777;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  html[data-skin="dark-terminal"] .people-filter-count { color: #9aa0a6; }
+  /* Filtering hides rows in place (kept in the DOM so the header-vs-rows audit
+     invariant is untouched); this class is the display toggle the JS applies. */
+  .people-row.people-filter-hidden,
+  .people-dormant.people-filter-hidden { display: none !important; }
+  /* The no-match line echoes the typed query; a long unbreakable term (a full
+     email / oidc subject) must wrap, not force horizontal page overflow at a
+     480px viewport. */
+  .people-filter-empty {
+    margin: 0.6rem 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .people-filter-empty [data-people-filter-term] { overflow-wrap: anywhere; }
+</style>
+<h1>Users <span class="meta" data-people-header-count data-people-total="{{.Count}}">({{.Count}})</span></h1>
+<p class="meta">Operator directory — sorted by most recent activity. Click a name to open their dashboard.</p>
+
+<div class="people-summary chip-strip" aria-label="Directory totals">
+  <span class="chip chip-type people-summary-people" title="Distinct humans after collapsing duplicate identities">
+    {{.Header.People}} people
+  </span>
+  {{if gt .Header.Identities .Header.People}}
+  <span class="chip chip-type people-summary-merged" title="Raw operator identities collapsed into the rows above (OIDC + Slack + agent aliases)">
+    {{.Header.Identities}} identities merged
+  </span>
+  {{end}}
+  <span class="chip chip-type people-summary-active" title="People with at least one open or in-progress bead">
+    {{.Header.ActiveNow}} active now
+  </span>
+  <span class="chip chip-type people-summary-open" title="Total open + in-progress beads across all operators">
+    {{.Header.OpenBeads}} open beads
+  </span>
+  {{if .Header.Created7d}}
+  <span class="chip chip-type people-summary-created" title="Beads created across the fleet in the last 7 days (throughput in)">
+    ↑{{.Header.Created7d}} created 7d
+  </span>
+  {{end}}
+  {{if .Header.Closed7d}}
+  <span class="chip chip-type people-summary-closed" title="Beads closed across the fleet in the last 7 days (throughput out)">
+    ↓{{.Header.Closed7d}} closed 7d
+  </span>
+  {{end}}
+  {{if .Header.MRsOpen}}
+  <span class="chip chip-type people-summary-mrs" title="Open merge-requests across all operators (review backlog)">
+    ⇄{{.Header.MRsOpen}} open MRs
+  </span>
+  {{end}}
+  {{if .Header.DecisionsPending}}
+  <span class="chip chip-type people-summary-decisions" title="Pending decisions across all operators (operator-action backlog)">
+    ⚑{{.Header.DecisionsPending}} pending decisions
+  </span>
+  {{end}}
+  {{if .Header.GardenersActive}}
+  <span class="chip chip-type people-summary-gardeners" title="Active gardeners (type=trigger) across all operators">
+    ⛵{{.Header.GardenersActive}} gardeners
+  </span>
+  {{end}}
+  {{if .Header.Machines}}
+  <span class="chip chip-type people-summary-machines" title="Machine identities (service / bridge / fleet / CI accounts) — listed separately below, NOT counted as people">
+    ⚙{{.Header.Machines}} machine identities
+  </span>
+  {{end}}
+</div>
+
+{{/* Directory-scoped filter box (ka-0000000978). A client-side, per-keystroke
+     substring filter over the rendered people-rows so an operator can jump to a
+     colleague by typing a name / email / handle / role instead of scanning ~34
+     cards. Mirrors the /extern search box (extern.html) and the /u activity
+     facet filter: it ships hidden and the script below reveals it, so a no-JS
+     client still gets the full, unfiltered directory. Filtering only toggles
+     `display` on rows already in the DOM (via data-search, server-built in
+     peopleRow.SearchText) — no daemon round-trip, and the SERVER-rendered header
+     count + row markup are untouched, so the audit's header_vs_rows_delta==0
+     invariant holds on the default (unfiltered) capture. Only rendered when the
+     directory actually has rows to filter. */}}
+{{if or .Rows .QuietRows}}
+<div class="people-filter" hidden data-people-filter>
+  <label for="people-filter-input" class="people-filter-label">Filter</label>
+  <input id="people-filter-input" type="search" autocomplete="off" spellcheck="false"
+         placeholder="Jump to a colleague — name, email, handle, role…"
+         aria-label="Filter the directory by name, email, handle, or role">
+  <span class="people-filter-count" data-people-filter-count aria-live="polite" hidden></span>
+</div>
+{{end}}
+
+{{if not .Rows}}
+{{if .QuietRows}}
+<p class="meta">Every operator in the directory is currently dormant — see the strip below.</p>
+{{else}}
+<p class="empty empty-yet">No operators have a public profile yet.</p>
+{{end}}
+{{else}}
+<ul class="bead-list people-list" aria-label="Operator directory">
+  {{range .Rows}}
+    {{template "people-row" (dict "Row" . "BasePath" $.BasePath)}}
+  {{end}}
+</ul>
+{{end}}
+
+{{/* Dormant strip (ka-0000000623, replacing the collapsed <details> of
+     ka-0000004086): operators with NO activity signal at all (server IsQuiet)
+     are partitioned out of the primary grid above and rendered here in an
+     ALWAYS-VISIBLE strip — no disclosure control to expand. The lane's north
+     star is that gardenio is FLAT: every human must be visible without a click,
+     so "every human is visible" is now literally true on load. The strip is
+     de-emphasized (a lighter, non-interactive heading + the per-card data-quiet
+     dimming) so an at-a-glance scan still lands on active colleagues first, but
+     the dormant operators are never hidden and stay counted in the header
+     totals — a reorder + de-emphasis, not a hide or a collapse. */}}
+{{if .QuietRows}}
+<section class="people-dormant" aria-label="Dormant operators">
+  <p class="people-dormant-heading meta">
+    Dormant operators <span data-people-dormant-count data-people-dormant-total="{{.QuietCount}}">({{.QuietCount}})</span>
+    <span class="people-dormant-hint">— no recent activity; counted in the totals above</span>
+  </p>
+  <ul class="bead-list people-list people-dormant-list" aria-label="Dormant operators">
+    {{range .QuietRows}}
+      {{template "people-row" (dict "Row" . "BasePath" $.BasePath)}}
+    {{end}}
+  </ul>
+</section>
+{{end}}
+
+{{/* Service & machine accounts section (ka-0000002163). Machine identities —
+     sentinel kinds (system/fleet/gitlab/jira/agent/email) plus human-kind rows
+     with a bot/group_/project_ subject — are NOT people, so they render here in
+     a collapsed <details> BELOW the human directory instead of being silently
+     dropped from the roster (the old behavior) or intermixed with real
+     colleagues. Collapsed by default (the human directory is the headline); the
+     header carries a machine count so the split is legible without expanding.
+     CRITICAL — audit safety: every element here uses a distinct `machine-*`
+     class (never `people-row`/`people-identity`/`people-row-name`) and plain-
+     text identifiers (never a `mailto:` link), so the Users-CAMP visual audit's
+     row/bot/service scanners — which key off exactly those markers — never count
+     or flag these rows, and header_vs_rows_delta stays 0. */}}
+{{if .MachineRows}}
+<details class="people-machines">
+  <summary class="people-machines-summary">
+    Service &amp; machine accounts <span data-people-machines-count>({{.MachineCount}})</span>
+    <span class="people-machines-hint">— bots, bridges, fleet &amp; CI identities; not counted as people</span>
+  </summary>
+  <ul class="people-machines-list" aria-label="Service and machine accounts">
+    {{range .MachineRows}}
+    <li class="machine-row" data-operator-id="{{.OperatorID}}">
+      <span class="machine-row-main">
+        {{if .UserHomeHref}}
+        <a class="machine-row-name" href="{{.UserHomeHref}}">{{.Display}}</a>
+        {{else}}
+        <span class="machine-row-name">{{.Display}}</span>
+        {{end}}
+        <span class="chip chip-type machine-kind" title="Operator kind">{{.Kind}}</span>
+        {{if .Handle}}<span class="machine-handle" title="{{.Handle}}">{{.Handle}}</span>{{end}}
+      </span>
+      <span class="chip chip-type machine-open" title="Open + in-progress beads attributed to this identity">
+        {{if .OpenBeads}}◷ {{.OpenBeads}} open{{else}}— open{{end}}
+      </span>
+    </li>
+    {{end}}
+  </ul>
+</details>
+{{end}}
+
+{{/* No-match empty state (ka-0000000978): shown by the filter JS when a query
+     hides every row. Hidden by default so a no-JS / unfiltered page never shows
+     it. Lives outside the lists so it carries neither bead-row nor people-row —
+     the audit's row grep and header_vs_rows check never see it. */}}
+{{if or .Rows .QuietRows}}
+<p class="empty people-filter-empty" data-people-filter-empty hidden>No colleague matches “<span data-people-filter-term></span>”.</p>
+{{end}}
+
+{{/* Directory-scoped client-side filter (ka-0000000978). Progressive
+     enhancement: the filter box ships server-rendered `hidden` and this script
+     reveals it, so a no-JS client keeps the full, unfiltered directory. Each
+     keystroke is a lowercased substring test of the query against every row's
+     data-search haystack (peopleRow.SearchText: name / email / status / every
+     identity kind+handle+slug) — a pure DOM display toggle, no server round-trip.
+     Rows are never removed from the DOM; they are only display:none'd, so the
+     SERVER-rendered <h1> count and the row markup the audit greps are untouched
+     (header_vs_rows_delta==0 holds on the default capture). Live, the header and
+     dormant counts are updated to the visible match count so the number the
+     operator reads stays consistent with the rows on screen while filtering; an
+     empty query restores the original server counts verbatim. */}}
+{{if or .Rows .QuietRows}}
+<script>
+(function () {
+  var box = document.querySelector('[data-people-filter]');
+  if (!box) { return; }
+  var input = box.querySelector('#people-filter-input');
+  var count = box.querySelector('[data-people-filter-count]');
+  var empty = document.querySelector('[data-people-filter-empty]');
+  var emptyTerm = empty ? empty.querySelector('[data-people-filter-term]') : null;
+  var headerCount = document.querySelector('[data-people-header-count]');
+  var dormant = document.querySelector('section.people-dormant');
+  var dormantCount = document.querySelector('[data-people-dormant-count]');
+  // Every people-row across BOTH the active grid and the always-visible dormant strip.
+  var rows = Array.prototype.slice.call(document.querySelectorAll('.people-row[data-search]'));
+  if (!rows.length) { return; }
+  // Original server-rendered totals — restored verbatim when the query clears
+  // so an empty filter is byte-for-byte the unfiltered page.
+  var headerTotal = headerCount ? (headerCount.getAttribute('data-people-total') || '') : '';
+  var dormantTotal = dormantCount ? (dormantCount.getAttribute('data-people-dormant-total') || '') : '';
+  box.removeAttribute('hidden');
+
+  function isDormant(row) {
+    return dormant ? dormant.contains(row) : false;
+  }
+
+  function apply(raw) {
+    var q = (raw || '').trim().toLowerCase();
+    var shown = 0;         // total visible rows (active + dormant)
+    var shownDormant = 0;  // visible rows inside the dormant section
+    rows.forEach(function (row) {
+      var hit = q === '' || (row.getAttribute('data-search') || '').indexOf(q) !== -1;
+      row.classList.toggle('people-filter-hidden', !hit);
+      if (hit) { shown++; if (isDormant(row)) { shownDormant++; } }
+    });
+    // Header "(N)" — visible match count while filtering, original total when
+    // empty. Kept consistent with the rendered rows (the audit asserts
+    // header_vs_rows_delta==0; on the live page the delta must stay 0 too).
+    if (headerCount) {
+      headerCount.textContent = q === '' ? '(' + headerTotal + ')' : '(' + shown + ')';
+    }
+    // Dormant heading "(N)" tracks visible dormant rows. The strip is
+    // always-visible (no disclosure to open), so filtering only updates the
+    // count and hides the whole strip when nothing in it matches, so its heading
+    // doesn't dangle over an empty list; an empty query restores the count.
+    if (dormant) {
+      if (dormantCount) {
+        dormantCount.textContent = q === '' ? '(' + dormantTotal + ')' : '(' + shownDormant + ')';
+      }
+      if (q !== '' && shownDormant === 0) {
+        dormant.classList.add('people-filter-hidden');
+      } else {
+        dormant.classList.remove('people-filter-hidden');
+      }
+    }
+    if (count) {
+      if (q === '') { count.setAttribute('hidden', ''); count.textContent = ''; }
+      else { count.removeAttribute('hidden'); count.textContent = shown + (shown === 1 ? ' match' : ' matches'); }
+    }
+    if (empty) {
+      if (q !== '' && shown === 0) {
+        if (emptyTerm) { emptyTerm.textContent = input.value; }
+        empty.removeAttribute('hidden');
+      } else {
+        empty.setAttribute('hidden', '');
+      }
+    }
+  }
+
+  input.addEventListener('input', function () { apply(input.value); });
+  // Escape clears the box.
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && input.value !== '') { input.value = ''; apply(''); }
+  });
+})();
+</script>
+{{end}}
+{{end}}
+
+{{/* One operator-row card, shared by the active grid and the dormant section
+     (ka-0000004086). Dot is a dict: .Row is the peopleRow, .BasePath the base
+     URL prefix (the recent-bead links need it and a shared partial can't reach
+     the page's $ root). */}}
+{{define "people-row"}}
+{{$row := .Row}}
+<li class="bead-row people-row" data-operator-id="{{$row.OperatorID}}" data-search="{{$row.SearchText}}"{{if $row.IsQuiet}} data-quiet="true"{{end}}>
+  <div class="bead-row-top">
+    <div class="bead-row-text">
+      <a class="bead-row-title people-row-name"
+         href="{{$row.UserHomeHref}}"
+         hx-get="{{$row.HoverHref}}"
+         hx-trigger="mouseover once delay:200ms"
+         hx-target="none"
+         hx-swap="none">{{$row.Display}}</a>
+      {{if $row.StatusMessage}}<div class="bead-row-desc people-row-status">{{$row.StatusMessage}}</div>{{end}}
+      {{if $row.Email}}<div class="people-row-email" title="Canonical email"><a href="mailto:{{$row.Email}}">{{$row.Email}}</a></div>{{end}}
+      <div class="chip-strip people-row-identities" aria-label="Linked identities">
+        {{range $row.Identities}}
+        <span class="chip chip-type people-identity{{if .Primary}} people-identity-primary{{end}}" title="{{.Kind}} identity{{if .Primary}} (canonical login){{end}}: {{.Handle}}"><span class="people-identity-kind">{{.Kind}}</span> <span class="people-identity-handle">{{.Handle}}</span> <a href="{{.UserHomeHref}}">/u/{{.Slug}}</a></span>
+        {{end}}
+      </div>
+      <div class="chip-strip people-row-stats" aria-label="Operator stats">
+        <span class="chip chip-type people-stat-open" title="Open + in-progress beads owned by this operator{{if $row.InProgress}} ({{$row.InProgress}} in progress){{end}}">
+          ◷ {{if $row.OpenBeads}}{{$row.OpenBeads}} open{{else}}— open{{end}}{{if $row.InProgress}} · {{$row.InProgress}} wip{{end}}
+        </span>
+        <span class="chip chip-type people-stat-created" title="Beads created by this operator in the last 7 days">
+          ↑ {{if $row.Created7d}}{{$row.Created7d}}{{else}}—{{end}} created
+        </span>
+        <span class="chip chip-type people-stat-closed" title="Beads closed by this operator in the last 7 days">
+          ↓ {{if $row.Closed7d}}{{$row.Closed7d}}{{else}}—{{end}} closed
+        </span>
+        <span class="chip chip-type people-stat-mrs" title="Merge-requests: open now / merged in the last 7 days">
+          ⇄ {{if $row.MRsOpen}}{{$row.MRsOpen}}{{else}}—{{end}} MR{{if $row.MRsMerged7d}} (↳{{$row.MRsMerged7d}} merged 7d){{end}}
+        </span>
+        <span class="chip chip-type people-stat-decisions" title="Decisions pending on this operator — someone is waiting on them">
+          ⚑ {{if $row.DecisionsPending}}{{$row.DecisionsPending}}{{else}}—{{end}} dec
+        </span>
+        <span class="chip chip-type people-stat-fleet" title="Active agents + gardeners owned by this operator ({{$row.AgentsActive}} agents, {{$row.GardenersActive}} gardeners)">
+          🤖 {{if $row.FleetActive}}{{$row.FleetActive}}{{else}}—{{end}}
+        </span>
+        {{if $row.PlansHref}}
+        <a class="chip chip-type people-stat-plans" href="{{$row.PlansHref}}" title="Plans this person is involved in ({{$row.PlansCount}} created — click to see the full involved set)">
+          🗺 {{if $row.PlansCount}}{{$row.PlansCount}}{{else}}—{{end}} plans
+        </a>
+        {{else}}
+        <span class="chip chip-type people-stat-plans" title="Plans this person created">
+          🗺 {{if $row.PlansCount}}{{$row.PlansCount}}{{else}}—{{end}} plans
+        </span>
+        {{end}}
+        <span class="chip chip-type people-stat-active" title="Most recent activity across all of this operator's beads">
+          {{if $row.LastActiveAgo}}active {{$row.LastActiveAgo}}{{else}}active —{{end}}
+        </span>
+      </div>
+      {{if $row.RecentMessages}}
+      <div class="people-row-requests" aria-label="Recent thread requests">
+        <span class="meta people-requests-label">recent requests:</span>
+        <ul class="people-requests-list">
+          {{range $row.RecentMessages}}
+          <li class="people-request">
+            {{if .ThreadHref}}<a class="people-request-link" href="{{.ThreadHref}}" title="Open the full thread">{{end}}
+            <span class="people-request-text">{{.Text}}{{if .Truncated}}…{{end}}</span>
+            {{if .Ago}}<span class="meta people-request-ago">{{.Ago}}</span>{{end}}
+            {{if .ThreadHref}}</a>{{end}}
+          </li>
+          {{end}}
+        </ul>
+      </div>
+      {{end}}
+      {{if $row.RecentBeads}}
+      <div class="chip-strip people-row-recent" aria-label="Recently created beads">
+        <span class="meta people-recent-label">recent:</span>
+        {{range $row.RecentBeads}}
+        <a class="chip chip-type people-recent-bead" href="{{$.BasePath}}/{{.ID}}" title="{{.Title}}">{{.ID}}{{if .Title}} · {{.Title}}{{end}}</a>
+        {{end}}
+      </div>
+      {{end}}
+    </div>
+  </div>
+</li>
+{{end}}

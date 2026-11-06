@@ -1,0 +1,157 @@
+# machine-principal-canary-job.yaml — one-off Job that proves a DIFFERENT
+# machine principal (Keycloak client gardenio-authz-canary, service account
+# holding only gardenio-operator) is refused an update on an account bead,
+# visibly: HTTP 403 with caller_subject=machine:gardenio-authz-canary and
+# required_role=gardenio-admin. Plan gd-UdM4LnnaGE Task 7 (gd-eiCV6zrLUS),
+# closing the evidence loop for bug gd-5NvJpCOlMC.
+#
+# RAW MANIFEST — not a chart template and never rolled by the deployer. The
+# operator applies it by hand, reads the log, and deletes it. It changes
+# nothing live: the write it attempts is idempotent (same field, same value)
+# and is expected to be refused.
+#
+# The script lives in gardenio/scripts/machine-principal-canary.sh and is
+# delivered through a ConfigMap created from that file, so the Job never
+# embeds a second copy that can drift from the tested one:
+#
+#   kubectl -n gardenio create configmap machine-principal-canary \
+#     --from-file=machine-principal-canary.sh=gardenio/scripts/machine-principal-canary.sh
+#   kubectl -n gardenio create -f gardenio/helm/manifests/machine-principal-canary-job.yaml
+#   kubectl -n gardenio wait --for=condition=complete --timeout=120s job/machine-principal-canary
+#   kubectl -n gardenio logs job/machine-principal-canary
+#   kubectl -n gardenio delete job/machine-principal-canary configmap/machine-principal-canary
+#
+# Expected log (exit 0 ⇒ Job Complete; exit 1 ⇒ the write was ALLOWED, which
+# is the finding; exit 2 ⇒ inconclusive — see the script header):
+#   HTTP 403
+#   caller_subject: machine:gardenio-authz-canary
+#   required_role: gardenio-admin
+#   canary: PASS: update/account by machine:gardenio-authz-canary was refused
+#
+# Prerequisites (laptop-claude, 2026-10-13 23:43Z, on gd-eiCV6zrLUS): the
+# KeycloakClient gardenio-authz-canary exists, its secret is in Secret
+# gardenio-machine-gardenio-authz-canary (key clientSecret, same layout the
+# controller mounts), and the client is listed in BEADS_MACHINE_CLIENTS.
+#
+# Image: the chart's own coopmux image. It is the only small in-cluster image
+# carrying bash + curl + jq (ubuntu:24.04 base; gardenio/images/coopmux/
+# Dockerfile), and on k3s it is already served from the ECR pull-through cache
+# for ghcr (deploy-values/gardenio-k3s.yaml global.imageRegistry), so the pull
+# is a cache hit, not a new upstream fetch. Set the tag to the one the running
+# coopmux Deployment uses:
+#   kubectl -n gardenio get deploy -l app.kubernetes.io/component=coopmux \
+#     -o jsonpath='{.items[0].spec.template.spec.containers[0].image}{"\n"}'
+#
+# Network: networkPolicies are disabled on k3s (deploy-values/gardenio-k3s.yaml
+# `networkPolicies: {enabled: false}`), so the pod reaches beads and the
+# in-cluster Keycloak directly. If they are ever enabled, this pod needs an
+# egress rule to beads:8080, keycloak-runtime:8080 and kube-dns, and an entry in
+# the beads-ingress policy — do not borrow the controller's component label.
+# No ziti, no public hostname, no ServiceAccount token.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: machine-principal-canary
+  namespace: gardenio
+  labels:
+    app.kubernetes.io/name: machine-principal-canary
+    app.kubernetes.io/component: machine-principal-canary
+    app.kubernetes.io/part-of: gardenio
+    gardenio.io/one-off: "true"
+  annotations:
+    gardenio.io/task: gd-eiCV6zrLUS
+    gardenio.io/purpose: >-
+      Wrong-principal 403 canary for machine principals. Run by hand, read the
+      log, delete. Expected: exit 0, HTTP 403, caller_subject
+      machine:gardenio-authz-canary.
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: machine-principal-canary
+        app.kubernetes.io/component: machine-principal-canary
+        app.kubernetes.io/part-of: gardenio
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # Every k3s node carries the gardenio.agent taint and the ECR image needs
+      # the `ecr` pull secret; both mirror the gardenio-agents pods. The first
+      # run (2026-10-14) was unschedulable (0/19 nodes) and then ErrImagePull
+      # without them.
+      tolerations:
+        - key: gardenio.agent
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      imagePullSecrets:
+        - name: ecr
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: canary
+          # Match the running coopmux Deployment's tag (see header).
+          image: 360190250083.dkr.ecr.us-east-1.amazonaws.com/ghcr/mattbakerconsulting/gardenio/coopmux:2026.286.8
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/opt/canary/machine-principal-canary.sh"]
+          env:
+            - name: BEADS_URL
+              value: http://gardenio-beads.gardenio.svc:8080
+            - name: BEADS_OIDC_TOKEN_URL
+              value: http://gardenio-keycloak-runtime.gardenio.svc:8080/auth/realms/gardenio/protocol/openid-connect/token
+            - name: TARGET
+              value: gd-XOnJ3PSDsn
+            - name: CANARY_CLIENT_ID
+              value: gardenio-authz-canary
+            - name: CANARY_CLIENT_SECRET_FILE
+              value: /var/run/secrets/gardenio-machine/clientSecret
+            - name: TMPDIR
+              value: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: script
+              mountPath: /opt/canary
+              readOnly: true
+            - name: machine-client-secret
+              mountPath: /var/run/secrets/gardenio-machine
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: script
+          configMap:
+            name: machine-principal-canary
+            defaultMode: 0555
+            items:
+              - key: machine-principal-canary.sh
+                path: machine-principal-canary.sh
+        - name: machine-client-secret
+          secret:
+            secretName: gardenio-machine-gardenio-authz-canary
+            defaultMode: 0440
+            items:
+              - key: clientSecret
+                path: clientSecret
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Mi

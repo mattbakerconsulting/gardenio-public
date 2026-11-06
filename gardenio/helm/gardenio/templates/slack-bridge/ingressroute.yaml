@@ -1,0 +1,147 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.slackBridge.enabled .Values.slackBridge.ingress.enabled }}
+{{- if and .Values.slackBridge.ingress.ipWhitelist.enabled (empty .Values.slackBridge.ingress.ipWhitelist.sourceRange) }}
+{{- fail "slackBridge.ingress.ipWhitelist.enabled is true but slackBridge.ingress.ipWhitelist.sourceRange is empty: set Slack webhook source CIDRs (see values.yaml comments) or set slackBridge.ingress.ipWhitelist.enabled=false." }}
+{{- end }}
+{{- $fullname := printf "%s-slack-bridge" (include "gardenio.fullname" .) -}}
+{{- $host := .Values.slackBridge.ingress.host -}}
+{{- $port := .Values.slackBridge.service.port | default 8090 -}}
+{{- $pathPrefix := .Values.slackBridge.ingress.pathPrefix | default "" -}}
+{{- $webhookPrefix := printf "%s/slack/" (trimSuffix "/" $pathPrefix) -}}
+{{- /*
+F14 (ka-0000000725): IngressRoute is split into two routes so Slack-delivered
+webhooks (PathPrefix `/slack/`) bypass forwardAuth and reach the bridge,
+while UI/admin paths (everything else on the host) keep SSO via forwardAuth.
+
+Auth gate on the webhook route is the Slack signing-secret check inside the
+bridge handler (controller/internal/bridge/slack.go HandleInteraction). The
+handler fail-closes when SLACK_SIGNING_SECRET is unset, so the chart relies
+on app-layer HMAC for webhook authenticity. Edge defenses (rate-limit and
+optional IP-allowlist) are defense-in-depth on top.
+
+Slack egress CIDRs for IP-allowlist: Slack does not publish a stable
+incoming-webhook egress range. See https://api.slack.com/robots and per-
+environment overlays in values.yaml (`slackBridge.ingress.ipWhitelist.sourceRange`).
+*/}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: slack-bridge
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    # Webhook route — Slack-delivered traffic. NO forwardAuth; signing-secret
+    # is verified in the bridge handler. Higher priority so it wins over the
+    # UI route's host-wide match.
+    - match: Host(`{{ $host }}`) && PathPrefix(`{{ $webhookPrefix }}`)
+      kind: Rule
+      priority: 200
+      services:
+        - name: {{ $fullname }}
+          port: {{ $port }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if $pathPrefix }}
+        - name: {{ $fullname }}-stripprefix
+        {{- end }}
+        {{- if .Values.slackBridge.ingress.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ipwhitelist
+        {{- end }}
+        {{- if .Values.slackBridge.ingress.rateLimit.enabled }}
+        - name: {{ $fullname }}-ratelimit
+        {{- end }}
+    # UI / admin route — browser-facing paths (decisions UI, /api/decisions,
+    # /api/escalations, /api/unreleased, /api/slack/* agent endpoints, etc.).
+    # forwardAuth applied when keycloak is on. Lower priority so the webhook
+    # route above takes precedence for `/slack/*`.
+    - match: Host(`{{ $host }}`){{ if $pathPrefix }} && PathPrefix(`{{ $pathPrefix }}`){{ end }}
+      kind: Rule
+      priority: 100
+      services:
+        - name: {{ $fullname }}
+          port: {{ $port }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if $pathPrefix }}
+        - name: {{ $fullname }}-stripprefix
+        {{- end }}
+        {{- if .Values.slackBridge.ingress.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ipwhitelist
+        {{- end }}
+        {{- if and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-forwardauth
+        {{- if .Values.keycloak.forwardAuth.forceLogoutOn403.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-forwardauth-errors
+        {{- end }}
+        {{- end }}
+        {{- if .Values.slackBridge.ingress.rateLimit.enabled }}
+        - name: {{ $fullname }}-ratelimit
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if $pathPrefix }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: slack-bridge
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $pathPrefix }}
+{{- end }}
+{{- if .Values.slackBridge.ingress.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: slack-bridge
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.slackBridge.ingress.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.slackBridge.ingress.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if .Values.slackBridge.ingress.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: slack-bridge
+spec:
+  rateLimit:
+    average: {{ .Values.slackBridge.ingress.rateLimit.average }}
+    burst: {{ .Values.slackBridge.ingress.rateLimit.burst }}
+{{- end }}
+{{- end }}

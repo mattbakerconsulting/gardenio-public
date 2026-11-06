@@ -1,0 +1,142 @@
+{{- /*
+vmalert-logs — a dedicated vmalert instance that evaluates the Phase-2 EKS-audit
+LogsQL detections (#3/#5/#6, ka-0000006485) against VictoriaLogs and fires
+through the SAME gardenio-alertmanager -> Slack path as the PromQL detections
+#1/#2/#4.
+
+WHY A SECOND vmalert (not a rule group on the existing one): vmalert's
+-datasource.url is a single global flag. The shared gardenio-vmalert points at
+vmsingle:8428 to evaluate PromQL recording/alerting rules; the LogsQL rules are
+`type: vlogs` and must be evaluated against the VictoriaLogs stats API
+(/select/logsql/stats_query on :9428). Retargeting the shared evaluator would
+break every PromQL rule, so we stand up a small sibling pointed at VictoriaLogs
+and set -rule.defaultRuleType=vlogs (defence-in-depth alongside the per-group
+`type: vlogs`). Alerting-only: no -remoteWrite.url (these rules PAGE, they do not
+record a series).
+
+Off by default. Enabled per-env once VictoriaLogs (ka-0000007261) and the
+CloudWatch->VL transport (ka-0000007889) land; until then the datasource answers
+nothing and every rule evaluates to an empty result — inert-but-ready.
+*/ -}}
+{{- if .Values.vmalertLogs.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.vmalertLogs.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmalertLogs.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.vmalertLogs.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.vmalertLogs.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "gardenio.contentChecksum" (include (print .Template.BasePath "/vmalert-logs/configmap.yaml") .) }}
+        {{- if .Values.vmalertLogs.selfScrape }}
+        # Expose vmalert-logs's own /metrics to the in-chart vmagent so an
+        # up{component="vmalert-logs"} series exists for a dead-man's-switch.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8880"
+        prometheus.io/path: "/metrics"
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: vmalert-logs
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.vmalertLogs.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.vmalertLogs.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            # Glob over the mounted LogsQL rules ConfigMap.
+            - "-rule=/config/*.yaml"
+            # Auto-reload rules at runtime (per-env overlay may toggle
+            # detections without a pod restart; kubelet projects ConfigMap
+            # updates into the mount within ~1m).
+            - "-configCheckInterval={{ .Values.vmalertLogs.configCheckInterval | default "30s" }}"
+            # Evaluate against VictoriaLogs (the /select/logsql/stats_query API
+            # lives under this base). No -remoteWrite.url: these are ALERTING
+            # rules, not recording rules — nothing to write back.
+            - "-datasource.url={{ include "gardenio.vmalertLogs.datasourceURL" . }}"
+            # Treat every loaded rule as LogsQL by default (belt-and-suspenders
+            # with the per-group `type: vlogs`), so a rule that omits the type
+            # is still evaluated against VictoriaLogs, not misparsed as PromQL.
+            - "-rule.defaultRuleType=vlogs"
+            - "-evaluationInterval={{ .Values.vmalertLogs.evaluationInterval | default "1m" }}"
+            {{- $notifierURL := include "gardenio.vmalertLogs.effectiveNotifierURL" . }}
+            {{- if $notifierURL }}
+            # ALERTING rules need a notifier. Precedence
+            # (gardenio.vmalertLogs.effectiveNotifierURL): an explicit
+            # vmalertLogs.notifierURL always wins; otherwise, when the in-chart
+            # Alertmanager is enabled, auto-wire to its ClusterIP Service — the
+            # same alert -> Slack delivery path as vmalert.
+            - "-notifier.url={{ $notifierURL }}"
+            {{- else if .Values.vmalertLogs.notifierBlackhole }}
+            # No-Alertmanager fallback: evaluate alerting rules and expose firing
+            # state via /api/v1/alerts while discarding notifications, instead of
+            # refusing to start. notifierURL takes precedence above.
+            - "-notifier.blackhole=true"
+            {{- end }}
+            - "-httpListenAddr=:8880"
+          ports:
+            - name: http
+              containerPort: 8880
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.vmalertLogs.resources | nindent 12 }}
+          volumeMounts:
+            - name: rules
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: rules
+          configMap:
+            name: {{ include "gardenio.vmalertLogs.rulesConfigMapName" . }}
+        - name: tmp
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.vmalertLogs.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.vmalertLogs.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.vmalertLogs.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

@@ -1,0 +1,174 @@
+{{define "type_molecule"}}
+{{/* Molecule execution view — "where in its execution a given molecule is"
+     (formula-legibility plan ka-0000007376, step S3 ka-0000007739). Renders
+     the SAME structure DAG as the parent formula (shared formula_dag_svg
+     partial) overlaid with live per-step status, the active frontier
+     highlighted ("you are here"), per-step owner + rolled-up cost, and a top
+     progress bar. The dynamic content lives in the molecule_exec fragment
+     below so the /molecule/{id}/events SSE stream (molecule_events.js) can
+     swap #molecule-exec outerHTML the moment any subtree bead changes. */}}
+<style>
+  .molecule-card h3 { margin-bottom: 0.35rem; }
+  .molecule-progress { display: flex; align-items: center; gap: 0.6rem; margin: 0.4rem 0 0.6rem; }
+  .molecule-progress-bar { flex: 1 1 auto; height: 10px; border-radius: 5px; background: rgba(127,127,127,0.18); overflow: hidden; }
+  .molecule-progress-bar span { display: block; height: 100%; border-radius: 5px; background: #43a047; }
+  .molecule-progress-label { font-size: 0.85em; white-space: nowrap; color: var(--text-subtle, #666); }
+  .molecule-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.3rem 0 0.6rem; font-size: 0.8em; }
+  .molecule-chip { border: 1px solid var(--border, #ddd); border-radius: 999px; padding: 0.1rem 0.6rem; white-space: nowrap; }
+  .molecule-chip-in_progress { border-color: #f9a825; color: #f9a825; }
+  .molecule-chip-ready { border-color: #1e88e5; color: #1e88e5; }
+  .molecule-chip-failed { border-color: #e53935; color: #e53935; }
+  .molecule-chip-done { border-color: #43a047; color: #43a047; }
+  .molecule-frontier { margin: 0.4rem 0 0.75rem; padding: 0.5rem 0.75rem; border: 1px solid #1976d2; border-radius: 8px; background: rgba(25,118,210,0.07); font-size: 0.9em; }
+  .molecule-frontier .molecule-frontier-marker { font-weight: 600; margin-right: 0.4rem; }
+  .molecule-frontier a { text-decoration: none; }
+  /* Desktop layout: lay the DAG overlay (which shrink-to-fits to its rendered
+     ~250px width) and the per-step execution table SIDE-BY-SIDE so the steps
+     fill the band the thin DAG leaves empty, instead of stacking below it under
+     a ~1000px white void (ka-0000006510 — the molecule-page analogue of the
+     iter9 recipe-page fix ka-0000002500). Stacked (flex-direction:column) by
+     default so narrow (375px) keeps its already-designed full-width layout —
+     the DAG spans the viewport, no void, no regression. The row layout only
+     kicks in at >=1024px, where there IS a wide band to fill. */
+  .molecule-exec-body { display: flex; flex-direction: column; gap: 0.6rem; margin-top: 0.6rem; }
+  @media (min-width: 1024px) {
+    .molecule-exec-body { flex-direction: row; flex-wrap: wrap; gap: 1rem; align-items: flex-start; }
+    /* DAG left: hug its own rendered width (flex-grow:0), never overflow. */
+    .molecule-dag-pane { flex: 0 1 auto; min-width: 0; max-width: 100%; }
+    /* Table right: grow to fill the band the DAG leaves; min-width:0 lets the
+       inner overflow-x scroll box, not the flex item, absorb any wide table. */
+    .molecule-steps-pane { flex: 1 1 380px; min-width: 0; }
+  }
+  /* The steps table's min-content width (unbreakable step ids, bead ids,
+     status chips, agent names) exceeds narrow viewports — without a scroll
+     container the WHOLE page pans horizontally at 375px (ka-0000007727).
+     Mirror .formula-dag-scroll: wide content scrolls inside its own box. */
+  .molecule-steps-scroll { overflow-x: auto; max-width: 100%; }
+  .molecule-steps-table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+  .molecule-steps-table th { text-align: left; font-weight: 600; padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--border, #ddd); color: var(--text-subtle, #666); }
+  .molecule-steps-table td { padding: 0.3rem 0.5rem; border-bottom: 1px solid rgba(127,127,127,0.15); vertical-align: top; }
+  .molecule-steps-table tr.molecule-row-frontier { background: rgba(25,118,210,0.06); }
+  .molecule-step-status { display: inline-block; border-radius: 999px; padding: 0.05rem 0.55rem; font-size: 0.85em; white-space: nowrap; border: 1px solid var(--border, #bbb); }
+  .molecule-step-status.status-done { border-color: #43a047; color: #43a047; }
+  .molecule-step-status.status-in_progress { border-color: #f9a825; color: #f9a825; }
+  .molecule-step-status.status-ready { border-color: #1e88e5; color: #1e88e5; }
+  .molecule-step-status.status-partial, .molecule-step-status.status-failed { border-color: #e53935; color: #e53935; }
+  .molecule-step-status.status-blocked, .molecule-step-status.status-deferred { border-color: #8e24aa; color: #8e24aa; }
+  .molecule-step-status.status-pending, .molecule-step-status.status- { opacity: 0.65; }
+  .molecule-owner-initials { display: inline-block; min-width: 1.6em; text-align: center; border-radius: 4px; background: rgba(127,127,127,0.15); font-size: 0.8em; padding: 0.05rem 0.25rem; margin-right: 0.3rem; }
+  .molecule-exec-meta { font-size: 0.85em; color: var(--text-subtle, #666); margin: 0.2rem 0 0.5rem; }
+  .molecule-exec-meta a { text-decoration: none; }
+  .molecule-vars { margin-top: 0.5rem; }
+  .molecule-not-poured td { opacity: 0.55; }
+  @keyframes molecule-exec-flash { from { box-shadow: 0 0 0 3px rgba(25,118,210,0.35); } to { box-shadow: none; } }
+  .molecule-exec-updated { animation: molecule-exec-flash 1.2s ease-out; }
+</style>
+
+<section class="molecule-card">
+  <h3>Molecule execution</h3>
+  {{template "molecule_exec" .}}
+  {{/* molecule_events.js reads this anchor, opens an EventSource against
+       /molecule/{id}/events, and swaps #molecule-exec on each frame. */}}
+  <span class="molecule-events-anchor" data-molecule-events="{{.BasePath}}/molecule/{{.Molecule.MoleculeID}}/events" hidden></span>
+</section>
+{{end}}
+
+{{define "molecule_exec"}}
+{{/* The live-swapped execution fragment: progress bar, frontier callout, the
+     recipe DAG with status overlay, and the per-step execution table. Root
+     carries id="molecule-exec" — the SSE swap contract. Called with a data
+     bag: Molecule (moleculeExecView), BasePath. */}}
+<div id="molecule-exec" class="molecule-exec">
+  {{with .Molecule}}
+    <div class="molecule-exec-meta">
+      {{if .FormulaID}}
+        Poured from <a href="{{$.BasePath}}/{{.FormulaID}}"><code>{{.FormulaID}}</code>{{if .FormulaTitle}} — {{.FormulaTitle}}{{end}}</a>
+      {{end}}
+      {{if .TotalCostUSD}}
+        · <a href="{{$.BasePath}}/molecule/{{.MoleculeID}}/cost" title="Open the full cost rollup for this molecule">{{.TotalCostUSD}}{{if .CostPartial}} (in flight){{end}}</a>
+      {{end}}
+    </div>
+
+    {{if .FormulaError}}
+    <p class="formula-dag-note" role="status">{{.FormulaError}}</p>
+    {{end}}
+
+    {{if .Total}}
+    <div class="molecule-progress" title="{{.Done}} of {{.Total}} steps done">
+      <div class="molecule-progress-bar"><span style="width: {{.PctDone}}%"></span></div>
+      <span class="molecule-progress-label">{{.Done}}/{{.Total}} done · {{.PctDone}}%</span>
+    </div>
+    <div class="molecule-chips">
+      {{if .InProgress}}<span class="molecule-chip molecule-chip-in_progress">{{.InProgress}} in progress</span>{{end}}
+      {{if .Ready}}<span class="molecule-chip molecule-chip-ready">{{.Ready}} ready</span>{{end}}
+      {{if .Pending}}<span class="molecule-chip">{{.Pending}} pending</span>{{end}}
+      {{if .Failed}}<span class="molecule-chip molecule-chip-failed">{{.Failed}} partial/failed</span>{{end}}
+      {{if .Done}}<span class="molecule-chip molecule-chip-done">{{.Done}} done</span>{{end}}
+    </div>
+    {{else}}
+    <p class="formula-dag-note">No step beads found under this molecule.</p>
+    {{end}}
+
+    {{if .Frontier}}
+    <div class="molecule-frontier" role="status">
+      <span class="molecule-frontier-marker">▶ You are here:</span>
+      {{range $i, $f := .Frontier}}{{if $i}} · {{end}}{{$beads := $f.Beads}}{{if eq (len $beads) 1}}{{range $beads}}<a href="{{$.BasePath}}/{{.BeadID}}"><code>{{$f.StepID}}</code> — {{$f.Title}}</a>{{end}}{{else}}<code>{{$f.StepID}}</code> — {{$f.Title}}{{end}}
+      <span class="molecule-step-status status-{{$f.Status}}">{{$f.Status}}</span>{{end}}
+    </div>
+    {{end}}
+
+    {{/* DAG left, steps table right on desktop (>=1024px); stacked at narrow.
+         See .molecule-exec-body in the style block above (ka-0000006510). */}}
+    <div class="molecule-exec-body">
+    {{with .DAG}}
+      <div class="molecule-dag-pane">
+      {{template "formula_dag_svg" (dict "DAG" . "BasePath" $.BasePath)}}
+      </div>
+    {{end}}
+
+    {{if .Steps}}
+    <div class="molecule-steps-pane">
+    <div class="molecule-steps-scroll">
+    <table class="molecule-steps-table">
+      <thead><tr><th>Step</th><th>Status</th><th>Owner</th>{{if .AnyStepCost}}<th>Cost</th>{{end}}<th>Bead</th></tr></thead>
+      <tbody>
+        {{range .Steps}}
+        <tr class="{{if .Frontier}}molecule-row-frontier{{end}}{{if not .Beads}} molecule-not-poured{{end}}">
+          <td>{{if .Frontier}}<span title="you are here">▶ </span>{{end}}<code>{{.StepID}}</code>{{if .Title}} — {{.Title}}{{end}}</td>
+          <td><span class="molecule-step-status status-{{.Status}}">{{if .Status}}{{.Status}}{{else}}not instantiated{{end}}</span></td>
+          <td>{{range .Beads}}{{if .Assignee}}<span class="molecule-owner-initials" title="{{.Assignee}}">{{.Initials}}</span>{{agentLink .Assignee}}{{end}} {{end}}</td>
+          {{if $.Molecule.AnyStepCost}}<td>{{.CostUSD}}</td>{{end}}
+          <td>{{range $i, $b := .Beads}}{{if $i}} · {{end}}<a href="{{$.BasePath}}/{{$b.BeadID}}" title="{{$b.Title}} [{{$b.Status}}]"><code>{{$b.BeadID}}</code></a>{{end}}</td>
+        </tr>
+        {{end}}
+        {{range .Extras}}
+        <tr>
+          <td><code>{{.BeadID}}</code> — {{.Title}} <span class="formula-dag-note" style="display:inline">(not in recipe)</span></td>
+          <td><span class="molecule-step-status status-{{.Status}}">{{.Status}}</span></td>
+          <td>{{if .Assignee}}<span class="molecule-owner-initials" title="{{.Assignee}}">{{.Initials}}</span>{{agentLink .Assignee}}{{end}}</td>
+          {{if $.Molecule.AnyStepCost}}<td></td>{{end}}
+          <td><a href="{{$.BasePath}}/{{.BeadID}}"><code>{{.BeadID}}</code></a></td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    </div>
+    </div>
+    {{end}}
+    </div>{{/* .molecule-exec-body */}}
+
+    {{if .AppliedVars}}
+    <details class="molecule-vars">
+      <summary>Applied variables ({{len .AppliedVars}})</summary>
+      <dl class="field-list">
+        {{range .AppliedVars}}
+        <dt><code>{{.Name}}</code></dt><dd><code>{{.Value}}</code></dd>
+        {{end}}
+      </dl>
+    </details>
+    {{end}}
+  {{else}}
+    <p class="empty">Molecule execution data unavailable.</p>
+  {{end}}
+</div>
+{{end}}

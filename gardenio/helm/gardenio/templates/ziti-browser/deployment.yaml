@@ -1,0 +1,141 @@
+{{- if .Values.zitiBrowser.enabled }}
+{{- $cfg := .Values.zitiBrowser -}}
+{{- $oauth := $cfg.oauth2Proxy -}}
+{{- if not $cfg.host -}}
+{{- fail "zitiBrowser.enabled is true but zitiBrowser.host is empty" -}}
+{{- end -}}
+{{- if not (hasPrefix "https://" ($oauth.issuerURL | default "")) -}}
+{{- fail "zitiBrowser.oauth2Proxy.issuerURL must be an https:// OIDC issuer" -}}
+{{- end -}}
+{{- if eq (len ($oauth.allowedRoles | default list)) 0 -}}
+{{- fail "zitiBrowser.oauth2Proxy.allowedRoles must contain at least one Entra application role" -}}
+{{- end -}}
+{{- $fullname := include "gardenio.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-ziti-forwardauth
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ziti-forwardauth
+spec:
+  replicas: {{ $oauth.replicaCount | default 2 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}-ziti-forwardauth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Chart.Name }}-ziti-forwardauth
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: ziti-forwardauth
+    spec:
+      automountServiceAccountToken: false
+      {{- include "gardenio.nodeSelector" (dict "local" $oauth.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" $oauth.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: oauth2-proxy
+          image: {{ include "gardenio.mirroredImage" (dict "image" $oauth.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ $oauth.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 4180
+              protocol: TCP
+          args:
+            - --http-address=0.0.0.0:4180
+            - --provider={{ $oauth.provider | default "entra-id" }}
+            - --provider-display-name=Example SSO
+            - --oidc-issuer-url={{ $oauth.issuerURL }}
+            - --oidc-groups-claim=roles
+            {{- range $oauth.allowedRoles }}
+            - --allowed-group={{ . }}
+            {{- end }}
+            {{- range $oauth.emailDomains }}
+            - --email-domain={{ . }}
+            {{- end }}
+            - --scope={{ $oauth.scope | default "openid profile email" }}
+            - --redirect-url=https://{{ $cfg.host }}/oauth2/callback
+            - --whitelist-domain={{ $cfg.host }}
+            - --cookie-name={{ $oauth.cookieName | default "_gardenio_ziti_oauth2" }}
+            - --cookie-secure={{ $oauth.cookieSecure }}
+            - --cookie-samesite=lax
+            {{- if $oauth.cookieRefresh }}
+            - --cookie-refresh={{ $oauth.cookieRefresh }}
+            {{- end }}
+            {{- if $oauth.cookieExpire }}
+            - --cookie-expire={{ $oauth.cookieExpire }}
+            {{- end }}
+            - --upstream=static://202
+            - --reverse-proxy=true
+            - --set-xauthrequest=true
+            # The beads-only ForwardAuth middleware copies this ID token
+            # response header to the viewer. The mux/kd middleware deliberately
+            # omits Authorization so edge-auth selects cookie auth, not PAT.
+            - --set-authorization-header=true
+            - --pass-access-token=true
+            - --pass-user-headers=true
+            - --skip-provider-button=true
+            - --code-challenge-method=S256
+            - --cookie-csrf-per-request=true
+            - --cookie-csrf-expire=15m
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $oauth.clientSecretRef.name }}
+                  key: {{ $oauth.clientSecretRef.clientIDKey }}
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $oauth.clientSecretRef.name }}
+                  key: {{ $oauth.clientSecretRef.clientSecretKey }}
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $oauth.cookieSecretRef.name }}
+                  key: {{ $oauth.cookieSecretRef.key }}
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml $oauth.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with $oauth.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

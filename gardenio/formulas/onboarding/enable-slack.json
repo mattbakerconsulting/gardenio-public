@@ -1,0 +1,96 @@
+{
+  "description": "Turn on Slack for a project: install the gardenio Slack app, give the bridge its tokens, and bind a channel to the project. The installs and the binding are gated human steps; checking the result is a task.",
+  "phase": "liquid",
+  "vars": [
+    {
+      "name": "project",
+      "required": true,
+      "description": "Project to bind the channel to (the type:project bead name)"
+    },
+    {
+      "name": "channel_id",
+      "required": true,
+      "pattern": "^[CG][A-Z0-9]{8,}$",
+      "description": "Slack channel ID (channel details, About; starts with C, or G for an old private channel). Not the #name"
+    },
+    {
+      "name": "role",
+      "default": "crew",
+      "description": "Role an @mention in the channel spawns, and whose agent cards route back to it"
+    }
+  ],
+  "steps": [
+    {
+      "id": "install-app",
+      "title": "Install the gardenio Slack app in the workspace",
+      "short_title": "install the Slack app",
+      "type": "task",
+      "gate": {
+        "type": "manual",
+        "timeout": "72h"
+      },
+      "description": "Human step for a Slack workspace admin.\n\nCreate the app from gardenio/slack/manifest.json, the single source of truth for its scopes, slash commands, events and Socket Mode: api.slack.com, Your Apps, Create New App, From a manifest. For an existing app, paste the manifest under App Manifest and save. Install (or reinstall) it to the workspace; Slack only grants changed scopes on reinstall. gardenio/slack/README.md explains the bot and user scope blocks.\n\nClose this step once the app is installed."
+    },
+    {
+      "id": "bridge-tokens",
+      "title": "Give the Slack bridge its bot and app tokens",
+      "short_title": "give the bridge its tokens",
+      "type": "task",
+      "gate": {
+        "type": "manual",
+        "timeout": "72h"
+      },
+      "needs": [
+        "install-app"
+      ],
+      "description": "Human or operator step. The slack-bridge needs the bot token (`xoxb-`, as SLACK_BOT_TOKEN) and an app-level token with `connections:write` (`xapp-`, as SLACK_APP_TOKEN, for Socket Mode). Store both as secrets in the deployment (the Helm chart reads them from secretKeyRefs); never paste a token into a bead, a comment or Slack.\n\nIf you are not the operator, file `gb escalation create --requesting-task <this step's id>` naming the two secrets, and close this step when it is done."
+    },
+    {
+      "id": "invite-app",
+      "title": "Create or pick the Slack channel and invite the gardenio app",
+      "short_title": "invite the app to the channel",
+      "type": "task",
+      "gate": {
+        "type": "manual",
+        "timeout": "72h"
+      },
+      "needs": [
+        "install-app"
+      ],
+      "description": "Human step in Slack. Create the channel (or pick an existing one), then invite the app with `/invite @<app name>` in it. Check that its ID matches the one this formula was poured with (`{{channel_id}}`)."
+    },
+    {
+      "id": "find-project",
+      "title": "Find the {{project}} project bead",
+      "short_title": "find the project bead",
+      "type": "task",
+      "description": "```sh\nkd list --type project\n```\n\nComment the id of the bead titled {{project}} on the bind-channel step."
+    },
+    {
+      "id": "bind-channel",
+      "title": "Bind channel {{channel_id}} to {{project}} with {{role}} as its handler",
+      "short_title": "bind the channel to the project",
+      "type": "task",
+      "gate": {
+        "type": "manual",
+        "timeout": "72h"
+      },
+      "needs": [
+        "bridge-tokens",
+        "invite-app",
+        "find-project"
+      ],
+      "description": "Human or operator step: it edits shared routing on the project bead. Both fields are shared aggregates, so use the flags that append; a bare `-f slack_channel=` or `-f channel_roles=` replaces the whole value and un-wires every other channel.\n\n```sh\nkd update <project-bead-id> --field-append slack_channel={{channel_id}}\nkd update <project-bead-id> --field-set channel_roles.{{channel_id}}={{role}}\n```\n\nThe first makes the project own the channel; the second makes {{role}} the channel's default handler, so an @mention spawns it and its agent cards route back here. See Step 4b of gardenio/docs/onboarding-new-project-and-role.md."
+    },
+    {
+      "id": "verify",
+      "title": "Verify the bridge sees channel {{channel_id}} and routes it to {{project}}",
+      "short_title": "verify the channel binding",
+      "type": "task",
+      "needs": [
+        "bind-channel"
+      ],
+      "description": "The project-to-channel cache has a TTL of about 30 seconds, so allow a moment.\n\n```sh\ngb slack channels                         # the bot is a member of {{channel_id}}\nkd show <project-bead-id> --json \\\n  --jq '.fields | {slack_channel, channel_roles}'   # {{channel_id}} listed, mapped to {{role}}\n```\n\nTell the person what to look for in Slack: the next agent card for a {{role}} agent on {{project}} lands in this channel."
+    }
+  ]
+}

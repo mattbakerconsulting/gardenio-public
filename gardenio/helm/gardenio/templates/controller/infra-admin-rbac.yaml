@@ -1,0 +1,60 @@
+{{- /*
+Admin infrastructure identity (plan gd-xiV5hyhPrG P6, gd-sAMar9tn5B): full
+cluster control for the `infra-admin` role, decision D2. Design and the list of
+what cluster-admin includes: gardenio/docs/infra-admin-role-design.md.
+
+A dedicated ServiceAccount bound to the BUILT-IN cluster-admin ClusterRole. No
+chart-authored ClusterRole: nothing here can drift narrower than the grant the
+owner approved. The token is only mounted into pods whose ROLE bead sets
+needs_k8s_api=true and service_account=<this SA> (the `infra-admin` role bead).
+Every other agent pod stays token-less, and automountServiceAccountToken is
+false on the SA so nothing else that references it inherits a mount. The pod
+gets the kubelet-projected bound token (about 1h, rotated, invalid once the pod
+is deleted); there is NO long-lived token Secret.
+
+Deliberately NOT agents.clusterAdmin: that path also renders
+templates/controller/cluster-rbac.yaml, which grants the deployer SA
+clusterrolebinding create. Leave agents.clusterAdmin off.
+
+Never auto-approved: spawns of the role need a human OIDC approval every time
+(kbeads neverAutoApproveRoles, kbeads/internal/server/spawn_policy.go). Do not
+enable this before P12 (agent-chosen ServiceAccount) is rolled.
+*/ -}}
+{{- /*
+ClusterRoleBinding labels below are STATIC on purpose: no gardenio.labels or
+gardenio.coop.labels, which carry the chart name-version label. A label that
+changes every release makes helm patch this binding on every upgrade, and the
+release-deployer cannot (it has no `bind` on cluster-admin), so --atomic would
+roll back every autonomous release. Keep the rendered binding byte-identical
+across chart versions (TestInfraAdmin_ClusterRoleBindingIsStaticAcrossChartVersions).
+*/ -}}
+{{- if and .Values.agents.enabled .Values.agents.infraAdmin.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.agents.infraAdmin.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: infra-admin
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.agents.infraAdmin.name }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/component: agent
+    gardenio.io/access-boundary: infra-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.agents.infraAdmin.name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

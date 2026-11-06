@@ -1,0 +1,600 @@
+{
+  "description": "Receive-path liveness for the two non-AVA webhook doors (Jira HMAC, GitLab shared-secret) — the compensating detective control the carve-out is accepted under. dark == 1 on either hook means no authenticated delivery arrived inside the deadman window while upstream still showed activity: the hook is silently dark, and every mention-driven agent behind it is dead without an error. Read the two verdict stats first, then the per-outcome rates to see whether deliveries are arriving and FAILING (hmac_failed / token_failed) rather than not arriving at all.",
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "type": "dashboard",
+        "name": "Annotations & Alerts",
+        "enable": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        }
+      },
+      {
+        "name": "gardenio rollout",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "victoriametrics"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "semi-dark-orange",
+        "expr": "count(changes(process_start_time_seconds{namespace=\"gardenio-system\",component!=\"\"}[$__interval]) > 0) >= 3",
+        "step": "1m",
+        "titleFormat": "gardenio rollout",
+        "textFormat": "3+ gardenio-system components restarted at once - a release deploy or chart apply. Check this marker before hunting a code cause for a step change on this board."
+      },
+      {
+        "name": "component restart",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "victoriametrics"
+        },
+        "enable": false,
+        "hide": false,
+        "iconColor": "semi-dark-blue",
+        "expr": "changes(process_start_time_seconds{namespace=\"gardenio-system\",component!=\"\"}[$__interval]) > 0",
+        "step": "1m",
+        "tagKeys": "component",
+        "titleFormat": "{{component}} restarted",
+        "textFormat": "gardenio-system/{{component}} moved its process start time - deploy, OOM-kill or crash-loop. Off by default: ~22 single-component restarts/day fleet-wide would bury the rollout markers."
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "title": "All gardenio boards",
+      "type": "dashboards",
+      "tags": [
+        "gardenio"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Every gardenio board, with this board's time range carried over"
+    },
+    {
+      "title": "Jira conversation health",
+      "type": "link",
+      "url": "/grafana/d/gardenio-jira-conversation-health",
+      "icon": "external link",
+      "tooltip": "Mention -> reply loop health for the Jira bridge",
+      "targetBlank": false,
+      "keepTime": true
+    },
+    {
+      "title": "Jira metrics",
+      "type": "link",
+      "url": "/grafana/d/jira-metrics",
+      "icon": "external link",
+      "tooltip": "Ticket backlog, SLA age and throughput from the JQL-count exporter",
+      "targetBlank": false,
+      "keepTime": true
+    },
+    {
+      "title": "System health",
+      "type": "link",
+      "url": "/grafana/d/gardenio-system-health",
+      "icon": "external link",
+      "tooltip": "The alert-target board: every signal an alert fires on, in one place",
+      "targetBlank": false,
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "type": "text",
+      "title": "Non-AVA webhook carve-out",
+      "id": 1,
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "Inbound **Jira** and **GitLab** bridge webhooks are a named, permanent **NON-AVA carve-out** (operator decision, Matt 2026-06-03; ka-0000005632): third-party POSTers cannot do AWS Verified Access browser OIDC, so the two `/webhook` doors authenticate at the application layer (Jira HMAC-SHA256, GitLab shared-secret token) instead of behind AVA. The carve-out is accepted **only** because it is compensated by **(1) structured logs** and **(2) these receive-path metrics**. This board is the “metrics fronted via Grafana” control. `dark == 1` on either bridge means no authenticated delivery arrived within the deadman window while upstream still shows activity — the hook is silently dark. See `gardenio/docs/security/non-ava-webhook-carveout.md` and `gardenio/docs/compliance/webhook-non-ava-carveout.md`."
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Jira hook — dark verdict",
+      "description": "gardenio_jira_webhook_dark{component=\"jira-bridge\"}: 0 = a recent authenticated delivery kept the hook alive; 1 = no authenticated delivery within the deadman window while Jira upstream still shows activity (the hook is silently dark — bug ka-0000000426).",
+      "id": 2,
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_webhook_dark series — the deadman monitor itself is not reporting, which is worse than a verdict of 1: nothing is watching the Jira hook. Check up{component=\"jira-bridge\"} on Gardenio — System Health.",
+          "unit": "none",
+          "decimals": 0,
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "ALIVE", "color": "green" } } },
+            { "type": "value", "options": { "1": { "text": "DARK", "color": "red" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 1, "color": "red" }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max(gardenio_jira_webhook_dark{component=\"jira-bridge\"})",
+          "legendFormat": "jira dark"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "GitLab hook — dark verdict",
+      "description": "gardenio_gitlab_webhook_dark{component=\"gitlab-bridge\"}: 0 = a recent authenticated delivery kept the hook alive; 1 = no authenticated delivery within the deadman window while the group's recent MRs still show activity (GAP-C, ka-0000002218). Only meaningful where GITLAB_GROUP_ID is configured.",
+      "id": 3,
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_gitlab_webhook_dark series — the deadman monitor itself is not reporting, which is worse than a verdict of 1: nothing is watching the GitLab hook. Check up{component=\"gitlab-bridge\"} on Gardenio — System Health.",
+          "unit": "none",
+          "decimals": 0,
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "ALIVE", "color": "green" } } },
+            { "type": "value", "options": { "1": { "text": "DARK", "color": "red" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 1, "color": "red" }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max(gardenio_gitlab_webhook_dark{component=\"gitlab-bridge\"})",
+          "legendFormat": "gitlab dark"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Jira — authenticated deliveries (1h)",
+      "description": "increase() over the authenticated Jira outcomes (processed|ignored) in the last hour. A healthy hook that upstream is active on should be non-zero; a persistent 0 with active upstream is what flips the dark verdict.",
+      "id": 4,
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_webhook_deliveries_total series — no authenticated delivery has arrived since the jira-bridge booted, so the receive-path counter does not exist. Empty here plus a dark verdict of 1 above is the confirmed “hook is dead” state.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 1, "color": "green" }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum(increase(gardenio_jira_webhook_deliveries_total{outcome=~\"processed|ignored\"}[1h]))",
+          "legendFormat": "jira authenticated (1h)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "GitLab — authenticated deliveries (1h)",
+      "description": "increase() over the authenticated GitLab outcomes (processed|ignored|error) in the last hour. token_failed / bad_request are excluded on purpose — they do not prove the hook is registered and correctly secreted.",
+      "id": 5,
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_gitlab_webhook_deliveries_total series — no authenticated delivery has arrived since the gitlab-bridge booted. Empty here plus a dark verdict of 1 above is the confirmed “hook is dead” state.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 1, "color": "green" }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum(increase(gardenio_gitlab_webhook_deliveries_total{outcome=~\"processed|ignored|error\"}[1h]))",
+          "legendFormat": "gitlab authenticated (1h)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Jira webhook deliveries by outcome (rate/5m)",
+      "description": "rate() of gardenio_jira_webhook_deliveries_total split by terminal outcome. processed/ignored = authenticated; hmac_failed = fail-closed 403 (bad/missing HMAC); bad_request = malformed. A rejected-but-arriving stream shows as hmac_failed/bad_request instead of silence.",
+      "id": 6,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_jira_webhook_deliveries_total series — nothing has arrived at the Jira hook since the bridge booted, of any outcome. Empty is “nothing arrived”, not “nothing was rejected”.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": { "mode": "none" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "hmac_failed" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "bad_request" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "processed" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (outcome) (rate(gardenio_jira_webhook_deliveries_total[5m]))",
+          "legendFormat": "{{ outcome }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "GitLab webhook deliveries by outcome (rate/5m)",
+      "description": "rate() of gardenio_gitlab_webhook_deliveries_total split by terminal outcome. processed/ignored = authenticated; token_failed = fail-closed 403 (bad/missing X-Gitlab-Token); bad_request = malformed; error = authenticated + decoded but downstream 500. The GitLab door emitted no receive-path metric before ka-0000005632.",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_gitlab_webhook_deliveries_total series — nothing has arrived at the GitLab hook since the bridge booted, of any outcome. Empty is “nothing arrived”, not “nothing was rejected”.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": { "mode": "none" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "token_failed" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "bad_request" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "error" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "processed" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (outcome) (rate(gardenio_gitlab_webhook_deliveries_total[5m]))",
+          "legendFormat": "{{ outcome }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Dark-hook verdict over time (1 = dark)",
+      "description": "The Go-computed dark verdict for each bridge over time. A step to 1 is the deadman firing: no authenticated delivery in the window while upstream still shows activity. Filtered to each metric's own bridge component (the gauge is registered on every bridge binary but only its home monitor updates it).",
+      "id": 8,
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "neither dark-verdict gauge exists in this range — the deadman monitors published nothing, so hook liveness is UNKNOWN over the whole window. A live monitor draws a flat 0 line; empty means the bridges were not scraped.",
+          "unit": "none",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "spanNulls": true,
+            "lineInterpolation": "stepAfter",
+            "stacking": { "mode": "none" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max(gardenio_jira_webhook_dark{component=\"jira-bridge\"})",
+          "legendFormat": "jira dark"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max(gardenio_gitlab_webhook_dark{component=\"gitlab-bridge\"})",
+          "legendFormat": "gitlab dark"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Deadman monitor heartbeat (evaluations rate/5m)",
+      "description": "rate() of *_webhook_evaluations_total by result. A flat-zero ok rate means the monitor loop itself stalled — the deadman's second leg (catch a dead/hung monitor). scan_error/count_error = the upstream-activity confirmation arm failed.",
+      "id": 9,
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "neither gardenio_jira_webhook_evaluations_total nor gardenio_gitlab_webhook_evaluations_total returned data. This is the board's own liveness anchor and it cannot certify itself: either the deadman evaluation loops are not running, or the bridges are not being scraped — either way every verdict above this panel is unverified. Resolve with up{component=~\"jira-bridge|gitlab-bridge\"} on Gardenio — System Health.",
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": { "mode": "none" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*error.*" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (result) (rate(gardenio_jira_webhook_evaluations_total[5m]))",
+          "legendFormat": "jira {{ result }}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (result) (rate(gardenio_gitlab_webhook_evaluations_total[5m]))",
+          "legendFormat": "gitlab {{ result }}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Delivery-rate distribution & outcome inventory",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Authenticated delivery-rate distribution — p50 / p95 / p99 of the 5m rate (both hooks)",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 25 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "neither bridge is reporting the delivery counter — liveness is UNKNOWN, not quiet"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "quantile_over_time(0.5, sum(rate(gardenio_jira_webhook_deliveries_total{outcome=~\"processed|ignored\"}[5m])) + sum(rate(gardenio_gitlab_webhook_deliveries_total{outcome=~\"processed|ignored|error\"}[5m]))[$__range:5m])",
+          "refId": "A",
+          "legendFormat": "p50 rate"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "quantile_over_time(0.95, sum(rate(gardenio_jira_webhook_deliveries_total{outcome=~\"processed|ignored\"}[5m])) + sum(rate(gardenio_gitlab_webhook_deliveries_total{outcome=~\"processed|ignored|error\"}[5m]))[$__range:5m])",
+          "refId": "B",
+          "legendFormat": "p95 rate"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "quantile_over_time(0.99, sum(rate(gardenio_jira_webhook_deliveries_total{outcome=~\"processed|ignored\"}[5m])) + sum(rate(gardenio_gitlab_webhook_deliveries_total{outcome=~\"processed|ignored|error\"}[5m]))[$__range:5m])",
+          "refId": "C",
+          "legendFormat": "p99 rate"
+        }
+      ],
+      "description": "Quantiles of the authenticated delivery rate taken over the dashboard range. This is the number the deadman window should be sized from: if p50 is a delivery every few minutes, a 1h silence is genuinely dark; if p50 is near zero, the hook is legitimately quiet overnight and a dark verdict there means nothing."
+    },
+    {
+      "type": "bargauge",
+      "title": "Authenticated deliveries per hook (window)",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 25 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "green", "value": 10 }
+            ]
+          },
+          "noValue": "neither bridge is reporting the delivery counter — liveness is UNKNOWN, not quiet"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        },
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum(increase(gardenio_jira_webhook_deliveries_total{outcome=~\"processed|ignored\"}[$__range]))",
+          "refId": "A",
+          "legendFormat": "jira"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum(increase(gardenio_gitlab_webhook_deliveries_total{outcome=~\"processed|ignored|error\"}[$__range]))",
+          "refId": "B",
+          "legendFormat": "gitlab"
+        }
+      ],
+      "description": "Window totals per hook, ranked. Zero on a hook is the dark condition the verdict stats above assert, so the bars are coloured red at zero and green once deliveries are flowing."
+    },
+    {
+      "type": "table",
+      "title": "Delivery outcome inventory — hook × outcome (window)",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 33 },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "neither bridge is reporting the delivery counter — liveness is UNKNOWN, not quiet"
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "/^Value/" }, "properties": [ { "id": "unit", "value": "short" } ] }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "footer": { "show": false }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (outcome) (increase(gardenio_jira_webhook_deliveries_total[$__range]))",
+          "refId": "A",
+          "legendFormat": "jira {{outcome}}",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (outcome) (increase(gardenio_gitlab_webhook_deliveries_total[$__range]))",
+          "refId": "B",
+          "legendFormat": "gitlab {{outcome}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "description": "Every delivery outcome both bridges recorded over the range. This is where an authentication regression shows up: hmac_failed / token_failed / bad_request rows mean POSTs ARE arriving and being rejected, which the dark verdict cannot distinguish from silence."
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 39,
+  "tags": ["gardenio", "webhook", "non-ava", "jira-bridge", "gitlab-bridge", "security"],
+  "templating": { "list": [] },
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Gardenio — Inbound Webhook Liveness (non-AVA carve-out)",
+  "uid": "gardenio-webhook-liveness",
+  "version": 1,
+  "weekStart": ""
+}

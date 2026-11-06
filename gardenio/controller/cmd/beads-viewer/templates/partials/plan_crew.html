@@ -1,0 +1,120 @@
+{{define "plan_crew"}}
+{{/* The plan CREW roster (Matt's ask, ka-0000000150: "show crew the gardener has
+     created and how it's going"). Lists the agents the plan's gardener has
+     dispatched onto steps, grouped live-first, each with the step it works, its
+     working/done/failed state, and a link to its terminal. Rendered in the plan
+     cockpit's steps column (below the timeline) by plan_detail.html; re-rendered
+     standalone by the SSE `plan-crew-updated` frame so a crew flipping
+     working→done, or a new crew being spawned, lands live with no reload.
+
+     The root <section id="plan-crew"> ALWAYS renders (even with zero crew) so
+     the SSE outerHTML swap has a stable anchor — a first crew spawn swaps the
+     empty state into the populated roster in place. Called with a data bag:
+     PlanID, Crew (planCrewInfo), IsOperator, BasePath. */}}
+<section id="plan-crew" class="plan-crew" data-plan-id="{{.PlanID}}">
+  <div class="plan-crew-head">
+    {{/* aria-level 2 on the cockpit, under the plan's h1; the peek drawer passes
+         InPeek, and there the h3 sits under its h2 (gd-ddw0WBzm9S). */ -}}
+    <h3{{if not .InPeek}} aria-level="2"{{end}}>Crew
+      {{if .Crew.Total}}<span class="meta">{{.Crew.Total}} agent{{if ne .Crew.Total 1}}s{{end}}</span>{{end}}
+    </h3>
+    {{if .Crew.Total}}
+    <div class="plan-crew-tally" role="group" aria-label="Crew status tally">
+      {{/* "(K starting)" honest sub-qualifier (ka-0000005352): of the N working
+           crew, K are still BOOTING (spawning) — dispatched, pod coming up, not yet
+           grinding. The cockpit twin of the index card's "· M working (K starting)"
+           facet; both read planCrew*.Starting off the SAME alive bucket + raw
+           agent_state so they agree by construction. Gated HasStarting (0<K<N): an
+           all-spawning tally reads a bare "N working", a set with none reads exactly
+           as before. Calm/muted — a booting crew is context, not an alarm; it already
+           rides the green working dot. */}}
+      {{/* Working RUNTIME facet (ka-0000005352): the cockpit twin of the index
+           card's "· M working 4h" facet — fold the longest-running live crew's
+           elapsed RUNTIME ("· 4h") into the "N working" chip so the roster's
+           primary live count carries the same temporal signal its queued ("·
+           12m") and stuck ("· 6h") siblings already do, and the two surfaces
+           agree by construction. Aged on now - CreatedAt (RUNTIME, NOT
+           last-activity: a working crew heartbeats so updated_at is always fresh
+           ~0s), the live-effort twin of the calm "$N spent" chip. Rendered in the
+           tooltip AND on the face only when derivable (WorkingOldestAge
+           non-empty); an undatable working crew reads its bare "N working" count
+           exactly as before. Calm (context, not an alarm — a genuinely-wedged
+           crew is re-bucketed to the loud ⚠ stuck chip). reconcileTerminal clears
+           it on a terminal plan (Working folds to Done), matching the index. */}}
+      {{if .Crew.Working}}<span class="chip plan-crew-count plan-crew-count-working" title="{{.Crew.Working}} crew agent{{if ne .Crew.Working 1}}s{{end}} working now{{if .Crew.HasStarting}} ({{.Crew.Starting}} still starting up){{end}}{{if .Crew.WorkingOldestAge}} (longest running {{.Crew.WorkingOldestAge}}){{end}}"><span class="plan-crew-dot" aria-hidden="true"></span>{{.Crew.Working}} working{{if .Crew.HasStarting}} <span class="plan-crew-count-starting">({{.Crew.Starting}} starting)</span>{{end}}{{if .Crew.WorkingOldestAge}} <span class="plan-crew-count-working-age">· {{.Crew.WorkingOldestAge}}</span>{{end}}</span>{{end}}
+      {{/* Queued tally chip (ka-0000005352 iter-31): crew DISPATCHED onto a step
+           but not yet working (an open idle/queued agent_state — its pod is
+           capacity-deferred in the pool). Before this the header folded it into the
+           "done" chip while each member row rendered its raw "queued"/"idle" state
+           chip — a self-contradiction on ONE page (header says done, member says
+           queued). This gives the disposition its own calm neutral chip, matching
+           the member rows and the index card's "· N queued" facet. Rendered only
+           when non-zero; a terminal plan folds idle→done so a closed roster never
+           shows it. */}}
+      {{/* Queued wait-age (ka-0000005352 iter-32): the cockpit twin of the index
+           card's queued-facet age — the "N queued" chip carries the oldest queued
+           crew's wait in its tooltip (and the chip tints loud past the stale bar) so
+           the cockpit and the index agree on how long the pool has been starved. */}}
+      {{if .Crew.Idle}}<span class="chip plan-crew-count plan-crew-count-idle{{if .Crew.QueuedOldestStale}} plan-crew-count-idle-stale{{end}}" title="{{.Crew.Idle}} crew agent{{if ne .Crew.Idle 1}}s{{end}} dispatched but not yet working — waiting on a pod slot (queued in the pool){{if .Crew.QueuedOldestAge}}; oldest queued {{.Crew.QueuedOldestAge}}{{if .Crew.QueuedOldestStale}} (pool starved){{end}}{{end}}">{{.Crew.Idle}} queued{{if .Crew.QueuedOldestAge}} · {{.Crew.QueuedOldestAge}}{{end}}</span>{{end}}
+      {{if .Crew.Done}}<span class="chip plan-crew-count plan-crew-count-done" title="{{.Crew.Done}} crew agent{{if ne .Crew.Done 1}}s{{end}} finished">{{.Crew.Done}} done</span>{{end}}
+      {{/* Two-tier stuck tally (ka-0000005352 iter-33): the roster header used to
+           render ONE loud red "⚠ N stuck" chip counting .Crew.Failed = OPEN-stuck
+           + CLOSED-failed combined — but iter-29 (ka-0000003213) already split the
+           index card's crew chip by REACHABILITY into a loud "⚠ K" (OPEN, reachable
+           terminal, act now) and a calm "✕ K" (CLOSED, dead terminal, history). The
+           cockpit was the last surface still conflating the two, so a plan whose
+           failures are all closed history rendered a CALM "✕ 1" on the index board
+           beside a LOUD red "⚠ 1 stuck" on its own cockpit — a card-vs-truth
+           contradiction (a false "act now" pointing at nothing clickable). Split it
+           here to match: the LOUD chip counts OPEN (reachable) stuck crew only, the
+           CALM muted chip records the CLOSED-failed remainder. Both classify a crew
+           via the SAME classifyCrewBead the index rollup uses, so the two surfaces
+           agree by construction. Rendered only when non-zero, so a plan with only
+           open stuck reads one loud chip, only closed-failed reads one calm chip,
+           and both reads both — exactly the index card's facet behavior. */}}
+      {{if .Crew.HasOpenStuck}}<span class="chip plan-crew-count plan-crew-count-failed" title="{{.Crew.OpenStuck}} crew agent{{if ne .Crew.OpenStuck 1}}s{{end}} stuck and still reachable — jump to a terminal to unstick">⚠ {{.Crew.OpenStuck}} stuck</span>{{end}}
+      {{if .Crew.HasClosedFailed}}<span class="chip plan-crew-count plan-crew-count-failed-closed" title="{{.Crew.ClosedFailed}} crew agent{{if ne .Crew.ClosedFailed 1}}s{{end}} failed and closed on this plan (historical — no reachable terminal to unstick)">✕ {{.Crew.ClosedFailed}} failed</span>{{end}}
+      {{/* Cumulative crew SPEND (ka-0000004218, iter-12): the cockpit twin of the
+           index crew chip's spend facet — the roster answered who/how-many/state
+           but never "how much has this plan burned". Summed over the SAME crew
+           beads planCrew already hydrated (zero extra daemon call) via the shared
+           agentSpendUSD helper, so it reads the same dollars as the index chip and
+           each crew's own agent-card cost. Rendered only when spend is known. */}}
+      {{if .Crew.HasSpend}}<span class="chip plan-crew-count plan-crew-count-spend" title="Total crew spend on this plan so far (sum of every dispatched crew's cost)">{{.Crew.SpendLabel}} spent</span>{{end}}
+    </div>
+    {{end}}
+  </div>
+
+  {{if .Crew.Members}}
+  <ul class="plan-crew-list">
+    {{range .Crew.Members}}
+    <li class="plan-crew-member plan-crew-member-{{.Bucket}}{{if .Failed}} is-failed{{end}}{{if .Live}} is-live{{end}}" data-bead-id="{{.ID}}">
+      <div class="plan-crew-line">
+        {{if .Live}}<span class="plan-crew-live-dot" title="working now" aria-hidden="true"></span>{{end}}
+        <a class="plan-crew-name" href="{{.URL}}"{{if .External}} target="_blank" rel="noopener"{{end}} title="{{if .External}}Open {{.Name}}'s live terminal{{else}}Open {{.Name}}'s bead page{{end}}">{{.Name}}</a>
+        {{if .Role}}<span class="chip plan-crew-role">{{.Role}}</span>{{end}}
+        <span class="chip plan-crew-state plan-crew-state-{{.Bucket}}{{if .Failed}} plan-crew-state-failed{{end}}">{{if .AgentState}}{{.AgentState}}{{else}}unknown{{end}}</span>
+        {{if .Ago}}<span class="meta plan-crew-ago"{{if .AgoRFC}} title="last activity {{.AgoRFC}}"{{end}}>{{.Ago}}</span>{{end}}
+      </div>
+      {{if .StepID}}
+      <div class="plan-crew-step">
+        {{/* Deep-link the step so clicking a crew's task jumps to it in the
+             timeline (reuses the #step-{ID} focus scroll+highlight). */}}
+        <a class="plan-crew-step-link" href="#step-{{.StepID}}" title="jump to this step in the timeline">
+          {{if .StepNumber}}<span class="plan-crew-step-num">#{{.StepNumber}}</span>{{end}}
+          <span class="plan-crew-step-title">{{.StepTitle}}</span>
+        </a>
+      </div>
+      {{end}}
+      {{if .Outcome}}<p class="plan-crew-outcome{{if .Failed}} is-failed{{end}}">{{.Outcome}}</p>{{end}}
+    </li>
+    {{end}}
+  </ul>
+  {{if .Crew.HasMore}}
+  <p class="plan-crew-more meta">+ {{.Crew.MoreCount}} more crew not shown (live and most-recent crew are listed first).</p>
+  {{end}}
+  {{else}}
+  <p class="plan-crew-empty meta">No crew yet. The plan gardener dispatches a crew agent onto a step when it's ready to build{{if .IsOperator}} — use <em>Dispatch</em> on an open step, or wake the gardener{{end}}.</p>
+  {{end}}
+</section>
+{{end}}

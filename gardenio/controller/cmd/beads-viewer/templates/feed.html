@@ -1,0 +1,350 @@
+{{template "layout" .}}
+{{define "title"}}Activity feed · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+{{with .GardenHref}}{{template "garden_banner" .}}{{end}}
+
+<style>
+  /* feed.html — prototype activity-feed front page (ka-0000003020, epic
+     ka-0000003263). Scoped under .feed-page so nothing leaks into the real /
+     landing page. Design of record:
+     gardenio/docs/beads-viewer-activity-feed-ux-proposals.md (Concept A default,
+     Concept B as the ?view=lanes toggle). */
+
+  .feed-layout { display: grid; grid-template-columns: minmax(0, 1fr) 20rem; gap: 1.25rem; align-items: start; }
+  /* minmax(0, 1fr) — not a bare 1fr — is load-bearing (ka-0000002820 / dedup
+     ka-0000001664): a bare 1fr grid track floors at min-content, so an unbroken
+     token (a bead id / path / URL in a rail item) forces the collapsed column —
+     and the page — past a 375px viewport. Same failure class the /plans cockpit
+     fixed with minmax(0, …) (ka-0000000256 / ka-0000004897). */
+  @media (max-width: 60rem) { .feed-layout { grid-template-columns: minmax(0, 1fr); } }
+
+  .feed-head { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; }
+  .feed-status { font-size: 0.85rem; color: var(--text-subtle, #6b6b6b); display: inline-flex; align-items: center; gap: 0.35rem; }
+  .feed-status .dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: #bbb; display: inline-block; }
+  .feed-status[data-state="live"] .dot { background: #1a7f37; box-shadow: 0 0 0 3px rgba(26,127,55,0.2); }
+  .feed-status[data-state="connecting"] .dot { background: #d4a017; }
+  .feed-status[data-state="offline"] .dot,
+  .feed-status[data-state="error"] .dot,
+  .feed-status[data-state="auth-expired"] .dot { background: #cf222e; }
+
+  .feed-toolbar { display: flex; align-items: center; gap: 0.85rem; margin: 0.4rem 0 0.8rem; flex-wrap: wrap; }
+  .feed-toolbar label { font-size: 0.85rem; color: var(--text-subtle, #6b6b6b); display: inline-flex; align-items: center; gap: 0.3rem; cursor: pointer; }
+
+  /* Segmented view toggle: Concept A (stream) vs Concept B (lanes). */
+  .feed-viewtoggle { display: inline-flex; border: 1px solid rgba(128,128,128,0.4); border-radius: 5px; overflow: hidden; }
+  .feed-viewtoggle button {
+    font: inherit; font-size: 0.82rem; padding: 0.2rem 0.7rem; cursor: pointer;
+    background: var(--bg, #fff); color: inherit; border: 0; border-right: 1px solid rgba(128,128,128,0.3);
+  }
+  .feed-viewtoggle button:last-child { border-right: 0; }
+  .feed-viewtoggle button[aria-pressed="true"] { background: #2563eb; color: #fff; font-weight: 600; }
+
+  /* Scope toggle: Mine (per-viewer relevance, default) vs Everyone (firehose). */
+  .feed-scopetoggle { display: inline-flex; border: 1px solid rgba(128,128,128,0.4); border-radius: 5px; overflow: hidden; }
+  .feed-scopetoggle button {
+    font: inherit; font-size: 0.82rem; padding: 0.2rem 0.7rem; cursor: pointer;
+    background: var(--bg, #fff); color: inherit; border: 0; border-right: 1px solid rgba(128,128,128,0.3);
+  }
+  .feed-scopetoggle button:last-child { border-right: 0; }
+  .feed-scopetoggle button[aria-pressed="true"] { background: #1a7f37; color: #fff; font-weight: 600; }
+
+  .feed-projectfilter, .feed-userfilter { font-size: 0.85rem; color: var(--text-subtle, #6b6b6b); display: inline-flex; align-items: center; gap: 0.3rem; }
+  .feed-project, .feed-user { padding: 0.18rem 0.4rem; font: inherit; font-size: 0.82rem; border: 1px solid rgba(128,128,128,0.4); border-radius: 4px; background: var(--bg, #fff); color: inherit; max-width: 12rem; }
+
+  .feed-pause, .feed-filters-clear {
+    font: inherit; font-size: 0.82rem; padding: 0.2rem 0.6rem; cursor: pointer;
+    border: 1px solid rgba(128,128,128,0.4); border-radius: 4px; background: var(--bg, #fff); color: inherit; white-space: nowrap;
+  }
+  .feed-pause[aria-pressed="true"] { background: #d4a017; border-color: #d4a017; color: #1a1a1a; font-weight: 600; }
+  .feed-filter { padding: 0.2rem 0.4rem; font: inherit; font-size: 0.82rem; border: 1px solid rgba(128,128,128,0.4); border-radius: 4px; background: var(--bg, #fff); color: inherit; }
+
+  /* Event-type mute chips (kill the firehose, per Concept A trade-offs). */
+  .feed-typefilters { display: inline-flex; gap: 0.3rem; flex-wrap: wrap; }
+  .feed-typefilters button {
+    font: inherit; font-size: 0.72rem; padding: 0.08rem 0.45rem; cursor: pointer;
+    border: 1px solid rgba(128,128,128,0.35); border-radius: 999px; background: var(--bg, #fff); color: var(--text-muted, #595959);
+    text-transform: lowercase; letter-spacing: 0.02em;
+  }
+  /* Muted (off) state: keep the line-through affordance but use an explicit
+     muted color instead of opacity:0.4 — opacity dropped the effective contrast
+     to ~1.9:1 (axe color-contrast, ka-0000004083). #6b6b6b on white is 5.3:1
+     and still reads clearly "muted" against the active chips. */
+  .feed-typefilters button[aria-pressed="false"] { color: #6b6b6b; border-color: rgba(128,128,128,0.45); text-decoration: line-through; }
+
+  /* ---- Feed body: stream (A) is one column; lanes (B) is one per status. ---- */
+  .feed-body { font-variant-numeric: tabular-nums; }
+  .feed-stream { display: flex; flex-direction: column; gap: 0.4rem; max-height: calc(100vh - 13rem); overflow-y: auto;
+    border: 1px solid rgba(128,128,128,0.25); border-radius: 6px; padding: 0.6rem; background: rgba(128,128,128,0.03); }
+
+  .feed-lanes { display: none; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.75rem; }
+  .feed-lane { display: flex; flex-direction: column; min-width: 0; }
+  .feed-lane-head { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted, #595959); padding: 0.2rem 0.1rem;
+    display: flex; align-items: center; gap: 0.4rem; }
+  /* Status dot on each lane head, keyed to the lane's bead status. */
+  .feed-lane-head::before { content: ""; width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--lane-dot, #9ca3af); flex: 0 0 auto; }
+  .feed-lane[data-lane="open"]        { --lane-dot: #6b7280; }
+  .feed-lane[data-lane="in_progress"] { --lane-dot: #2563eb; }
+  .feed-lane[data-lane="blocked"]     { --lane-dot: #dc2626; }
+  .feed-lane[data-lane="done"]        { --lane-dot: #16a34a; }
+  .feed-lane-body { display: flex; flex-direction: column; gap: 0.4rem; max-height: calc(100vh - 14rem); overflow-y: auto;
+    border: 1px solid rgba(128,128,128,0.25); border-radius: 6px; padding: 0.5rem; background: rgba(128,128,128,0.03); }
+  /* On narrow viewports the four status lanes stack two-up rather than squeezing. */
+  @media (max-width: 1100px) { .feed-lanes { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+  /* When the page is in lanes view, hide the stream and show the lanes. The
+     client copies cards into the matching lane by data-lane. */
+  .feed-page[data-view="lanes"] .feed-stream { display: none; }
+  .feed-page[data-view="lanes"] .feed-lanes { display: grid; }
+
+  /* ---- The card (shared by stream + lanes; rendered in feed.go). ---- */
+  .feed-card {
+    display: grid; grid-template-columns: auto auto 1fr; align-items: baseline; gap: 0.4rem 0.55rem;
+    padding: 0.35rem 0.5rem; border-radius: 5px; border-left: 3px solid #9aa0a6;
+    background: var(--bg, #fff); animation: feed-flash 0.6s ease-out;
+  }
+  @keyframes feed-flash { from { filter: brightness(1.3); } }
+  .feed-card-kind { grid-column: 1; font-size: 0.72rem; font-weight: 700; white-space: nowrap; color: #595959; }
+  .feed-card-type { grid-column: 2; font-size: 0.7rem; text-transform: lowercase; padding: 0.02rem 0.35rem; border-radius: 3px;
+    background: rgba(128,128,128,0.15); color: var(--text-muted, #595959); white-space: nowrap; }
+  .feed-card-title { grid-column: 3; font-size: 0.88rem; text-decoration: none; color: inherit; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .feed-card-title:hover { text-decoration: underline; }
+  .feed-card-meta { grid-column: 1 / -1; display: flex; gap: 0.5rem; align-items: baseline; font-size: 0.74rem; color: var(--text-subtle, #6b6b6b); flex-wrap: wrap; }
+  .feed-card-id code, .feed-card-id { font-size: 0.72rem; }
+  .feed-card-project { padding: 0.02rem 0.3rem; border-radius: 3px; background: rgba(37,99,235,0.1); color: #1d4ed8; }
+  .feed-card-ago { margin-left: auto; }
+
+  /* Event taxonomy colors (left border + kind text) — consistent across A & B. */
+  .feed-card-decision { border-left-color: #d4a017; }
+  .feed-card-decision .feed-card-kind { color: #806400; }
+  .feed-card-decision { background: rgba(212,160,23,0.06); }
+  .feed-card-closed { border-left-color: #1a7f37; }
+  .feed-card-closed .feed-card-kind { color: #1a7f37; }
+  .feed-card-mr-merged { border-left-color: #8250df; }
+  .feed-card-mr-merged .feed-card-kind { color: #8250df; }
+  .feed-card-claimed { border-left-color: #2563eb; }
+  .feed-card-claimed .feed-card-kind { color: #2563eb; }
+  .feed-card-blocked { border-left-color: #cf222e; }
+  .feed-card-blocked .feed-card-kind { color: #cf222e; }
+  .feed-card-created { border-left-color: #9aa0a6; }
+  .feed-card-updated { border-left-color: #6b7280; }
+
+  /* ---- Phase 3 multi-family taxonomy (ka-0000006994). Colours follow the UX
+     proposal: gate=amber (decision-adjacent), MR opened=purple (lighter than
+     merged), pipeline ok=green / failed=red, squawk+mail=teal, spawn/stop=grey. */
+  .feed-card-gate { border-left-color: #d4a017; background: rgba(212,160,23,0.04); }
+  .feed-card-gate .feed-card-kind { color: #806400; }
+  .feed-card-mr-opened { border-left-color: #a371f7; }
+  .feed-card-mr-opened .feed-card-kind { color: #8250df; }
+  .feed-card-pipeline-ok { border-left-color: #1a7f37; }
+  .feed-card-pipeline-ok .feed-card-kind { color: #1a7f37; }
+  .feed-card-pipeline-failed { border-left-color: #cf222e; }
+  .feed-card-pipeline-failed .feed-card-kind { color: #cf222e; }
+  .feed-card-squawk { border-left-color: #0f766e; }
+  .feed-card-squawk .feed-card-kind { color: #0f766e; } /* WCAG AA: 5.47:1 on white; #0d9488 was 3.74:1 (ka-0000005146) */
+  .feed-card-mail { border-left-color: #0e7490; }
+  .feed-card-mail .feed-card-kind { color: #0e7490; } /* WCAG AA: 5.36:1 on white; #0891b2 was 3.68:1 (ka-0000005146) */
+  .feed-card-spawned { border-left-color: #9aa0a6; }
+  .feed-card-spawned .feed-card-kind { color: #6b7280; }
+  .feed-card-stopped { border-left-color: #6b7280; }
+  .feed-card-stopped .feed-card-kind { color: #6b7280; }
+
+  html[data-skin="dark-terminal"] .feed-card { background: rgba(255,255,255,0.03); }
+
+  /* ---- Right rail: the three "needs you" signals. ---- */
+  .feed-rail { display: flex; flex-direction: column; gap: 1rem; position: sticky; top: 1rem; }
+  .feed-rail-panel { border: 1px solid rgba(128,128,128,0.25); border-radius: 6px; padding: 0.6rem 0.7rem; }
+  .feed-rail-panel h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 0.5rem; color: var(--text-muted, #595959); }
+  .feed-rail-panel.is-decisions { border-color: rgba(212,160,23,0.5); background: rgba(212,160,23,0.05); }
+  .feed-rail-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.35rem; min-width: 0; }
+  /* min-width:0 + overflow-wrap:anywhere (ka-0000002820 / dedup ka-0000001664):
+     rail titles/ids carry long unbroken tokens (bead ids, paths, URLs). Without
+     a break guard, such a token widens the rail track, and — once .feed-layout
+     collapses to a single column at ≤60rem — the whole page past 375px. Mirrors
+     the .plan-tl-title guard on the /plans cockpit (ka-0000000256). */
+  .feed-rail-list li { font-size: 0.82rem; line-height: 1.3; min-width: 0; overflow-wrap: anywhere; }
+  .feed-rail-list a { text-decoration: none; overflow-wrap: anywhere; }
+  .feed-rail-list a:hover { text-decoration: underline; }
+  .feed-rail-meta { color: var(--text-subtle, #6b6b6b); font-size: 0.72rem; overflow-wrap: anywhere; }
+  .feed-rail-empty { color: var(--text-subtle, #6b6b6b); font-style: italic; font-size: 0.8rem; }
+
+  .feed-empty-state { padding: 2rem 1rem; text-align: center; color: var(--text-subtle, #6b6b6b); }
+  .feed-filtered-empty { display: flex; flex-direction: column; align-items: center; gap: 0.6rem; }
+  .feed-widen { font: inherit; font-size: 0.82rem; padding: 0.2rem 0.7rem; cursor: pointer;
+    border: 1px solid rgba(128,128,128,0.4); border-radius: 4px; background: var(--bg, #fff); color: inherit; }
+</style>
+
+<div class="feed-page" data-view="{{.View}}"
+     data-events-url="{{.BasePath}}/feed/events"
+     data-backfill-url="{{.BasePath}}/feed/backfill"
+     data-status-url="{{.BasePath}}/agents/events-status"
+     data-scope="{{.Scope}}"
+     data-project="{{.Project}}"
+     data-user="{{.SelectedUser}}"
+     data-default-project="{{.DefaultProject}}"
+     data-has-viewer="{{if .HasViewer}}1{{else}}0{{end}}"
+     data-viewer-email="{{.ViewerEmail}}">
+
+  <h1 class="feed-head">
+    Activity feed
+    <span class="meta">· prototype (ka-0000003020) — opt-in, does not replace <a href="{{.BasePath}}/">/</a></span>
+    <span class="feed-status" data-state="connecting" aria-live="polite"><span class="dot"></span><span class="feed-status-label">connecting…</span></span>
+  </h1>
+
+  <div class="feed-toolbar">
+    <span class="feed-viewtoggle" role="group" aria-label="Feed layout">
+      <button type="button" class="feed-view-stream" data-view="stream" aria-pressed="{{if eq .View "stream"}}true{{else}}false{{end}}" title="Concept A — one chronological stream">Stream</button>
+      <button type="button" class="feed-view-lanes" data-view="lanes" aria-pressed="{{if eq .View "lanes"}}true{{else}}false{{end}}" title="One lane per status — open / in progress / blocked / done">Lanes</button>
+    </span>
+
+    {{if .HasViewer}}
+    <span class="feed-scopetoggle" role="group" aria-label="Whose activity">
+      <button type="button" class="feed-scope-mine" data-scope="mine" aria-pressed="{{if eq .Scope "mine"}}true{{else}}false{{end}}" title="Only activity you operated — your recent interactions">Mine</button>
+      <button type="button" class="feed-scope-everyone" data-scope="everyone" aria-pressed="{{if eq .Scope "everyone"}}true{{else}}false{{end}}" title="The whole fleet's activity">Everyone</button>
+    </span>
+    {{end}}
+
+    <label class="feed-projectfilter">project
+      <select class="feed-project" aria-label="Filter by project">
+        <option value=""{{if eq .Project ""}} selected{{end}}>all projects</option>
+        {{range .Projects}}
+        <option value="{{.}}"{{if eq . $.Project}} selected{{end}}>{{.}}{{if eq . $.DefaultProject}} ★{{end}}</option>
+        {{end}}
+      </select>
+    </label>
+
+    <!-- User filter: pick one operator to scope the feed to. Options are
+         operators seen in the recent seed window, sorted most-recently-active
+         first (Matt: "select user to filter by, sort by recency of activity").
+         A selected user that isn't in the recent window is still offered so a
+         shared/reloaded ?user= link keeps its selection. -->
+    <label class="feed-userfilter">user
+      <select class="feed-user" aria-label="Filter by user">
+        <option value=""{{if eq .SelectedUser ""}} selected{{end}}>all users</option>
+        {{$sel := .SelectedUser}}{{$found := false}}
+        {{range .Users}}
+        <option value="{{.Key}}"{{if eq .Key $sel}} selected{{end}}>{{.Label}}</option>
+        {{if eq .Key $sel}}{{$found = true}}{{end}}
+        {{end}}
+        {{if and (ne $sel "") (not $found)}}
+        <option value="{{$sel}}" selected>{{$sel}}</option>
+        {{end}}
+      </select>
+    </label>
+
+    <span class="feed-typefilters" aria-label="Mute event types">
+      <!-- aria-pressed="true" = shown, "false" = muted by default. The routine
+           churn families (created / updated / squawk) start muted so the feed
+           defaults to actionable signal, not the firehose (Matt, ka-0000005238:
+           "we don't want to show normal events and trigger updates and such by
+           default"). "updated" also covers trigger-bead churn (gardener run-tally
+           edits classify as feedKindUpdated). The whole agent family — spawn,
+           stop, AND gate transitions — is not surfaced at all (feedKindForBead
+           drops it; ka-0000003549 / Matt 2026-06-17: agent-lifecycle gate churn
+           is pure orchestration noise that does not tell the workflow story,
+           agents surface under their own beads/MRs and the LIVE AGENTS rail), so
+           they have no chip. Each remaining chip is a one-click toggle to
+           re-admit. -->
+      <button type="button" data-type="decision" aria-pressed="true">decision</button>
+      <button type="button" data-type="blocked" aria-pressed="true">blocked</button>
+      <button type="button" data-type="claimed" aria-pressed="true">claimed</button>
+      <button type="button" data-type="created" aria-pressed="false">created</button>
+      <button type="button" data-type="updated" aria-pressed="false">updated</button>
+      <button type="button" data-type="closed" aria-pressed="true">closed</button>
+      <button type="button" data-type="mr-opened" aria-pressed="true">mr opened</button>
+      <button type="button" data-type="mr-merged" aria-pressed="true">mr merged</button>
+      <button type="button" data-type="pipeline" aria-pressed="true">pipeline</button>
+      <button type="button" data-type="mail" aria-pressed="true">mail</button>
+      <button type="button" data-type="squawk" aria-pressed="false">squawk</button>
+    </span>
+
+    <button type="button" class="feed-pause" aria-pressed="false" title="Freeze the feed so you can read — buffered events flush on resume">⏸ Pause</button>
+    <label><input type="checkbox" class="feed-autoscroll" checked> auto-scroll</label>
+    <span class="meta feed-count" aria-live="polite"></span>
+  </div>
+
+  <div class="feed-layout">
+    <div class="feed-body">
+      <!-- Concept A — single chronological stream (default). Newest first. -->
+      <div class="feed-stream" id="feed-stream" role="log" aria-label="Activity stream" aria-live="polite">
+        {{range .Backfill}}{{.HTML}}{{else}}<div class="feed-empty-state">Waiting for fleet activity…</div>{{end}}
+      </div>
+      <!-- Shown by feed.js when the active scope/project filters hide every
+           card — keeps "Mine" from looking like a broken blank page. -->
+      <div class="feed-empty-state feed-filtered-empty" hidden>
+        No recent activity matches your filters.
+        <button type="button" class="feed-widen">Show everyone, all projects</button>
+      </div>
+
+      <!-- Lanes — one column per bead status. The SAME first-paint cards the
+           stream shows are SSR'd into their status lane here (bucketed by Lane
+           in feed.go), so ?view=lanes is populated even before feed.js runs
+           (ka-0000001008 — lanes used to render 0 cards because only a
+           client-side mirror filled them, leaving a direct ?view=lanes load
+           empty). feed.js skips re-mirroring these SSR'd cards and only clones
+           LIVE events into the matching lane. -->
+      <div class="feed-lanes" aria-label="Activity lanes by status">
+        <section class="feed-lane" data-lane="open">
+          <div class="feed-lane-head">Open</div>
+          <div class="feed-lane-body" data-lane="open" role="log" aria-label="Open">{{range .Backfill}}{{if eq .Lane "open"}}{{.HTML}}{{end}}{{end}}</div>
+        </section>
+        <section class="feed-lane" data-lane="in_progress">
+          <div class="feed-lane-head">In progress</div>
+          <div class="feed-lane-body" data-lane="in_progress" role="log" aria-label="In progress">{{range .Backfill}}{{if eq .Lane "in_progress"}}{{.HTML}}{{end}}{{end}}</div>
+        </section>
+        <section class="feed-lane" data-lane="blocked">
+          <div class="feed-lane-head">Blocked</div>
+          <div class="feed-lane-body" data-lane="blocked" role="log" aria-label="Blocked">{{range .Backfill}}{{if eq .Lane "blocked"}}{{.HTML}}{{end}}{{end}}</div>
+        </section>
+        <section class="feed-lane" data-lane="done">
+          <div class="feed-lane-head">Done</div>
+          <div class="feed-lane-body" data-lane="done" role="log" aria-label="Done">{{range .Backfill}}{{if eq .Lane "done"}}{{.HTML}}{{end}}{{end}}</div>
+        </section>
+      </div>
+    </div>
+
+    <aside class="feed-rail" aria-label="Needs you">
+      <div class="feed-rail-panel is-decisions">
+        <h2>Open decisions</h2>
+        {{if .Rail.Decisions}}
+        <ul class="feed-rail-list">
+          {{range .Rail.Decisions}}
+          <li><a href="{{$.BasePath}}/{{.ID}}">{{.Title}}</a>
+            <div class="feed-rail-meta"><code>{{.ID}}</code>{{if .Project}} · {{.Project}}{{end}}{{if .Ago}} · {{.Ago}}{{end}}</div>
+          </li>
+          {{end}}
+        </ul>
+        {{else}}<p class="feed-rail-empty">No open decisions.</p>{{end}}
+      </div>
+
+      <div class="feed-rail-panel">
+        <h2>Hot ready queue</h2>
+        {{if .Rail.Hot}}
+        <ul class="feed-rail-list">
+          {{range .Rail.Hot}}
+          <li><a href="{{$.BasePath}}/{{.ID}}">{{.Title}}</a>
+            <div class="feed-rail-meta">P{{.Priority}} · {{.Type}}{{if .Project}} · {{.Project}}{{end}}</div>
+          </li>
+          {{end}}
+        </ul>
+        {{else}}<p class="feed-rail-empty">Ready queue is empty.</p>{{end}}
+      </div>
+
+      <div class="feed-rail-panel">
+        <h2>Live agents</h2>
+        {{if .Rail.Agents}}
+        <ul class="feed-rail-list">
+          {{range .Rail.Agents}}
+          <li><a href="{{$.BasePath}}/{{.ID}}">{{.Title}}</a>
+            <div class="feed-rail-meta">{{.AgentState}}{{if .Role}} · {{.Role}}{{end}}{{if .Project}} · {{.Project}}{{end}}{{if .Stale}} · ⚠ stale{{end}}</div>
+          </li>
+          {{end}}
+        </ul>
+        {{else}}<p class="feed-rail-empty">No live agents.</p>{{end}}
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script src="{{.BasePath}}/assets/static/feed.js" defer></script>
+{{end}}

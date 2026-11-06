@@ -1,0 +1,88 @@
+{{- if and .Values.coopmux.enabled .Values.coopmux.networkPolicy.enabled }}
+{{- /* coopmux ingress allowlist (gd-yDXrcBd0Uq). Renders independently of
+       networkPolicies.enabled: that flag turns on the whole namespace
+       default-deny layer, which the k3s overlay deliberately leaves off, yet
+       coopmux serves every agent session's screen and transcript and must not be
+       reachable from arbitrary pods. This policy isolates ONLY the coopmux pod
+       (policyTypes: [Ingress]), so nothing else changes. The same object name is
+       what networkPolicies.enabled used to render; it now lives here only.
+
+       Every legitimate caller of :9800 (verified against code + chart):
+         agents          controller: credential sync, session list, assistant-turn
+                         minter, plan agent (internal/coopmuxapi)
+         agent pods      coop sidecar registers its session and pulls creds
+                         (COOP_MUX_URL), `gb peek`, resolve-auth.sh distribute
+         beads-viewer    agent terminal first-paint (COOPMUX_URL, coopmuxapi)
+         vmagent         GET /metrics scrape
+         edge-auth       proxies /mux when edgeAuth.enabled (EDGE_AUTH_UPSTREAM_COOPMUX)
+         traefik         only when networkPolicies.traefik.* is set (mux Ingress)
+         viewer-authproxy  nginx in front of mux.clonk.tv, out-of-chart
+                         (gardenio-ziti/viewer-authproxy.yaml), injects the bearer
+         ziti-host       out-of-chart tunnel host for the microVM coopmux service
+         land pods       tenant coop sidecars in land-* namespaces, with
+                         landNamespaces.enabled (landns.DefaultPeers)
+       Add anything else under coopmux.networkPolicy.extraFrom. */}}
+{{- $port := .Values.coopmux.mux.port | default 9800 }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "gardenio.fullname" . }}-coopmux-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.coopmux.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Controller
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: agents
+        # Agent pods (ka-0000006038)
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+        # beads-viewer: COOPMUX_URL, agent terminal first-paint
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads-viewer
+        {{- if .Values.edgeAuth.enabled }}
+        # edge-auth proxy (EDGE_AUTH_UPSTREAM_COOPMUX)
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.edgeAuth.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if .Values.vmagent.enabled }}
+        # vmagent scrapes /metrics on the mux port (ka-0000000370)
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- range .Values.coopmux.networkPolicy.extraFrom }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+    {{- if .Values.landNamespaces.enabled }}
+    {{- include "gardenio.landIngressRule" (list 9800) | nindent 4 }}
+    {{- end }}
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    # Traefik ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+    {{- end }}
+{{- end }}

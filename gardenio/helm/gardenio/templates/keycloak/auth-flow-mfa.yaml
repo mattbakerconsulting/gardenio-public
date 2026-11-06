@@ -1,0 +1,176 @@
+{{- if and .Values.keycloak.enabled .Values.keycloak.realm.create .Values.keycloak.mfa.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- $mfa := .Values.keycloak.mfa -}}
+{{- $alias := $mfa.flowAlias | default "gardenio-mfa-browser" -}}
+{{- $adminRole := $mfa.adminRole | default "gardenio-admin" -}}
+{{- /* Resolve the second-factor authenticator from the configured factor.
+       totp     → auth-otp-form          (TOTP / Google-Authenticator style)
+       webauthn → webauthn-authenticator (FIDO2 / passkey, two-factor)
+       passkey  → webauthn-authenticator-passwordless, behind a
+                  conditional-credential gate: the passkey IS the second factor
+                  after a password, and is skipped when a passkey already was
+                  the primary credential (design doc section 4.1). Needs the
+                  WebAuthn Passwordless policy (realmHardening.passkeys).
+       totp and webauthn auto-trigger their enrollment required action
+       (CONFIGURE_TOTP / webauthn-register) when a matched admin has no
+       credential yet, so first admin login forces enrolment inline — no
+       realm-wide required action is needed (and none is CRD-expressible;
+       spike ka-0000006878). passkey does NOT: Keycloak's passwordless
+       authenticator factory does not allow user setup, so a matched admin with
+       no passkey is refused ("credential setup required"). They enrol in the
+       account console before they hold the admin role (CI-measured, harness
+       scenario 4; design doc 4.1). */ -}}
+{{- $factor := $mfa.factor | default "webauthn" -}}
+{{- $secondFactor := "" -}}
+{{- if eq $factor "totp" -}}
+{{-   $secondFactor = "auth-otp-form" -}}
+{{- else if eq $factor "webauthn" -}}
+{{-   $secondFactor = "webauthn-authenticator" -}}
+{{- else if eq $factor "passkey" -}}
+{{-   $secondFactor = "webauthn-authenticator-passwordless" -}}
+{{- else -}}
+{{-   fail (printf "keycloak.mfa.factor must be one of \"totp\", \"webauthn\" or \"passkey\", got %q" $factor) -}}
+{{- end -}}
+{{- /* factor=passkey adds a middle step to the conditional subflow:
+
+           conditional-user-role                  (condUserRole = admin role)
+           conditional-credential                 (skip when a passkey was the primary credential)
+           webauthn-authenticator-passwordless    REQUIRED
+
+       so an admin never gets in without a passkey: a passkey picked in the
+       username box (conditional UI / "Sign in with Passkey") authenticates in
+       auth-username-password-form and the subflow is skipped; a typed password
+       is followed by a passkey prompt. Non-admins are unchanged. Kept as a
+       template comment so totp/webauthn renders stay byte-identical. */ -}}
+# ── KeycloakAuthFlow: mandatory MFA for the {{ $adminRole }} role ─────────────
+# MFA epic ka-0000001366 / research ka-0000004895 §5. CRD-native MFA via a custom
+# browser flow (gating spike ka-0000006878 disproved the KeycloakRealmRequiredAction
+# CRD; KeycloakAuthFlow + KeycloakRealm.browserFlow is the validated alternative).
+#
+# Structure (clone of Keycloak's built-in `browser` flow with the conditional OTP
+# subflow re-gated on a role instead of on "user has OTP configured"):
+#
+#   {{ $alias }}                 topLevel browser flow
+#     ├─ auth-cookie                   ALTERNATIVE
+#     ├─ identity-provider-redirector  ALTERNATIVE
+#     └─ {{ $alias }}-forms       ALTERNATIVE subflow
+#          ├─ auth-username-password-form  REQUIRED
+#          └─ {{ $alias }}-conditional-mfa CONDITIONAL subflow
+#               ├─ conditional-user-role   (condUserRole={{ $adminRole }})
+#               └─ {{ $secondFactor }}     REQUIRED
+#
+# The CONDITIONAL subflow evaluates to REQUIRED only for users holding the
+# {{ $adminRole }} realm role; for everyone else it is DISABLED, so non-admins
+# authenticate with username+password exactly as before. Bound to the realm by
+# templates/keycloak/realm.yaml setting `spec.browserFlow: {{ $alias }}` when
+# keycloak.mfa.enabled.
+#
+# Each subflow is its own KeycloakAuthFlow CR referencing its parent's alias via
+# `spec.parentName` (EDP operator model — it calls AddChildFlowToFlow). The
+# operator reconciles each CR independently and retries until the parent exists,
+# so apply ordering is eventually consistent.
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakAuthFlow
+metadata:
+  name: {{ $fullname }}-mfa-browser
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-mfa
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: {{ $alias | quote }}
+  description: "Browser flow with mandatory MFA for the {{ $adminRole }} role (managed by gardenio helm chart)"
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: basic-flow
+  topLevel: true
+  builtIn: false
+  authenticationExecutions:
+    - authenticator: auth-cookie
+      requirement: ALTERNATIVE
+      priority: 10
+    - authenticator: identity-provider-redirector
+      requirement: ALTERNATIVE
+      priority: 20
+---
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakAuthFlow
+metadata:
+  name: {{ $fullname }}-mfa-forms
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-mfa
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: {{ printf "%s-forms" $alias | quote }}
+  description: "Username/password + conditional MFA forms subflow"
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: basic-flow
+  topLevel: false
+  builtIn: false
+  parentName: {{ $alias | quote }}
+  childType: basic-flow
+  childRequirement: ALTERNATIVE
+  authenticationExecutions:
+    - authenticator: auth-username-password-form
+      requirement: REQUIRED
+      priority: 10
+---
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakAuthFlow
+metadata:
+  name: {{ $fullname }}-mfa-conditional
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-mfa
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: {{ printf "%s-conditional-mfa" $alias | quote }}
+  description: "Conditional second factor — REQUIRED only for the {{ $adminRole }} role"
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: basic-flow
+  topLevel: false
+  builtIn: false
+  parentName: {{ printf "%s-forms" $alias | quote }}
+  childType: basic-flow
+  childRequirement: CONDITIONAL
+  authenticationExecutions:
+    # Gate: the subflow is active only for users holding the admin realm role.
+    - authenticator: conditional-user-role
+      requirement: REQUIRED
+      priority: 10
+      authenticatorConfig:
+        alias: {{ printf "%s-cond-user-role" $alias | quote }}
+        config:
+          condUserRole: {{ $adminRole | quote }}
+          negate: "false"
+{{- if eq $factor "passkey" }}
+    # Passkey factor only: the subflow applies only when the primary credential
+    # was NOT a passkey (included=false → true when none of `credentials` was
+    # used). Config keys and the credential type were read off Keycloak 26.7.5
+    # (ConditionalCredentialAuthenticatorFactory: `credentials`, `included`).
+    - authenticator: conditional-credential
+      requirement: REQUIRED
+      priority: 20
+      authenticatorConfig:
+        alias: {{ printf "%s-cond-credential" $alias | quote }}
+        config:
+          credentials: "webauthn-passwordless"
+          included: "false"
+{{- end }}
+    # Second factor, forced for matched admins (auto-prompts enrolment if absent).
+    - authenticator: {{ $secondFactor }}
+      requirement: REQUIRED
+      priority: {{ if eq $factor "passkey" }}30{{ else }}20{{ end }}
+{{- end }}

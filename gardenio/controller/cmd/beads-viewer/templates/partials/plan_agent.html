@@ -1,0 +1,480 @@
+{{define "plan_agent"}}
+{{/* The ONE plan-agent card on /plans/{id} — step 6 of the unify-plan-gardener
+     plan (epic ka-0000000081, task ka-0000000116). A plan's gardener and its
+     interactive agent are the SAME agent (one first-class plan-gardener role,
+     steps 1-3), so the cockpit renders ONE control surface: a merged header (the
+     unified chip + lifecycle chip + deep links), the gardener loop levers
+     (Pause/Resume, Wake) and the plan-agent conversation (transcript + typing
+     indicator + compose box + activity feed) in a single #plan-agent card.
+     Replaces the former plan_gardener.html bar + plan_assistant.html lane,
+     which each defined their own card, chip and SSE frame.
+
+     Swap contract: every operator lever and the compose form target
+     #plan-agent (hx-swap=outerHTML), and the shared /plans/{id}/events SSE
+     stream emits ONE `plan-agent-updated` frame carrying this whole section —
+     a gardener toggle, an agent_state flip, a plan_state change, or a new
+     transcript turn all re-render the same single card (plan_events.js).
+
+     Data: the ONE merged planAgentPanelData bag (step 4, ka-0000001218) —
+     .Gardener (planGardenerView: loop state + lifecycle + lever gating),
+     .Chip (the unified compound chip, step 5, ka-0000001332) and the
+     assistant lane's flat keys (.State / .Assistant / .Transcript / .Typing /
+     .Delivery / .Activity / .MaxLen / .IsOperator / .BasePath).
+
+     Dual entry-point, one lineage: the Wake lever (the gardener run-now verb)
+     and the message box below both spawn/resolve the SAME bound plan agent —
+     Wake fires one unprompted iteration; a message wakes it with your words
+     as its instruction. Neither creates a second agent.
+
+     Whole-card swap, preserved state: the card swaps as a UNIT, so a
+     background SSE frame (a new turn, a typing-bubble flip, a gardener-side
+     change) re-renders the transcript + compose box too. plan_events.js
+     onAgentEvent snapshots the transcript scroll position and the compose
+     textarea draft/caret BEFORE that swap and restores them after, so a new
+     message no longer rescrolls the log from the top (ka-0000000059) or wipes
+     an in-progress draft (ka-0000006168). Operator-initiated htmx lever swaps
+     (Pause/Resume/Wake/state/build) still reset the compose box — those are
+     deliberate clicks, not background frames.
+
+     Clear-on-send (ka-0000002657): a SUCCESSFUL send must always leave the
+     composer empty. The hx-on::after-request reset() below is skipped on any
+     non-2xx (so a failed send keeps the operator's words), and on the outerHTML
+     swap it acts on the detached form — the real clearing is the swap bringing
+     an empty composer. That clearing RACED the draft save/restore above: the
+     operator's turn is minted at send time, which fires a plan-agent-updated
+     frame whose onAgentEvent snapshotted the still-present sent text and
+     restored it into the freshly-emptied composer, so the message "didn't
+     clear". plan_events.js now tracks the in-flight send (htmx:beforeRequest/
+     afterRequest on this form) and (a) never restores a draft equal to the
+     in-flight text and (b) deterministically clears any resurrected value on
+     success — while re-filling on failure so nothing is lost.
+
+     Failure handling (R1, ka-0000005794#10-risks-mitigations): a compose POST
+     error returns a non-2xx status, which htmx's default responseHandling
+     does NOT swap — so the operator's textarea is never reset and their
+     message is never lost. The form's hx-on::response-error hook reads the
+     plain-text error body and shows it inline in .plan-assistant-error. */}}
+<section id="plan-agent" class="plan-agent" data-plan-id="{{.PlanID}}" data-state="{{.State}}" data-loop="{{.Gardener.State}}" data-plan-state="{{.Gardener.PlanState}}">
+  <div class="plan-agent-head">
+    <h3 aria-level="2">Plan agent
+      {{- /* Authoring-lifecycle chip (task ka-0000005350, D5, R6): draft →
+             ready → building. Renders only for a plan that opted into the
+             lifecycle; legacy/hand-marked plans (unset state) show only the
+             unified chip.
+
+             Terminal-reconcile (ka-0000005352 iter-27): renders off
+             .Gardener.LifecycleChip — the plan_state reconciled against the
+             epic's terminal status (planLifecycleChipState) — so a plan
+             closed/deferred with a stale non-terminal plan_state
+             (draft/ready/building never rewound by a hand-close or drain
+             cascade) no longer advertises an in-flight lifecycle ("building —
+             the gardener is dispatching crew") on a FINISHED plan. Agrees with
+             the /plans index card (plan_card.html) by construction — both
+             gate + label off the same reconciled state. The Reopen lever below
+             still keys off the RAW PlanState (.LifecycleGated), so a closed
+             plan keeps its Reopen affordance even though the chip drops. */ -}}
+      {{if .Gardener.LifecycleChip}}
+      <span class="chip plan-lifecycle-chip plan-lifecycle-chip-{{.Gardener.LifecycleChip}}"
+            title="{{if eq .Gardener.LifecycleChip "draft"}}Draft — the plan agent is still researching / clarifying. Nothing builds until you approve.{{else if eq .Gardener.LifecycleChip "ready"}}Ready — finalized and awaiting your deliberate “Approve & build”. Nothing builds until you approve.{{else if eq .Gardener.LifecycleChip "complete"}}Complete — this plan is done; the plan is closed and the gardener disabled. Reopen to resume work.{{else if eq .Gardener.LifecycleChip "abandoned"}}Abandoned — this plan was given up on without finishing; the plan is closed and the gardener disabled. Reopen to resume work.{{else}}Building — approved; the bound gardener is dispatching crew step by step.{{end}}">
+        {{.Gardener.LifecycleChip}}
+      </span>
+      {{end}}
+      {{- /* The unified plan-agent chip (step 5, ka-0000001332): ONE compound
+             chip — loop-primary tone + a pulsing agent-liveness dot — derived
+             from the unified PanelState, so a running gardener + live iteration
+             reads "running · live", never two contradictory chips. Shared with
+             the /plans index card (step 7, ka-0000003685) via the
+             plan_agent_chip define below so the two surfaces render the SAME
+             markup. */ -}}
+      {{with .Chip}}{{template "plan_agent_chip" .}}{{end}}
+      {{- /* Firing-mode flip affordance (Task 8, epic ka-0000006020): an
+             operator-only <details> popover beside the chip that flips the bound
+             gardener's firing mode via the CANONICAL /gardener/{id}/mode verb
+             (Task 7). It posts the OPPOSITE mode with hx-swap="none" — the verb
+             re-renders the gardener-detail control bar, which is not on this page,
+             so instead we rely on the flip's label/field write firing a
+             plan-agent-updated frame via the plan /events SSE gardenerID branch,
+             which re-renders THIS whole card (glyph + cadence) in place. Rendered
+             only for an operator on a plan whose gardener has a resolvable mode
+             (⏱/⚡); a condition-gated gardener (empty FiringMode) shows no flip. */ -}}
+      {{if and .Gardener.IsOperator .Gardener.GardenerID .Chip.FiringMode}}
+      <details class="plan-agent-mode-flip">
+        <summary class="plan-agent-mode-flip-summary" title="Switch this gardener's firing mode">Firing mode ▾</summary>
+        <div class="plan-agent-mode-flip-menu" role="group" aria-label="Gardener firing mode">
+          <button type="button"
+                  class="bead-action plan-agent-mode-opt{{if eq .Chip.FiringMode "cron"}} plan-agent-mode-opt-active{{end}}"
+                  {{if eq .Chip.FiringMode "cron"}}aria-pressed="true" disabled title="Timed: fires on a fixed cron schedule (current mode)"{{else}}hx-post="{{.BasePath}}/gardener/{{.Gardener.GardenerID}}/mode" hx-vals='{"mode":"timed"}' hx-swap="none" hx-confirm="Switch this gardener to TIMED firing? It will fire on its cron schedule instead of subtree events." title="Switch to timed (cron) firing"{{end}}>⏱ Timed</button>
+          <button type="button"
+                  class="bead-action plan-agent-mode-opt{{if eq .Chip.FiringMode "event"}} plan-agent-mode-opt-active{{end}}"
+                  {{if eq .Chip.FiringMode "event"}}aria-pressed="true" disabled title="Event: fires on subtree bead events, with a slow fallback-cron watchdog (current mode)"{{else}}hx-post="{{.BasePath}}/gardener/{{.Gardener.GardenerID}}/mode" hx-vals='{"mode":"event"}' hx-swap="none" hx-confirm="Switch this gardener to EVENT firing? It will wake on activity inside its plan subtree, with a slow fallback-cron watchdog." title="Switch to event (subtree activity) firing"{{end}}>⚡ Event</button>
+        </div>
+      </details>
+      {{end}}
+    </h3>
+    <span class="plan-agent-links">
+      {{if .Gardener.GardenerID}}
+      <a class="plan-agent-open bead-action" href="{{.BasePath}}/gardener/{{.Gardener.GardenerID}}"
+         title="Open the gardener page (full lifecycle levers: cancel-run, retire, edit config){{if .Gardener.Title}} — {{.Gardener.Title}}{{end}}">Gardener &rarr;</a>
+      {{end}}
+      {{if and .Assistant .AssistantURL}}
+      {{/* Prefer the coopmux terminal page for the agent's pod (ka-0000007019);
+           AssistantURL falls back to the agent's bead page /{id} when the
+           coopmux URL can't be derived. AssistantExternal → open in a new tab,
+           matching the other coopmux terminal links. */}}
+      <a class="plan-agent-open plan-agent-terminal bead-action" href="{{.AssistantURL}}"{{if .AssistantExternal}} target="_blank" rel="noopener"{{end}} title="{{if .AssistantExternal}}Open the agent's live coopmux terminal{{else}}Open the agent's bead page (screen + full input surface){{end}}">Terminal &rarr;</a>
+      {{end}}
+    </span>
+  </div>
+
+  {{with .Gardener}}
+  {{if .Error}}
+  <p class="bead-actions-error" role="alert">{{.Error}}</p>
+  {{end}}
+
+  {{- /* Approve→build gate (§6.4). The single deliberate "Approve & build"
+         action (ExitPlanMode-analogous) flips ready→building AND starts the
+         bound gardener; "Mark ready" / "Keep editing" move draft↔ready without
+         building. Rendered for an operator on a lifecycle-gated plan — OR on an
+         UNSET plan the daemon still lets complete (.ShowMarkComplete), so the
+         cockpit offers the terminal lever on a legacy/ungated plan just like the
+         index card + peek drawer do (bug ka-0000007777). On such an unset plan
+         every approve/build sub-branch below is false, so only the "Mark
+         complete" button renders. */ -}}
+  {{if and .IsOperator (or .LifecycleGated .ShowMarkComplete .ShowReopen)}}
+  <div class="plan-lifecycle" role="group" aria-label="Plan approval">
+    {{if .ShowMarkReady}}
+    <p class="meta plan-lifecycle-note">This plan is a <strong>draft</strong> — nothing builds yet. Finalize the steps and questions, then mark it ready.</p>
+    <button type="button"
+            class="bead-action plan-lifecycle-ctl plan-lifecycle-ready"
+            hx-post="{{$.BasePath}}/plans/{{.PlanID}}/state"
+            hx-vals='{"state":"ready"}'
+            hx-target="#plan-agent" hx-swap="outerHTML"
+            hx-disabled-elt="this"
+            title="Mark this plan ready — it stays unbuilt until you Approve & build">Mark ready</button>
+    {{else if .ShowKeepEditing}}
+    {{- /* ready state: the Approve & build lever needs a bound gardener to
+           enable; when none is bound, explain that instead of a dead button.
+           "Keep editing" is always offered so a ready plan can be reopened. */ -}}
+    <p class="meta plan-lifecycle-note">This plan is <strong>ready</strong>. Nothing builds until you approve — this is the deliberate build gate.</p>
+    {{if .ShowApproveBuild}}
+    <button type="button"
+            class="bead-action plan-lifecycle-ctl plan-lifecycle-approve"
+            hx-post="{{$.BasePath}}/plans/{{.PlanID}}/build"
+            hx-target="#plan-agent" hx-swap="outerHTML"
+            hx-disabled-elt="this"
+            hx-confirm="Approve this plan and start the gardener building it, step by step?"
+            title="Approve the plan and enable the bound gardener to build it step by step">Approve &amp; build</button>
+    {{else}}
+    {{- /* ready plan, no gardener: the "Enable gardener" button below binds one in
+           place (thread ka-0000004696) — point at it, not the CLI. */ -}}
+    <p class="meta plan-lifecycle-note">No gardener is bound yet — click “Enable gardener” below before you can build. “Approve &amp; build” then starts it.</p>
+    {{end}}
+    <button type="button"
+            class="bead-action plan-lifecycle-ctl plan-lifecycle-edit"
+            hx-post="{{$.BasePath}}/plans/{{.PlanID}}/state"
+            hx-vals='{"state":"draft"}'
+            hx-target="#plan-agent" hx-swap="outerHTML"
+            hx-disabled-elt="this"
+            title="Reopen this plan for editing — moves it back to draft">Keep editing</button>
+    {{else if .Building}}
+    <p class="meta plan-lifecycle-note">Approved — the bound gardener is building this plan. Pause the gardener below to hold the build, or mark it complete when the work is done.</p>
+    {{end}}
+    {{- /* Terminal completion (task ka-0000000616, decision ka-0000004595:
+           PROPOSE — the plan-gardener proposes closure, the operator confirms
+           here). "Mark complete" closes the plan epic + disables the gardener;
+           "Abandon" (task ka-0000001377) is the DISTINCT cheap exit — same
+           close+disable, but records the plan as given up on rather than done,
+           and is offered from any non-terminal working state; "Reopen" is the
+           inverse of either. A soft guard warns when open steps remain. */ -}}
+    {{if .ShowMarkComplete}}
+    <button type="button"
+            class="bead-action plan-lifecycle-ctl plan-lifecycle-complete"
+            hx-post="{{$.BasePath}}/plans/{{.PlanID}}/complete"
+            hx-target="#plan-agent" hx-swap="outerHTML"
+            hx-disabled-elt="this"
+            hx-confirm="{{if .OpenStepsRemaining}}{{.OpenStepsRemaining}} step{{if ne .OpenStepsRemaining 1}}s{{end}} still open — mark this plan complete anyway? It closes the plan and stops the gardener (you can Reopen later).{{else}}Mark this plan complete? It closes the plan and stops the gardener (you can Reopen later).{{end}}"
+            title="Mark this plan complete — closes the plan and disables the bound gardener">Mark complete</button>
+    {{end}}
+    {{if .ShowAbandon}}
+    <button type="button"
+            class="bead-action plan-lifecycle-ctl plan-lifecycle-abandon"
+            hx-post="{{$.BasePath}}/plans/{{.PlanID}}/abandon"
+            hx-target="#plan-agent" hx-swap="outerHTML"
+            hx-disabled-elt="this"
+            hx-confirm="Abandon this plan? It closes the plan and stops the gardener without marking it done — the leftover work is given up on (you can Reopen later)."
+            title="Abandon this plan — the cheap exit: closes the plan and disables the gardener, recording it as given up on rather than done">Abandon</button>
+    {{end}}
+    {{if .ShowReopen}}
+    <button type="button"
+            class="bead-action plan-lifecycle-ctl plan-lifecycle-reopen"
+            hx-post="{{$.BasePath}}/plans/{{.PlanID}}/reopen"
+            hx-target="#plan-agent" hx-swap="outerHTML"
+            hx-disabled-elt="this"
+            hx-confirm="Reopen this {{if eq .PlanState "abandoned"}}abandoned{{else}}completed{{end}} plan? It moves back to building; resume the gardener to restart the loop."
+            title="Reopen this {{if eq .PlanState "abandoned"}}abandoned{{else}}completed{{end}} plan — moves it back to building (the gardener stays paused until you resume it)">Reopen</button>
+    {{end}}
+  </div>
+  {{else if and .LifecycleGated (not .Building) (ne .PlanState "complete") (ne .PlanState "abandoned")}}
+  {{- /* Non-operator viewing a still-authoring plan: explain the gate. */ -}}
+  <p class="meta plan-lifecycle-note">This plan is a {{.PlanState}} — it won't build until an operator approves it.</p>
+  {{else if eq .PlanState "complete"}}
+  {{- /* Non-operator viewing a completed plan: state the terminal fact. */ -}}
+  <p class="meta plan-lifecycle-note">This plan is complete.</p>
+  {{else if eq .PlanState "abandoned"}}
+  {{- /* Non-operator viewing an abandoned plan: state the terminal fact. */ -}}
+  <p class="meta plan-lifecycle-note">This plan was abandoned.</p>
+  {{end}}
+
+  {{if .GardenerID}}
+    {{- /* Parked gardener (gd-f2fc4jcRn3): the LIVE dormancy verdict
+           (bridge.ReconcileDormancyProbe, the engine's own dormant-gate
+           predicates), never the stamped dormant_blocker, which goes stale.
+           Renders for everyone, operator or not: it answers "why is nothing
+           happening on this plan?". */ -}}
+    {{with .Park}}
+    <p class="meta plan-gardener-parked" role="status" data-park-kind="{{.Kind}}">
+      <strong>Gardener parked.</strong>
+      {{if eq .Kind "mr_merged"}}It fires nothing until the merge request tracked by{{else}}Every open step waits on{{end}}
+      {{if .BlockerType}}{{.BlockerType}} {{end}}<a href="{{$.BasePath}}/{{.BlockerID}}">{{.BlockerID}}</a>{{if .BlockerTitle}} — {{.BlockerTitle}}{{end}}{{if eq .Kind "mr_merged"}} merges{{end}}.
+      It wakes on its own once {{if eq .Kind "mr_merged"}}it merges{{else}}that is resolved or another step is free to work{{end}}.
+      {{if .StaleStamp}}<span class="plan-gardener-parked-stale">(Its stamped blocker {{.StaleStamp}} is out of date.)</span>{{end}}
+    </p>
+    {{end}}
+    {{if .IsOperator}}
+    {{if eq .State "retired"}}
+    <p class="meta plan-gardener-note">This gardener is retired — <a href="{{$.BasePath}}/gardener/{{.GardenerID}}">open the gardener page</a> to review its history.</p>
+    {{else}}
+    <div class="plan-gardener-controls" role="group" aria-label="Plan gardener controls">
+      {{- /* Pause / resume toggle. Posts to the plan-scoped route, which flips
+             the bound gardener's enabled field via the shared core and re-renders
+             this card in place. */ -}}
+      <button type="button"
+              class="bead-action plan-gardener-ctl plan-gardener-toggle{{if .Paused}} plan-gardener-toggle-paused{{else}} plan-gardener-toggle-running{{end}}"
+              hx-post="{{$.BasePath}}/plans/{{.PlanID}}/gardener/toggle"
+              hx-target="#plan-agent" hx-swap="outerHTML"
+              hx-disabled-elt="this"
+              aria-pressed="{{if .Paused}}false{{else}}true{{end}}"
+              title="{{if .Paused}}Paused — click to resume (lets the loop spawn iterations again){{else}}Running — click to pause (stops spawning new iterations){{end}}">
+        {{if .Paused}}Resume{{else}}Pause{{end}}
+      </button>
+
+      {{- /* Wake — spawn one gardener iteration immediately (the run-now verb).
+             Same agent the message box below reaches: Wake fires one unprompted
+             iteration, a message delivers your words as its instruction —
+             both resolve the plan's ONE bound agent lineage. */ -}}
+      <button type="button"
+              class="bead-action plan-gardener-ctl plan-gardener-wake"
+              hx-post="{{$.BasePath}}/plans/{{.PlanID}}/gardener/wake"
+              hx-target="#plan-agent" hx-swap="outerHTML"
+              hx-disabled-elt="this"
+              hx-confirm="Wake the plan agent — spawn one iteration right now?"
+              title="Spawn one iteration immediately, unprompted (steers the plan + checks for orphaned work). To wake it WITH instructions, use the message box below — same agent either way.">Wake</button>
+
+      {{if .HasInflightRun}}
+      <span class="meta plan-gardener-inflight">A run is in flight — Wake is disabled until it finishes.</span>
+      {{end}}
+    </div>
+
+    {{- /* Cadence editor (task ka-0000008237): tune the bound gardener's firing
+           cadence WITHOUT leaving /plans. In timed mode the field is the cron
+           schedule; in event mode it is the fallback-watchdog cron — and leaving
+           it BLANK runs the gardener purely on subtree activity with NO clock
+           floor (the plan-gardener default). Posts to the plan-scoped cadence
+           route, which validates the cron and delegates to gardenermode.SetCadence,
+           then re-renders this card. Hidden for a condition-gated gardener with no
+           single cron knob (CadenceEditable false). */ -}}
+    {{if .CadenceEditable}}
+    <details class="plan-gardener-cadence">
+      <summary class="plan-gardener-cadence-summary" title="Set or tune how often this gardener fires">
+        Cadence: {{if .Cadence}}<code>{{.Cadence}}</code>{{else if eq .FiringMode "event"}}event-driven (no clock floor){{else}}—{{end}} ▾
+      </summary>
+      <form class="plan-gardener-cadence-form"
+            hx-post="{{$.BasePath}}/plans/{{.PlanID}}/gardener/cadence"
+            hx-target="#plan-agent" hx-swap="outerHTML">
+        <label class="plan-gardener-cadence-label" for="plan-gardener-cadence-{{.PlanID}}">
+          {{if eq .FiringMode "event"}}Fallback watchdog cron{{else}}Cron schedule{{end}}
+        </label>
+        <input type="text" id="plan-gardener-cadence-{{.PlanID}}" name="cadence"
+               class="plan-gardener-cadence-input" value="{{.Cadence}}"
+               placeholder="{{if eq .FiringMode "event"}}blank = purely event-driven (no cron floor){{else}}e.g. 7,37 * * * *{{end}}"
+               autocomplete="off" spellcheck="false">
+        <button type="submit" class="bead-action plan-gardener-cadence-save" hx-disabled-elt="this">Save cadence</button>
+        <p class="meta plan-gardener-cadence-hint">
+          {{if eq .FiringMode "event"}}This gardener fires on activity inside its plan subtree. The fallback cron is a slow floor that bounds staleness if the event stream drops — leave it blank to run purely on events with no clock floor.{{else}}Standard 5-field cron (minute hour day month weekday), evaluated in {{if .Timezone}}{{.Timezone}}{{else}}America/Los_Angeles{{end}}.{{end}}
+        </p>
+      </form>
+    </details>
+    {{end}}
+    {{end}}
+    {{else}}
+    <p class="meta">This plan has a bound gardener{{if eq .State "paused"}} (paused){{else if eq .State "retired"}} (retired){{end}}. Sign in as an operator to pause, resume, or wake it.</p>
+    {{end}}
+  {{else}}
+    {{/* No gardener bound — surface the gap (the stalled signal in miniature).
+         An operator gets a one-click bind button (Matt's ask, thread
+         ka-0000004696) that POSTs to /plans/{id}/gardener/enable and re-renders
+         this card with the pause/resume + Wake levers; the CLI is still the
+         out-of-page path. A non-operator sees the gap + how to bind. */}}
+    {{if .IsOperator}}
+    <div class="plan-gardener-controls" role="group" aria-label="Bind plan gardener">
+      <p class="meta plan-gardener-none">No gardener is watching this plan — orphaned work could go unnoticed. Enable one to watch it, steer its steps, and answer your messages.</p>
+      <button type="button"
+              class="bead-action plan-gardener-ctl plan-gardener-enable"
+              hx-post="{{$.BasePath}}/plans/{{.PlanID}}/gardener/enable"
+              hx-target="#plan-agent" hx-swap="outerHTML"
+              hx-disabled-elt="this"
+              hx-confirm="Enable a gardener to watch this plan? It binds the durable plan-gardener loop (born paused behind “Approve &amp; build” while the plan is still a draft/ready)."
+              title="Bind the plan's durable watchdog gardener — the same as running gb plan gardener {{.PlanID}}">Enable gardener</button>
+    </div>
+    {{else}}
+    <p class="meta plan-gardener-none">No gardener is watching this plan. Bind one with <code>gb plan gardener {{.PlanID}}</code> so orphaned work never goes unnoticed.</p>
+    {{end}}
+  {{end}}
+  {{end}}
+
+  {{/* The persistent chat transcript (task 2b, ka-0000004607): operator +
+       agent turns rendered through the SHARED bead_chat direction-bubble
+       partial. The partial self-gates on .Chat.HasMessages, so it paints
+       nothing on a plan with no turns yet. */}}
+  {{template "bead_chat" (dict "Chat" .Transcript)}}
+
+  {{/* The "plan agent is typing…" indicator (task 2c, ka-0000000311): a live
+       three-dot bubble shown whenever the bound agent is actively producing a
+       turn (agent_state in the alive bucket — planTranscriptTyping), so
+       "working" is visibly distinct from "stuck" (§10-R1). The whole card
+       re-renders on the agent_state change via the plan-agent-updated SSE
+       frame, so this bubble appears and clears live. */}}
+  {{if .Typing}}
+  <div class="plan-assistant-typing" role="status" aria-live="polite" data-plan-assistant-typing>
+    <span>plan agent is typing…</span>
+    <span class="plan-assistant-typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+  </div>
+  {{end}}
+
+  {{/* Honest delivery ack for a just-sent message (R1): sent / queued-waking /
+       spawning — distinct from the liveness chip. Present only on the POST
+       response; the next SSE re-render omits Delivery, so it clears itself. */}}
+  {{if .DeliveryLabel}}
+  <p class="plan-assistant-delivery plan-assistant-delivery-{{.Delivery}}" role="status">{{.DeliveryLabel}}</p>
+  {{end}}
+
+  {{if .IsOperator}}
+  {{/* .plan-assistant-error is populated CLIENT-SIDE by hx-on::response-error
+       (htmx does not swap 4xx/5xx bodies, so a server-rendered error partial
+       would be discarded AND would reset the textarea). before-request clears
+       any stale error; response-error fills it from the plain-text body. */}}
+  <p class="plan-assistant-error bead-actions-error" role="alert" hidden></p>
+  {{- /* Native method+action = progressive-enhancement fallback (ka-0000005067).
+         htmx wires its submit handler per-form-node during htmx.process and
+         cancels the native submit; but a submit that fires on an UNPROCESSED
+         form — the defer-load gap before htmx inits on first paint, a swapped-in
+         card whose htmx.process was skipped/threw (plan_events.js swallows that
+         error), or htmx failing to load at all — would otherwise fall through to
+         a native submit against the current URL and reload the page, dropping the
+         message. With a real method+action the native fallback POSTs to the SAME
+         endpoint; the handler 303-redirects a non-htmx POST back to the plan so
+         the send still lands. When htmx IS wired it preventDefaults the native
+         submit and uses hx-post as before — the action/method are never reached. */ -}}
+  {{- /* State-adaptive submit + operator-gating (S5, ka-0000003325). The
+         hx-confirm lives HERE on the form — the element that carries hx-post, so
+         htmx resolves the confirm off the request-initiating element (a child
+         button's hx-confirm would NOT gate a form-level hx-post). It is attached
+         ONLY for the sensitive WAKE transition (a parked/dormant agent → thaw it):
+         reviving a checkpointed pod someone let go idle is the one send that is
+         neither expected-by-construction (the first Spawn) nor instant (a live
+         Send), so it earns a deliberate confirm. Because the confirm is on the
+         form, it gates BOTH the click AND plan_composer.js's Enter-to-send
+         (requestSubmit fires the form's real submit path, so htmx's confirm runs
+         identically). SendNeedsConfirm is a pure projection of the SAME .State the
+         button label and hint read, so all three stay in lockstep. */ -}}
+  <form class="plan-assistant-form"
+        method="post"
+        action="{{.BasePath}}/plans/{{.PlanID}}/assistant/prompt"
+        hx-post="{{.BasePath}}/plans/{{.PlanID}}/assistant/prompt"
+        {{- if .SendNeedsConfirm}}
+        hx-confirm="Wake the plan agent with this message? It thaws the parked agent and delivers your words as its next instruction."{{end}}
+        hx-target="#plan-agent"
+        hx-swap="outerHTML"
+        hx-on::before-request="var e=this.parentNode.querySelector('.plan-assistant-error'); if(e){e.hidden=true; e.textContent='';}"
+        hx-on::after-request="if(event.detail.successful) this.reset(); if(window.planComposerAfterRequest) window.planComposerAfterRequest(event)"
+        hx-on::response-error="var e=this.parentNode.querySelector('.plan-assistant-error'); if(e){e.textContent=(event.detail.xhr.responseText||'Message failed to send — nothing was lost, try again.').trim(); e.hidden=false;}"
+        hx-disabled-elt="find textarea, find button">
+    {{- /* The placeholder is the house voice (emptyPrompt, gd-5e6xgIOH6B), the
+           same in every state; what the state means for a send is the hint's and
+           the button's job. */}}
+    <textarea name="message" class="plan-assistant-input empty-prompt" rows="2"
+              placeholder="{{emptyPrompt}}"
+              aria-label="Message the plan agent" maxlength="{{.MaxLen}}" required></textarea>
+    <div class="plan-assistant-form-row">
+      <span class="plan-assistant-hint meta">{{if eq .State "live"}}Instant — the agent is live.{{else if eq .State "parked"}}Next message wakes it.{{else if eq .State "waking"}}Agent is coming online — send follow-ups any time.{{else}}First message spawns the plan agent: ask it to draft the plan, refine a step, or answer a question.{{end}}</span>
+      {{- /* Enter-to-send keybinding discovery (task ka-0000002000, Phase B):
+             plan_composer.js sends on bare Enter and keeps Shift+Enter as a
+             newline. Surface it so the Slack-like gesture is discoverable. */ -}}
+      <span class="plan-assistant-kbd meta" aria-hidden="true"><kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> newline</span>
+      {{- /* State-adaptive submit label (S5, ka-0000003325): the button names what
+             pressing it DOES — "Spawn" (no agent yet → cold-start), "Wake" (a
+             parked agent → thaw it), or "Send" (a live/waking agent → nudge it
+             now). SendLabel is a pure projection of the SAME .State the hint + the
+             form's confirm gate read (sendButtonLabel), so all three
+             stay in lockstep. data-send-state carries the resolved state for the
+             E2E label-transition assertions; the operator-gating confirm for the
+             sensitive Wake transition lives on the <form> above (where hx-post is),
+             so it gates both the click and the Enter-to-send path. */ -}}
+      <button type="submit" class="bead-action plan-assistant-send" data-send-state="{{.State}}">{{.SendLabel}}</button>
+    </div>
+  </form>
+  {{else}}
+  <p class="meta">{{if .Assistant}}This plan has an agent bound to it — open it above to view its screen. Sign in as an operator to send messages.{{else}}Sign in as an operator to start the plan agent.{{end}}</p>
+  {{end}}
+
+  {{if .Activity}}
+  {{/* The lifecycle activity feed (created/updated/closed rows across the plan
+       subtree), demoted to a collapsed secondary disclosure — the transcript
+       above is the primary "what's happening" surface (task 2b). */}}
+  <details class="plan-assistant-activity">
+    <summary class="plan-assistant-activity-summary">Recent activity</summary>
+    <ul class="plan-assistant-events">
+      {{range .Activity}}
+      <li class="plan-assistant-event plan-assistant-event-{{.Kind}}" data-bead-id="{{.BeadID}}">
+        <span class="plan-assistant-event-kind">{{.Kind}}</span>
+        <span class="plan-assistant-event-type">{{.Type}}</span>
+        <a class="plan-assistant-event-link" href="{{$.BasePath}}/{{.BeadID}}"><code>{{.BeadID}}</code></a>
+        <span class="plan-assistant-event-title">{{.Title}}</span>
+        {{if .Ago}}<span class="meta">{{.Ago}}</span>{{end}}
+      </li>
+      {{end}}
+    </ul>
+  </details>
+  {{end}}
+</section>
+{{end}}
+
+{{/* plan_agent_chip — the ONE unified plan-agent chip markup (dot: a
+     planAgentChipView), rendered by BOTH the detail card header above and each
+     /plans index card (step 7, ka-0000003685), so index and detail can never
+     drift apart. The .plan-agent-chip-* CSS lives in layout.html for the same
+     reason. */}}
+{{define "plan_agent_chip"}}
+<span class="chip plan-agent-chip plan-agent-chip-{{.Tone}}" title="{{.Title}}">
+  {{- if .Dot}}<span class="plan-agent-chip-dot plan-agent-chip-dot-{{.Dot}}" aria-hidden="true"></span>{{end -}}
+  {{.Label}}
+  {{- /* Firing-mode glyph (Task 8, epic ka-0000006020): ⏱ clock-fired (cron) /
+         ⚡ subtree-activity fired (event). Rendered here in the SHARED chip so it
+         shows on BOTH the /plans/{id} card header and every /plans index card.
+         Empty FiringMode (no gardener bound / condition-gated) renders no glyph.
+         The flip AFFORDANCE (popover form) is detail-card only — the index chip
+         is read-only — so it lives in the card header, not here. */ -}}
+  {{- if eq .FiringMode "cron"}}<span class="plan-agent-chip-mode" title="Timed — this gardener fires on a cron schedule." aria-label="timed firing mode">⏱</span>
+  {{- else if eq .FiringMode "event"}}<span class="plan-agent-chip-mode" title="Event — this gardener fires on activity inside its plan subtree, with a slow fallback-cron watchdog." aria-label="event firing mode">⚡</span>{{end -}}
+  {{- /* Next-fire facet (ka-0000005352 iter-56): the forward-looking "· fires in
+         12m" countdown to the armed-idle cron gardener's NEXT scheduled run — the
+         temporal INVERSE of the whole backward "how long since" wait-age family
+         (decision "· 32d", escalation "· 40d", stall "· 3d", crew "· 6h", MR
+         "· 8d", now-step "· 5d", ready "· 4d"). NextFire is populated by
+         setNextFire ONLY on an idle+cron chip, so it is absent (and this renders
+         nothing) for a running·live / paused / retired / event / gardener-less
+         chip — the chip then reads exactly as before. Rendered in the SAME shared
+         partial so index + cockpit carry the identical facet. */ -}}
+  {{- if .NextFire}}<span class="plan-agent-chip-next" title="This gardener is armed and idle — its next scheduled run is {{.NextFire}}." aria-label="next run {{.NextFire}}"> · {{.NextFire}}</span>{{end -}}
+</span>
+{{end}}

@@ -1,0 +1,1 @@
+/home/agent/bot/gasboat/repos/fics-helm-chart/.claude/commands/litellm-new-key.md

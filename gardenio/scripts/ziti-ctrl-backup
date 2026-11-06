@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# ziti-ctrl-backup -- back up the OpenZiti controller's raft DB and PKI off-box,
+# and prove the backup restores.
+#
+#   ziti-ctrl-backup snapshot [--home DIR] [--out FILE] [--offline]
+#                          on the controller box: consistent snapshot -> tarball
+#   ziti-ctrl-backup pull   [--host vultr] [--s3 URI] [--keep DIR]
+#                          from the laptop: ssh + snapshot + encrypt + upload
+#   ziti-ctrl-backup verify ARCHIVE
+#                          structural + bolt-readability check, prints identity count
+#   ziti-ctrl-backup restore ARCHIVE DEST
+#                          unpack into a NEW ziti home, ready to start
+#
+# Why a pull, not a push: the controller box is on Vultr and holds no AWS
+# credential. `pull` runs where the operator's AWS credential already lives,
+# so nothing long-lived is planted on a box whose process table already leaks
+# the ziti admin password (bundle gd-8brYjTBHIu). Plaintext never leaves the
+# puller's 0700 tmpdir: what lands in S3 is openssl-encrypted.
+#
+# What is in the backup, and why losing it is the expensive failure:
+#   pki/                 root CA + intermediate CA, INCLUDING PRIVATE KEYS.
+#                        Lose this and every enrolled identity must be
+#                        re-enrolled by hand.
+#   instance-*/raft/     ctrl-ha.db (the bolt state machine), raft.db (the raft
+#                        log), snapshots/, and the ctrl-ha.db-<ts> consistent
+#                        snapshot this script asks the controller to write.
+#   instance-*/ctrl.yaml, endpoints.yml, router certs/keys.
+#   export/              logical export (identities/services/configs/
+#                        service-policies/edge-router-policies) via
+#                        `ziti edge list ... -j`. Online snapshots only --
+#                        restorable even if the raft/bbolt file copy is torn.
+# ~4 MB total. Size is never the problem; node-locality and the CA keys are.
+#
+# Overrides: ZITI_HOME (/home/claude/ziti), ZITI_SSH_HOST (vultr),
+# ZITI_BACKUP_S3 (s3://gardenio-hq-backups-360190250083/ziti-ctrl/),
+# ZITI_BIN (ziti), AWS_PROFILE (gardenio), AWS_REGION (us-east-1).
+set -euo pipefail
+export AWS_PAGER=""
+
+ZITI_HOME_DEFAULT=/home/claude/ziti
+SSH_HOST=${ZITI_SSH_HOST:-vultr}
+S3_BASE=${ZITI_BACKUP_S3:-s3://gardenio-hq-backups-360190250083/ziti-ctrl/}
+# TWO binaries, deliberately separate. ZITI_BIN is the LOCAL one, used by
+# `verify` for the bolt read-back that counts identities; a bare name is right
+# because the puller's ziti (if any) is on PATH. ZITI_REMOTE_BIN is the one on
+# the CONTROLLER box, used only by the snapshot that `pull` runs over ssh: a
+# non-interactive ssh does not source the profile that adds ~/.local/bin to
+# PATH, so it must be an absolute path or the snapshot dies "ziti not on PATH".
+# Collapsing these into one variable makes fixing the remote break the local
+# verify (it silently degrades to structure-only) and vice versa.
+ZITI_BIN=${ZITI_BIN:-ziti}
+ZITI_REMOTE_BIN=${ZITI_REMOTE_BIN:-/home/claude/.local/bin/ziti}
+PROFILE=${AWS_PROFILE:-gardenio}
+REGION=${AWS_REGION:-us-east-1}
+# The passphrase for the at-rest encryption. SecureString, minted once by the
+# operator; `pull` refuses rather than uploading a CA private key in the clear.
+PASS_PARAM=${ZITI_BACKUP_PASS_PARAM:-/gardenio/ziti/backup-passphrase}
+
+die() { echo "ziti-ctrl-backup: $*" >&2; exit 1; }
+log() { echo "ziti-ctrl-backup: $*" >&2; }
+ts()  { date -u +%Y%m%dT%H%M%SZ; }
+
+# `pgrep -f 'ziti (edge quickstart|controller run)'` only recognizes the two
+# launch forms this script's author knew about. A controller started any
+# other way (a systemd unit, a container ENTRYPOINT, e.g. the in-cluster
+# openziti/ziti-controller image) is invisible to it, and treating "no pgrep
+# match" as "stopped" would silently snapshot a RUNNING controller and
+# produce a torn backup. Check what actually matters instead: whether
+# anything has the raft data files open. Returns 0 quiescent, 1 in use, 2
+# unknown (neither lsof nor fuser present) -- callers must fail closed on 2,
+# never treat "can't tell" as "stopped".
+home_is_quiescent() {
+  local home=$1 db raftdir
+  db=$(find "$home" -name 'ctrl-ha.db' 2>/dev/null | head -1)
+  raftdir=${db:+$(dirname "$db")}
+  raftdir=${raftdir:-$home}
+
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof +D "$raftdir" 2>/dev/null | grep -q .; then
+      return 1
+    fi
+    return 0
+  fi
+  if command -v fuser >/dev/null 2>&1; then
+    local f
+    while IFS= read -r -d '' f; do
+      if fuser -s "$f" 2>/dev/null; then
+        return 1
+      fi
+    done < <(find "$raftdir" -maxdepth 1 -type f -print0)
+    return 0
+  fi
+  return 2
+}
+
+# ── snapshot: runs ON the controller box ────────────────────────────────
+# Default is online: ask the running controller for a consistent copy of the
+# state machine (`ziti edge db snapshot` writes raft/ctrl-ha.db-<ts>), then tar
+# the home. The live ctrl-ha.db in that tar may be torn; the -<ts> member never
+# is, and `restore` uses that one. --offline instead requires the controller to
+# be stopped and takes the whole raft/ directory as one coherent set.
+cmd_snapshot() {
+  local home=${ZITI_HOME:-$ZITI_HOME_DEFAULT} out="" offline=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --home) home=$2; shift 2 ;;
+      --out) out=$2; shift 2 ;;
+      --offline) offline=1; shift ;;
+      *) die "snapshot: unknown argument $1" ;;
+    esac
+  done
+  [ -d "$home" ] || die "no ziti home at $home"
+  [ -d "$home/pki" ] || die "$home has no pki/ -- wrong directory?"
+  out=${out:-$home/../ziti-ctrl-$(ts).tar.gz}
+
+  # NOT `local` -- see the matching note on tmp in cmd_pull: a local here
+  # would be invisible to the EXIT trap below once cmd_snapshot returns.
+  export_tmp=""
+  if [ "$offline" = 1 ]; then
+    local q=0
+    home_is_quiescent "$home" || q=$?
+    case $q in
+      0) log "offline snapshot of $home (raft data directory verified quiescent)" ;;
+      1) die "--offline needs the controller stopped; the raft data directory is still open by a process" ;;
+      *) die "--offline can't verify the controller is stopped (neither lsof nor fuser is available on this box); refusing rather than risk a torn backup" ;;
+    esac
+  else
+    if command -v "$ZITI_BIN" >/dev/null 2>&1; then
+      log "asking the controller for a consistent db snapshot"
+      # The controller rate-limits this (429 RATE_LIMITED) -- roughly one a
+      # minute. A backup an hour never notices; a retry loop would.
+      "$ZITI_BIN" edge db snapshot >/dev/null \
+        || die "db snapshot failed -- 429 means another snapshot was taken in the last minute; otherwise log in (ziti edge login) or use --offline"
+    else
+      die "$ZITI_BIN not on PATH (on the box it is ~/.local/bin/ziti); set ZITI_BIN or use --offline"
+    fi
+    local snap
+    snap=$(find "$home" -name 'ctrl-ha.db-*' -newermt '-5 minutes' | head -1)
+    [ -n "$snap" ] || die "no fresh ctrl-ha.db-<ts> appeared; is this controller in HA/raft mode?"
+    log "snapshot member: ${snap#"$home"/}"
+
+    # Logical export alongside the file-level copy: a raft/bbolt file copied
+    # from under a running process can be torn, but this is a live read
+    # through the controller's own API -- what is actually restorable at
+    # 3am. Login already succeeded above (db snapshot needs it), so a
+    # per-entity failure here is a real problem, not an auth issue; warn and
+    # keep going rather than fail a backup that DID capture the file copy.
+    export_tmp=$(mktemp -d)
+    # ${export_tmp:-} not $export_tmp: under `set -u` this trap also fires on
+    # the EXIT of subshells spawned before/around the assignment, where
+    # export_tmp is unset (mirrors the tmp trap in cmd_pull). Registered here,
+    # not after tar, so a failure between mktemp and tar (mkdir, a per-entity
+    # export, the completeness check) still cleans up rather than leaking a
+    # temp dir on the Vultr box.
+    trap 'rm -rf "${export_tmp:-}"' EXIT
+    mkdir -p "$export_tmp/export"
+    local entity failed=0
+    # `ziti edge list` paginates at 10 and `--limit` silently returns nothing
+    # (gardenio/helm/ziti/README.md); the positional `limit 500` is
+    # the working form. A silently truncated export is worse than none -- it
+    # looks whole and gets trusted at 3am -- so also compare the rows returned
+    # against the server's own total and shout if they differ.
+    for entity in identities services configs service-policies edge-router-policies; do
+      if "$ZITI_BIN" edge list "$entity" 'limit 500' -j > "$export_tmp/export/$entity.json" 2>"$export_tmp/export/$entity.err"; then
+        rm -f "$export_tmp/export/$entity.err"
+        local got total
+        got=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("data",[])))' < "$export_tmp/export/$entity.json" 2>/dev/null || echo "?")
+        total=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("meta",{}).get("pagination",{}).get("totalCount","?"))' < "$export_tmp/export/$entity.json" 2>/dev/null || echo "?")
+        if [ "$got" = "?" ] || [ "$total" = "?" ]; then
+          log "WARNING: could not verify $entity export completeness (rows=$got total=$total); treat this export as unverified"
+          failed=1
+        elif [ "$got" != "$total" ]; then
+          log "WARNING: $entity export is TRUNCATED: $got of $total rows captured -- raise the limit; do not trust this export"
+          failed=1
+        else
+          log "logical export: $entity $got/$total"
+        fi
+      else
+        log "WARNING: logical export of $entity failed: $(cat "$export_tmp/export/$entity.err" 2>/dev/null)"
+        rm -f "$export_tmp/export/$entity.json"
+        failed=1
+      fi
+    done
+    if [ "$failed" = 0 ]; then
+      log "logical export captured: identities, services, configs, service-policies, edge-router-policies"
+    else
+      log "logical export incomplete -- see warnings above; the file-level backup is still the primary source"
+    fi
+  fi
+
+  # Snapshots accumulate next to the live DB and nothing prunes them. Keep the
+  # three newest in the tar and on the box; the rest are dead weight.
+  local pruned=0
+  while IFS= read -r -d '' -u 3 stale; do
+    rm -f "$stale"; pruned=$((pruned + 1))
+  done 3< <(find "$home" -name 'ctrl-ha.db-*' -printf '%T@ %p\0' \
+              | sort -zrn | tail -z -n +4 | cut -z -d' ' -f2-)
+  [ "$pruned" = 0 ] || log "pruned $pruned older on-box snapshot(s)"
+
+  if [ -n "$export_tmp" ]; then
+    tar -czf "$out" --numeric-owner -C "$(dirname "$home")" "$(basename "$home")" -C "$export_tmp" export
+  else
+    tar -czf "$out" -C "$(dirname "$home")" --numeric-owner "$(basename "$home")"
+  fi
+  sha256sum "$out" | awk '{print $1}' > "$out.sha256"
+  log "wrote $out ($(du -h "$out" | cut -f1)), sha256 $(cat "$out.sha256")"
+  echo "$out"
+}
+
+# ── pull: runs on the laptop ────────────────────────────────────────────
+cmd_pull() {
+  local keep="" s3=$S3_BASE host=$SSH_HOST
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --host) host=$2; shift 2 ;;
+      --s3) s3=$2; shift 2 ;;
+      --keep) keep=$2; shift 2 ;;
+      *) die "pull: unknown argument $1" ;;
+    esac
+  done
+  command -v aws >/dev/null || die "aws CLI not found"
+  local pass
+  pass=$(aws --profile "$PROFILE" --region "$REGION" ssm get-parameter \
+           --name "$PASS_PARAM" --with-decryption --query Parameter.Value --output text 2>/dev/null) \
+    || die "no SSM SecureString at $PASS_PARAM -- mint one before backing up a CA private key to S3"
+  [ -n "$pass" ] && [ "$pass" != "None" ] || die "$PASS_PARAM is empty"
+
+  # tmp is deliberately NOT `local`: bash tears down a function's locals
+  # before running the EXIT trap, even when the trap itself is what's firing
+  # the function off the call stack (set -e mid-function included) -- a
+  # `local tmp` here would make the trap below see an empty "${tmp:-}" and
+  # silently clean up nothing.
+  local stamp
+  tmp=$(mktemp -d); chmod 700 "$tmp"
+  # ${tmp:-} not $tmp: under `set -u` this trap also fires on the EXIT of
+  # subshells spawned before/around the assignment, where tmp is unset, and a
+  # bare $tmp there aborts with "tmp: unbound variable" — which surfaced on top
+  # of the real error and obscured it.
+  trap 'rm -rf "${tmp:-}"' EXIT
+  stamp=$(ts)
+  local plain="$tmp/ziti-ctrl-$stamp.tar.gz"
+
+  log "snapshotting on $host"
+  # The remote script is this file: no second copy to keep in sync, and the box
+  # needs nothing installed. --stdout is not a mode; we cat the file back.
+  local remote_out
+  # Forward ZITI_BIN/ZITI_HOME to the remote. A NON-INTERACTIVE ssh does not
+  # source the profile that puts ~/.local/bin on PATH, so the box's ziti — which
+  # lives exactly there — is invisible and `snapshot` dies "ziti not on PATH".
+  # Without this the operator is told to "set ZITI_BIN", but `pull` had no way
+  # to pass it through, so the advice could not be followed and the only route
+  # was --offline (which needs the controller stopped). Defaults keep the
+  # documented behaviour when the caller sets neither.
+  local remote_env="ZITI_BIN=${ZITI_REMOTE_BIN@Q}"
+  [ -n "${ZITI_HOME:-}" ] && remote_env="$remote_env ZITI_HOME=${ZITI_HOME@Q}"
+  remote_out=$(ssh "$host" "$remote_env bash -s -- snapshot" < "${BASH_SOURCE[0]}" | tail -1)
+  [ -n "$remote_out" ] || die "remote snapshot produced no path"
+  ssh "$host" "cat '$remote_out'" > "$plain"
+  local remote_sum local_sum
+  remote_sum=$(ssh "$host" "cat '$remote_out.sha256'")
+  local_sum=$(sha256sum "$plain" | awk '{print $1}')
+  [ "$remote_sum" = "$local_sum" ] || die "checksum mismatch in transit ($remote_sum != $local_sum)"
+  log "pulled $(du -h "$plain" | cut -f1), sha256 $local_sum"
+
+  cmd_verify "$plain"
+
+  local enc="$plain.enc"
+  printf '%s' "$pass" | openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt \
+    -in "$plain" -out "$enc" -pass stdin
+  local key="${s3%/}/ziti-ctrl-$stamp.tar.gz.enc"
+  aws --profile "$PROFILE" --region "$REGION" s3 cp "$enc" "$key" --only-show-errors
+  # Belt and braces: the sha256 of the PLAINTEXT rides alongside, so a restore
+  # can prove it decrypted to the same bytes that were verified here.
+  printf '%s  ziti-ctrl-%s.tar.gz\n' "$local_sum" "$stamp" \
+    | aws --profile "$PROFILE" --region "$REGION" s3 cp - "$key.sha256" --only-show-errors
+  log "uploaded $key"
+
+  if [ -n "$keep" ]; then
+    mkdir -p "$keep"; chmod 700 "$keep"
+    cp "$plain" "$plain.sha256" "$keep/" 2>/dev/null || cp "$plain" "$keep/"
+    log "kept a plaintext copy in $keep (it holds CA private keys -- 0700, and delete it when done)"
+  fi
+  echo "$key"
+}
+
+# ── verify: structural + bolt-readability ───────────────────────────────
+cmd_verify() {
+  local archive=${1:?usage: ziti-ctrl-backup verify ARCHIVE}
+  [ -f "$archive" ] || die "no such archive: $archive"
+  local members
+  members=$(tar -tzf "$archive")
+  local missing=0
+  for want in 'pki/root-ca/keys/root-ca.key' 'pki/root-ca/certs/root-ca.cert' 'ctrl.yaml'; do
+    echo "$members" | grep -q "$want" || { log "MISSING $want"; missing=1; }
+  done
+  echo "$members" | grep -qE 'raft/ctrl-ha\.db$' || { log "MISSING raft/ctrl-ha.db"; missing=1; }
+  [ "$missing" = 0 ] || die "archive is not a usable controller backup"
+
+  if echo "$members" | grep -q '^export/identities\.json$'; then
+    log "logical export present (identities/services/configs/service-policies/edge-router-policies)"
+  else
+    log "no logical export in this archive (offline backup, or predates the export feature) -- relying on the raft/bbolt copy only"
+  fi
+
+  local snap
+  snap=$(echo "$members" | grep -E 'raft/ctrl-ha\.db-[0-9]' | sort | tail -1)
+  [ -n "$snap" ] || snap=$(echo "$members" | grep -E 'raft/ctrl-ha\.db$' | head -1)
+  local tmp; tmp=$(mktemp -d)
+  tar -xzf "$archive" -C "$tmp" "$snap"
+  if command -v "$ZITI_BIN" >/dev/null 2>&1; then
+    local ver ids
+    ver=$("$ZITI_BIN" ops db get-db-version "$tmp/$snap" 2>&1 | tail -1)
+    ids=$("$ZITI_BIN" ops db du "$tmp/$snap" 2>/dev/null | grep -cE '^/ziti/identities/[^/]+: ' || true)
+    log "ok: ${snap##*/} -- $ver, $ids identities"
+  else
+    log "PARTIAL: structure only -- $ZITI_BIN is not on PATH here, so the bolt"
+    log "PARTIAL: read-back and identity count did NOT run. This is NOT a full verify;"
+    log "PARTIAL: run verify where a ziti binary exists before trusting this archive."
+  fi
+  rm -rf "$tmp"
+}
+
+# ── restore: unpack into a NEW home ─────────────────────────────────────
+# Never restores over a live home. From an online backup the newest
+# ctrl-ha.db-<ts> snapshot member is staged OUTSIDE the raft dir (not named
+# ctrl-ha.db-*) and raft/ is left completely EMPTY; a top-level `db:` line in
+# ctrl.yaml (added below) makes the controller import that file on its FIRST
+# start, running RaftRestoreFromBoltDb to bootstrap a fresh single-voter raft
+# cluster, then it exits once ("database restore requires controller
+# restart") -- restart it and it comes up as leader on the imported state.
+#
+# The old behavior -- promote the snapshot member INTO raft/ over ctrl-ha.db
+# and just drop raft.db -- restores the FSM (edge) database but not raft
+# MEMBERSHIP, which lives in raft.db: the restored controller boots with
+# zero peers, logs "no known peers, aborting election", and never gets a
+# leader. Every model write then returns CLUSTER_NO_LEADER even though a
+# plain `edge list` against the stale pre-restore state still succeeds,
+# which is why that behavior passed an identity-count-only check for months.
+# Proven false on ziti 2.0.4, 2026-09-23 (gd-3AhYZKV7yH). Same fix as
+# controller.yaml's restore-if-empty (commit 00ec9d0). See
+# docs/ziti-controller-backup.md for the real verification output.
+cmd_restore() {
+  local archive=${1:?usage: ziti-ctrl-backup restore ARCHIVE DEST}
+  local dest=${2:?usage: ziti-ctrl-backup restore ARCHIVE DEST}
+  [ -f "$archive" ] || die "no such archive: $archive"
+  [ -e "$dest" ] && die "$dest exists -- restore into a NEW directory and switch, never over a live home"
+  cmd_verify "$archive"
+
+  local parent; parent=$(dirname "$dest")
+  mkdir -p "$parent"
+  local tmp; tmp=$(mktemp -d -p "$parent")
+  tar -xzf "$archive" -C "$tmp" --numeric-owner
+  # Exclude export/ -- the tar has two top-level directories since the
+  # logical export landed (the ziti home, and export/), and picking
+  # whichever `find` happens to list first silently restores the wrong one.
+  local home; home=$(find "$tmp" -maxdepth 1 -mindepth 1 -type d ! -name export | head -1)
+  [ -n "$home" ] || die "archive has no top-level home directory"
+
+  local raft; raft=$(dirname "$(find "$home" -name 'ctrl-ha.db' | head -1)")
+  local instdir instname; instdir=$(dirname "$raft"); instname=$(basename "$instdir")
+  local snap; snap=$(find "$raft" -name 'ctrl-ha.db-*' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+  local imported=0
+  if [ -n "$snap" ]; then
+    log "staging $(basename "$snap") for import; raft starts empty (two-start restore)"
+    mkdir -p "$instdir/import"
+    mv "$snap" "$instdir/import/ctrl-import.db"
+    rm -rf "$raft"
+    mkdir -p "$raft"
+    imported=1
+  else
+    log "no consistent snapshot member; keeping the raft/ set as taken (offline backup)"
+  fi
+  mv "$home" "$dest"
+  if [ -d "$tmp/export" ]; then
+    mv "$tmp/export" "$dest/export"
+    log "logical export carried into $dest/export (manual reference if a rebuild from bolt state is ever needed)"
+  fi
+  rm -rf "$tmp"
+  chmod 700 "$dest"
+
+  # ctrl.yaml and router-*.yaml hard-code the ABSOLUTE home path for dataDir
+  # and for every cert/key. A restore to any other directory -- a scratch dir
+  # for a drill, or the in-cluster mount path -- must rewrite them or the
+  # controller reads the old home's PKI (or fails outright). This is also the
+  # reason the in-cluster home should be mounted at the same path it was
+  # generated for.
+  local cfg oldhome
+  cfg=$(find "$dest" -maxdepth 2 -name 'ctrl.yaml' | head -1)
+  [ -n "$cfg" ] || die "restored tree has no ctrl.yaml"
+  oldhome=$(sed -nE 's/^[[:space:]]*dataDir:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/p' "$cfg" | head -1)
+  oldhome=${oldhome%/raft}          # .../<home>/instance-N
+  oldhome=${oldhome%/*}             # .../<home>
+  if [ -n "$oldhome" ] && [ "$oldhome" != "$dest" ]; then
+    log "rewriting absolute paths: $oldhome -> $dest"
+    find "$dest" -maxdepth 2 \( -name '*.yaml' -o -name '*.yml' \) \
+      -exec sed -i "s|$oldhome|$dest|g" {} +
+  fi
+
+  if [ "$imported" = 1 ]; then
+    # Prepended AFTER the absolute-path rewrite above, with the final $dest
+    # path baked in directly, so it is correct whether or not that rewrite
+    # ran and never needs a second pass to catch a stale old-home path in it.
+    local importfile="$dest/$instname/import/ctrl-import.db"
+    { printf 'db: %s\n' "$importfile"; cat "$cfg"; } > "$cfg.new"
+    mv "$cfg.new" "$cfg"
+    log "wrote 'db: $importfile' to $cfg -- FIRST start only, ziti drops it once raft.db exists"
+  fi
+
+  log "restored to $dest -- THIS IS A TWO-START RESTORE:"
+  if [ "$imported" = 1 ]; then
+    log "  1st start: ziti controller run $cfg"
+    log "    -- imports $instname/import/ctrl-import.db, bootstraps a single-voter"
+    log "       raft cluster, then EXITS ONCE (\"database restore requires"
+    log "       controller restart\") -- this is expected; restart it"
+    log "  2nd start: ziti controller run $cfg -- comes up as leader on the imported state"
+    log "  then check: ziti agent cluster list   (expect 1 voter + a leader)"
+    log "  and: ziti edge login <addr> && ziti edge list identities"
+    log "  NOTE: the imported FSM's last-applied-index carries over, so the first"
+    log "  few writes on the new raft log can be silently skipped as replays (real"
+    log "  201, no persistence) until the log catches back up past it -- this is"
+    log "  bounded and self-resolves; verify a write with a follow-up GET/list and"
+    log "  retry if it didn't take, don't trust a bare 201 (see docs/ziti-controller-backup.md)"
+  else
+    log "  offline backup, no snapshot member to import -- start with: ziti controller run $cfg"
+    log "  then check: ziti edge login <addr> && ziti edge list identities"
+  fi
+}
+
+case "${1:-}" in
+  snapshot) shift; cmd_snapshot "$@" ;;
+  pull)     shift; cmd_pull "$@" ;;
+  verify)   shift; cmd_verify "$@" ;;
+  restore)  shift; cmd_restore "$@" ;;
+  *) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 1 ;;
+esac

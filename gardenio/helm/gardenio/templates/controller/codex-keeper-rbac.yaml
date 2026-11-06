@@ -1,0 +1,49 @@
+{{- /*
+Codex subscription refresh keeper RBAC (gd-Hk4RBE2MC7, escalation gd-rhOpykucrj;
+keeper: gd-6ggiM3hiV5, docs/codex-subscription-keeper.md).
+
+The keeper rotates a single-use ChatGPT refresh token and must persist it, so it
+needs `update` on the login Secret <n> and the pod-facing Secret <n>-session —
+and nothing else: `get` on Secrets is already in the standing controller Role,
+and there is deliberately NO `create` (the operator pre-creates an empty
+<n>-session; the keeper warns and does nothing harmful if it is missing).
+
+Bound to the controller ServiceAccount ONLY. beads-viewer was
+moved to the aux SA (serviceaccount.yaml) precisely so the controller is the
+sole holder of this grant. Do not add subjects here.
+Empty agents.codexAuth.secretNames renders nothing.
+*/ -}}
+{{- if and .Values.agents.enabled .Values.agents.codexAuth.secretNames }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-codex-keeper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      {{- range .Values.agents.codexAuth.secretNames }}
+      - {{ . | quote }}
+      - {{ printf "%s-session" . | quote }}
+      {{- end }}
+    verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-codex-keeper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "gardenio.agents.fullname" . }}-codex-keeper
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.agents.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

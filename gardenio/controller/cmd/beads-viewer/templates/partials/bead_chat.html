@@ -1,0 +1,122 @@
+{{define "bead_chat"}}
+{{/* Message-bead chat thread (feature ka-0000007791 follow-on). type=message
+     beads that mention (or are mentioned by) this bead — squawks, Slack drops,
+     delivery reports — are pulled OUT of the constellation and interleaved here
+     by timestamp as a scrollable chat log (oldest at the top, newest at the
+     bottom). Light-themed to sit with the comments block, not the deep-space
+     maps console. Renders only when .Chat has messages. */}}
+{{with .Chat}}{{if .HasMessages}}
+<style>
+  .bead-chat { margin: 1rem 0 0.5rem; border: 1px solid rgba(128,128,128,0.25);
+    border-radius: 8px; overflow: hidden; }
+  .bead-chat-head { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;
+    padding: 0.5rem 0.75rem; border-bottom: 1px solid rgba(128,128,128,0.2);
+    background: rgba(33,150,243,0.05); }
+  .bead-chat-head h2 { margin: 0; font-size: 1.05rem; }
+  .bead-chat-sub { font-size: 0.8em; opacity: 0.7; }
+  .bead-chat-spacer { flex: 1; }
+  .bead-chat-log { max-height: clamp(240px, 46vh, 620px); overflow-y: auto;
+    padding: 0.55rem 0.75rem 0.7rem; display: flex; flex-direction: column; gap: 0.4rem;
+    scroll-behavior: smooth; }
+  .bead-chat-older { font-size: 0.78em; opacity: 0.6; text-align: center;
+    padding: 0.2rem 0; font-style: italic; }
+  .bead-chat-msg { display: flex; flex-direction: column; gap: 0.15rem;
+    padding: 0.35rem 0.55rem; border-radius: 6px; background: rgba(128,128,128,0.06);
+    border: 1px solid rgba(128,128,128,0.14); max-width: 88%; }
+  /* Direction bubbles (ka-0000000676): user-authored Slack replies sit on the
+     own side (right), agent squawks / mail on the other side (left) — mirrors
+     the /u/{slug} inbox convention so agent-vs-user attribution is visible. */
+  .bead-chat-msg.dir-from-user { align-self: flex-end; background: rgba(33,150,243,0.10);
+    border-color: rgba(33,150,243,0.30); }
+  .bead-chat-msg.dir-from-agent { align-self: flex-start; }
+  .bead-chat-meta { display: flex; align-items: baseline; gap: 0.45rem; flex-wrap: wrap;
+    font-size: 0.76em; opacity: 0.85; }
+  .bead-chat-author { font-weight: 600; overflow-wrap: anywhere; }
+  .bead-chat-kind { font-size: 0.82em; text-transform: lowercase; letter-spacing: 0.02em;
+    border: 1px solid rgba(128,128,128,0.35); border-radius: 999px; padding: 0 0.4rem;
+    opacity: 0.85; }
+  .bead-chat-kind.kind-squawk { color: #b8860b; border-color: rgba(184,134,11,0.5); }
+  .bead-chat-kind.kind-slack { color: #1769aa; border-color: rgba(23,105,170,0.5); }
+  .bead-chat-kind.kind-mail { color: #6a1b9a; border-color: rgba(106,27,154,0.5); }
+  .bead-chat-ago { font-variant-numeric: tabular-nums; }
+  .bead-chat-id { text-decoration: none; opacity: 0.6; font-family: ui-monospace,
+    SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+  .bead-chat-id:hover { opacity: 1; }
+  .bead-chat-body { font-size: 0.92em; line-height: 1.45;
+    overflow-wrap: anywhere; white-space: pre-wrap; }
+  /* Tool-call turns (Phase A, ka-0000004601): a plan agent's tool_use rendered
+     as a compact, collapsible entry styled distinctly from a prose bubble, so
+     "what the agent DID" is visible inline without drowning the conversation.
+     A <details> keeps it one glanceable line by default, expandable to the
+     optional result. Monospace + a wrench glyph + a muted slab set it apart
+     from the rounded chat bubbles. */
+  .bead-chat-msg.is-tool { background: rgba(128,128,128,0.05);
+    border-style: dashed; border-color: rgba(128,128,128,0.30); padding: 0.2rem 0.5rem; }
+  .bead-chat-tool { font-size: 0.86em; }
+  .bead-chat-tool-summary { cursor: pointer; list-style: none;
+    display: flex; align-items: baseline; gap: 0.4rem; flex-wrap: wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .bead-chat-tool-summary::-webkit-details-marker { display: none; }
+  .bead-chat-tool-summary::before { content: "🔧"; font-size: 0.9em; }
+  .bead-chat-tool[open] .bead-chat-tool-summary::before { content: "🔧"; }
+  .bead-chat-tool-name { font-weight: 600; color: #1769aa;
+    border: 1px solid rgba(23,105,170,0.45); border-radius: 4px;
+    padding: 0 0.35rem; }
+  .bead-chat-tool-args { opacity: 0.85; overflow-wrap: anywhere; }
+  .bead-chat-tool-result { margin: 0.3rem 0 0; padding: 0.35rem 0.5rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.92em; line-height: 1.4; white-space: pre-wrap;
+    overflow-wrap: anywhere; background: rgba(128,128,128,0.10);
+    border-radius: 4px; }
+</style>
+<section class="bead-chat" aria-label="Message thread for this bead">
+  <div class="bead-chat-head">
+    <h2>Chat thread</h2>
+    <span class="bead-chat-spacer"></span>
+    <span class="bead-chat-sub">
+      {{if .OlderHidden}}newest {{.Shown}} of {{.Total}} message{{if ne .Total 1}}s{{end}}{{else}}{{.Shown}} message{{if ne .Shown 1}}s{{end}}{{end}}
+    </span>
+  </div>
+  <div class="bead-chat-log" data-bead-chat-log>
+    {{if .OlderHidden}}
+    <p class="bead-chat-older">{{.HiddenCount}} older message{{if ne .HiddenCount 1}}s{{end}} not shown</p>
+    {{end}}
+    {{range .Messages}}
+    {{if .IsTool}}
+    {{/* Tool-call turn (Phase A, ka-0000004601): a compact collapsible entry —
+         tool name + args summary on one line, optional result on expand. Styled
+         distinctly from a prose bubble (dashed slab, monospace, wrench glyph). */}}
+    <div class="bead-chat-msg is-tool{{if .Direction}} dir-{{.Direction}}{{end}}">
+      <details class="bead-chat-tool"{{if not .ToolResult}} open{{end}}>
+        <summary class="bead-chat-tool-summary">
+          <span class="bead-chat-tool-name">{{.ToolName}}</span>
+          {{if .ToolArgs}}<span class="bead-chat-tool-args">{{.ToolArgs}}</span>{{end}}
+          {{if .Ago}}<span class="bead-chat-ago" title="{{.TimestampRFC}}">{{.Ago}}</span>{{end}}
+          <a class="bead-chat-id" href="{{.Href}}">{{.ID}}</a>
+        </summary>
+        {{if .ToolResult}}<pre class="bead-chat-tool-result">{{.ToolResult}}</pre>{{end}}
+      </details>
+    </div>
+    {{else}}
+    <div class="bead-chat-msg{{if .Direction}} dir-{{.Direction}}{{end}}">
+      <div class="bead-chat-meta">
+        {{if .Author}}<span class="bead-chat-author">{{.Author}}</span>{{end}}
+        <span class="bead-chat-kind kind-{{.Kind}}">{{.Kind}}</span>
+        {{if .Ago}}<span class="bead-chat-ago" title="{{.TimestampRFC}}">{{.Ago}}</span>{{end}}
+        <a class="bead-chat-id" href="{{.Href}}">{{.ID}}</a>
+      </div>
+      <div class="bead-chat-body">{{.BodyHTML}}</div>
+    </div>
+    {{end}}
+    {{end}}
+  </div>
+</section>
+<script>
+  // Pin the chat log to the newest line on first paint (chat-log convention).
+  (function () {
+    var log = document.querySelector('[data-bead-chat-log]');
+    if (log) { log.scrollTop = log.scrollHeight; }
+  })();
+</script>
+{{end}}{{end}}
+{{end}}

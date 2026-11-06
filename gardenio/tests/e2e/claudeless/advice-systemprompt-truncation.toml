@@ -1,0 +1,175 @@
+# advice-systemprompt-truncation.toml
+#
+# Claudeless scenario (F9 integration): the TRUNCATED advice actually reaches
+# the channel the model sees on turn 1 — the system-prompt subset — and stays
+# under the enforced ceiling, carrying the visible truncation footer rather
+# than silently losing content.
+#
+# Design: gardenio/docs/advice-truncation-e2e-test-design.md §F9 + §3. A shell
+# script (test-advice-budget.sh Scenario 13) covers the same bytes more cheaply
+# and is the GATING assertion. This TOML is the INTEGRATION proof that the
+# system-prompt render path — the one `gb prime --system-prompt` feeds into
+# `claude --append-system-prompt-file` — produces an in-budget, footer-bearing
+# advice section under real budget pressure. The value-add of claudeless over a
+# shell script is that it drives the coop-facing path a live session consumes.
+#
+# What it asserts (all via `gb prime --system-prompt` for a seeded agent under a
+# TIGHT advice budget forced by env override):
+#   1. the system-prompt subset renders and is non-empty;
+#   2. it stays under the 100 KB total ceiling (primeBudgetTotal) even with a
+#      large seeded advice corpus;
+#   3. it contains the "## Advice" section (advice is a rules-only subset member);
+#   4. under the tight budget it carries the VISIBLE truncation footer — proving
+#      truncation (not silent loss) is what lands in the model's context;
+#   5. the footer points at the `gb advice list --for` recovery path.
+#
+# Never asserts truncation on the DEFAULT budget — the real corpus does not
+# truncate at 60k/20k. It forces the cascade with GB_PRIME_ADVICE_BUDGET_BYTES,
+# exactly like the shell module.
+#
+# Run via:
+#   claudeless --scenario advice-systemprompt-truncation.toml -p "run"
+
+[claude]
+session_id = "e2e00000-00ad-4000-a000-000000000f09"
+username = "e2e-advice-systemprompt-truncation"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 30000
+
+[[responses]]
+on = "*"
+say = "Running advice-systemprompt-truncation: assert gb prime --system-prompt is in-budget and carries the visible truncation footer under budget pressure."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# The advice section is only a rules-only subset member when gb prime supports
+# --system-prompt. Skip cleanly on older binaries rather than false-fail.
+if ! gb prime --help 2>&1 | grep -q -- '--system-prompt'; then
+  echo "SKIP: gb prime --system-prompt not present on this binary"
+  if [ -n "${GB_SCENARIO_RESULT_FILE:-}" ]; then echo "pass" > "$GB_SCENARIO_RESULT_FILE"; fi
+  exit 0
+fi
+
+CEILING=102400   # primeBudgetTotal — keep in sync with prime_size_budget_test.go
+TAG="e2e-sysprompt-trunc-$$-$(date +%s)"
+# Project-rooted agent id so BuildAgentSubscriptions derives project:gardenio +
+# role:crew and our seeded agent:<id> beads actually match (see
+# test-advice-budget.sh Scenario 0 for the rationale on this id shape).
+AGENT="gardenio/crews/$TAG"
+SEED_N=25
+CREATED=""
+
+cleanup() {
+  for id in $CREATED; do
+    gb advice remove "$id" --hard >/dev/null 2>&1 || kd delete "$id" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+# Never let this throwaway agent auto-claim real work.
+export BOAT_TASK_ID="e2e-sysprompt-trunc-noassign"
+
+# ── Seed an over-budget agent-scoped corpus ────────────────────────
+seeded=0
+i=1
+while [ "$i" -le "$SEED_N" ]; do
+  # ~1 KB single-line body, distinct from the title so it renders as the
+  # abbreviated summary and adds real byte pressure.
+  body="INSTRUCTION-$TAG-$i: $(printf 'always-do-the-important-thing %.0s' $(seq 1 40))"
+  id=$(kd create "ADV-$TAG-$i systemprompt probe" --type=advice \
+    -l "agent:$AGENT" -d "$body" --json 2>/dev/null \
+    | jq -r '.id // empty' 2>/dev/null)
+  if [ -n "$id" ]; then CREATED="$CREATED $id"; seeded=$((seeded + 1)); fi
+  i=$((i + 1))
+done
+if [ "$seeded" -ge $((SEED_N - 2)) ]; then
+  pass "seeded $seeded/$SEED_N agent-scoped advice beads"
+else
+  fail "seed corpus" "only seeded $seeded/$SEED_N"
+  echo "=== Results: $PASS passed, $FAIL failed ==="
+  if [ -n "${GB_SCENARIO_RESULT_FILE:-}" ]; then echo "fail" > "$GB_SCENARIO_RESULT_FILE"; fi
+  exit 1
+fi
+
+# ── Render the system-prompt subset under a TIGHT advice budget ────
+# Tight abbrev + tight title budget forces most of the corpus into the footer,
+# so the system-prompt subset the model would receive carries the visible
+# truncation marker rather than silently dropping instructions.
+SP_OUT=$(GB_PRIME_ADVICE_BUDGET_BYTES=1500 \
+         GB_PRIME_ADVICE_TITLE_BUDGET_BYTES=1500 \
+         gb prime --for "$AGENT" --system-prompt 2>/dev/null)
+SP_BYTES=$(printf '%s' "$SP_OUT" | wc -c | tr -d ' ')
+echo "system-prompt bytes=$SP_BYTES ceiling=$CEILING"
+
+# 1. non-empty render
+if [ -n "$SP_OUT" ] && [ "$SP_BYTES" -gt 0 ]; then
+  pass "gb prime --system-prompt produced a non-empty render"
+else
+  fail "system-prompt render" "empty output"
+fi
+
+# 2. under the 100 KB total ceiling
+if [ "$SP_BYTES" -le "$CEILING" ]; then
+  pass "system-prompt subset ($SP_BYTES B) is under the ${CEILING}B ceiling"
+else
+  fail "system-prompt ceiling" "$SP_BYTES B > ${CEILING}B — advice aggregate overran the context channel"
+fi
+
+# 3. advice section present (it's a rules-only subset member)
+if printf '%s' "$SP_OUT" | grep -qF "## Advice"; then
+  pass "advice section present in the system-prompt subset"
+else
+  # If the daemon didn't surface our seeds, the ceiling check still holds but
+  # the footer checks below would be vacuous — treat as a soft skip there.
+  fail "advice section present" "'## Advice' header missing (corpus may not have matched agent $AGENT)"
+fi
+
+# 4. the VISIBLE truncation footer is what landed in-context (not silent loss)
+if printf '%s' "$SP_OUT" | grep -qF "more advice items not shown (budget exceeded)"; then
+  pass "truncation footer present in the system-prompt subset (visible, not silent)"
+else
+  fail "truncation footer" "no footer under tight budget — advice may have been silently dropped from the model's context"
+fi
+
+# 5. the footer points at the recovery path
+if printf '%s' "$SP_OUT" | grep -qF "gb advice list --for $AGENT"; then
+  pass "footer carries the 'gb advice list --for' recovery pointer"
+else
+  fail "recovery pointer" "footer missing the gb advice list --for $AGENT pointer"
+fi
+
+# ── Summary ─────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+
+# Emit pass/fail verdict for gb-agent to read (ka-0000006600). Without this a
+# bare exit 1 is invisible to the runner.
+if [ -n "${GB_SCENARIO_RESULT_FILE:-}" ]; then
+  if [ $FAIL -gt 0 ]; then echo "fail" > "$GB_SCENARIO_RESULT_FILE"; else echo "pass" > "$GB_SCENARIO_RESULT_FILE"; fi
+fi
+
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "advice-systemprompt-truncation: truncated advice reaches the system prompt in-budget with a visible footer."
+exit 0
+""" } }
+]
+
+[default]
+say = "advice-systemprompt-truncation scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

@@ -1,0 +1,151 @@
+# gardener-trigger-debounce-coalesce.toml
+#
+# Live-flow scenario for ka-0000002765 §8: debounce coalesces a burst of
+# events into one fire after the settle deadline elapses.
+#
+# Engine code covered:
+#   - gardenio/controller/internal/scheduler/triggers.go:389-413
+#     (tickDebounce: extends deadline on each event in the burst).
+#   - gardenio/controller/internal/scheduler/triggers.go:415-432
+#     (drainSettledDebounce: returns the most-recent buffered event
+#     after the window has settled — fires exactly once for the burst).
+#   - gardenio/controller/internal/scheduler/triggers.go:545-554, 599-602
+#     (evaluateEventEntry: opens debounce window on tick, drains on
+#     settled tick, swallows fire during burst).
+#
+# Shape: three closes in a 10-second window. Debounce=30s. Reconcile ticks
+# at 60s and 120s. By the second reconcile, the burst has settled; the
+# drainSettledDebounce path fires exactly once (not three times).
+#
+# Why live-flow: shape tests pass even if drainSettledDebounce regresses
+# (e.g. fires immediately on the first event AND on settle, or never
+# fires because the deadline-extension math is off-by-one).
+
+[claude]
+session_id = "e2e00000-000c-4000-a000-000000000008"
+username = "e2e-gardener-debounce"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 300000
+
+[[responses]]
+on = "*"
+say = "Running gardener-trigger-debounce-coalesce: 3-event burst inside debounce → 1 settled fire."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if [ -z "${BEADS_HTTP_URL:-}" ] || [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL/BEADS_TOKEN unset"; exit 0
+fi
+
+TAG="e2e-cdeb-$$-$(date +%s)"
+
+EPIC_ID=$(kd create "gardener-debounce-epic-$TAG" --type=epic -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+
+C1=$(kd create "deb-c1-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+C2=$(kd create "deb-c2-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+C3=$(kd create "deb-c3-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$C1" ] || [ -z "$C2" ] || [ -z "$C3" ]; then fail "create children"; exit 1; fi
+for c in "$C1" "$C2" "$C3"; do
+  kd dep add "$c" "$EPIC_ID" --type parent-child >/dev/null 2>&1 || true
+done
+
+TRIGGERS=$(cat <<JSON
+[
+  {"kind":"cron","cron":"0 0 1 1 *","timezone":"UTC"},
+  {"kind":"bead_event","events":["closed"],
+   "match":{"all":[{"field":"parent","op":"==","value":"$EPIC_ID"}]},
+   "debounce":"30s"}
+]
+JSON
+)
+STOP='{"loop_end":{"any":[{"kind":"max_runs"}]},"run_end":{"any":[{"kind":"no_actionable_state"}]},"hard_stop":{"any":[{"kind":"manual_force","field":"force_close","value":"true"}]}}'
+
+SCHED_ID=$(kd create "gardener-sched-$TAG" --type=schedule \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "role:gardener" -l "project:gardenio" \
+  -f "enabled=true" -f "role=gardener" -f "assign_bead=$EPIC_ID" -f "project=gardenio" \
+  -f "prompt=gardener test prompt" -f "max_runs=10" \
+  -f "cron=0 0 1 1 *" -f "timezone=UTC" \
+  -f "triggers=$TRIGGERS" -f "stop=$STOP" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$SCHED_ID" ]; then fail "create schedule"; exit 1; fi
+echo "schedule: $SCHED_ID (debounce=30s)"
+
+cleanup() {
+  kd update "$SCHED_ID" -f "enabled=false" -f "force_close=true" >/dev/null 2>&1 || true
+  AGENT=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.last_agent_id // empty')
+  [ -n "$AGENT" ] && kd close "$AGENT" >/dev/null 2>&1 || true
+  for id in "$SCHED_ID" "$C1" "$C2" "$C3" "$EPIC_ID"; do
+    kd close "$id" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+sleep 5
+
+# ── Burst: 3 closes inside the 30s debounce window ───────────────
+kd close "$C1" >/dev/null 2>&1 || true
+sleep 5
+kd close "$C2" >/dev/null 2>&1 || true
+sleep 5
+kd close "$C3" >/dev/null 2>&1 || true
+echo "burst closed at $(date -u +%FT%TZ)"
+
+# Within the first reconcile tick (~60s from start), tickDebounce should
+# OPEN the window — no fire yet. By the next tick (~120s), the 30s settle
+# deadline has elapsed → drainSettledDebounce fires exactly once.
+# Total budget: 180s.
+DEADLINE=$(( $(date +%s) + 180 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  RS=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.runs_spawned // "0"')
+  if [ "${RS:-0}" -ge 1 ] 2>/dev/null; then
+    FIRED=1
+    pass "settled debounce fire observed (runs_spawned=$RS)"
+    break
+  fi
+  sleep 5
+done
+if [ "$FIRED" = "0" ]; then
+  fail "debounce never settled within 180s"
+  kd show "$SCHED_ID" 2>/dev/null | head -40 || true
+  exit 1
+fi
+
+# Hold for one more reconcile tick (65s) to confirm exactly ONE fire —
+# the burst should not produce duplicates after settle.
+echo "waiting 65s to confirm no duplicate settle fires..."
+sleep 65
+RS_FINAL=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.runs_spawned // "0"')
+if [ "${RS_FINAL:-0}" = "1" ]; then
+  pass "debounce coalesced burst — runs_spawned stayed at 1"
+else
+  fail "debounce produced duplicate fires" "runs_spawned=$RS_FINAL (expected 1)"
+  kd show "$SCHED_ID" 2>/dev/null | head -40 || true
+  exit 1
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "gardener-trigger-debounce-coalesce OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-trigger-debounce-coalesce scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

@@ -1,0 +1,295 @@
+{{template "layout" .}}
+{{define "title"}}Extern · Beads Viewer{{end}}
+
+{{/* extern_row renders one unified MR/JIRA row. Passed an externRowView as
+     "." and the page root as ".Root" via a wrapper map so $.BasePath etc.
+     stay reachable from inside a {{range}} or {{template}} call. */}}
+{{define "extern_row"}}
+{{$root := .Root}}{{with .Row}}
+<li class="bead-row extern-row extern-row-{{.Source}}" id="extern-row-{{.BeadID}}" data-bead-id="{{.BeadID}}" data-last-activity-ts="{{.UpdatedAtRFC}}" data-search="{{.SearchText}}">
+  <div class="bead-row-top">
+    <div class="bead-row-text">
+      <div class="extern-row-head">
+        {{if .ExternalURL}}
+        <a class="extern-ext-link extern-ext-{{.Source}}" href="{{.ExternalURL}}" target="_blank" rel="noopener"
+           title="{{if eq .Source "mr"}}Open MR on GitLab{{else}}Open issue on JIRA{{end}}">
+          <span class="extern-ext-glyph" aria-hidden="true">&#x2197;</span>{{if .ExternalLabel}}<span class="extern-ext-id">{{.ExternalLabel}}</span>{{end}}
+        </a>
+        {{else if .ExternalLabel}}
+        <span class="extern-ext-id">{{.ExternalLabel}}</span>
+        {{end}}
+        <a class="extern-title" href="{{$root.BasePath}}/{{.BeadID}}"
+           hx-get="{{$root.BasePath}}/{{.BeadID}}"
+           hx-trigger="mouseover once"
+           hx-target="none"
+           hx-swap="none">{{.Title}}</a>
+      </div>
+
+      <div class="chip-strip" aria-label="Status">
+        {{if eq .Source "mr"}}
+          {{if .MRState}}<span class="chip mr-state mr-state-{{.MRState}}" title="MR state">{{.MRState}}</span>{{end}}
+          {{if .PipelineStatus}}
+            {{if .PipelineURL}}<a class="chip pipe pipe-{{.PipelineStatus}}" href="{{.PipelineURL}}" target="_blank" rel="noopener" title="pipeline">{{.PipelineStatus}}</a>
+            {{else}}<span class="chip pipe pipe-{{.PipelineStatus}}" title="pipeline">{{.PipelineStatus}}</span>{{end}}
+          {{end}}
+          {{if .TargetBranch}}<span class="chip chip-type" title="target branch">&rarr; {{.TargetBranch}}</span>{{end}}
+        {{else}}
+          {{if .JiraType}}<span class="chip chip-type jira-type" title="issue type">{{.JiraType}}</span>{{end}}
+          {{if .JiraStatus}}<span class="chip jira-status" title="JIRA status">{{.JiraStatus}}</span>{{end}}
+        {{end}}
+        {{if eq .Status "closed"}}<span class="chip extern-bead-closed" title="gardenio bead status">bead&nbsp;closed</span>{{else if eq .Status "in_progress"}}<span class="chip extern-bead-active" title="gardenio bead status">in&nbsp;progress</span>{{end}}
+      </div>
+
+      <div class="bead-row-meta">
+        <a class="bead-row-id" href="{{$root.BasePath}}/{{.BeadID}}">{{.BeadID}}</a>
+        {{if .Project}}<a class="chip-type" href="{{$root.ChipBasePath}}?project={{.Project}}{{if $root.SourceFilter}}&source={{$root.SourceFilter}}{{end}}" title="Filter to {{.Project}}">{{.Project}}</a>{{end}}
+        {{if and (eq .Source "mr") .Author}}<span class="meta">{{.Author}}</span>{{end}}
+        {{if and (eq .Source "jira") .JiraAssignee}}<span class="meta">{{.JiraAssignee}}</span>{{end}}
+        <span class="bead-row-spacer"></span>
+        {{if .Ago}}<span class="bead-row-ago">{{.Ago}}</span>{{end}}
+      </div>
+    </div>
+  </div>
+</li>
+{{end}}
+{{end}}
+
+{{define "content"}}
+<span class="wide-page" hidden></span>
+<h1>Extern{{if .ProjectFilter}} · {{.ProjectFilter}}{{end}}
+  {{if .Rows}}<span class="meta">({{len .Rows}})</span>{{end}}
+</h1>
+
+<p class="meta">
+  Externally-sourced gardenio objects — GitLab merge requests and JIRA tickets —
+  with deep links and live-synced status. Read-only: status reflects the last
+  sync from the gitlab / jira bridges.
+</p>
+
+{{if .Error}}
+<div class="banner banner-error">{{.Error}}</div>
+{{end}}
+
+{{/* Live GitLab MR-status strip — 60s-cached counts for the gardenio project. */}}
+{{with .MRLive}}{{if .Available}}
+<div class="extern-mrlive" aria-label="Live GitLab MR status">
+  <span class="extern-mrlive-head">
+    {{if .ProjectURL}}<a href="{{.ProjectURL}}" rel="noopener" target="_blank">GitLab MRs</a>{{else}}GitLab MRs{{end}}
+    <span class="meta" title="live, 60s-cached">live</span>
+  </span>
+  <span class="extern-mrlive-counts">
+    <span class="extern-mrlive-stat"><b>{{.Open}}</b> open</span>
+    <span class="extern-mrlive-stat" title="opened, not draft, can_be_merged"><b>{{.Mergeable}}</b> mergeable</span>
+    <span class="extern-mrlive-stat" title="opened, draft=true"><b>{{.Drafts}}</b> draft</span>
+    <span class="extern-mrlive-stat" title="merged on or after today's UTC midnight"><b>{{.MergedToday}}</b> merged today</span>
+  </span>
+  {{if .Err}}<span class="empty extern-mrlive-err">{{.Err}}</span>{{end}}
+</div>
+{{end}}{{end}}
+
+{{/* Client-side search box (ka-0000008251). Ships hidden + progressively
+     enhanced: the script below reveals it, so no-JS clients still get the full
+     list. Filtering is a per-keystroke substring test of the lowercased query
+     against each row's data-search haystack — no server round-trip, snappy
+     character-by-character. Only shown when the page actually has rows. */}}
+{{if .Rows}}
+<div class="extern-search" hidden data-extern-search>
+  <label for="extern-search-input" class="filter-row-label">Search</label>
+  <input id="extern-search-input" type="search" autocomplete="off" spellcheck="false"
+         placeholder="Filter by title, !MR, JIRA key, project, author…" aria-label="Filter external objects">
+  <span class="extern-search-count" data-extern-search-count hidden></span>
+</div>
+{{end}}
+
+<div class="filter-rows" aria-label="Extern controls">
+  {{with .Controls}}
+    {{template "filter_row" (dict "Name" "Source" "Items" .Sources)}}
+    {{template "filter_row" (dict "Name" "Sort" "Items" .Sorts)}}
+    {{template "filter_row" (dict "Name" "Group" "Items" .Groups)}}
+  {{end}}
+  {{if or .ProjectFilter (ne .StatusFilter "open") (ne .SortKey "updated") .GroupKey}}
+  <div class="filter-row">
+    <span class="filter-row-label" aria-hidden="true"></span>
+    <a class="chip-clear" href="{{.ClearURL}}" title="Clear filters" aria-label="Clear filters">× clear</a>
+  </div>
+  {{end}}
+</div>
+
+{{if .Truncated}}
+<div class="banner banner-warn">Showing first {{.Limit}} per source.</div>
+{{end}}
+
+{{if .Rows}}
+  {{if .Groups}}
+    {{range .Groups}}
+    <section class="extern-group" id="extern-group-{{.Key}}">
+      <h2 class="extern-group-head">{{.Label}} <span class="meta">({{len .Rows}})</span></h2>
+      <ul class="bead-list extern-list">
+        {{range .Rows}}{{template "extern_row" (dict "Root" $ "Row" .)}}{{end}}
+      </ul>
+    </section>
+    {{end}}
+  {{else}}
+  <ul class="bead-list extern-list" id="extern-list">
+    {{range .Rows}}{{template "extern_row" (dict "Root" $ "Row" .)}}{{end}}
+  </ul>
+  {{end}}
+
+  {{/* No-search-match empty state — shown by the search JS when a query hides
+       every row. Hidden by default. */}}
+  <p class="extern-search-empty" data-extern-search-empty hidden>No external objects match “<span data-extern-search-term></span>”.</p>
+
+<style>
+  /* Live MR-status strip — compact, above the controls. */
+  .extern-mrlive { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.4rem 1rem; margin: 0.5rem 0 0.75rem; padding: 0.4rem 0.6rem; border: 1px solid rgba(128,128,128,0.25); border-radius: 6px; background: rgba(128,128,128,0.06); }
+  .extern-mrlive-head { font-weight: 600; display: inline-flex; align-items: baseline; gap: 0.4rem; }
+  .extern-mrlive-counts { display: inline-flex; flex-wrap: wrap; gap: 0.2rem 1rem; }
+  .extern-mrlive-stat b { font-variant-numeric: tabular-nums; }
+  .extern-mrlive-err { color: #c62828; }
+
+  /* External-object link — the primary affordance: out to GitLab / JIRA. */
+  .extern-row-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.5rem; }
+  .extern-ext-link { display: inline-flex; align-items: baseline; gap: 0.2rem; font-variant-numeric: tabular-nums; font-weight: 600; text-decoration: none; padding: 0.05rem 0.4rem; border-radius: 4px; border: 1px solid rgba(128,128,128,0.4); }
+  .extern-ext-link:hover, .extern-ext-link:focus { text-decoration: none; background: rgba(128,128,128,0.14); }
+  .extern-ext-glyph { font-size: 0.85em; opacity: 0.8; }
+  .extern-ext-mr   { color: #1d6bbd; border-color: rgba(29,107,189,0.45); }
+  .extern-ext-jira { color: #2c6f30; border-color: rgba(44,111,48,0.45); }
+  .extern-ext-id { letter-spacing: 0.01em; }
+  .extern-title { font-weight: 500; }
+
+  /* MR state pills — palette mirrors the agent run-glyph MR badges. */
+  .mr-state { text-transform: lowercase; }
+  .mr-state-merged  { background: rgba(138,92,246,0.18); border-color: rgba(138,92,246,0.5); }
+  .mr-state-opened  { background: rgba(29,107,189,0.16); border-color: rgba(29,107,189,0.5); }
+  .mr-state-closed  { background: rgba(120,120,120,0.18); border-color: rgba(120,120,120,0.5); }
+  .mr-state-locked  { background: rgba(120,120,120,0.18); border-color: rgba(120,120,120,0.5); }
+  .mr-state-unknown { background: rgba(120,120,120,0.12); border-color: rgba(120,120,120,0.35); opacity: 0.8; }
+
+  /* Pipeline status pills. */
+  .pipe { text-decoration: none; }
+  .pipe-success  { background: rgba(44,111,48,0.18);  border-color: rgba(44,111,48,0.5); }
+  .pipe-running  { background: rgba(74,158,255,0.18); border-color: rgba(74,158,255,0.5); }
+  .pipe-pending  { background: rgba(255,167,38,0.18); border-color: rgba(255,167,38,0.5); }
+  .pipe-failed   { background: rgba(198,40,40,0.20);  border-color: rgba(198,40,40,0.5); }
+  .pipe-canceled { background: rgba(120,120,120,0.18); border-color: rgba(120,120,120,0.5); }
+
+  /* JIRA pills. */
+  .jira-type   { background: rgba(44,111,48,0.10); }
+  .jira-status { background: rgba(44,111,48,0.16); border-color: rgba(44,111,48,0.45); }
+
+  /* Gardenio-side bead status — secondary signal next to the external state. */
+  .extern-bead-closed { opacity: 0.7; }
+  .extern-bead-active { background: rgba(74,158,255,0.16); border-color: rgba(74,158,255,0.5); }
+
+  /* Client-side search box (ka-0000008251) — a snappy per-keystroke filter over
+     the rendered rows. Mirrors the /maps search affordance. */
+  .extern-search { margin: 0.5rem 0 0.6rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .extern-search input { flex: 1 1 22rem; max-width: 30rem; padding: 0.35rem 0.55rem; border: 1px solid rgba(128,128,128,0.4); border-radius: 6px; font: inherit; }
+  html[data-skin="dark-terminal"] .extern-search input { background: #14181d; }
+  .extern-search input:focus { outline: 2px solid rgba(33,150,243,0.55); outline-offset: 0; }
+  .extern-search-count { font-size: 0.72rem; color: #777; font-variant-numeric: tabular-nums; }
+  html[data-skin="dark-terminal"] .extern-search-count { color: #9aa0a6; }
+  .extern-search-hidden { display: none !important; }
+  .extern-search-empty { font-size: 0.9rem; color: #777; margin: 0.5rem 0; }
+  html[data-skin="dark-terminal"] .extern-search-empty { color: #9aa0a6; }
+
+  /* Control strip — source / sort / group toggle rows — now renders through the
+     shared `.filter-rows` / `.filter-row` labeled-control component in
+     layout.html (ka-0000006647 / audit F7). */
+
+  /* Grouped sections. */
+  .extern-group { margin: 0 0 1.25rem; }
+  .extern-group-head { font-size: 1.05rem; margin: 0.5rem 0 0.25rem; }
+</style>
+
+{{/* Client-side /extern search (ka-0000008251). Progressive enhancement: the
+     search box ships hidden and this script reveals it, so no-JS clients still
+     see the full list. Filtering is a substring test of the lowercased query
+     against each row's data-search haystack (title / external id / bead id /
+     project / author / state, built in extern.go's externSearchText). When the
+     list is grouped, a whole group section is hidden once none of its rows
+     match, so the heading + count don't dangle over an empty bucket. The query
+     persists in ?q= (history.replaceState, no reload) so a filtered view is a
+     shareable / back-button-safe link, and is restored on load. */}}
+<script>
+(function () {
+  var box = document.querySelector('[data-extern-search]');
+  if (!box) return;
+  var input = box.querySelector('#extern-search-input');
+  var count = box.querySelector('[data-extern-search-count]');
+  var empty = document.querySelector('[data-extern-search-empty]');
+  var emptyTerm = empty ? empty.querySelector('[data-extern-search-term]') : null;
+  var rows = Array.prototype.slice.call(document.querySelectorAll('.extern-row[data-search]'));
+  var groups = Array.prototype.slice.call(document.querySelectorAll('.extern-group'));
+  box.removeAttribute('hidden');
+
+  function rowMatches(row, q) {
+    return q === '' || (row.getAttribute('data-search') || '').indexOf(q) !== -1;
+  }
+
+  function apply(q) {
+    q = (q || '').trim().toLowerCase();
+    var shown = 0;
+    rows.forEach(function (row) {
+      var hit = rowMatches(row, q);
+      row.classList.toggle('extern-search-hidden', !hit);
+      if (hit) shown++;
+    });
+    // Hide a whole group section when none of its rows survive the filter, so a
+    // heading never dangles over an empty list.
+    groups.forEach(function (group) {
+      var groupRows = group.querySelectorAll('.extern-row[data-search]');
+      var anyHit = false;
+      for (var i = 0; i < groupRows.length; i++) {
+        if (rowMatches(groupRows[i], q)) { anyHit = true; break; }
+      }
+      group.classList.toggle('extern-search-hidden', q !== '' && !anyHit);
+    });
+    if (count) {
+      if (q === '') { count.setAttribute('hidden', ''); }
+      else { count.removeAttribute('hidden'); count.textContent = shown + (shown === 1 ? ' match' : ' matches'); }
+    }
+    if (empty) {
+      if (q !== '' && shown === 0) {
+        if (emptyTerm) emptyTerm.textContent = input.value;
+        empty.removeAttribute('hidden');
+      } else {
+        empty.setAttribute('hidden', '');
+      }
+    }
+    // Reflect the query in the URL (?q=) without a reload.
+    try {
+      var url = new URL(window.location.href);
+      if (q === '') url.searchParams.delete('q'); else url.searchParams.set('q', input.value);
+      window.history.replaceState(null, '', url.toString());
+    } catch (e) { /* URL unsupported — filtering still works */ }
+  }
+
+  // Restore an initial ?q= from the URL.
+  try {
+    var initial = new URL(window.location.href).searchParams.get('q');
+    if (initial) { input.value = initial; apply(initial); }
+  } catch (e) { /* ignore */ }
+
+  input.addEventListener('input', function () { apply(input.value); });
+  // Escape clears the box.
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && input.value !== '') { input.value = ''; apply(''); }
+  });
+})();
+</script>
+{{else if not .Error}}
+<div class="empty extern-empty">
+  <p>No {{if eq .SourceFilter "mr"}}merge requests{{else if eq .SourceFilter "jira"}}JIRA tickets{{else}}external objects{{end}}{{if .ProjectFilter}} for <b>{{.ProjectFilter}}</b>{{end}}{{if ne .StatusFilter "all"}} with status <b>{{.StatusFilter}}</b>{{end}}.</p>
+  <p class="extern-empty-actions">
+    {{if ne .StatusFilter "all"}}<a class="chip" href="{{.AllStatusURL}}">Show all statuses</a>{{end}}
+    {{if or .ProjectFilter (ne .StatusFilter "open") (ne .SortKey "updated") .GroupKey}}<a class="chip" href="{{.ClearURL}}">Clear filters</a>{{end}}
+  </p>
+  <p class="meta">
+    MRs appear here once a bead carries an <code>mr_url</code> (gitlab-bridge
+    dual-write); JIRA tickets once the jira-bridge mirrors them with a
+    <code>source:jira</code> label. Both are read-only mirrors.
+  </p>
+</div>
+{{end}}
+{{end}}

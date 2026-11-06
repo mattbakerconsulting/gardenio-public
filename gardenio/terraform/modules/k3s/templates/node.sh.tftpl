@@ -1,0 +1,345 @@
+#!/bin/bash
+# k3s ${role} bootstrap. Idempotent enough to survive a re-run; logs to
+# /var/log/k3s-bootstrap.log. Leader election is an SSM put --no-overwrite:
+# exactly one server wins --cluster-init, the rest join through the API name.
+set -uo pipefail
+exec > >(tee -a /var/log/k3s-bootstrap.log) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q && apt-get install -y -q unzip jq curl
+# Ubuntu 24.04 ships no awscli deb (it is a snap); use the official v2 archive.
+curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip \
+  && unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install >/dev/null && rm -rf /tmp/aws /tmp/awscliv2.zip
+
+imds() { curl -sf -H "X-aws-ec2-metadata-token: $TOK" "http://169.254.169.254/latest/$1"; }
+TOK=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=$(imds meta-data/instance-id)
+PUBLIC_IP=$(imds meta-data/public-ipv4)
+PRIVATE_IP=$(imds meta-data/local-ipv4)
+export AWS_DEFAULT_REGION=$(imds meta-data/placement/region)
+API="${api_fqdn}"; JOIN="${join_fqdn}"; ZONE="${zone_id}"; TOKEN_PARAM="${token_param}"; KUBE_PARAM="${kube_param}"; INIT_PARAM="${init_param}"
+ROLE="${role}"; K3S_VERSION="${k3s_version}"
+
+# ── DNS helper: the servers keep the API record honest themselves ───────
+cat > /usr/local/bin/k3s-dns <<'EOF'
+#!/bin/bash
+# k3s-dns add|remove <public-ip> <private-ip>
+# Keeps two multi-value A records honest: the API name (public IPs, for
+# operators) and the join name (private IPs, for nodes -- so the SG
+# self-reference applies). Drops the RFC5737 placeholders and any IP that is
+# not a running server.
+set -euo pipefail
+ACTION=$1; PUB=$2; PRIV=$3; API="__API__"; JOIN="__JOIN__"; ZONE="__ZONE__"
+upsert() { # name live-list ip
+  local name=$1 live=$2 ip=$3 cur set final rrs
+  cur=$(aws route53 list-resource-record-sets --hosted-zone-id "$ZONE" --query "ResourceRecordSets[?Name=='$name.'&&Type=='A'].ResourceRecords[].Value" --output text | tr '\t' '\n' | grep -vE '^192\.0\.2\.[12]$' || true)
+  set=$(printf '%s\n%s\n' "$cur" "$live" | grep -E '^[0-9.]+$' | sort -u)
+  case "$ACTION" in add) set=$(printf '%s\n%s\n' "$set" "$ip" | sort -u);; remove) set=$(printf '%s\n' "$set" | grep -vx "$ip" || true);; esac
+  final=$(printf '%s\n' "$set" | grep -Fxf <(printf '%s\n' "$live" "$([ "$ACTION" = add ] && echo "$ip")") || true)
+  [ -z "$final" ] && final=$set
+  [ -z "$final" ] && { echo "refusing to empty $name"; return 0; }
+  rrs=$(printf '%s\n' "$final" | grep -E '^[0-9.]+$' | jq -R . | jq -s 'map({Value: .})')
+  aws route53 change-resource-record-sets --hosted-zone-id "$ZONE" --change-batch "$(jq -n --arg n "$name." --argjson r "$rrs" \
+    '{Changes:[{Action:"UPSERT",ResourceRecordSet:{Name:$n,Type:"A",TTL:30,ResourceRecords:$r}}]}')" >/dev/null
+  echo "k3s-dns $ACTION $name -> $(printf '%s ' $final)"
+}
+inst=$(aws ec2 describe-instances --filters "Name=tag:k3s:role,Values=server" "Name=instance-state-name,Values=running" \
+        --query 'Reservations[].Instances[].[PublicIpAddress,PrivateIpAddress]' --output text)
+# A server with no public IP (cost plan C3) publishes its private IP: the API name is then reachable only in the VPC and via the SSM relay, and never names an address AWS may give to someone else.
+upsert "$API"  "$(echo "$inst" | awk '{print ($1=="None")?$2:$1}' || true)" "$PUB"
+upsert "$JOIN" "$(echo "$inst" | awk '{print $2}' | grep -v None || true)" "$PRIV"
+EOF
+sed -i "s|__API__|$API|; s|__JOIN__|$JOIN|; s|__ZONE__|$ZONE|" /usr/local/bin/k3s-dns; chmod +x /usr/local/bin/k3s-dns
+
+# ── Spot / rebalance notice: leave the cluster cleanly, then let the ASG replace us ─
+cat > /usr/local/bin/k3s-spot-watch <<'EOF'
+#!/bin/bash
+# Poll IMDS for the 2-minute spot notice (or a rebalance recommendation).
+# On notice: drop our IP from the API record, drain, delete the node so k3s
+# removes our etcd member, and stop k3s. The ASG launches a replacement.
+IP=$(cat /run/k3s-public-ip); PIP=$(cat /run/k3s-private-ip); KC=/etc/rancher/k3s/k3s.yaml
+while true; do
+  T=$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+  if curl -sf -o /dev/null -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/spot/instance-action \
+  || curl -sf -o /dev/null -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/events/recommendations/rebalance; then
+    echo "$(date -u +%FT%TZ) interruption notice received"
+    /usr/local/bin/k3s-dns remove "$IP" "$PIP" || true
+    kubectl --kubeconfig $KC drain "$(hostname)" --ignore-daemonsets --delete-emptydir-data --force --timeout=100s || true
+    kubectl --kubeconfig $KC delete node "$(hostname)" --timeout=30s || true
+    systemctl stop k3s k3s-agent 2>/dev/null || true
+    exit 0
+  fi
+  sleep 5
+done
+EOF
+chmod +x /usr/local/bin/k3s-spot-watch
+echo "$${PUBLIC_IP:-$PRIVATE_IP}" > /run/k3s-public-ip; echo "$PRIVATE_IP" > /run/k3s-private-ip
+cat > /etc/systemd/system/k3s-spot-watch.service <<'EOF'
+[Unit]
+Description=k3s spot interruption watcher
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/k3s-spot-watch
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+
+TOKEN=$(aws ssm get-parameter --name "$TOKEN_PARAM" --with-decryption --query Parameter.Value --output text)
+AZ=$(imds meta-data/placement/availability-zone)
+# "spot" or "on-demand"; the beads Dolt StatefulSet pins to the on-demand
+# server through this label (its local-path volume lives on that node).
+LIFECYCLE=$(imds meta-data/instance-life-cycle || echo unknown)
+# cluster-autoscaler matches nodes to ASG instances by providerID; k3s does
+# not set the aws:/// form by itself, so every pool announces it.
+# karpenter.sh/capacity-type carries the same value as gardenio.io/lifecycle
+# (IMDS instance-life-cycle is already "spot" / "on-demand", which is exactly
+# Karpenter's vocabulary). The gardenio controller hardcodes a REQUIRED node
+# affinity on karpenter.sh/capacity-type In ["on-demand"] for its interactive
+# agent roles, and a PREFERRED one on "spot" for batch roles, with no config
+# override (controller/internal/podmanager/defaults.go). Emitting the label
+# here means every node -- including spot replacements -- satisfies that
+# affinity at registration, instead of needing a kubectl label after each
+# reclaim. The durable fix is making that affinity configurable upstream in
+# the controller; this keeps a non-Karpenter cluster working until then.
+# k3s REPLACES the upstream kubelet evictionHard default with disk thresholds
+# only -- {imagefs.available: 5%, nodefs.available: 5%}, no memory.available
+# key, measured on all 15 nodes via the kubelet configz endpoint 2026-09-22.
+# So the kubelet has NO memory eviction path: the kernel OOM killer is the
+# first responder, and twice that day it left a server wedged in userspace
+# instead of shedding one pod, taking the co-resident ARC listener with it --
+# tier dispatch stops and jobs queue against an idle pool (gd-V0I09YuV8K).
+# The disk values are copied verbatim because specifying eviction-hard
+# replaces the whole map. Servers get 200Mi, not the upstream 100Mi: on a
+# 2 GiB node running etcd and the API server in one process that is about one
+# allocation burst of warning. Verified before applying that k3s passes this
+# comma-separated value through as ONE token (a split would hand kubelet a
+# bare `nodefs.available<5%` as an unknown flag and no node would ever join).
+# Read at node start, like --node-taint: ci nodes pick it up as they churn,
+# the three servers not until rebuilt. Full detail on gd-V0I09YuV8K.
+if [ "$ROLE" = "server" ]; then
+  EVICTION="memory.available<200Mi,nodefs.available<5%,imagefs.available<5%"
+else
+  EVICTION="memory.available<100Mi,nodefs.available<5%,imagefs.available<5%"
+fi
+COMMON="$${PUBLIC_IP:+--node-external-ip $PUBLIC_IP} --node-ip $PRIVATE_IP --kubelet-arg=provider-id=aws:///$AZ/$INSTANCE_ID --node-label topology.kubernetes.io/zone=$AZ --kubelet-arg=eviction-hard=$EVICTION --node-label gardenio.io/lifecycle=$LIFECYCLE --node-label karpenter.sh/capacity-type=$LIFECYCLE ${extra_args}"
+
+api_up() { curl -sk -o /dev/null -w '%%{http_code}' "https://$JOIN:6443/ping" 2>/dev/null | grep -qE '^(200|401)$'; }
+
+if [ "$ROLE" = "server" ]; then
+  # Advertise the PRIVATE IP: without this k3s advertises --node-external-ip,
+  # the in-cluster kubernetes Service then points pods at the servers' public
+  # IPs, and the SG (6443 from operator CIDRs only) drops that traffic. Every
+  # pod that talks to the API -- traefik's installer, cluster-autoscaler,
+  # ARC -- timed out on 10.43.0.1 until this was added on 2026-09-17.
+  # Taint the servers at REGISTRATION. These are t3/t3a.small -- 2 GiB total,
+  # ~1.86 GiB allocatable -- and they carry etcd, the API server, traefik,
+  # coredns and every ARC listener. A single crew pod (1Gi request, 3Gi limit)
+  # scheduled onto one is enough to take the whole node into global OOM: it
+  # happened twice on 2026-09-22 (gd-V0I09YuV8K). The node wedges in userspace,
+  # goes NotReady, and the ARC listener sharing it goes Terminating -- so CI
+  # dispatch for that tier stops and jobs sit queued against an idle pool. That
+  # is the single most misleading shape this cluster produces, because the
+  # symptom is "queued jobs + spare capacity" and nothing points at memory.
+  #
+  # The taint was previously hand-applied and lived in no code (gd-541UxLRosa),
+  # which is exactly how it drifted: ip-10-90-10-77 joined untainted on
+  # 2026-09-22 and was the node that died, while its two older peers -- tainted
+  # by hand long ago -- were fine.
+  #
+  # It cannot cause the outage it prevents: all six ARC listeners already
+  # tolerate node-role.kubernetes.io/control-plane, and crew pods tolerate
+  # nothing, so this excludes precisely the workload that kills the node and
+  # nothing else. beads/ziti-host does not tolerate it, but ziti does not need
+  # a server -- gardenio/ziti-host and ziti-controller already run on plain
+  # agents today.
+  #
+  # NOTE: k3s applies --node-taint when the node first registers, so this takes
+  # effect on the next server to JOIN, not on a k3s restart of an existing one.
+  # Tainting a server that is already up is a kubectl taint, done separately.
+%{ if role == "server" ~}
+  # ── API server audit log (gd-HXRD9yizAE) ──────────────────────────────
+  # Server-side record of who did what through the API, chiefly the
+  # cluster-admin identity gardenio-infra-admin, whose only other trail is
+  # its own task-bead comments. The policy file must exist BEFORE k3s starts
+  # (the apiserver refuses to boot on a missing --audit-policy-file), so it is
+  # written here, ahead of the install below.
+  #
+  # Rendered only for the server role: this text would push the agents' user
+  # data past the 16 KB EC2 limit for no benefit (and the server's is gzipped).
+  #
+  # Rules are first-match-wins, so the order is load-bearing:
+  #   1. Drop the high-volume routine traffic that has no bearing on the admin
+  #      identity: health probes, kubelet (system:nodes), kube-proxy /
+  #      scheduler / controller-manager reads. A 30 GB, 2 GiB spot server
+  #      cannot carry a log of all of it.
+  #   2. Secrets, token minting and CSRs at Metadata ONLY, for everyone,
+  #      including the admin identity: a Request/RequestResponse record of
+  #      those would copy the secret (or the minted token) into the log.
+  #   3. gardenio-infra-admin writes at RequestResponse (full bodies).
+  #   4. Drop events and leases for everyone else. This sits BELOW rule 3 so
+  #      the admin identity's event/lease writes are still recorded.
+  #   5. Everything else, reads included, at Metadata.
+  # Order is pinned by scripts/check-k3s-audit-policy-order_test.py: secrets
+  # (2) above admin (3) above the events/leases drop (4). Swapping 2 and 3
+  # logs Secret bodies.
+  # The log is local to the node and the node is spot: it dies with the
+  # instance. Retention beyond the node's life needs a shipper (follow-up).
+  mkdir -p /etc/rancher/k3s /var/log/k3s-audit
+  cat > /etc/rancher/k3s/audit-policy.yaml <<'EOF'
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - RequestReceived
+rules:
+  - level: None
+    nonResourceURLs: ["/healthz*", "/livez*", "/readyz*", "/version", "/metrics"]
+  - level: None
+    userGroups: ["system:nodes"]
+  - level: None
+    users: ["system:kube-proxy", "system:kube-scheduler", "system:kube-controller-manager", "system:apiserver", "system:k3s-controller"]
+    verbs: ["get", "list", "watch"]
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "serviceaccounts/token"]
+      - group: "authentication.k8s.io"
+      - group: "certificates.k8s.io"
+        resources: ["certificatesigningrequests"]
+  - level: RequestResponse
+    users: ["system:serviceaccount:gardenio:gardenio-infra-admin"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+  - level: None
+    resources:
+      - group: ""
+        resources: ["events"]
+      - group: "events.k8s.io"
+      - group: "coordination.k8s.io"
+        resources: ["leases"]
+  - level: Metadata
+EOF
+  chmod 600 /etc/rancher/k3s/audit-policy.yaml
+  # 5 x 100 MB caps the log at ~500 MB (under 2% of the root volume); maxage
+  # is days. Under heavy traffic maxsize/maxbackup trim first, so the
+  # effective window can be shorter than 7 days: measure after rollout.
+  AUDIT_FLAGS="--kube-apiserver-arg=audit-policy-file=/etc/rancher/k3s/audit-policy.yaml --kube-apiserver-arg=audit-log-path=/var/log/k3s-audit/audit.log --kube-apiserver-arg=audit-log-maxage=7 --kube-apiserver-arg=audit-log-maxbackup=5 --kube-apiserver-arg=audit-log-maxsize=100"
+%{ endif ~}
+  SERVER_FLAGS="--advertise-address $PRIVATE_IP --tls-san $API --tls-san $JOIN $${PUBLIC_IP:+--tls-san $PUBLIC_IP} --tls-san $PRIVATE_IP --write-kubeconfig-mode 600 --node-taint node-role.kubernetes.io/control-plane:NoSchedule --kube-apiserver-arg=event-ttl=24h $AUDIT_FLAGS $COMMON"
+  if aws ssm put-parameter --name "$INIT_PARAM" --type String --value "$INSTANCE_ID" --no-overwrite >/dev/null 2>&1; then
+    echo "won election: initialising cluster"
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" K3S_TOKEN="$TOKEN" sh -s - server --cluster-init $SERVER_FLAGS
+    until [ -s /etc/rancher/k3s/k3s.yaml ] && kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get --raw /readyz >/dev/null 2>&1; do sleep 3; done
+    sed "s|https://127.0.0.1:6443|https://$API:6443|" /etc/rancher/k3s/k3s.yaml \
+      | aws ssm put-parameter --name "$KUBE_PARAM" --type SecureString --overwrite --value "$(cat)" >/dev/null
+    echo "kubeconfig published to $KUBE_PARAM"
+  else
+    echo "joining existing cluster via $JOIN"
+    for i in $(seq 1 240); do api_up && break; sleep 5; done   # up to 20 min
+    if ! api_up; then
+      echo "API never came up; the initialiser may have been reclaimed -- re-running election"
+      aws ssm delete-parameter --name "$INIT_PARAM" >/dev/null 2>&1 || true
+      exec "$0"
+    fi
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" K3S_TOKEN="$TOKEN" sh -s - server --server "https://$JOIN:6443" $SERVER_FLAGS
+  fi
+  until kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get node "$(hostname)" >/dev/null 2>&1; do sleep 3; done
+  /usr/local/bin/k3s-dns add "$${PUBLIC_IP:-$PRIVATE_IP}" "$PRIVATE_IP"
+%{ if role == "server" ~}
+  # ── CoreDNS: >= 2 replicas, spread across servers (gd-ybTutceJpn) ─────────
+  # k3s ships CoreDNS at one replica. On 2026-10-14 that one pod sat on the
+  # server that ran out of memory, cluster DNS went down, and a deploy rolled
+  # back mid-flight. Re-assert 2 replicas and a soft hostname spread on every
+  # server boot (a strategic-merge patch is a no-op when nothing differs, so
+  # three servers racing is harmless). Soft on purpose: a hard constraint could
+  # strand a replica Pending while a server is down, which is the outage this
+  # prevents. Best effort: a failure here must never fail server bootstrap.
+  # No PDB: the packaged manifest may carry one, and two PDBs on one pod make
+  # every eviction (drain) fail with a 500.
+  for i in $(seq 1 60); do
+    kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml -n kube-system get deploy coredns >/dev/null 2>&1 && break
+    sleep 5
+  done
+  kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml -n kube-system patch deploy coredns -p \
+    '{"spec":{"replicas":2,"template":{"spec":{"topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"kubernetes.io/hostname","whenUnsatisfiable":"ScheduleAnyway","labelSelector":{"matchLabels":{"k8s-app":"kube-dns"}}}]}}}}' \
+    || echo "coredns HA patch failed; re-asserted on the next server boot"
+%{ endif ~}
+else
+  for i in $(seq 1 240); do api_up && break; sleep 5; done
+  curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" K3S_URL="https://$JOIN:6443" K3S_TOKEN="$TOKEN" sh -s - agent $COMMON
+  # kube-proxy can lose a boot race with flannel and never retry, leaving this
+  # node Ready=True with ZERO service rules for its entire life. Pod-to-pod and
+  # pod-to-internet still work; only ClusterIPs are black holes, so cluster DNS
+  # is dead. A CI runner that lands here starts, cannot resolve GitHub, and
+  # never claims its job -- GitHub shows `queued`, the pod shows `Running`, and
+  # the slot is held until a human notices. It presents as queue congestion
+  # with idle capacity. Seen 2026-09-22 on ip-10-90-19-145:
+  #
+  #   proxier.go:710 "Failed to ensure chain jumps"
+  #     iptables v1.8.10 (nf_tables): Chain 'KUBE-EXTERNAL-SERVICES' does not exist
+  #   proxier.go:673 "Sync failed" ipFamily="IPv4" retryingTime="30s"
+  #   iptables.go:101 ...trying to recycle old iptables rules   <- flannel
+  #
+  # The advertised 30s retry never produced a sync and
+  # `iptables-save | grep -c KUBE-SERVICES` was still 0 forty minutes later.
+  #
+  # Restarting the agent fixes it, and it is cheap HERE AND NOWHERE ELSE: at
+  # boot no containers are running yet. The same restart on a live node HANGS
+  # -- containerd cannot shut down past a running dind container. That attempt
+  # never returned and the instance had to be terminated instead.
+  #
+  # This is defence in depth, not the only guard: a runner can still land
+  # during the window below, so the scale sets also carry a `dns-preflight`
+  # init container (gardenio/helm/ci/arc-runners-*.yaml).
+  #
+  # FAILS OPEN BY CONSTRUCTION. A guard that wrongly concluded "broken" would
+  # stop the agent on every new CI node and take out the whole pool, so a dump
+  # it cannot positively identify as iptables output means "cannot tell" and
+  # nothing is done. Measured on two healthy ci nodes 2026-09-22:
+  # COMMIT x3, KUBE-SERVICES x52, /usr/sbin/iptables-save present, rc=0.
+  kube_proxy_rules_ok() {
+    local dump
+    dump=$(iptables-save 2>/dev/null)
+    # COMMIT is the control string -- every real dump has one. Its absence
+    # means iptables-save is missing or failed, NOT that the rules are gone.
+    case "$dump" in
+      *COMMIT*) ;;
+      *) return 0 ;;
+    esac
+    case "$dump" in
+      *KUBE-SERVICES*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  proxy_ok=no
+  for i in $(seq 1 24); do
+    if kube_proxy_rules_ok; then proxy_ok=yes; break; fi
+    sleep 5
+  done
+  if [ "$proxy_ok" = no ]; then
+    echo "kube-proxy: no KUBE-SERVICES rules after 120s; restarting k3s-agent"
+    systemctl restart k3s-agent
+    for i in $(seq 1 24); do
+      if kube_proxy_rules_ok; then proxy_ok=yes; break; fi
+      sleep 5
+    done
+  fi
+  if [ "$proxy_ok" = no ]; then
+    # Stop, don't self-terminate. A node that terminates itself on a buggy
+    # check would loop, burning spot quota against the L-34B43A08 ceiling. A
+    # stopped agent goes NotReady, takes no pods, and cluster-autoscaler reaps
+    # it -- and NotReady is loud, whereas Ready-with-no-service-rules is
+    # silent, which is the whole problem.
+    echo "FATAL: no KUBE-SERVICES rules after restart; stopping k3s-agent so this node takes no jobs"
+    systemctl stop k3s-agent
+  else
+    echo "kube-proxy: service rules present"
+  fi
+fi
+# Servers must leave etcd cleanly, so they act on the 2-minute notice AND on
+# rebalance recommendations. Agents (the CI pool) must not: a rebalance
+# recommendation is only a risk signal, the watcher stopped k3s-agent on one
+# mid-job (2026-09-17), and an agent has no kubeconfig to drain or delete
+# itself anyway. Their node objects are reaped by cluster-autoscaler.
+if [ "$ROLE" = "server" ]; then
+  systemctl enable --now k3s-spot-watch
+fi
+echo "bootstrap complete: role=$ROLE ip=$${PUBLIC_IP:-$PRIVATE_IP}"

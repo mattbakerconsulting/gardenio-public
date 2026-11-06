@@ -1,0 +1,160 @@
+{{define "project_hub_section"}}
+{{- $sec := .Section -}}
+{{- $base := .BasePath -}}
+{{/* One template renders all six project-hub dependent-object fragments
+     (task ka-0000004817, design doc §3.2). The handler sets exactly one
+     section-specific key (Agents / Gardeners / Accounts / CostRollup /
+     Activity / Blocked+Escalations); the body switches on Section.Slug.
+     Best-effort contract: Section.Error → a retry affordance; an empty list →
+     a quiet empty-state; never a 500. */}}
+<section id="{{$sec.Slug}}" class="project-hub-section">
+  <h2>{{$sec.Title}}</h2>
+  {{if $sec.Error}}
+  <div class="project-hub-section-error">
+    <p class="empty">{{$sec.Error}}</p>
+    <button type="button"
+            hx-get="{{$sec.LazyURL}}"
+            hx-target="#{{$sec.Slug}}"
+            hx-swap="outerHTML">Retry</button>
+  </div>
+  {{else}}
+
+  {{if eq $sec.Slug "project-hub-agents"}}
+    {{if .Agents}}
+    <ul class="bead-list project-hub-agents">
+      {{range .Agents}}
+      <li class="bead-row">
+        <a href="{{$base}}/{{.ID}}"><code>{{.ID}}</code></a>
+        <span class="bead-row-title">{{.Name}}</span>
+        {{/* Role chip cross-links to the role hub (/role/<name>, task
+             ka-0000004054) so the project page and the role hub interlink. */}}
+        {{if .Role}}<a class="bead-row-type" href="{{$base}}/role/{{.Role}}">{{.Role}}</a>{{end}}
+        {{if .AgentState}}<span class="bead-row-status">{{.AgentState}}</span>{{end}}
+        {{if .TaskID}}<span class="meta">on <a href="{{$base}}/{{.TaskID}}">{{if .TaskTitle}}{{.TaskTitle}}{{else}}{{.TaskID}}{{end}}</a></span>{{end}}
+        <span class="meta">{{.Ago}}</span>
+      </li>
+      {{end}}
+    </ul>
+    <p><a href="{{$base}}/agents?project={{$sec.Project}}">All agents &rsaquo;</a></p>
+    {{else}}
+    <p class="empty">No active agents in this project.</p>
+    {{end}}
+
+  {{else if eq $sec.Slug "project-hub-gardeners"}}
+    {{if or .SchedulesPaused .TriggersPaused}}
+    <p class="project-hub-paused-banner">
+      {{if and .SchedulesPaused .TriggersPaused}}Schedules and triggers are paused for this project — gardeners will not fire.
+      {{else if .SchedulesPaused}}Schedules are paused for this project.
+      {{else}}Triggers are paused for this project.{{end}}
+    </p>
+    {{end}}
+    {{if .Gardeners}}
+    <ul class="bead-list project-hub-gardeners">
+      {{range .Gardeners}}
+      <li class="bead-row">
+        <a href="{{.Href}}"><code>{{.ID}}</code></a>
+        <span class="bead-row-title">{{.Name}}</span>
+        <span class="bead-row-type">{{.Kind}}</span>
+        <span class="bead-row-status">{{.Status}}</span>
+        {{if .TerminalGoal}}<span class="meta">{{.TerminalGoal}}</span>{{end}}
+        <span class="meta">{{.RunsSpawned}} runs</span>
+      </li>
+      {{end}}
+    </ul>
+    {{else}}
+    <p class="empty">No gardeners or schedules for this project.</p>
+    {{end}}
+
+  {{else if eq $sec.Slug "project-hub-accounts"}}
+    {{if .Accounts}}
+    <ul class="bead-list project-hub-accounts">
+      {{range .Accounts}}
+      <li class="bead-row">
+        {{if .ID}}<a href="{{$base}}/{{.ID}}"><code>{{.ID}}</code></a>{{end}}
+        <span class="bead-row-title">{{.Name}}</span>
+        {{if .Provider}}<span class="bead-row-type">{{.Provider}}</span>{{end}}
+        {{if .Model}}<span class="meta">{{.Model}}</span>{{end}}
+        {{if .Status}}<span class="bead-row-status">{{.Status}}</span>{{end}}
+      </li>
+      {{end}}
+    </ul>
+    {{else}}
+    <p class="empty">No accounts authorized for this project.</p>
+    {{end}}
+
+  {{else if eq $sec.Slug "project-hub-costs"}}
+    {{if .HasAccounts}}
+    <dl class="project-hub-cost-rollup">
+      <dt>today</dt><dd>{{printf "$%.2f" .CostRollup.DailyUSD}}</dd>
+      <dt>week</dt><dd>{{printf "$%.2f" .CostRollup.WeeklyUSD}}</dd>
+      <dt>lifetime</dt><dd>{{printf "$%.2f" .CostRollup.TotalUSD}}</dd>
+      <dt>accounts</dt><dd>{{.CostRollup.Accounts}}</dd>
+    </dl>
+    <ul class="bead-list project-hub-cost-accounts">
+      {{range .Accounts}}
+      <li class="bead-row">
+        <span class="bead-row-title">{{.Name}}</span>
+        {{if .HasSpend}}<span class="meta">{{printf "$%.2f" .DailyCostUSD}} today · {{printf "$%.2f" .TotalCostUSD}} lifetime</span>
+        {{else}}<span class="meta">no spend</span>{{end}}
+      </li>
+      {{end}}
+    </ul>
+    <p><a href="{{$base}}/costs">Fleet costs &rsaquo;</a></p>
+    {{else}}
+    <p class="empty">No accounts to roll up costs for.</p>
+    {{end}}
+
+  {{else if eq $sec.Slug "project-hub-activity"}}
+    {{if .Activity}}
+    <ul class="bead-list project-hub-activity">
+      {{range .Activity}}
+      <li class="bead-row">
+        <a href="{{$base}}/{{.ID}}"><code>{{.ID}}</code></a>
+        <span class="bead-row-type">{{.Type}}</span>
+        <span class="bead-row-status">{{.Status}}</span>
+        <span class="bead-row-title">{{.Title}}</span>
+        <span class="meta">{{.Ago}}</span>
+      </li>
+      {{end}}
+    </ul>
+    {{else}}
+    <p class="empty">No recent in-progress activity in this project.</p>
+    {{end}}
+
+  {{else if eq $sec.Slug "project-hub-decisions"}}
+    {{if or .Blocked .Escalations}}
+    {{if .Blocked}}
+    <h3>Blocked on decision</h3>
+    <ul class="bead-list project-hub-blocked">
+      {{range .Blocked}}
+      <li class="bead-row">
+        <a href="{{$base}}/{{.ID}}"><code>{{.ID}}</code></a>
+        <span class="bead-row-title">{{.Title}}</span>
+        <span class="meta">{{.Ago}}</span>
+      </li>
+      {{end}}
+    </ul>
+    {{end}}
+    {{if .Escalations}}
+    <h3>Escalations</h3>
+    <ul class="bead-list project-hub-escalations">
+      {{range .Escalations}}
+      <li class="bead-row">
+        <a href="{{$base}}/{{.ID}}"><code>{{.ID}}</code></a>
+        <span class="bead-row-title">{{.Title}}</span>
+        {{if .OperationType}}<span class="bead-row-type">{{.OperationType}}</span>{{end}}
+        <span class="bead-row-status">{{.Status}}</span>
+        <span class="meta">{{.Ago}}</span>
+      </li>
+      {{end}}
+    </ul>
+    <p><a href="{{$base}}/escalations?project={{$sec.Project}}">All escalations &rsaquo;</a></p>
+    {{end}}
+    {{else}}
+    <p class="empty">No decisions or escalations waiting on a human.</p>
+    {{end}}
+  {{end}}
+
+  {{end}}
+</section>
+{{end}}

@@ -1,0 +1,310 @@
+# Is this ci.yml run already obsolete -- has a LATER push to the same branch
+# produced a run that builds this tree anyway?
+#
+# ── WHY THIS IS A COMPOSITE ACTION AND NOT JUST A GATE JOB ──────────────────
+# It started as a gate job (`supersession`) and that placement is nearly
+# worthless on its own, because of WHEN it answers. Measured 2026-09-22 over
+# the last 40 ci.yml push runs, the gap between a run being CREATED and its
+# first heavy `build + test` job actually STARTING is:
+#
+#   p90 41-46 min | max 50.8 min | 15-22 of 40 waited > 5 min
+#
+# ── DO NOT CITE A MEDIAN HERE ───────────────────────────────────────────────
+# An earlier revision of this comment cited "median 10.0 min". Re-measured
+# later the same day, the same metric over the same rolling 40-run window gave
+# median 2.9 min, with `max` agreeing to the decimal -- the same population
+# with newer runs appended. The cause is sample contamination, and it was
+# self-inflicted: developing this guard meant pushing ci.yml repeatedly onto a
+# drained pool, and those cheap runs became the majority of the window. The
+# tail is intact (the oldest 11 runs still read 18-51 min); the middle moved
+# because of who pushed last.
+#
+# So the median here is a statement about recent pushers, not about
+# contention. The p90/max is the stable part across both windows, and it is
+# what justifies this guard: the guard exists for the tail. Two caveats found
+# with fimba-a6 while checking these numbers, both worth reapplying to any
+# future measurement:
+#   * Compute the wait from JOB-level timestamps. GitHub sets a run's
+#     `startedAt` equal to its `createdAt`, so any run-level wait is
+#     identically zero.
+#   * Drop jobs with `runner_name` empty. They never got a runner, so
+#     `started_at == created_at` enters the sample as an artificial zero and
+#     drags the median down. (Verified nil here: 0 of 120 heavy job records in
+#     the window were runnerless. The filter is still correct to apply.)
+#
+# The gate job lands on the light tier (0.64 of 10 busy) and answers in ~6 s.
+# The heavy jobs then sit in the queue -- minutes at the median, three quarters
+# of an hour at the p90. So a gate-job-only verdict is badly stale by the time
+# the expensive work begins -- and the waste this exists to stop is a BURST (the
+# 03:05Z census: nine pushes to main in 22 minutes, 26 of 34 queued heavy jobs
+# already ancestors of the tip). Every one of those supersessions arrives
+# inside the window the gate job cannot see.
+#
+# The guard is therefore load-dependent in exactly the wrong direction: when
+# the pool is drained the build starts in 30 s and supersession barely matters;
+# when the pool is jammed the build waits an hour and the gate's answer is an
+# hour old. Weakest precisely when it is needed most.
+#
+# So the check runs TWICE, from this one implementation:
+#
+#   1. As the `superseded` step of ci.yml's `gate` job, at run creation. Catches the cases that
+#      are already stale on arrival -- reruns, delayed dispatch, two pushes
+#      within seconds. Worth keeping because it skips the heavy jobs before
+#      they are ever queued, so it saves the QUEUE SLOT and not just the
+#      node-minutes.
+#   2. As step 0 of each heavy job, AFTER the queue wait, where it can finally
+#      see the pushes that landed while it waited. This is where the
+#      node-minutes actually are: a superseded job that exits here releases
+#      its node in seconds instead of holding it for a 20- or 45-minute
+#      matrix.
+#
+# Measured cost, run 35684286705: 2s for this action inside a heavy job on top
+# of a 4s checkout, and 8s for the whole gate job including its sparse
+# checkout.
+#
+# ── DO NOT CITE 20/45-MINUTE MATRICES ───────────────────────────────────────
+# An earlier revision of this line finished "Against a 20-minute (go) or
+# 45-minute (rust) matrix." Those were true when written and are now stale by
+# roughly 5x: they are PRE-hostPath-GOCACHE numbers, from when every Go build
+# on a self-hosted runner was cold. Measured over the 17 heavy jobs that
+# actually built in the last 40 push runs, wall clock was:
+#
+#   39 45 70 105 133 184 198 207 218 228 229 258 345 348 378 475 752  (seconds)
+#
+# Median 218s (3.6 min), max 752s (12.5 min). The spread is not noise: build
+# caches are PER NODE, so the same commit is 39s on a warm node and 12 min on
+# a cold one, and a cold node still approaches the old figures. Quote the
+# range and say which node, or the number means nothing.
+#
+# The guard is still strongly net-positive -- just by 5x, not 100x. See below.
+#
+# ── IN-JOB OBSERVED n=10; THE GATE HAS STILL NEVER BEEN SEEN TO FIRE ────────
+# An earlier revision of this header said "BOTH HALVES PROVEN LIVE". That was
+# an overclaim and it contradicted ci.yml's own discriminator table, which
+# records the gate-skipped outcome as NOT YET OBSERVED. It is still not
+# observed. Census of 117 heavy job records over the last 40 push runs, read
+# as the (job conclusion, sentinel) PAIR:
+#
+#   88  success / none      pre-sentinel, runs older than b5ba4f06
+#    2  failure / none      likewise
+#   17  success / success   BUILT
+#   10  success / skipped   SUPERSEDED -- the in-job check fired
+#    0  skipped / -         the GATE firing. Still zero.
+#
+# So of the 27 heavy jobs that ran with the sentinel in place, 10 (37%) were
+# already redundant by the time they reached a runner. Each exited in 8-11s
+# instead of a median 218s build: ~35 minutes of node time saved, against
+# ~2s x 27 = under a minute of guard overhead.
+#
+# Every one of those 10 was caught IN-JOB. The gate answered `false` on all of
+# them, and we can say exactly by how much it missed:
+#
+#   run 35686737901  gate answered 04:24:25Z, successor created 04:24:50Z   25s
+#   run 35686786386  gate answered 04:25:19Z, successor created 04:25:34Z   15s
+#   run 35686834892  gate answered 04:25:59Z, successor created 04:26:21Z   22s
+#   run 35686417841  gate answered 04:19:15Z, successor created 04:20:52Z   97s
+#   run 35684471028  gate answered 03:48:09Z, successor created 03:48:14Z    5s
+#
+# That is the blind window made concrete: the gate is not wrong, it is early.
+#
+# A caveat on all of this: the burst these came from was two Claude sessions
+# pushing to main within a few minutes of each other, which is the same kind
+# of self-inflicted sample that contaminated the median above. It inflates how
+# OFTEN supersession happens; it does not affect which call site catches it,
+# which is what this section is about. Do not quote 37% as a steady-state rate.
+#
+# An earlier classification of 40 runs by successor arrival gave 23 never
+# superseded, 15 in-job, 1 at creation. Treat it as counterfactual: 34 of the
+# 40 predate cdfde351/c023d0fe and so predate both call sites. It says where a
+# supersession WOULD have landed, not what a guard did. The census above is
+# the observed version of the same question.
+#
+# The gate is kept on a different argument, which does not need observation:
+# the split is sensitive to gate LATENCY alone -- 94% in-job at a 6s or 15s
+# gate, 62% at 30s, 42% at 120s (fimba-a6). So the gate takes over precisely
+# when the light tier itself starts queueing, which is when a burst is worst.
+# The two call sites cover opposite load regimes; neither is redundant.
+#
+# ── THE IN-JOB HALF IS THE ONE THAT HAS PAID SO FAR ─────────────────────────
+# Run #416 (35684471028), two commits pushed 23s apart:
+#
+#   03:48:09Z  gate job       superseded=false -- no ci.yml push run newer
+#                             than #416 on main
+#   03:48:14Z  (successor #417 pushed -- 5s AFTER the gate had answered)
+#   03:49:00Z  kbeads in-job  superseded=true -- run #417 (2ec832749) is a
+#   03:49:51Z  coop in-job    descendant push and builds this whole tree
+#   03:49:53Z  controller     ... skipping 5cfee09e7
+#
+# All three heavy jobs then ran checkout + this action + the guard echo and
+# skipped every build step. A gate-only guard would have run all three build
+# matrices for a tree #417 already covers. Note the margin: the gate missed it
+# by FIVE SECONDS, on a drained pool where the build started ~50s after run
+# creation. That is the BEST case for the gate.
+# At the p90 queue wait the blind window is ~50 minutes wide, which is the
+# case this exists for.
+#
+# A superseded heavy job is therefore `success` with skipped steps, not
+# `skipped`. See the `heavy work starting` sentinel in ci.yml -- reading job
+# conclusions as build evidence is wrong, and wrong in the common case.
+#
+# ── FAILING OPEN IS THE WHOLE DESIGN ────────────────────────────────────────
+# This can only ever report `true` for work it has positively proven redundant:
+# a newer push run exists for this branch AND `compare` says its commit is
+# strictly `ahead` of ours. Every other path -- API error, unparseable
+# response, ambiguous history, non-branch ref, anything but `push` -- reports
+# false, and the build runs. ci.yml is main's only build signal; a guard that
+# can withhold it is not worth any number of node-minutes.
+#
+# Callers must guard on `!= 'true'`, never on `== 'false'`, so that an action
+# that failed to run at all (empty output) still builds.
+#
+# ── TWO WORKFLOWS, AND WHY PATH-GATED JOBS PASS `job` ───────────────────────
+# Everything above was measured on ci.yml, the original caller. checks.yml
+# calls this too (gd-BCyDxqofKe), with `workflow: checks.yml`. What matters in
+# both is whether the calling job is PATH-GATED PER PUSH: checks.yml's lint-go,
+# helm and cargo-security, and ci.yml's rust, gardenhub-browser and
+# lands-conformance (gd-025MCE7PhK). A newer run does not run those; it runs
+# what ITS push touched. So push A touches the chart, push B touches only
+# docs, and B's `helm` job is skipped by B's own gate -- if A's `helm` deferred
+# to B, nobody would ever lint A's chart change. The same held for ci.yml's
+# rust until gd-025MCE7PhK: it read the run-wide verdict, so a coop push
+# followed by a kbeads-only push left the coop change unbuilt on main. Only
+# ci.yml's `build + test (go)` runs in every push run, so only it (and the
+# `gate` job's verdict, which only it reads) calls this without `job`.
+#
+# `job` closes it. When set, a newer run counts only if it has a job of
+# exactly that name (the evaluated `name:`, e.g. "golangci-lint (kbeads)")
+# that is pending, queued, in progress, or completed `success`/`failure`. Such
+# a job already passed its own `if:` -- its path gate said yes -- so it will
+# either build or defer, by this same rule, to a still newer live job; the
+# newest live one builds. Anything else -- no such job yet, skipped,
+# cancelled, an API error -- does not count, and the caller builds. Without
+# `job` the old whole-run semantics apply, which is only sound for a job that
+# every newer run also runs.
+#
+# That rests on one observed fact, so here is the observation. A job still
+# blocked on `needs` has NO job record; once its `if:` passes it appears as
+# `pending` while it waits for a runner. Demo runs #5434/#5435 (2026-10-29,
+# branch agent/checks-supersession-demo/gd-BCyDxqofKe): #5434's jobs that
+# checked before #5435's gate had answered saw their #5435 twin `absent`
+# (5 of 5); #5434's govulncheck, which waited 4.5 min for a heavy runner, saw
+# its twin `pending/null`. An earlier revision counted only queued and
+# in_progress, and so saved nothing in exactly the contended-pool case this
+# exists for: a job waiting for a runner reads `pending`.
+name: superseded
+description: Report whether a later push to this branch already covers this workflow run (or this one job of it)
+
+inputs:
+  workflow:
+    description: 'Workflow file whose push runs are compared, e.g. ci.yml or checks.yml. Must be the CALLING workflow.'
+    required: false
+    default: ci.yml
+  job:
+    description: 'Optional exact job name. When set, a newer run covers this one only if its job of this name is live or finished success/failure.'
+    required: false
+    default: ''
+
+outputs:
+  superseded:
+    description: '"true" only if a newer push run provably builds this same tree. Guard on != ''true''.'
+    value: ${{ steps.check.outputs.superseded }}
+
+runs:
+  using: composite
+  steps:
+    - id: check
+      uses: actions/github-script@v7
+      env:
+        WORKFLOW: ${{ inputs.workflow }}
+        JOB: ${{ inputs.job }}
+      with:
+        script: |
+          const workflow = process.env.WORKFLOW || 'ci.yml';
+          const job = process.env.JOB || '';
+          // Every return goes through here, so there is exactly one place
+          // that can set the output and it always sets it.
+          const verdict = (v, why) => {
+            core.setOutput('superseded', v ? 'true' : 'false');
+            core.info(`superseded=${v ? 'true' : 'false'} -- ${why}`);
+          };
+
+          if (context.eventName !== 'push') {
+            return verdict(false, `event is ${context.eventName}; this guard is push-only ` +
+              `(PRs already supersede via cancel-in-progress, dispatch is always deliberate)`);
+          }
+          // Tags are releases: never skip one, however stale it looks.
+          if (!context.ref.startsWith('refs/heads/')) {
+            return verdict(false, `ref ${context.ref} is not a branch`);
+          }
+          const branch = context.ref.slice('refs/heads/'.length);
+          const { owner, repo } = context.repo;
+
+          let mine, candidates;
+          try {
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: workflow, branch, event: 'push', per_page: 50,
+            });
+            mine = data.workflow_runs.find((r) => r.id === context.runId);
+            if (!mine) {
+              return verdict(false, `FAIL OPEN: own run ${context.runId} not in the newest 50 ` +
+                `push runs for ${branch}, so "newer" cannot be established`);
+            }
+            // run_number is monotonic per workflow, unlike created_at, which a
+            // rerun leaves pinned to the original attempt.
+            candidates = data.workflow_runs.filter((r) => r.run_number > mine.run_number);
+          } catch (e) {
+            return verdict(false, `FAIL OPEN: could not list runs (${e.message})`);
+          }
+          if (candidates.length === 0) {
+            return verdict(false, `no ${workflow} push run newer than #${mine.run_number} on ${branch}`);
+          }
+
+          for (const cand of candidates.sort((a, b) => b.run_number - a.run_number)) {
+            // A run that was cancelled or skipped never built the tree, so it
+            // cannot cover us. Its own successor will.
+            if (cand.status === 'completed' &&
+                ['cancelled', 'skipped', 'stale', 'action_required'].includes(cand.conclusion)) {
+              core.info(`  #${cand.run_number} ${cand.head_sha.slice(0, 9)}: ${cand.conclusion}, no coverage`);
+              continue;
+            }
+            if (cand.head_sha === context.sha) continue; // same tree, not a supersession
+            if (job) {
+              // The newer run must really be running THIS job; see the header.
+              let jobs;
+              try {
+                jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                  owner, repo, run_id: cand.id, filter: 'latest', per_page: 100,
+                });
+              } catch (e) {
+                core.info(`  #${cand.run_number}: listing jobs failed (${e.message}), not counting it`);
+                continue;
+              }
+              const live = jobs.find((j) => j.name === job && (
+                ['pending', 'queued', 'in_progress'].includes(j.status) ||
+                (j.status === 'completed' && ['success', 'failure'].includes(j.conclusion))));
+              if (!live) {
+                const seen = jobs.filter((j) => j.name === job)
+                  .map((j) => `${j.status}/${j.conclusion}`).join(',') || 'absent';
+                core.info(`  #${cand.run_number} ${cand.head_sha.slice(0, 9)}: job "${job}" ${seen}, no coverage`);
+                continue;
+              }
+            }
+            let cmp;
+            try {
+              cmp = await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `${context.sha}...${cand.head_sha}`,
+              });
+            } catch (e) {
+              core.info(`  #${cand.run_number}: compare failed (${e.message}), not counting it`);
+              continue;
+            }
+            // 'ahead' means cand strictly descends from us: our tree is
+            // contained in theirs. 'diverged' after a force-push is NOT.
+            if (cmp.data.status === 'ahead') {
+              return verdict(true, `run #${cand.run_number} (${cand.head_sha.slice(0, 9)}) is a ` +
+                `descendant push and ${job ? `runs "${job}" over` : 'builds'} this whole tree; ` +
+                `skipping ${context.sha.slice(0, 9)}`);
+            }
+            core.info(`  #${cand.run_number} ${cand.head_sha.slice(0, 9)}: compare=${cmp.data.status}, not a descendant`);
+          }
+          return verdict(false, `${candidates.length} newer run(s), none proven to be a descendant that ran`);

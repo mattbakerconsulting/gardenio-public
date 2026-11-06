@@ -1,0 +1,203 @@
+# CI — manual only (no auto-trigger on push/PR).
+# Run manually: rwx run .rwx/ci.yml --init commit-sha=$(git rev-parse HEAD) --wait
+#
+# ── The clone roots at the MONOREPO root, not at kbeads/ (ka-0000001846) ─────
+# `code` clones the whole gardenio monorepo, so the RWX workspace root holds
+# `coop/`, `kbeads/`, `gardenio/`, `.rwx/` — there is NO `go.mod` at the
+# workspace root (the Go module is `kbeads/go.mod`; the root has only
+# `go.work`). So every `go`/`golangci-lint` invocation below must `cd kbeads`
+# first, and every path (filter globs, lock files, artifact paths) is
+# workspace-root-relative and needs its `kbeads/` prefix. Without the `cd`,
+# `go mod download` dies with `go: no modules specified (see 'go help mod
+# download')` — MEASURED on 66ca4414, run 09d5c89ceb784c3886a0fc15738392fc.
+#
+# `GOWORK=off` is required alongside the `cd`: from inside `kbeads/`, Go walks
+# up and finds the monorepo `go.work`, entering workspace mode over sibling
+# modules (gardenio/controller, the script modules) that this workflow neither
+# stages nor needs. Same convention as the root `.rwx/ci.yml` kbeads tasks
+# (`cd kbeads && GOWORK=off go …`).
+#
+# `kbeads/go.mod` also has `replace gardenio/clicreds =>
+# ../gardenio/clicreds`, so every Go task's filter must additionally stage that
+# local module or the command FATALs on the missing path (ka-0000003839).
+on:
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      trigger: cli
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  # ── System deps (heavily cached via filter) ────────────────────────────
+  - key: system-deps
+    filter:
+      - kbeads/.rwx/system-deps.lock  # Only rebuild when lock file changes
+    run: |
+      echo "Installing system dependencies (should be cached)..."
+      sudo apt-get update
+      sudo apt-get install -y libicu-dev gcc g++
+
+  # ── Clone ────────────────────────────────────────────────────────────────
+  - key: code
+    # ── Clone credential MUST be in the URL (ka-0000006904) ────────────────
+    # With a bare `https://gitlab.com/...` URL, `git/clone` falls back to the
+    # RWX vault-resolved GitLab credential, which is DENIED on the CLI/manual
+    # `rwx run` path: every run aborted in the first task,
+    # `code.get-latest-sha-for-ref`, with `remote: HTTP Basic: Access denied`
+    # / `fatal: Authentication failed` (exit 128) — killing the self-verify
+    # command this repo's CLAUDE.md documents. `secrets.GITLAB_CLONE_TOKEN` is
+    # the credential source the root `.rwx/ci.yml` and `.rwx/e2e.yml` already
+    # use, and it resolves on every trigger (cli, push, tag-push, MR, dispatch).
+    call: git/clone 2.0.3
+    with:
+      repository: https://oauth2:${{ secrets.GITLAB_CLONE_TOKEN }}@gitlab.com/Acme/Platform/gardenio.git
+      ref: ${{ init.commit-sha }}
+
+  # ── Go toolchain (cached by version) ───────────────────────────────────
+  - key: go
+    call: golang/install 1.2.0
+    with:
+      go-version: "1.25"
+    filter:
+      - kbeads/go.mod
+
+  # ── golangci-lint (cached with fix) ─────────────────────────────────────
+  - key: golangci-lint
+    use: go
+    filter:
+      - kbeads/.rwx/ci.yml
+    run: |
+      # Version must match GOLANGCI_LINT_VERSION in
+      # gardenio/images/agent/install/versions.env — scripts/check-golangci-pin.sh
+      # enforces that (ka-0000000665). v2 moved to a /v2 module path and hosts
+      # the binary at ./cmd/golangci-lint under it.
+      echo "Building golangci-lint from source (needs Go 1.25 for go1.25 target)..."
+      # GOWORK=off: `go install pkg@version` refuses to run inside a workspace
+      # whose modules it is not part of. Matches the root .rwx/ci.yml
+      # `gcov2lcov` task.
+      GOWORK=off go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.2
+
+  # ── Download modules (cached by lockfiles) ──────────────────────────────
+  - key: go-deps
+    use: [code, go, system-deps]
+    run: cd kbeads && GOWORK=off go mod download
+    filter:
+      - kbeads/go.mod
+      - kbeads/go.sum
+      # `replace gardenio/clicreds => ../gardenio/clicreds`
+      # (ka-0000003839).
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+
+  # ── Git config (minimal, cached) ────────────────────────────────────────
+  - key: git-config
+    use: go-deps
+    filter:
+      - kbeads/.rwx/ci.yml
+    run: |
+      git config --global user.name "CI Bot"
+      git config --global user.email "ci@kbeads.test"
+
+  # ── Build (only when source changes) ────────────────────────────────────
+  - key: build
+    use: [code, go-deps, git-config]
+    # Whole-component glob, matching the root .rwx/ci.yml `build-kbeads` task.
+    # An extension-enumerated filter (`**/*.go` + `**/*.sql`) is what caused
+    # the second-order failures in run e3c8d69a28ae429badbb23a6ea84d54b: RWX
+    # stages ONLY declared paths, and no `*.go` glob matches a dotfile config
+    # or a testdata fixture (ka-0000001846).
+    filter:
+      - "kbeads/**"
+      # clicreds source needed to build kbeads (ka-0000003839).
+      - "gardenio/clicreds/**"
+    run: |
+      echo "Building (cache miss if code changed)..."
+      cd kbeads
+      time GOWORK=off go build -v ./cmd/kd
+
+  # ── Lint (parallel with build) ──────────────────────────────────────────
+  - key: lint
+    use: [code, git-config, golangci-lint, go-deps]
+    # Whole-component glob, matching the root .rwx/ci.yml `lint-kbeads` task.
+    # `kbeads/.golangci.yml` is load-bearing — it disables errcheck and
+    # excludes the staticcheck QF*/ST* families — and NO `**/*.go` glob stages
+    # a dotfile, so the enumerated filter silently linted with golangci's
+    # DEFAULT config: 60 pre-existing issues (50 errcheck + 10 QF*/ST*) in run
+    # e3c8d69a28ae429badbb23a6ea84d54b, none of them real (ka-0000001846).
+    filter:
+      - "kbeads/**"
+      # clicreds source needed to typecheck kbeads (ka-0000003839).
+      - "gardenio/clicreds/**"
+    # `./...` is explicit: with no target argument golangci-lint analyzes only
+    # the current directory, so a bare `run` here would lint the single
+    # package at kbeads/ root and read green while covering nothing. Matches
+    # the root .rwx/ci.yml `lint-kbeads` task.
+    run: cd kbeads && GOWORK=off golangci-lint run --timeout=5m ./...
+
+  # ── Fast tests (parallel execution, no race for speed) ─────────────────
+  - key: test
+    use: build
+    # Whole-component glob, matching the root .rwx/ci.yml `test-kbeads` task.
+    # The enumerated filter staged no testdata, so TestDashboardModel_Golden
+    # hard-failed on `read golden dir testdata/dashboards: no such file or
+    # directory` in run e3c8d69a28ae429badbb23a6ea84d54b (the fixtures live at
+    # kbeads/internal/server/testdata/dashboards/) — ka-0000001846.
+    #
+    # The cross-module drift guards that the root `test-kbeads` task stages
+    # explicitly (gardenio/controller/**, gardenio/tests/e2e/scripts/*.sh,
+    # gardenio/helm/gardenio/dashboards/*.json) are deliberately NOT staged here:
+    # each t.Skip-s cleanly when its sibling tree is absent, and this is the
+    # component-scoped manual workflow. The root pipeline is where those guards
+    # run non-vacuously.
+    filter:
+      - "kbeads/**"
+      # clicreds source needed to compile the kbeads test binary
+      # (ka-0000003839).
+      - "gardenio/clicreds/**"
+    run: |
+      echo "Running tests with parallel execution..."
+      cd kbeads
+      GOWORK=off go test -v -short -parallel 8 -coverprofile=coverage.out ./... 2>&1 | tee test-output.txt
+
+      # Check coverage (integer comparison — truncates decimal)
+      # Use tail -1 to get only the final "total:" line (grep may match functions containing "total")
+      COVERAGE=$(go tool cover -func=coverage.out | grep total | tail -1 | awk '{print $3}' | sed 's/%//')
+      COVERAGE_INT=${COVERAGE%%.*}
+      MIN_COVERAGE=25
+      echo "Coverage: $COVERAGE%"
+      if [ "$COVERAGE_INT" -lt "$MIN_COVERAGE" ]; then
+        echo "Coverage below ${MIN_COVERAGE}% threshold"
+        exit 1
+      fi
+    outputs:
+      artifacts:
+        - key: coverage
+          path: kbeads/coverage.out
+
+  # ── Quench quality checks ──────────────────────────────────────────────
+  - key: quench
+    use: [code, go-deps, git-config]
+    cache: false
+    run: |
+      echo "Installing quench build deps (openssl, pkg-config)..."
+      sudo apt-get update
+      sudo apt-get install -y pkg-config libssl-dev
+
+      echo "Installing Rust toolchain for quench..."
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      . "$HOME/.cargo/env"
+
+      echo "Installing quench..."
+      cargo install quench --git https://github.com/alfredjeanlab/quench
+
+      echo "Running quench checks..."
+      # docs.toc false-positives in RWX: the kbeads/ prefix in CLAUDE.md
+      # directory tree resolves locally but not when cloned to a different
+      # path. docs is warn-level in quench.toml so skip it here.
+      # `cd kbeads`: quench.toml lives at kbeads/quench.toml, not at the
+      # monorepo workspace root (ka-0000001846).
+      cd kbeads
+      quench check --no-docs

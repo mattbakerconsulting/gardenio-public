@@ -1,0 +1,160 @@
+{{- if and .Values.postgres.enabled .Values.postgres.backup.enabled }}
+# In-box logical backup for the postgres StatefulSet.
+#
+# Writes timestamped `pg_dump -Fc` (custom-format) archives to a dedicated PVC
+# and prunes to .Values.postgres.backup.retention most-recent files each run.
+# Reuses the postgres image (pg_dump already present) — no extra image. Fully
+# in-cluster: no AWS API, no EBS snapshots. Restore: pg_restore from an archive
+# on the PVC (see gardenio/docs/postgres-backup-restore.md).
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "gardenio.postgres.fullname" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.postgres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-backup
+spec:
+  accessModes:
+    {{- toYaml .Values.postgres.backup.storage.accessModes | nindent 4 }}
+  {{- if .Values.postgres.backup.storage.storageClass }}
+  storageClassName: {{ .Values.postgres.backup.storage.storageClass }}
+  {{- else if .Values.global.storageClass }}
+  storageClassName: {{ .Values.global.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.postgres.backup.storage.size }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "gardenio.postgres.fullname" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.postgres.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-backup
+spec:
+  schedule: {{ .Values.postgres.backup.schedule | quote }}
+  # Forbid: never run two dumps against the same DB at once. If a prior dump is
+  # still running, skip this slot — the next tick covers it. activeDeadline
+  # below guarantees a wedged run can't block the schedule forever.
+  concurrencyPolicy: Forbid
+  # After an outage, don't backfill missed nightly slots; if a run can't start
+  # within 5 min of its slot, skip it.
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      activeDeadlineSeconds: {{ .Values.postgres.backup.activeDeadlineSeconds }}
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "gardenio.postgres.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: postgres-backup
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: OnFailure
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+          {{- if $.Values.global.systemPriorityClass.create }}
+          priorityClassName: {{ $.Values.global.systemPriorityClass.name }}
+          {{- end }}
+          containers:
+            - name: backup
+              image: {{ include "gardenio.mirroredImage" (dict "image" .Values.postgres.image "global" .Values.global) | quote }}
+              imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              env:
+                # application_name (gd-rXqkv4rSmG): libpq and lib/pq read PGAPPNAME, so
+                # pg_stat_activity and the postgres exporter attribute this client's load.
+                - name: PGAPPNAME
+                  value: "gardenio-backup"
+                - name: PGHOST
+                  value: {{ include "gardenio.postgres.fullname" . | quote }}
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  value: "postgres"
+                - name: PGDATABASE
+                  value: {{ .Values.postgres.database | default "beads" | quote }}
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .) }}
+                      key: password
+                - name: BACKUP_DIR
+                  value: /backups
+                - name: RETENTION
+                  value: {{ .Values.postgres.backup.retention | quote }}
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+                  OUT="${BACKUP_DIR}/${PGDATABASE}-${STAMP}.dump"
+                  TMP="${OUT}.partial"
+
+                  echo "=== pg_dump start: db=${PGDATABASE} host=${PGHOST} -> ${OUT} (retention=${RETENTION}) ==="
+                  echo "[backup] waiting for postgres to accept connections"
+                  for i in $(seq 1 30); do
+                    if pg_isready -q; then break; fi
+                    echo "[backup]   not ready yet (${i}/30)"; sleep 5
+                  done
+
+                  # -Fc = custom format (compressed, restorable with pg_restore).
+                  # Write to .partial first, then atomic rename so a killed run
+                  # never leaves a truncated archive that retention would keep.
+                  pg_dump -Fc -f "${TMP}"
+                  mv "${TMP}" "${OUT}"
+                  SIZE=$(stat -c %s "${OUT}" 2>/dev/null || echo "?")
+                  echo "[backup] wrote ${OUT} (${SIZE} bytes)"
+
+                  # Retention: keep the RETENTION most-recent *.dump archives,
+                  # delete the rest. Clean up any stale .partial files too.
+                  rm -f "${BACKUP_DIR}"/*.partial 2>/dev/null || true
+                  COUNT=$(ls -1 "${BACKUP_DIR}"/*.dump 2>/dev/null | wc -l | tr -d ' ')
+                  echo "[backup] ${COUNT} archive(s) present; retention=${RETENTION}"
+                  if [ "${COUNT}" -gt "${RETENTION}" ]; then
+                    # Sort newest-first by name (timestamp is lexicographically
+                    # sortable), drop the first RETENTION, delete the tail.
+                    ls -1 "${BACKUP_DIR}"/*.dump | sort -r | tail -n +"$((RETENTION + 1))" | while read -r OLD; do
+                      echo "[backup] pruning ${OLD}"
+                      rm -f "${OLD}"
+                    done
+                  fi
+                  echo "=== pg_dump complete ==="
+              resources:
+                {{- toYaml .Values.postgres.backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+          {{- include "gardenio.nodeSelector" (dict "local" .Values.postgres.nodeSelector "global" .Values.global.nodeSelector) | nindent 10 }}
+          {{- include "gardenio.tolerations" (dict "local" .Values.postgres.tolerations "global" .Values.global.tolerations) | nindent 10 }}
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ include "gardenio.postgres.fullname" . }}-backup
+            - name: tmp
+              emptyDir: {}
+{{- end }}

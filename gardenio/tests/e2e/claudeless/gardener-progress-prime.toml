@@ -1,0 +1,140 @@
+# gardener-progress-prime.toml
+#
+# Claudeless scenario: `gb prime --for <agent>` renders the "## Loop
+# Progress" block when the agent bead's `schedule_id` points to a gardener
+# schedule whose `progress.surface.in_prime=true`.
+#
+# Plan §T9: "gardener-progress-prime: prime renders progress block correctly."
+#
+# The render path lives in:
+#   gardenio/controller/cmd/gb/prime_progress.go::outputProgressBlock
+#   gardenio/controller/internal/scheduler/progress/render.go::RenderPrimeBlock
+#
+# The default §5.1 gardener schedule has `progress.surface.in_prime=true`, so
+# any agent bead linked via `schedule_id` to that schedule should see the
+# block in `gb prime` output. This test asserts that wiring end-to-end:
+#   1. Create a fresh epic.
+#   2. `gb gardener start <epic>` — produces a schedule with in_prime=true.
+#   3. Create an agent bead whose `schedule_id` field points at the schedule.
+#   4. `gb prime --for <agent-id>` and assert "## Loop Progress" appears.
+#   5. Cleanup all three beads.
+#
+# If the lowering ever drops the in_prime surface, or the prime command
+# loses the schedule lookup, this scenario fails.
+
+[claude]
+session_id = "e2e00000-0009-4000-a000-000000000006"
+username = "e2e-gardener-progress-prime"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 30000
+
+[[responses]]
+on = "*"
+say = "Running gardener-progress-prime: assert gb prime renders Loop Progress block."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+if ! gb gardener --help >/dev/null 2>&1; then
+  echo "SKIP: gb gardener not present (pre-T6)"
+  exit 0
+fi
+
+# ── Setup: epic + gardener ──────────────────────────────────────────
+EPIC_ID=$(kd create "e2e-gardener-progress-prime-$$-$(date +%s)" --type=epic --json 2>/dev/null | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+echo "epic: $EPIC_ID"
+
+cleanup() {
+  if [ -n "${AGENT_ID:-}" ]; then
+    kd close "$AGENT_ID" >/dev/null 2>&1 || true
+  fi
+  gb gardener stop "$EPIC_ID" --reason "e2e cleanup" >/dev/null 2>&1 || true
+  kd close "$EPIC_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+START_OUT=$(gb gardener start "$EPIC_ID" --i-read-the-gardener-instructions --json 2>&1)
+if [ $? -ne 0 ]; then fail "gb gardener start" "$START_OUT"; exit 1; fi
+SCHED_ID=$(echo "$START_OUT" | jq -r '.id // empty')
+if [ -z "$SCHED_ID" ]; then fail "extract schedule id" "$START_OUT"; exit 1; fi
+echo "schedule: $SCHED_ID"
+
+# Sanity: the schedule we just created opts into in_prime.
+IN_PRIME=$(gb gardener status "$EPIC_ID" --json 2>/dev/null | jq -r '.progress.surface.in_prime // false')
+if [ "$IN_PRIME" = "true" ]; then
+  pass "schedule progress.surface.in_prime=true"
+else
+  fail "schedule progress.surface.in_prime=true" "got=[$IN_PRIME]"
+  exit 1
+fi
+
+# ── Create a fake agent bead linked to the schedule ────────────────
+AGENT_ID=$(kd create "e2e-progress-prime-agent-$$-$(date +%s)" \
+  --type=agent \
+  --field "schedule_id=$SCHED_ID" \
+  --field "assign_bead=$EPIC_ID" \
+  --json 2>/dev/null | jq -r '.id // empty')
+if [ -z "$AGENT_ID" ]; then fail "create agent bead"; exit 1; fi
+echo "agent: $AGENT_ID"
+
+# ── Run gb prime --for <agent> and look for the Loop Progress block ─
+PRIME_OUT=$(gb prime --for "$AGENT_ID" 2>&1)
+if [ -z "$PRIME_OUT" ]; then
+  fail "gb prime produced output" "empty"
+  exit 1
+fi
+
+if echo "$PRIME_OUT" | grep -q "## Loop Progress"; then
+  pass "prime contains '## Loop Progress' header"
+else
+  fail "prime contains '## Loop Progress' header" "head=$(echo "$PRIME_OUT" | head -5)"
+fi
+
+# ── Sanity: --no-advice should still render the progress block ─────
+PRIME_NA=$(gb prime --for "$AGENT_ID" --no-advice 2>&1)
+if echo "$PRIME_NA" | grep -q "## Loop Progress"; then
+  pass "--no-advice still renders Loop Progress"
+else
+  fail "--no-advice still renders Loop Progress" "head=$(echo "$PRIME_NA" | head -5)"
+fi
+
+# ── Negative control: an agent without schedule_id sees no block ────
+PLAIN_AGENT=$(kd create "e2e-progress-prime-plain-$$-$(date +%s)" --type=agent --json 2>/dev/null | jq -r '.id // empty')
+if [ -n "$PLAIN_AGENT" ]; then
+  PLAIN_OUT=$(gb prime --for "$PLAIN_AGENT" 2>&1)
+  if echo "$PLAIN_OUT" | grep -q "## Loop Progress"; then
+    fail "non-scheduled agent rendered Loop Progress (should be silent)"
+  else
+    pass "non-scheduled agent has no Loop Progress block"
+  fi
+  kd close "$PLAIN_AGENT" >/dev/null 2>&1 || true
+fi
+
+# ── Summary ─────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "gardener-progress-prime: prime renders the Loop Progress block end-to-end."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-progress-prime scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

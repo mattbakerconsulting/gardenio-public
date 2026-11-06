@@ -1,0 +1,233 @@
+# CI — manual only (no auto-trigger on push/PR).
+# Run manually: rwx run .rwx/ci.yml --init commit-sha=$(git rev-parse HEAD) --wait
+#
+# ── The clone roots at the MONOREPO root, not at coop/ (ka-0000006904) ──────
+# `code` clones the whole gardenio monorepo, so the RWX workspace root holds
+# `coop/`, `kbeads/`, `gardenio/`, `.rwx/` — there is NO `Cargo.toml` at the
+# workspace root (the Rust workspace is `coop/Cargo.toml`). Every cargo
+# invocation below must therefore `cd coop` first, and every path (filter
+# globs, lock files) is workspace-root-relative and needs its `coop/` prefix.
+# Without the `cd`, cargo dies with "could not find Cargo.toml in
+# /var/mint-workspace or any parent directory" (exit 101). This was masked for
+# as long as the clone itself failed; it surfaced the moment it was fixed.
+# Same convention as the root `.rwx/ci.yml` coop tasks (`cd coop && cargo …`).
+on:
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tool-cache:
+  vault: default
+
+tasks:
+  # ── System deps ────────────────────────────────────────────────────────
+  - key: system-deps
+    filter:
+      - coop/.rwx/ci.yml
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y protobuf-compiler tmux curl pkg-config libssl-dev
+
+  # ── Clone (parallel with system-deps) ─────────────────────────────────
+  - key: code
+    # ── Clone credential MUST be in the URL (ka-0000006904) ────────────────
+    # With a bare `https://gitlab.com/...` URL, `git/clone` falls back to the
+    # RWX vault-resolved GitLab credential, which is DENIED on the CLI/manual
+    # `rwx run` path: every run aborted in the first task,
+    # `code.get-latest-sha-for-ref`, with `remote: HTTP Basic: Access denied`
+    # / `fatal: Authentication failed` (exit 128) — killing the self-verify
+    # command this repo's CLAUDE.md documents. `secrets.GITLAB_CLONE_TOKEN` is
+    # the credential source the root `.rwx/ci.yml` and `.rwx/e2e.yml` already
+    # use, and it resolves on every trigger (cli, push, tag-push, MR, dispatch).
+    call: git/clone 2.0.3
+    with:
+      repository: https://oauth2:${{ secrets.GITLAB_CLONE_TOKEN }}@gitlab.com/Acme/Platform/gardenio.git
+      ref: ${{ init.commit-sha }}
+
+  # ── Rust toolchain (cached across workflow runs) ──────────────────────
+  - key: rust
+    use: [code, system-deps]
+    filter:
+      - coop/.rwx/ci.yml
+      # The pin is a real input to this task (it decides the channel AND the
+      # component set) — without it a pin bump left this layer cached and stale.
+      - coop/rust-toolchain.toml
+    run: |
+      # ── Toolchain install is DERIVED from coop/rust-toolchain.toml ──────
+      # Nothing here hand-copies the channel or the component list. That
+      # duplication is what let the `llvm-tools` component conflict bite twice
+      # (ka-0000001846, ka-0000001870); the trigger is characterized in
+      # ka-0000008092 and the two guards below are the measured fix.
+      curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+      . "$HOME/.cargo/env"
+      COOP_TOOLCHAIN=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' coop/rust-toolchain.toml)
+      test -n "$COOP_TOOLCHAIN" || { echo "cannot parse [toolchain] channel from coop/rust-toolchain.toml"; exit 1; }
+      # GUARD 1 — completeness. Argument-less `rustup toolchain install` run
+      # inside `coop/` reads the pin and installs the channel plus EVERY
+      # component it declares, so this task cannot drift from the pin. It MUST
+      # run before RUSTUP_TOOLCHAIN is exported below: the env var suppresses
+      # the toolchain file, and with it the component list.
+      ( cd coop && rustup toolchain install )
+      # Assert the pin's components really landed, HERE in the cheap toolchain
+      # task, instead of surfacing as a confusing failure inside an 8-cpu build.
+      for c in $(sed -n 's/^[[:space:]]*components[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p' coop/rust-toolchain.toml | tr -d '" ' | tr ',' ' '); do
+        rustup component list --toolchain "$COOP_TOOLCHAIN" --installed | grep -q "^${c}-" \
+          || { echo "coop/rust-toolchain.toml declares component '$c' but rustup did not install it"; exit 1; }
+        echo "component ok: $c"
+      done
+      # GUARD 2 — no lazy sync, ever. RUSTUP_TOOLCHAIN outranks
+      # rust-toolchain.toml in rustup's override precedence, so no cargo
+      # invocation in any downstream task re-reads the pin and rustup can never
+      # attempt a component sync into a `tool-cache:`d tree. This is what makes
+      # the fix deterministic rather than probabilistic — see ka-0000008092.
+      export RUSTUP_TOOLCHAIN="$COOP_TOOLCHAIN"
+      echo "$COOP_TOOLCHAIN" | tee $RWX_ENV/RUSTUP_TOOLCHAIN
+      echo "$HOME/.cargo/bin" | tee -a $RWX_ENV/PATH
+      # Disable sccache wrapper (set by rwx/base) — we use RWX content caching.
+      echo "" | tee $RWX_ENV/RUSTC_WRAPPER
+
+  # ── Cargo fetch ────────────────────────────────────────────────────────
+  - key: cargo-deps
+    use: rust
+    run: cd coop && cargo fetch
+
+  # ── Format check (parallel) ──────────────────────────────────────────
+  - key: fmt
+    use: cargo-deps
+    run: cd coop && cargo fmt --all -- --check
+
+  # ── Clippy (parallel with fmt, tests, smoke-test) ──────────────────────
+  - key: clippy
+    use: cargo-deps
+    agent:
+      cpus: 8
+    tool-cache: ci-clippy
+    run: cd coop && cargo clippy --all -- -D warnings
+
+  # ── Install cargo-audit (cached) ───────────────────────────────────────
+  # Version-PINNED from .rwx/security-tools.lock + `--locked`, exactly as the
+  # root .rwx/ci.yml `cargo-sec-bin` task does (ka-0000006904). A bare
+  # `cargo install cargo-audit` resolves the LATEST release, whose transitive
+  # deps outrun this workflow's pinned rustc 1.93.0 toolchain and hard-fail the
+  # install: `rustc 1.93.0 is not supported by the following package:
+  # kstring@2.0.4 requires rustc 1.96.0` (exit 101). Unpinned installs also
+  # silently re-break CI on any upstream release — pinning keeps the lock file
+  # the single place either version moves.
+  - key: install-audit
+    use: rust
+    filter:
+      - .rwx/security-tools.lock
+    run: |
+      set -euo pipefail
+      # shellcheck disable=SC1091
+      . .rwx/security-tools.lock
+      cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}" --locked
+      cargo audit --version
+
+  # ── Install cargo-deny (cached) ───────────────────────────────────────
+  # Version-pinned for the same reason as install-audit above.
+  - key: install-deny
+    use: rust
+    filter:
+      - .rwx/security-tools.lock
+    run: |
+      set -euo pipefail
+      # shellcheck disable=SC1091
+      . .rwx/security-tools.lock
+      cargo install cargo-deny --version "${CARGO_DENY_VERSION}" --locked
+      cargo deny --version
+
+  # ── Audit (parallel) ─────────────────────────────────────────────────
+  # ADVISORY, mirroring the root .rwx/ci.yml `cargo-audit` task and its
+  # rationale verbatim (ka-0000007861): coop's CI was manual-only, so these
+  # scans hit PRE-EXISTING dependency debt. Report findings loudly, exit 0
+  # while the gate soaks; enforcement is the root workflow's `CI / Cargo-Audit`
+  # status check, which this file does not and cannot post.
+  #
+  # Measured on 66ca4414 (ka-0000006904, run 59ad1295): `4 allowed warnings
+  # found`, exit 1 — RUSTSEC-2026-0253 (scc 2.4.0, unsound), RUSTSEC-2026-0205
+  # (spin 0.10.0, yanked) and two more. Untouched by this MR; without the
+  # absorb, the self-verify command coop/CLAUDE.md documents is permanently red
+  # for reasons unrelated to the change under test.
+  - key: audit
+    use: [cargo-deps, install-audit]
+    run: |
+      # set +e: reach `exit 0` even when cargo audit exits non-zero on a finding
+      # (RWX errexit is NOT cleared by `set -uo pipefail`; ka-0000004694).
+      set +e -uo pipefail
+      cd coop && cargo audit
+      rc=$?
+      if [ "$rc" != "0" ]; then
+        echo "[cargo-audit] ⚠ ADVISORY: findings above (rc=$rc; would BLOCK once enforced)"
+      fi
+      echo "[cargo-audit] advisory rollout — reporting only, not blocking."
+      exit 0
+
+  # ── Deny (parallel) ──────────────────────────────────────────────────
+  # ADVISORY for the same reason as `audit` above, and with the same
+  # pre-existing finding the root .rwx/ci.yml `cargo-deny` task already
+  # documents: duplicate webpki-roots 0.26.11/1.0.6 pulled in via
+  # async-nats 0.47 → tokio-websockets 0.10, i.e. `bans FAILED, licenses ok,
+  # sources ok`, exit 2 (run 59ad1295). Not introduced or fixable here.
+  - key: deny
+    use: [cargo-deps, install-deny]
+    run: |
+      # set +e: see `audit` above (RWX errexit; ka-0000004694).
+      set +e -uo pipefail
+      cd coop && cargo deny check licenses bans sources
+      rc=$?
+      if [ "$rc" != "0" ]; then
+        echo "[cargo-deny] ⚠ ADVISORY: policy violation above (rc=$rc; would BLOCK once enforced)"
+      fi
+      echo "[cargo-deny] advisory rollout — reporting only, not blocking."
+      exit 0
+
+  # ── Tests (parallel with clippy) ─────────────────────────────────────
+  - key: test-linux
+    use: cargo-deps
+    agent:
+      cpus: 8
+    tool-cache: ci-test
+    run: cd coop && cargo test --all --lib --bins
+
+  # ── Smoke test (native binary, no Docker needed) ────────────────────
+  - key: smoke-test
+    use: cargo-deps
+    tool-cache: ci-smoke
+    run: |
+      cd coop
+      cargo build -p coop
+      ./target/debug/coop --help
+
+  # ── Rendering fidelity: Layer A (no external deps) ─────────────────
+  - key: rendering-a
+    use: cargo-deps
+    tool-cache: ci-rendering-a
+    run: cd coop && cargo test -p coop --test rendering_fidelity
+
+  # ── Install claudeless (cached) ────────────────────────────────────
+  - key: install-claudeless
+    use: system-deps
+    filter:
+      - coop/.rwx/ci.yml
+    run: |
+      curl -fsSL -o /tmp/claudeless.tar.gz \
+        https://github.com/alfredjeanlab/claudeless/releases/download/v0.4.0/claudeless-linux-x86_64.tar.gz
+      sudo tar -xzf /tmp/claudeless.tar.gz -C /usr/local/bin
+      sudo chmod +x /usr/local/bin/claudeless
+      claudeless --version
+
+  # ── Rendering fidelity: Layer B+C (claudeless + tmux + built coop) ─
+  - key: rendering-bc
+    use: [smoke-test, install-claudeless]
+    run: |
+      which tmux || (echo "tmux not found, installing..." && sudo apt-get update && sudo apt-get install -y tmux)
+      tmux -V
+      claudeless --version
+      cd coop
+      export COOP_BIN="$(pwd)/target/debug/coop"
+      cargo test -p coop --test rendering_tmux_oracle --test rendering_attach

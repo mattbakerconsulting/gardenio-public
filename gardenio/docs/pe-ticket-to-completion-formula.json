@@ -1,0 +1,135 @@
+{
+  "formula_type": "workflow",
+  "extends": [
+    "ka-0000001189"
+  ],
+  "phase": "liquid",
+  "description": "PE Ticket to Completion \u2014 drive a single PE-XXXX Jira ticket from triage to a merge-ready MR. Extends the golden Bug-Fix-MR formula and adds what makes it trustworthy unattended: three adversarial CRITIC gates (the fix actually fixes it and is narrow; the test has RED-before/GREEN-after proof; the MR description scores >=8 on root-cause/fix/evidence/screenshots/scope/ticket) plus a per-ticket GARDENER that drives the loop to completion and signs off that all three critics are green and CI is green before a human reviewer is tagged. Invoke from Slack: `/formula pour <id> --var TICKET=PE-XXXX`.",
+  "vars": [
+    {
+      "name": "TICKET",
+      "required": true,
+      "description": "JIRA ticket ID (e.g. PE-7289)"
+    },
+    {
+      "name": "BRANCH",
+      "description": "Git branch name (e.g. agent/my-agent/fix-pe-7289)"
+    },
+    {
+      "name": "MR_IID",
+      "description": "GitLab MR number if already created (e.g. 385), or 'TBD' if not yet"
+    }
+  ],
+  "steps": [
+    {
+      "id": "gardener-setup",
+      "type": "task",
+      "title": "{{TICKET}}: Stand up the per-ticket gardener (gb gardener start \u2014 type=trigger)",
+      "labels": [
+        "project:monorepo",
+        "project:gardenio",
+        "pattern:gardener"
+      ],
+      "depends_on": [
+        "check-existing-work"
+      ],
+      "description": "## Gardener setup \u2014 drive {{TICKET}} to a merge-ready, critic-green MR\n\nStand up a per-ticket **gardener** scoped to THIS molecule's subtree. The gardener wakes on a\ncadence, triages the molecule's open children, dispatches/nudges work, and drives the loop\nuntil {{TICKET}} reaches a merge-ready MR with all three critics green. Satisfies the\nevery-gardener-self-blocks rule (advice `ka-0000000974`).\n\nRuns EARLY (right after `check-existing-work`) so the gardener exists before the fix chain\ngets going.\n\n> **Firing model (do NOT hand-roll a `type=schedule` bead).** Phase 3b/D10 removed\n> `type=schedule` firing entirely \u2014 **only `type=trigger` beads fire** (see\n> `gardenio/docs/gardener-loop-runbook.md` and `gb gardener start --help`). Use the canonical\n> `gb gardener start` endpoint below; it mints the one shape the trigger-engine actually\n> fires (`type=trigger` / `trigger:schedule` / `action=spawn_agent`), pins the epic via a\n> `gardener-epic:<id>` label, adds a cron pre-flight that only fires while the epic has open\n> children, and emits a **bounded default blob** (`run_budget` + a `hard_stop` wall_clock +\n> a `bead_query` loop_end + `no_progress_for`) \u2014 so it already satisfies advice\n> `ka-0000000974` (self-block) without you assembling `stop`/`progress`/`triggers` by hand.\n\n### 1. Discover this molecule's root\nThis step bead's parent IS the molecule root. Capture it:\n```bash\nTHIS=<this step bead id>   # shown in your assignment\nMOLECULE_ROOT=$(kd show \"$THIS\" --json | python3 -c \"import sys,json; d=json.load(sys.stdin); print(next((x['id'] for x in d.get('depends_on',d.get('dependencies',[])) if x.get('type')=='parent-child'), ''))\")\necho \"molecule root = $MOLECULE_ROOT\"   # fallback: kd mol list / kd show $THIS\n```\n\n### 2. Create the gardener (the one command)\n```bash\ngb gardener start \"$MOLECULE_ROOT\" \\\n  --i-read-the-gardener-instructions \\\n  --project gardenio \\\n  --title \"gardener-pe-{{TICKET}}: drive {{TICKET}} to a critic-green merge-ready MR\" \\\n  --max-runs 24 \\\n  --loop-wall-clock 168h \\\n  --run-wall-clock 30m \\\n  --terminal-goal \"Molecule rooted at $MOLECULE_ROOT is closed: MR !{{MR_IID}} merge-ready with all 3 critics >=8 and CI green.\" \\\n  --json\n```\n`gb gardener start` is **idempotent** \u2014 if a gardener is already attached to this molecule it\nadopts that one instead of duplicating a loop, and exits non-zero with a link. The default\ncadence is a deterministic staggered 30-minute cron seeded from the epic id; pass `--cron`\nonly if you need a different beat. Capture the printed schedule/trigger bead id \u2014 the\n`gardener-signoff` step references it.\n\n> The gardener is created **enabled**. If you want it to stay dormant until the fix chain is\n> underway, pause it immediately after creation:\n> `kd update <gardener-bead-id> -f enabled=false` (re-enable with `-f enabled=true`, or let\n> an operator flip it on). Its cron pre-flight already no-ops while the molecule has no open\n> children, and its `bead_query` loop_end self-disables once the subtree drains.\n\n### 3. Verify the self-block with the engine's own verdict (never hand-parse fields)\n```bash\ngb gardener status <gardener-bead-id> --json | jq '.has_backstop, .self_block, .self_block_reason'\n# want:  true  \"ok\"  null   \u2192 backstop + wedge-detector both green (advice ka-0000000974)\n```\nIf `has_backstop` is not `true` or `self_block` is not `ok`, the gardener is unsafe \u2014 fix it\n(raise `--max-runs` / add cadence) and re-verify before proceeding.\n\n## Gate\n- [ ] Molecule root discovered and recorded as a comment on this step\n- [ ] Gardener created via `gb gardener start` (a **`type=trigger`** bead \u2014 NOT `type=schedule`)\n- [ ] `gb gardener status \u2026 --json` reports `has_backstop=true` and `self_block=\"ok\"` (self-block per advice ka-0000000974)\n- [ ] Gardener bead id recorded as a comment on this step (the `gardener-signoff` step references it)"
+    },
+    {
+      "id": "fix-critic",
+      "type": "task",
+      "title": "{{TICKET}}: CRITIC \u2014 does the diff actually fix it, and is the scope narrow?",
+      "labels": [
+        "project:monorepo",
+        "kind:critic",
+        "critic:fix"
+      ],
+      "depends_on": [
+        "investigate-fix"
+      ],
+      "description": "## How to run a critic gate\n\nYou are an **adversarial reviewer**, not the author. Your default posture is skepticism: assume the work is *not* good enough until the evidence forces you to score it >=8. Produce a written verdict, score it 0-10 against the rubric below, and act on the threshold:\n\n1. **Measure** \u2014 gather the objective signals the rubric names (the diff, the test output, the MR body). Do not score from memory; read the actual artifact.\n2. **Judge** \u2014 assign a 0-10 score with a one-paragraph written verdict that cites specific evidence (file:line, a quoted assertion, a screenshot URL). Bands: 0-3 broken, 4-5 weak, 6-7 borderline, 8-9 good, 10 excellent.\n3. **Bounce or pass** \u2014 record the verdict as a comment on THIS step bead, then:\n   - **score >= 8** \u2192 PASS. Comment `CRITIC PASS <n>/10` + verdict, close this step, let the chain proceed.\n   - **score < 8** \u2192 DO NOT PROCEED. Comment `CRITIC BOUNCE <n>/10` + the written verdict naming exactly what must change, then reopen/return to the named bounce target step. The downstream steps stay blocked until the bounce target is redone and this critic re-scores >=8.\n\n## Critic 1 of 3: Fix critic\n\nAdversarially review the committed diff for **{{TICKET}}** on branch `{{BRANCH}}`. Two independent questions, both must hold:\n\n### A. Does it actually fix the ticket?\n- Re-read the JIRA ticket's *reported behaviour* (`issue/{{TICKET}}/details.md`).\n- Trace the diff: does the changed code sit on the exact path that produces the bug? Could the bug still reproduce after this change (wrong layer, masked symptom, happy-path-only)?\n- Is the root cause addressed, or just a symptom papered over?\n\n### B. Is the scope NARROW?\n- `git diff --stat origin/main...HEAD` \u2014 every changed file must be justified by the ticket. Flag drive-by refactors, reformatting churn, unrelated files, dependency bumps, or 'while I was in here' edits.\n- A correct fix buried in unrelated changes still scores low \u2014 narrow scope is a first-class requirement, not a nicety.\n\n### Rubric (0-10)\n| Band | Meaning |\n|---|---|\n| 0-3 | Does not fix the ticket, OR fixes it but touches many unrelated files. |\n| 4-5 | Plausibly fixes it but root cause is unproven, or scope has avoidable creep. |\n| 6-7 | Fixes the reported behaviour; one or two unjustified hunks remain. |\n| 8-9 | Clearly fixes the root cause; every changed line is ticket-justified. |\n| 10  | Minimal, surgical, obviously-correct fix; zero collateral. |\n\n### Bounce target\n**If score < 8: bounce to `investigate-fix`.** Write a verdict naming the gap (\"still reproduces because X\" / \"files A,B,C are unrelated \u2014 revert them\") and do NOT let `e2e-test` start. The author re-does `investigate-fix`; you re-score."
+    },
+    {
+      "id": "e2e-test",
+      "type": "task",
+      "title": "{{TICKET}}: Write E2E test that captures the defect",
+      "labels": [
+        "project:monorepo"
+      ],
+      "depends_on": [
+        "fix-critic"
+      ],
+      "description": "## (inherited from golden formula ka-0000001189, dependency re-pointed)\n\nThis step's full instructions are unchanged from the golden Bug-Fix-MR formula. Run the body of the **`e2e-test`** step exactly as defined there:\n\n```bash\nkd formula dump ka-0000001189\n```\n\nThe ONLY change in the PE-Ticket-to-Completion variant is the gate that precedes it: this step now waits on **`fix-critic`** instead of its original predecessor.\n\n> Why: we do not invest in writing/regression-proofing a test until a critic has confirmed the diff actually fixes the ticket and is narrow in scope.\n"
+    },
+    {
+      "id": "test-evidence-critic",
+      "type": "task",
+      "title": "{{TICKET}}: CRITIC \u2014 RED-before / GREEN-after proof the test captures the defect",
+      "labels": [
+        "project:monorepo",
+        "kind:critic",
+        "critic:test-evidence"
+      ],
+      "depends_on": [
+        "e2e-test"
+      ],
+      "description": "## How to run a critic gate\n\nYou are an **adversarial reviewer**, not the author. Your default posture is skepticism: assume the work is *not* good enough until the evidence forces you to score it >=8. Produce a written verdict, score it 0-10 against the rubric below, and act on the threshold:\n\n1. **Measure** \u2014 gather the objective signals the rubric names (the diff, the test output, the MR body). Do not score from memory; read the actual artifact.\n2. **Judge** \u2014 assign a 0-10 score with a one-paragraph written verdict that cites specific evidence (file:line, a quoted assertion, a screenshot URL). Bands: 0-3 broken, 4-5 weak, 6-7 borderline, 8-9 good, 10 excellent.\n3. **Bounce or pass** \u2014 record the verdict as a comment on THIS step bead, then:\n   - **score >= 8** \u2192 PASS. Comment `CRITIC PASS <n>/10` + verdict, close this step, let the chain proceed.\n   - **score < 8** \u2192 DO NOT PROCEED. Comment `CRITIC BOUNCE <n>/10` + the written verdict naming exactly what must change, then reopen/return to the named bounce target step. The downstream steps stay blocked until the bounce target is redone and this critic re-scores >=8.\n\n## Critic 2 of 3: Test-evidence critic\n\nAdversarially verify that the test written in `e2e-test` genuinely captures the **{{TICKET}}** defect \u2014 i.e. it is a real regression guard, not a test that would pass with or without the fix.\n\n### What you must see (the bisection proof)\n- **RED before:** captured output (terminal screenshot or `/tmp/*-failure.txt`) showing the SAME test FAILING on pre-fix code, with an assertion error that names the buggy value/state.\n- **GREEN after:** captured output showing the SAME test (same file + same test name) PASSING on post-fix code.\n- **Assertion specificity:** at least one assertion targets the specific behaviour the ticket reported \u2014 not a generic `assert no error` / `assert 200`.\n\n### Adversarial checks\n- Could this test pass on UNFIXED code? If the assertion is too loose, it proves nothing \u2014 score <= 4.\n- Are the failure and success outputs from the *same* test name? A different test in each => not a bisection proof => score <= 3.\n- If the step legitimately SKIPPED tests (pure-CSS bug, no e2e coverage), the skip justification must be documented; a skip with no justification scores <= 4.\n\n### Rubric (0-10)\n| Band | Meaning |\n|---|---|\n| 0-3 | No RED/GREEN evidence, or failure & success are different tests. |\n| 4-5 | Evidence exists but assertion is loose / could pass unfixed / skip unjustified. |\n| 6-7 | Real bisection proof; assertion specificity is thin. |\n| 8-9 | Clear RED->GREEN on the same test; assertion pins the exact defect. |\n| 10  | Above, plus the test is well-placed and would catch a future regression. |\n\n### Bounce target\n**If score < 8: bounce to `e2e-test`.** Write a verdict naming what is missing (\"no pre-fix failure capture\" / \"assertion only checks status 200\") and do NOT let `draft-mr` start. The author re-does `e2e-test`; you re-score."
+    },
+    {
+      "id": "draft-mr",
+      "type": "task",
+      "title": "{{TICKET}}: Push branch and create draft MR",
+      "labels": [
+        "project:monorepo"
+      ],
+      "depends_on": [
+        "test-evidence-critic"
+      ],
+      "description": "## (inherited from golden formula ka-0000001189, dependency re-pointed)\n\nThis step's full instructions are unchanged from the golden Bug-Fix-MR formula. Run the body of the **`draft-mr`** step exactly as defined there:\n\n```bash\nkd formula dump ka-0000001189\n```\n\nThe ONLY change in the PE-Ticket-to-Completion variant is the gate that precedes it: this step now waits on **`test-evidence-critic`** instead of its original predecessor.\n\n> Why: we do not push a branch / open an MR until a critic has confirmed there is RED-before / GREEN-after proof the test genuinely captures the defect.\n"
+    },
+    {
+      "id": "mr-description-critic",
+      "type": "task",
+      "title": "{{TICKET}}: CRITIC \u2014 MR description rubric (root cause, fix, evidence, screenshots, scope, ticket)",
+      "labels": [
+        "project:monorepo",
+        "kind:critic",
+        "critic:mr-description"
+      ],
+      "depends_on": [
+        "mark-mr-ready"
+      ],
+      "description": "## How to run a critic gate\n\nYou are an **adversarial reviewer**, not the author. Your default posture is skepticism: assume the work is *not* good enough until the evidence forces you to score it >=8. Produce a written verdict, score it 0-10 against the rubric below, and act on the threshold:\n\n1. **Measure** \u2014 gather the objective signals the rubric names (the diff, the test output, the MR body). Do not score from memory; read the actual artifact.\n2. **Judge** \u2014 assign a 0-10 score with a one-paragraph written verdict that cites specific evidence (file:line, a quoted assertion, a screenshot URL). Bands: 0-3 broken, 4-5 weak, 6-7 borderline, 8-9 good, 10 excellent.\n3. **Bounce or pass** \u2014 record the verdict as a comment on THIS step bead, then:\n   - **score >= 8** \u2192 PASS. Comment `CRITIC PASS <n>/10` + verdict, close this step, let the chain proceed.\n   - **score < 8** \u2192 DO NOT PROCEED. Comment `CRITIC BOUNCE <n>/10` + the written verdict naming exactly what must change, then reopen/return to the named bounce target step. The downstream steps stay blocked until the bounce target is redone and this critic re-scores >=8.\n\n## Critic 3 of 3: MR-description critic\n\nAdversarially review the finalized MR description for **{{TICKET}}** (MR !{{MR_IID}}). A reviewer who never saw the ticket should be able to understand the bug, the fix, and the proof from the description alone.\n\n### Six required elements \u2014 each is 0, 1, or 2 points (max 12, normalise to /10)\n1. **Root cause** \u2014 names the actual cause with a code reference (file:line), not just the symptom.\n2. **Fix summary** \u2014 2+ sentences explaining what changed and why it resolves the root cause.\n3. **Test evidence** \u2014 the RED-before / GREEN-after outputs (or collapsible logs) from the test-evidence step are present and render.\n4. **Before/after screenshots** \u2014 both render inline (use the upload `url` field, not `full_path`) and are apples-to-apples.\n5. **Narrow-scope statement** \u2014 an explicit sentence asserting the change is scoped to the ticket, with the changed-file list.\n6. **Linked ticket** \u2014 the JIRA {{TICKET}} link is present and the ticket was commented with the MR link.\n\nScore = round(sum/12 * 10). Any element scoring 0 caps the overall at <= 6 regardless of the others (a missing required element is a fail, not an average).\n\n### Bounce target\n**If score < 8: bounce to `mark-mr-ready`.** Write a verdict listing each element and its 0/1/2 score plus what to add, and do NOT let `gardener-signoff` proceed. The author re-does `mark-mr-ready`; you re-score."
+    },
+    {
+      "id": "gardener-signoff",
+      "type": "task",
+      "title": "{{TICKET}}: GARDENER SIGN-OFF \u2014 all 3 critics >=8 and CI green before tagging a reviewer",
+      "labels": [
+        "project:monorepo",
+        "pattern:gardener",
+        "kind:gate"
+      ],
+      "depends_on": [
+        "mr-description-critic"
+      ],
+      "gate": {
+        "type": "manual",
+        "timeout": "72h"
+      },
+      "description": "## Gardener sign-off gate\n\nThe per-ticket gardener (created in `gardener-setup`) confirms the ticket is truly merge-ready before a human reviewer is pulled in. This is a **manual gate**: it stays blocked until the gardener works the checklist and clears it. `tag-reviewer` depends on this step, so no reviewer is tagged until sign-off.\n\n### The gardener MUST verify ALL of the following\n- [ ] **fix-critic** closed with a recorded `CRITIC PASS` verdict scored **>= 8**.\n- [ ] **test-evidence-critic** closed with a recorded `CRITIC PASS` verdict scored **>= 8**.\n- [ ] **mr-description-critic** closed with a recorded `CRITIC PASS` verdict scored **>= 8**.\n- [ ] **CI is green** on MR !{{MR_IID}} \u2014 verify, do not assume:\n  ```bash\n  glab mr view {{MR_IID}} --json head_pipeline\n  ```\n  Ignore only the known-flaky jobs the golden formula lists; any real failure blocks sign-off.\n- [ ] The MR is marked **ready** (not draft).\n\n### Actions\n- **All boxes checked** \u2192 record a `GARDENER SIGN-OFF` comment on this bead citing the three critic scores + the green pipeline id, close this step (clearing the manual gate), and let `tag-reviewer` fire. If the gardener schedule is still enabled, the gardener should then offer to self-disable (its loop_end will also fire once the molecule children all close).\n- **Any box fails** \u2192 do NOT clear the gate. Comment what is missing and ensure the responsible critic has bounced to its target step. Sign-off waits for the redo.\n\n> A critic that merely *ran* is not a pass \u2014 only a recorded score >= 8 counts. If a critic verdict is missing, treat that critic as failing and block sign-off."
+    },
+    {
+      "id": "tag-reviewer",
+      "type": "task",
+      "title": "{{TICKET}}: Find and tag the best reviewer for this MR",
+      "labels": [
+        "project:monorepo"
+      ],
+      "depends_on": [
+        "gardener-signoff"
+      ],
+      "description": "## (inherited from golden formula ka-0000001189, dependency re-pointed)\n\nThis step's full instructions are unchanged from the golden Bug-Fix-MR formula. Run the body of the **`tag-reviewer`** step exactly as defined there:\n\n```bash\nkd formula dump ka-0000001189\n```\n\nThe ONLY change in the PE-Ticket-to-Completion variant is the gate that precedes it: this step now waits on **`gardener-signoff`** instead of its original predecessor.\n\n> Why: we do not pull a human reviewer in until the gardener has signed off that all three critics scored >=8 AND CI is green. gardener-signoff sits after mr-description-critic, so the description rubric is transitively satisfied too.\n"
+    }
+  ]
+}

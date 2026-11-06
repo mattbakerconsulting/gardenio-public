@@ -1,0 +1,81 @@
+{{- if .Values.agents.metrics.prometheusRule.harnessOverhead.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.harnessOverhead }}
+# PrometheusRule for the gardenio harness tax per tool call
+# (gd-RpflV68KX1, plan gardenio/plans/agent-tool-latency-attribution.md P3,
+# epic gd-Oc3GVm9gc6: attribute agent slowness to specific tool calls).
+#
+# Source metric: gardenio_tool_harness_overhead_seconds (HistogramVec,
+# labels {phase,agent}), pushed to vmagent from gb hook itself
+# (gardenio/controller/cmd/gb/hook_harness_metrics.go). phase is a small
+# hand-picked enum — relay (the whole `gb hook relay` command, Go process
+# time only: binary exec/startup is excluded, and only Pre/PostToolUse[Failure]
+# invocations are counted, not SessionStart/Notification/etc.),
+# bus_publish (the HTTP-daemon-or-NATS publish step inside relay), and
+# drain_queue (the whole `/hooks/drain-queue.sh` PostToolUse script) — NOT
+# per-tool or per-pod-unique, matching the plan's explicit cardinality
+# rejection (~49k series from a per-tool/per-pod combination). Each push
+# carries the full on-disk cumulative histogram for that pod, so the
+# resulting {phase,agent} series are genuine monotonic counters and
+# rate()/histogram_quantile() behave normally.
+#
+# One alert:
+#   - HarnessOverheadP95High: a single hook command's p95 wall-clock exceeds
+#     p95ThresholdSeconds (default 1s — the task's acceptance criterion
+#     verbatim: "alert when overhead p95 > 1s"). Per-phase breakdown in the
+#     description pinpoints which hook command is the slow one.
+#
+# Off by default; per-env overlays opt in. Requires the
+# monitoring.coreos.com/v1 PrometheusRule CRD.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-harness-overhead
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.harness_overhead
+      interval: 30s
+      rules:
+        - alert: HarnessOverheadP95High
+          # The `_count > 0` guard keeps an idle env (all-zero rate, hence a
+          # NaN histogram_quantile) from paging — mirrors the guard pattern
+          # in resume-latency-alerts.yaml.
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le, phase) (rate(gardenio_tool_harness_overhead_seconds_bucket[10m]))
+            ) > {{ $cfg.p95ThresholdSeconds }}
+            and
+            sum by (phase) (increase(gardenio_tool_harness_overhead_seconds_count[10m])) > 0
+          for: {{ $cfg.for | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: controller
+            subsystem: harness_overhead
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "gardenio hook overhead (phase {{`{{ $labels.phase }}`}}) p95 above {{ $cfg.p95ThresholdSeconds }}s"
+            description: |
+              The gardenio hook command phase={{`{{ $labels.phase }}`}} has a p95
+              wall-clock of {{`{{ $value | printf "%.3f" }}`}}s over the last 10m,
+              above the {{ $cfg.p95ThresholdSeconds }}s gate (gd-RpflV68KX1) — this
+              is gardenio's OWN tax on every tool call, not the tool's own
+              execution time (see gardenio_agent_tool_call_latency_seconds, coop's
+              ToolBefore->ToolAfter measurement, for that). Per-phase p95 breakdown:
+              {{`{{ with printf "histogram_quantile(0.95, sum by (le, phase) (rate(gardenio_tool_harness_overhead_seconds_bucket[10m])))" | query }}{{ range . }}  - {{ .Labels.phase }}: {{ .Value | printf "%.3f" }}s
+              {{ end }}{{ end }}`}}
+              relay = `gb hook relay` end-to-end on tool events (excludes binary startup); bus_publish = the HTTP-daemon-or-NATS
+              publish step inside relay; drain_queue = `/hooks/drain-queue.sh`. Check
+              whether the kbeads daemon or NATS is slow (bus_publish) or whether the
+              relay/drain-queue command itself regressed.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/plans/agent-tool-latency-attribution.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

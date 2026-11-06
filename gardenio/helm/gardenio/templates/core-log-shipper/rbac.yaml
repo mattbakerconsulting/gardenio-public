@@ -1,0 +1,56 @@
+{{- if .Values.coreLogShipper.enabled }}
+{{- /*
+core-log-shipper RBAC (general gardenio-pod slog transport, design ka-0000005579
+option A step 3, task ka-0000005209).
+
+Every core component this shipper streams — controller, slack-bridge,
+trigger-engine, grafana-bridge — runs in THIS release's namespace alongside the
+shipper. So the Role + RoleBinding are same-namespace and there is no
+cross-namespace plumbing.
+
+Least-privilege: list/get pods (to resolve the enabled component pods by
+selector) and get pods/log (to open the follow streams) in the release namespace
+ONLY. Nothing else — no write verbs, no other namespaces, no cluster scope. This
+is deliberately the SAME shape as bridge-log-shipper; note the gardenio-AGENT SA
+is a DIFFERENT SA and is NOT granted pods/log by this (or any) chart — the agent
+reads the log STORE over HTTP, never the pod-log API (ka-0000001752).
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "gardenio.coreLogShipper.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coreLogShipper.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "gardenio.coreLogShipper.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coreLogShipper.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "gardenio.coreLogShipper.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coreLogShipper.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "gardenio.coreLogShipper.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.coreLogShipper.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

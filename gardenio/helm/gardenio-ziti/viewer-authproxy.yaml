@@ -1,0 +1,499 @@
+# The trust headers the beads-viewer and coopmux expect, set from the identity
+# the public edge verified.
+#
+# WHY THIS EXISTS
+# beads-viewer runs with BEADS_VIEWER_DEV_AUTH_BYPASS=1 (no Keycloak operator on
+# this cluster, no AWS Verified Access off EKS). In that mode it derives operator
+# identity from exactly one source: the X-Auth-Request-Email header, which
+# cmd/beads-viewer/dev_auth.go documents as trustworthy ONLY when a forwardauth
+# edge overwrites it from a verified auth response. With no edge, no header, so
+# no identity — and every mutating endpoint (GET/POST /quick-spawn, the per-bead
+# spawn routes) correctly returns 401 Unauthenticated.
+#
+# This proxy sits between that edge and the viewer (and coopmux): it passes on
+# the identity the edge verified, adds the edge secret the viewer checks, and
+# builds the bearer each backend wants.
+#
+# WHAT ACTUALLY AUTHENTICATES A REQUEST HERE
+# The public edge (public-edge.yaml), not this proxy. gardenio.clonk.tv and
+# mux.clonk.tv answer only on the public-edge nginx, which runs the oauth2-proxy
+# sign-in check (Keycloak realm gardenio: /gardenio-admins for both, plus the
+# project groups for the viewer) and overwrites X-Auth-Request-Email and
+# X-Auth-Request-Access-Token from the verified reply before calling the two
+# listeners below. They stamp no fixed email and refuse a request that carries
+# none (401), except the Lands front-of-house pages the edge serves with no
+# session (Track B 7.8; $bv_public below) and the Window's /w/ (plan
+# gd-pz87vf3xsB PW.5), which forwards no identity at all. That trust is safe only because of
+# the viewer-authproxy-ingress NetworkPolicy at the end of this file: only the
+# public-edge namespace may connect. Any other pod that could would be whoever it claims.
+#
+# The ziti listeners (8095 break-glass, 8080/8443 gardenio.clonk.tv, 8446/8447
+# mux.clonk.tv) stamped a fixed operator email because the ziti identity was the
+# credential. They went with ziti (gd-xNMLrsgajy). There is no break-glass door
+# any more: with Keycloak or forwardauth down, `kubectl -n gardenio port-forward
+# svc/gardenio-beads-viewer 8095` still reads (no identity, so no writes).
+# Turning ziti back on needs those listeners back: revert gd-xNMLrsgajy's change
+# to this file along with gardenio/helm/ziti/README.md "Turning ziti back on".
+#
+# proxy_set_header OVERWRITES a client-supplied value rather than appending, so
+# a caller cannot forge a different operator by sending their own header — which
+# is the same property oauth2-proxy provides via Traefik authResponseHeaders.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: viewer-authproxy
+  namespace: gardenio
+data:
+  # NOTE: this is a .template, not a .conf. The nginx image's
+  # docker-entrypoint runs envsubst over /etc/nginx/templates/*.template and
+  # writes the result into /etc/nginx/conf.d/. That is how ${COOPMUX_TOKEN}
+  # below becomes a real token at container start WITHOUT the token ever
+  # living in this ConfigMap — it arrives as an env var from a Secret.
+  #
+  # NGINX_ENVSUBST_FILTER=^(COOPMUX_|VIEWER_PROXY_) is set on the Deployment so envsubst
+  # substitutes ONLY COOPMUX_* / VIEWER_PROXY_* names. Without that filter it would substitute
+  # every environment variable it knows, and nginx's own runtime variables
+  # ($host, $remote_addr, $http_upgrade, ...) would be at risk of being
+  # replaced with empty strings by any same-named env var.
+  default.conf.template: |
+    # WebSocket upgrade mapping, required by the coopmux terminal stream
+    # (/api/v1/mux is an axum WebSocketUpgrade). A plain
+    # `proxy_set_header Connection "upgrade"` would break ordinary XHR on the
+    # same server, so map the value off the request's own Upgrade header:
+    # empty request -> "close", upgrade request -> "upgrade".
+    map $http_upgrade $connection_upgrade {
+      default upgrade;
+      ''      close;
+    }
+
+    # Two listeners, both reached only from the public-edge nginx
+    # (public-edge.yaml, plan ziti-to-keycloak S4 gd-UqhR5d6qPt), which has
+    # already run the oauth2-proxy sign-in check and overwritten
+    # X-Auth-Request-Email with the verified address. Plain HTTP: the edge
+    # terminated TLS. They NEVER stamp a fixed email; they trust the one the
+    # edge sent. That trust is the viewer-authproxy-ingress NetworkPolicy
+    # below, which admits only the public-edge namespace. Do not widen it.
+
+    # The signed-in user's own access token (set by the edge) becomes the write
+    # bearer; no token, no Authorization header.
+    map $http_x_auth_request_access_token $bv_edge_bearer {
+      default "Bearer $http_x_auth_request_access_token";
+      ""      "";
+    }
+
+    # The Lands front-of-house paths the edge serves with no session (Lands
+    # Track B 7.8): its no-session locations on gardenio.clonk.tv, which are
+    # the viewer's routePublic noSessionPatterns. Only these may arrive here
+    # with no identity; the edge sends them GET-only, with the cookie, bearer
+    # and identity headers blanked. Keep the three lists equal.
+    map $uri $bv_public {
+      default                 0;
+      /lands/                 1;
+      /lands/terms            1;
+      /lands/privacy          1;
+      /lands/aup              1;
+      ~^/lands/static/meadow/ 1;
+      ~^/lands/static/homestead/ 1;
+      /garden/splash          1;
+      /garden/splash/three.module.min.js 1;
+      /garden/splash/still.png 1;
+    }
+    map "$bv_public:$http_x_auth_request_email" $bv_no_identity {
+      default 0;
+      "0:"    1;
+    }
+
+    # No window token in the access log (the Window, plan gd-pz87vf3xsB
+    # PW-D9): /w/<token>/rest is logged as /w/-/rest, query dropped, and a
+    # Referer naming a window as /w/-. Same maps as public-edge.yaml. The
+    # image's nginx.conf logs "main" (the full request line) at http level,
+    # so each server below sets its own access_log with this format.
+    map $uri $log_uri {
+      default                          $request_uri;
+      "~^/w/[^/]*(?<log_window_rest>/[^?]*)?$" /w/-$log_window_rest;
+    }
+    map $http_referer $log_referer {
+      default                  $http_referer;
+      "~*^[a-z]+://[^/]*/+(w|%77)/" /w/-;
+    }
+    log_format redacted '$remote_addr - $remote_user [$time_local] "$request_method $log_uri $server_protocol" '
+                        '$status $body_bytes_sent "$log_referer" "$http_user_agent" "$http_x_forwarded_for"';
+
+    # Viewer, port 8097 -> https://gardenio.clonk.tv from the internet.
+    server {
+      listen 8097;
+      server_name _;
+      access_log /dev/stdout redacted;
+      server_tokens off;
+
+      # The edge forwards the sign-in cookie (~4KB chunks) and the token.
+      large_client_header_buffers 4 32k;
+      proxy_buffer_size           32k;
+      proxy_buffers               8 32k;
+      proxy_busy_buffers_size     64k;
+
+      # The Window (plan gd-pz87vf3xsB, PW.5): /w/<token> carries no identity
+      # by design. The link is the credential and the viewer hands it to
+      # kbeads, which opens exactly one route for it. So this location skips
+      # the no-identity 401 of location / and forwards NO identity at all:
+      # never an email, an access token, a bearer or a cookie, whatever the
+      # edge or a client sent. It still proves the edge with the secret. GET
+      # and HEAD only. crit-only error log: nginx's error lines quote the
+      # request line, token and all.
+      location ^~ /w/ {
+        limit_except GET { deny all; }
+        error_log /dev/stderr crit;
+
+        proxy_pass http://gardenio-beads-viewer.gardenio.svc.cluster.local:8095;
+
+        proxy_set_header X-Authproxy-Secret "${VIEWER_PROXY_SECRET}";
+        proxy_set_header X-Auth-Request-Email "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+        proxy_set_header X-Auth-Request-User "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email "";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+      }
+
+      location / {
+        # No identity from the edge, no service, except on the front-of-house
+        # paths above. Never falls back to a fixed email.
+        if ($bv_no_identity) {
+          return 401;
+        }
+
+        proxy_pass http://gardenio-beads-viewer.gardenio.svc.cluster.local:8095;
+
+        proxy_set_header X-Auth-Request-Email $http_x_auth_request_email;
+        # Proves to the viewer this request came through the edge
+        # (gd-kRyMsWiDNZ). Overwrites any client value.
+        proxy_set_header X-Authproxy-Secret "${VIEWER_PROXY_SECRET}";
+        proxy_set_header X-Auth-Request-Access-Token $http_x_auth_request_access_token;
+        proxy_set_header Authorization $bv_edge_bearer;
+        # Blank the sibling identity headers so none can be smuggled in.
+        proxy_set_header X-Auth-Request-User "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email "";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        # The edge terminated TLS; the viewer treats https as a secure context.
+        proxy_set_header X-Forwarded-Proto https;
+
+        # Server-Sent Events (activity feed): no buffering.
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+      }
+    }
+
+    # coopmux terminal, port 8448 -> https://mux.clonk.tv from the internet.
+    # coopmux requires a bearer on every route, including the dashboard HTML
+    # (crates/mux/src/transport/auth.rs extract_bearer); nginx injects it from
+    # the COOPMUX_TOKEN secret, so the browser never holds the token.
+    server {
+      listen 8448;
+      server_name _;
+      access_log /dev/stdout redacted;
+      server_tokens off;
+
+      large_client_header_buffers 4 32k;
+
+      # DENIED ON PURPOSE. coopmux exposes credential management under
+      # /api/v1/credentials (set, new, exchange, distribute, pool/rebalance).
+      # This proxy injects an ADMIN token, so without this block anything that
+      # can reach it could mint, overwrite and redistribute the fleet's
+      # Anthropic credentials. The terminal needs none of it. ^~ so it wins
+      # over the prefix match below, and returns before proxying.
+      location ^~ /api/v1/credentials {
+        return 403;
+      }
+
+      location / {
+        if ($http_x_auth_request_email = "") {
+          return 401;
+        }
+
+        proxy_pass http://gardenio-coopmux.gardenio.svc.cluster.local:9800;
+
+        # The browser never sees the token.
+        proxy_set_header Authorization "Bearer ${COOPMUX_TOKEN}";
+        proxy_set_header X-Auth-Request-Access-Token "";
+
+        # coopmux has no DAEMON_HMAC_KEY and trusts these as an operator
+        # identity, so nothing a client (or the edge) sent may reach it.
+        proxy_set_header X-Operator "";
+        proxy_set_header X-Auth-Audit-Id "";
+        proxy_set_header X-Edge-Auth-Ts "";
+        proxy_set_header X-Edge-Auth-Sig "";
+        proxy_set_header X-Edge-Auth-Sig-V2 "";
+        proxy_set_header X-Edge-Auth-Version "";
+        proxy_set_header X-Edge-Auth-Mode "";
+        proxy_set_header X-Edge-Auth-Roles "";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+
+        # Terminal I/O is a WebSocket (/api/v1/mux) plus long-lived streams.
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: viewer-authproxy
+  namespace: gardenio
+  labels:
+    app: viewer-authproxy
+    app.kubernetes.io/part-of: gardenio
+spec:
+  # HA phase 2 (gd-bOJa10GcA6, epic gd-StII9fmzym): raised 1 -> 2. This proxy
+  # is genuinely stateless (no PVC, no session affinity), so it was already
+  # flagged in gd-27vcHmrurh as "a legitimate candidate for real multi-replica
+  # HA" — bumping it was deferred to this phase-2 chart PR.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: viewer-authproxy
+  template:
+    metadata:
+      annotations:
+        # The platform spot half of the pool is cluster-autoscaler managed
+        # (gd-AEm6o8aWkF, 2026-10-11). This pod is the access path; never let
+        # a scale-down evict it even if the nodeSelector below is ever lost.
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+      labels:
+        app: viewer-authproxy
+    spec:
+      tolerations:
+        - key: "gardenio.agent"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      # HA phase 1 (gd-kU2wuaNHMJ): was landing wherever the taint above let
+      # it, including the spot side of the pool. Pin to the on-demand
+      # platform pair alongside the rest of the control plane it fronts.
+      # BOTH labels required — lifecycle=on-demand alone also matches the
+      # on-demand k3s server (etcd + traefik + the beads Dolt volume).
+      nodeSelector:
+        gardenio.io/lifecycle: on-demand
+        gardenio.io/role: platform
+      # HA spread (gd-27vcHmrurh), flipped to DoNotSchedule in phase 2
+      # (gd-bOJa10GcA6): the on-demand pin above restricts this proxy to the
+      # 2-node on-demand platform pair (epic gd-StII9fmzym's measured
+      # starting point: gardenio-k3s-agents ASG, OnDemandBaseCapacity 2), so
+      # node count is now confirmed >= replicas (2 >= 2) — the precondition
+      # this comment used to wait on. DoNotSchedule is what actually makes
+      # "kill either replica, zero failed requests" true: ScheduleAnyway
+      # only prefers spreading, it does not forbid the scheduler from
+      # bin-packing both replicas onto the same node, which would make a
+      # single node loss take down both at once.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: viewer-authproxy
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: viewer-authproxy
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101      # nginx-unprivileged
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      # Class from the gardenio chart (global.systemPriorityClass): the sign-in path,
+      # so a crew burst cannot leave it Pending (gd-2qjxTVMBkC).
+      priorityClassName: gardenio-system-critical
+      containers:
+        - name: nginx
+          # -unprivileged so the pod needs no root and no NET_BIND_SERVICE.
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - containerPort: 8097
+              name: edge-viewer
+            - containerPort: 8448
+              name: edge-mux
+          env:
+            # Substituted into default.conf.template by the image's
+            # docker-entrypoint at start, so the token lives in a Secret and
+            # an env var — never in the ConfigMap.
+            #
+            # This is the AGENT-FACING coopmux token (COOP_MUX_AUTH_TOKEN), the
+            # same Secret as the chart's coopmux.coopmuxTokenSecret
+            # (deploy-values: coopmux-agent-token). It is NOT kd-beads-token:
+            # once agents.perAgentTokens is on, coopmux stops accepting the
+            # beads token, so keeping kd-beads-token here makes mux.clonk.tv
+            # return 401. Create coopmux-agent-token BEFORE applying this
+            # manifest; pinned to the overlay by TestViewerAuthproxy_CoopmuxTokenMatchesOverlay.
+            - name: COOPMUX_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: coopmux-agent-token
+                  key: token
+            # Edge secret the viewer checks before trusting X-Auth-Request-Email
+            # (gd-kRyMsWiDNZ). Same Secret as beadsViewer.devAuthProxySecret.
+            # Create it BEFORE applying this manifest, or the pod will not start.
+            - name: VIEWER_PROXY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: viewer-authproxy-secret
+                  key: secret
+            # Restrict envsubst to COOPMUX_* / VIEWER_PROXY_* ONLY. Without this it substitutes
+            # every known env name, which would put nginx's own $variables at
+            # risk of being blanked by a same-named env var.
+            - name: NGINX_ENVSUBST_FILTER
+              value: "^(COOPMUX_|VIEWER_PROXY_)"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            # The ConfigMap is now a TEMPLATE dir; the entrypoint renders it
+            # into conf.d, which therefore has to be writable (emptyDir)
+            # even though the root filesystem is read-only.
+            - name: conf
+              mountPath: /etc/nginx/templates
+              readOnly: true
+            - name: confd
+              mountPath: /etc/nginx/conf.d
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: run
+              mountPath: /tmp
+          readinessProbe:
+            tcpSocket: { port: 8097 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          # No livenessProbe existed before (gd-27vcHmrurh): a wedged-but-still
+          # TCP-accepting nginx worker (config parse hang, fd exhaustion) would
+          # never self-heal. Reuses the readiness port/timing; a bare TCP check
+          # is enough here since this proxy has no app-level health endpoint.
+          livenessProbe:
+            tcpSocket: { port: 8097 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+      volumes:
+        - name: conf
+          configMap:
+            name: viewer-authproxy
+        - name: confd
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: viewer-authproxy
+  namespace: gardenio
+  labels:
+    app: viewer-authproxy
+spec:
+  type: ClusterIP
+  selector:
+    app: viewer-authproxy
+  ports:
+    # Public-edge nginx only; see the NetworkPolicy below.
+    - name: edge-viewer
+      port: 8097
+      targetPort: 8097
+    - name: edge-mux
+      port: 8448
+      targetPort: 8448
+---
+# WHY maxUnavailable, NOT minAvailable (ka-0000001453, gd-27vcHmrurh): on a
+# 1-replica Deployment minAvailable:1 == maxUnavailable:0, which makes the
+# eviction API refuse the pod forever — a managed-nodegroup drain then hits
+# PodEvictionFailure and wedges. maxUnavailable:1 only blocks eviction while
+# the pod is currently unhealthy, so it is a safe drain guard at replicas=1
+# and upgrades to real quorum protection if replicas is ever raised.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: viewer-authproxy
+  namespace: gardenio
+  labels:
+    app: viewer-authproxy
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: viewer-authproxy
+---
+# FENCE: only the public-edge nginx may reach this proxy. Both listeners trust
+# the X-Auth-Request-Email they are sent and add the edge secret (8097) or the
+# admin COOPMUX_TOKEN (8448) to it, so any other pod that could connect would be
+# whoever it names, which would defeat the viewer-side secret check
+# (gd-kRyMsWiDNZ) entirely.
+#
+# Enforced by k3s's embedded kube-router netpol controller (node.sh.tftpl does
+# not pass --disable-network-policy), independent of the chart's
+# networkPolicies.enabled switch: this file is applied by hand, not by helm.
+# Kubelet probes (tcp 8097) originate from the node and are not blocked by
+# kube-router's ingress rules.
+#
+# In-cluster callers of this proxy: public-edge only (the ziti-host rule went
+# with ziti, gd-xNMLrsgajy; `git grep viewer-authproxy` finds comments, the
+# forwardauth fence and docs otherwise). A new caller needs its own rule here
+# with a reason.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: viewer-authproxy-ingress
+  namespace: gardenio
+  labels:
+    app: viewer-authproxy
+spec:
+  podSelector:
+    matchLabels:
+      app: viewer-authproxy
+  policyTypes:
+    - Ingress
+  ingress:
+    # The identity header is trusted here, so only the public-edge nginx may
+    # connect.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: public-edge
+      ports:
+        - { protocol: TCP, port: 8097 }
+        - { protocol: TCP, port: 8448 }

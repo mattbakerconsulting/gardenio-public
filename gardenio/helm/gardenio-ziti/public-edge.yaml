@@ -1,0 +1,2323 @@
+# Public HTTPS edge: the ONLY thing on gardenio that answers the internet on
+# 443 for humans (decision gd-GbIgemW3dt, escalation gd-NoOR0riqwi).
+#
+#   claimlayer.clonk.tv  -> oauth2-proxy (claimlayer-demo) -> static demo
+#   auth.clonk.tv        -> Keycloak, realm gardenio browser/OIDC paths, plus the realm
+#                           admin console behind a sign-in check (oauth2-proxy, /gardenio-admins),
+#                           and the one-click Become page (/gardenio/become/) behind the same check
+#   grafana.clonk.tv     -> sign-in check (oauth2-proxy, /gardenio-admins) -> Grafana
+#   dashboard.clonk.tv   -> sign-in check (oauth2-proxy, /gardenio-admins) -> Headlamp
+#   gardenio.clonk.tv    -> sign-in check (same) -> viewer-authproxy :8097 -> beads-viewer
+#   mux.clonk.tv         -> sign-in check (same) -> viewer-authproxy :8448 -> coopmux
+#   api.clonk.tv         -> bearer-JWT check (oauth2-proxy, /gardenio-admins) -> beads daemon /v1/*
+#                           /land/<name>/v1/* -> bearer-JWT check (/project-<name>) or, for a
+#                             minted land token, land-token check (daemon GET /v1/me) -> daemon /v1/*
+#                             (or the land's landgate, once $land_door_upstream names it)
+#   hooks.clonk.tv       -> GitHub hooks IPs, POST only: /webhooks/ -> trigger-engine :8094,
+#                           /webhook -> github-bridge :8101 (both verify the HMAC)
+#   runners.clonk.tv     -> "Bearer gr_" + the daemon's runner routes only -> beads daemon /v1/*
+#                           (plus POST /v1/runners/register, no bearer) -> daemon (runner bearer)
+#   clonk.tv             -> GET/HEAD only, no sign-in -> the chart's landing Service (the splash)
+#   www.clonk.tv         -> 301 https://clonk.tv$request_uri
+#
+# WHY NOT TRAEFIK. Traefik's 443 was the GitHub-hooks route (hooks.clonk.tv
+# moved here on the cost plan, C4 gd-040vrRf2II), and the shared nodes SG
+# (web_ingress_cidrs) was that route's allowlist: ServiceLB (klipper-lb)
+# MASQUERADEs every connection, in Cluster AND Local traffic policy (read off the
+# running klipper-lb v0.4.17 entry script), so Traefik never sees a client IP
+# and an ipAllowList cannot work. Opening the shared 443 to the world would
+# drop that allowlist and publish every Traefik route.
+#
+# So this edge has its own address: the nginx pod runs ON the ziti edge node
+# with hostPort 443. That node has its own SG (terraform ziti_edge_web: 443
+# from 0.0.0.0/0) and EIP, which claimlayer.clonk.tv and auth.clonk.tv point
+# at. hostPort is CNI portmap DNAT with no SNAT, so nginx sees real client
+# IPs. Traefik's svclb never runs there (the node's taint). NOT a ServiceLB
+# pool: k3s only honours svccontroller lbpool once some node carries
+# enablelb=true, and without it the svclb DaemonSet also targeted the three
+# servers (it sat Pending there only because Traefik holds 443) -- tried and
+# reverted 2026-10-11.
+#
+# grafana.clonk.tv is the first app behind the edge sign-in (plan
+# ziti-to-keycloak S3, gd-iS4Uxv9tfN). Every request runs auth_request against
+# oauth2-proxy (gardenio-forwardauth) with allowed_groups=/gardenio-admins: no
+# session -> 302 to /oauth2/start on the same host; signed in but not an admin
+# -> 403 from the edge. Grafana then does its own Keycloak login on top.
+#
+# gardenio.clonk.tv (plan ziti-to-keycloak S4, gd-UqhR5d6qPt) uses the same check,
+# widened to also admit each /project-<name> group (plan project-scoped-humans,
+# gd-4tvNth0mfq) and its land-role subgroups /project-<name>/owners and /guests,
+# whose members are not in the parent (gd-A9avO8cXBr). kbeads scopes what they
+# can read, this is only the coarse gate; `scripts/check-viewer-edge-groups.py
+# --write` writes the list from the realm and the plain run fails the build on
+# drift. The list also admits /lands-tenants (Lands Track B 7.8), the static
+# group every Lands tenant joins, so a land created at runtime needs no edit
+# here. It does not talk to the app directly: it goes through the edge-only listener
+# of viewer-authproxy (8097), which trusts
+# the identity headers set here and nothing else. That trust is the
+# viewer-authproxy-ingress NetworkPolicy (only this namespace reaches those
+# ports). The ziti listeners of viewer-authproxy are gone (gd-xNMLrsgajy), so
+# this is the only way in. The exceptions to that sign-in check on this host:
+#   - /slack/link/ (Slack account linking, gd-OZJ6H2S3xx) goes straight to
+#     slack-bridge: the bridge's single-use state and the Keycloak sign-in it
+#     starts are its authentication.
+#   - /lands/ (the Lands front of house, Track B 7.8) admits the same groups
+#     plus /invited (gd-ycE484kLyk): GitHub sign-in is invite-only (owner
+#     ruling gd-hCMlZ5jnvB = b), and a person joins /invited when their email
+#     invite is claimed. Anyone the viewer already admits still gets in, so
+#     no member is locked out; a signed-in user in none of them gets a plain
+#     "You need an invite" page. The demo land's door, = /lands/demo and
+#     = /lands/accept, admits any signed-in account (gd-T37nCeWMhq = open) so
+#     a stranger can take a demo pass. A signed-in user with no admitted group
+#     who asks for anything else is sent to /lands/ instead of a 403. The landing
+#     page, the three legal documents and their stylesheet need no session at
+#     all. All of /lands/ is per-IP rate-limited (front_door_per_ip) before
+#     any sign-in check.
+#   - /w/ (the Window, plan gd-pz87vf3xsB PW.5) needs no session: the link
+#     /w/<token> is the credential, which only kbeads judges. Read-only,
+#     rate-limited like /lands/ and capped per IP, and the token is written
+#     as /w/- in the access log (every server on this edge logs "redacted").
+#
+# dashboard.clonk.tv is Headlamp (plan ziti-to-keycloak S5, gd-duCuVLz5cU), same
+# sign-in check. Headlamp has no login: it acts as its ServiceAccount, bound to
+# the builtin `view` role (no Secrets; headlamp-rbac.yaml), and a NetworkPolicy
+# (headlamp-networkpolicy.yaml) lets only this namespace reach it.
+#
+# api.clonk.tv is the beads daemon API for kd and gb (plan ziti-to-keycloak S6,
+# gd-FQJHYGAnjB). There is no cookie flow and no redirect: API clients get 401
+# (no or bad bearer JWT) or 403 (valid JWT, not in /gardenio-admins) from the
+# edge. oauth2-proxy runs with --skip-jwt-bearer-tokens, so it verifies the
+# bearer JWT's signature, issuer and audience; the daemon verifies it again
+# (go-oidc) and stamps operated_by_source=oidc. The static fleet/bridge/agent
+# tokens (32-byte hex) are not JWTs and are refused at the edge. Only /v1/* and
+# /health are proxied; token management, /v1/admin/, embeddings and the SSE
+# stream are 404 here. Per-IP limit_req (429) sits before the sign-in check, so
+# garbage tokens cost Keycloak's JWKS endpoint nothing beyond the burst.
+#
+# api.clonk.tv also carries the land door (Door D.2, owner decision
+# gd-BTHHmA2rYc = edge-route): /land/<name>/v1/* is the daemon's /v1/* for a
+# tenant's kd, gb or gl, behind the same bearer-JWT check but admitting only
+# /project-<name> and its /owners and /guests (not /gardenio-admins), so a
+# bearer for another land gets 403. The bearer passes through and kbeads
+# scopes it; the SSE streams, token routes (including /v1/auth/refresh), admin
+# routes, hooks and embeddings are 404 on the land path. A land is a path
+# prefix, not a hostname, in v1 (a host per land is a later upgrade).
+#
+# The land door takes a second credential (Door D.18a gd-WTyoLCSMUp): the
+# minted land token a tenant's laptop agent runs kd, gb and gl under (the
+# 10.11 land principal, land-<name>). It is opaque, not a JWT, so oauth2-proxy
+# cannot judge it: a bearer of that shape (one base64url segment, see
+# $land_door_land_token) is checked instead by the daemon itself, GET /v1/me
+# with X-Land-Door, which answers 200 only for this land's land principal or
+# a per-agent token bound to this land (gd-mh9ANzCHIE: it writes only its own
+# agent bead). A JWT, or anything else, takes the bearer-JWT check as before.
+#
+# auth.clonk.tv is per-IP rate-limited too (auth_per_ip, Track B 7.8: GitHub is
+# the only bot filter at registration), except the back-channel endpoints the
+# cluster itself calls through this host (see auth_limit_key).
+#
+# Pod Security: hostPort is outside "baseline", so this namespace enforces
+# privileged with audit/warn at restricted. The pod itself is otherwise
+# restricted-clean (non-root, no caps, RuntimeDefault seccomp, no SA token).
+#
+# runners.clonk.tv is the public runner listener (local-agents spec §4.3, plan
+# gd-fwFefkDP4H, gd-T4eL6P5OtC): the k3s counterpart of the chart's Traefik
+# route (templates/beads/runner-ingress.yaml), which cannot face the internet
+# here for the reason above. A laptop runner's `gb runner` talks to the daemon
+# through it with its own runner token. There is no sign-in check: the daemon
+# judges the token. The edge forwards only a "Bearer gr_" request on a route in
+# kbeads' runnerAllowedPatterns (runner_auth.go), each method-pinned, plus
+# POST /v1/runners/register (an invite code, no bearer), and stamps
+# X-Gardenio-Listener: runner so the daemon refuses any bearer that is not a
+# runner token. Everything else is 404.
+#
+# clonk.tv is the public front door (plan gd-tLxfoaw366, route gd-Z3eh4eEJ87,
+# gd-gQ8hZLd4AQ): the splash, a static page baked into the gardenio landing
+# image (gardenio/images/landing, chart landing.page=image). It reads no bead
+# and holds no session, so there is no sign-in check: GET and HEAD go to the
+# landing Service with every credential the client sent stripped, anything
+# else is 405. Its Request an invite and Sign in links go to gardenio.clonk.tv.
+# www.clonk.tv only redirects to it.
+#
+# nginx serves only the eleven hosts below: unknown SNI is refused at the
+# handshake, unknown Host gets 421.
+#
+# Keycloak exposure is an allowlist: /auth/realms/gardenio/ and
+# /auth/resources/ (login page assets), open; and the gardenio realm's admin
+# console with its admin API (/auth/admin/gardenio/console/,
+# /auth/admin/realms/gardenio, GET /auth/admin/serverinfo and
+# /auth/admin/realms), behind the /gardenio-admins sign-in check and then
+# Keycloak's own admin token (owner decision gd-papvgFfwMf: admin impersonation
+# V1 needs the console on this host). The Become page, /gardenio/become/, is
+# static files behind the same sign-in check; it reaches Keycloak only through
+# the console paths. /auth/admin/ (the master console), the
+# master realm's console and API, every other realm's admin API and
+# everything else are 404 here. Paths carrying "..", encoded dots/slashes,
+# backslashes or ";" are refused before matching, so a path that nginx and
+# Keycloak would normalise differently never reaches Keycloak.
+#
+# Apply: kubectl apply -f public-edge.yaml (the namespace first time round
+# needs the Certificate to issue before the pod is Ready; DNS-01, ~1-2 min).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: public-edge
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: public-edge
+  namespace: public-edge
+spec:
+  secretName: public-edge-tls
+  issuerRef: {name: letsencrypt-dns01, kind: ClusterIssuer}
+  dnsNames: [claimlayer.clonk.tv, auth.clonk.tv, grafana.clonk.tv, dashboard.clonk.tv, gardenio.clonk.tv, mux.clonk.tv, api.clonk.tv, hooks.clonk.tv, runners.clonk.tv, clonk.tv, www.clonk.tv]
+  privateKey: {algorithm: ECDSA, size: 256, rotationPolicy: Always}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: public-edge
+  namespace: public-edge
+data:
+  default.conf: |
+    # Path part of the raw request (before "?") carrying traversal or
+    # ambiguous encodings. Query strings are not checked: OIDC redirect_uri
+    # values are legitimately percent-encoded there.
+    map $request_uri $public_edge_bad_path {
+      default 0;
+      "~*^[^?]*(\.\.|%2e|%2f|%5c|\x5c|;)" 1;
+    }
+
+    # Grafana Live and Headlamp (pod logs, exec, watches) are WebSockets: send "Connection: upgrade" only on upgrades.
+    map $http_upgrade $connection_upgrade {
+      default upgrade;
+      ""      "";
+    }
+
+    # mux.clonk.tv only: refuse a cross-origin request. The edge session cookie
+    # is SameSite=lax, which still rides along from any same-SITE page
+    # (claimlayer/grafana/dashboard/gardenio/auth are all *.clonk.tv), and
+    # coopmux allows any origin, so without this a script on one of them could
+    # open wss://mux.clonk.tv/ws/mux and type into every agent. A WebSocket
+    # handshake always carries Origin; "" is a plain same-origin navigation.
+    map $http_origin $mux_bad_origin {
+      default                0;
+      "~."                   1;
+      "https://mux.clonk.tv" 0;
+    }
+
+    # API host (api.clonk.tv): per-client-IP request limit, applied before the
+    # sign-in check so unauthenticated garbage is cut off at the edge. The land
+    # door (/land/<name>/v1/) shares it.
+    limit_req_zone $binary_remote_addr zone=api_per_ip:10m rate=10r/s;
+
+    # The land a /land/<name>/v1/ request names (Door D.2), read off the raw
+    # request line. The sign-in subrequest sees the same $request_uri as its
+    # parent, so this is how /oauth2/auth-land learns which /project-<name>
+    # groups to require; the name pattern is the contract's LandName, so it
+    # can never carry a "," or "&" into allowed_groups. Anything percent-
+    # encoded or doubled in the prefix maps to "", which the land door 404s.
+    map $request_uri $land_door_name {
+      default "";
+      "~^/land/(?<land_door_n>[a-z][a-z0-9-]{0,62})/v1/" $land_door_n;
+    }
+
+    # A land door bearer that is a minted land token (Door D.18a
+    # gd-WTyoLCSMUp): one base64url segment, the shape of a 10.11 land
+    # principal's token. It has no dot, so it can never be a JWT, and the
+    # daemon can only resolve it as a registered token: sending it to the
+    # land-token check never lets a Keycloak JWT skip oauth2-proxy's group
+    # check. Every other Authorization (a JWT, a malformed one, none) maps to
+    # 0 and goes to oauth2-proxy exactly as before. landgate classifies a
+    # bearer with the same pattern (cmd/landgate gate.go landTokenBearer).
+    map $http_authorization $land_door_land_token {
+      default 0;
+      "~^Bearer [A-Za-z0-9_-]+$" 1;
+    }
+
+    # The land door's route allowlist (Door D.18 gd-nvvTcZeBZD): the one
+    # list is kbeads/internal/server/land_door_routes.txt, which kbeads and
+    # landgate enforce too; the chart test holds these lines to it. A route
+    # is METHOD and the decoded, merged $uri the daemon will route on, each
+    # mux wildcard one path segment. Everything else under /land/ is 404.
+    map "$request_method $uri" $land_door_route {
+      default 0;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/plots$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/plots/[^/]+$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/crew$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/crew/[^/]+$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/whoami$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/tickets$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/tickets$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/tickets/[^/]+$" 1;
+      "~^PATCH /land/[^/]+/v1/lands/v1/lands/[^/]+/tickets/[^/]+$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/tickets/[^/]+/comments$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/tickets/[^/]+/close$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/tickets/[^/]+/reopen$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/search/tickets$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/decisions$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/decisions/[^/]+$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/decisions/[^/]+/resolve$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/decisions/[^/]+/cancel$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/decisions/[^/]+/comments$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/decisions/[^/]+/evidence/[^/]+$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/escalations$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/escalations$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/escalations/[^/]+$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/plans$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/plans/[^/]+$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/plans/[^/]+/answer$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/threads$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/threads/[^/]+$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/threads/[^/]+/messages$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/threads/[^/]+/messages$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/budget$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/budget/history$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/releases$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/releases/[^/]+$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/releases/[^/]+/deployments$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/events$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/agents$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/agents$" 1;
+      "~^GET /land/[^/]+/v1/lands/v1/lands/[^/]+/agents/[^/]+$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/agents/[^/]+/refresh$" 1;
+      "~^POST /land/[^/]+/v1/lands/v1/lands/[^/]+/agents/[^/]+/revoke$" 1;
+      "~^GET /land/[^/]+/v1/me$" 1;
+      "~^GET /land/[^/]+/v1/beads$" 1;
+      "~^GET /land/[^/]+/v1/beads/[^/]+$" 1;
+      "~^GET /land/[^/]+/v1/batch/beads$" 1;
+      "~^GET /land/[^/]+/v1/beads/[^/]+/dependencies$" 1;
+      "~^GET /land/[^/]+/v1/beads/[^/]+/dependents$" 1;
+      "~^GET /land/[^/]+/v1/beads/[^/]+/mentions$" 1;
+      "~^GET /land/[^/]+/v1/beads/[^/]+/mentioned-by$" 1;
+      "~^GET /land/[^/]+/v1/beads/[^/]+/comments$" 1;
+      "~^POST /land/[^/]+/v1/search/semantic$" 1;
+      "~^POST /land/[^/]+/v1/beads$" 1;
+      "~^PATCH /land/[^/]+/v1/beads/[^/]+$" 1;
+      "~^POST /land/[^/]+/v1/beads/[^/]+/close$" 1;
+      "~^POST /land/[^/]+/v1/beads/[^/]+/comments$" 1;
+      "~^POST /land/[^/]+/v1/beads/[^/]+/dependencies$" 1;
+      "~^DELETE /land/[^/]+/v1/beads/[^/]+/dependencies$" 1;
+      "~^POST /land/[^/]+/v1/beads/[^/]+/labels$" 1;
+      "~^DELETE /land/[^/]+/v1/beads/[^/]+/labels/[^/]+$" 1;
+      "~^GET /land/[^/]+/v1/agents/roster$" 1;
+      "~^GET /land/[^/]+/v1/agents-by-name/[^/]+$" 1;
+      "~^POST /land/[^/]+/v1/windows$" 1;
+      "~^GET /land/[^/]+/v1/windows$" 1;
+      "~^DELETE /land/[^/]+/v1/windows/[^/]+$" 1;
+      "~^GET /land/[^/]+/v1/windows/preview$" 1;
+    }
+
+    # Where the land door forwards a land (landgate v0, gd-ParwLpmgID): the
+    # land's own landgate once one runs (gardenio chart landgate.lands), the
+    # daemon otherwise. Add a land here only after its landgate is Ready, and
+    # only as `<name> gardenio-landgate-<name>.gardenio.svc.cluster.local:8080;`
+    # (the chart test pins the shape, so a land can never be sent to another
+    # land's gate).
+    map $land_door_name $land_door_upstream {
+      default gardenio-beads.gardenio.svc.cluster.local:8080;
+      scopetest gardenio-landgate-scopetest.gardenio.svc.cluster.local:8080;
+    }
+
+    # runners.clonk.tv's route allowlist: kbeads' runnerAllowedPatterns
+    # (kbeads/internal/server/runner_auth.go), the routes the daemon lets a
+    # runner token call. The chart's Traefik route renders the same list
+    # (templates/beads/runner-ingress.yaml); the chart test holds both to
+    # runner_auth.go. A route is METHOD and the decoded, merged $uri the daemon
+    # will route on, each mux wildcard one path segment ({name...} the rest
+    # of the path). Everything else on the host is 404.
+    map "$request_method $uri" $runner_route {
+      default 0;
+      "~^POST /v1/runners/[^/]+/heartbeat$" 1;
+      "~^GET /v1/runners/[^/]+$" 1;
+      "~^GET /v1/events/stream$" 1;
+      "~^GET /v1/beads$" 1;
+      "~^GET /v1/beads/[^/]+$" 1;
+      "~^GET /v1/beads/[^/]+/comments$" 1;
+      "~^GET /v1/beads/[^/]+/dependencies$" 1;
+      "~^GET /v1/beads/[^/]+/dependents$" 1;
+      "~^POST /v1/beads$" 1;
+      "~^PATCH /v1/beads/[^/]+$" 1;
+      "~^POST /v1/beads/[^/]+/close$" 1;
+      "~^POST /v1/beads/[^/]+/comments$" 1;
+      "~^POST /v1/hooks/emit$" 1;
+      "~^POST /v1/escalations/[^/]+/result$" 1;
+      "~^GET /v1/configs$" 1;
+      "~^GET /v1/configs/.+$" 1;
+      "~^GET /v1/me$" 1;
+      "~^GET /v1/agents-by-name/[^/]+$" 1;
+      "~^POST /v1/beads/[^/]+/dependencies$" 1;
+      "~^DELETE /v1/beads/[^/]+/dependencies$" 1;
+      "~^POST /v1/search/semantic$" 1;
+      "~^GET /v1/escalations$" 1;
+      "~^GET /v1/batch/beads$" 1;
+      "~^POST /v1/beads/[^/]+/labels$" 1;
+      "~^DELETE /v1/beads/[^/]+/labels/[^/]+$" 1;
+      "~^POST /v1/agents/[^/]+/gates/[^/]+/satisfy$" 1;
+    }
+
+    # A runner bearer (runnerTokenPrefix "gr_", runners.go): the only
+    # credential runners.clonk.tv forwards on those routes. The daemon still
+    # looks the token up; this keeps every other bearer off the host.
+    map $http_authorization $runner_bearer {
+      default 0;
+      "~^Bearer gr_" 1;
+    }
+
+    # runners.clonk.tv, per client IP, before anything reaches the daemon.
+    # Runner routes: as the chart's Traefik route (average 20/s, burst 40).
+    # Registration (spec §10: 10 an hour per IP): nginx's finest rate is one
+    # a minute, so the edge lets 10 through at once and then one a minute;
+    # the daemon's registerLimiter (runners.go) holds the hourly 10.
+    limit_req_zone $binary_remote_addr zone=runner_per_ip:10m rate=20r/s;
+    limit_req_zone $binary_remote_addr zone=runner_register_per_ip:10m rate=1r/m;
+
+    # Front-door pages on gardenio.clonk.tv (Lands Track B 7.8): the pages a
+    # visitor reaches with no session, or signed in with no admitted group.
+    # Per client IP, applied before any sign-in check. Named for the class of
+    # page, not for /lands/: every such location on this host shares it.
+    limit_req_zone $binary_remote_addr zone=front_door_per_ip:10m rate=5r/s;
+    # Requests in flight per client IP on the Window (^~ /w/, plan
+    # gd-pz87vf3xsB PW.5), the one front-door page anyone holding a link can
+    # load with no account.
+    limit_conn_zone $binary_remote_addr zone=front_door_conn_per_ip:10m;
+
+    # The access log never carries a window token (Window PW-D9): the link is
+    # the credential. /w/<token>/rest is logged as /w/-/rest, query dropped.
+    # Keyed on the normalised $uri, not the raw $request_uri, so every
+    # spelling nginx routes to ^~ /w/ (//w/, /%77/) is caught. A Referer that
+    # names a window is cut the same way (the page sends none, no-referrer).
+    # The image's nginx.conf logs "main" (the full request line) at http
+    # level, so every server below sets its own access_log with this format;
+    # TestPublicEdge_WindowLocation fails the build on a server that does not.
+    map $uri $log_uri {
+      default                          $request_uri;
+      "~^/w/[^/]*(?<log_window_rest>/[^?]*)?$" /w/-$log_window_rest;
+    }
+    map $http_referer $log_referer {
+      default                  $http_referer;
+      "~*^[a-z]+://[^/]*/+(w|%77)/" /w/-;
+    }
+    log_format redacted '$remote_addr - $remote_user [$time_local] "$request_method $log_uri $server_protocol" '
+                        '$status $body_bytes_sent "$log_referer" "$http_user_agent" "$http_x_forwarded_for"';
+
+    # auth.clonk.tv: per client IP on the browser-facing realm paths (login,
+    # GitHub broker, registration, login actions, resources). The back-channel
+    # endpoints map to an empty key, which limit_req does not count: the
+    # cluster calls them through this host from a few node addresses
+    # (forwardauth's code redeem and cookie refresh, every OIDC verifier's
+    # discovery and JWKS fetch, machine principals' client_credentials), so a
+    # per-IP limit there would throttle every signed-in user at once.
+    map $uri $auth_limit_key {
+      default                                                                       $binary_remote_addr;
+      "~^/auth/realms/gardenio/protocol/openid-connect/(token|certs|userinfo|token/introspect)$" "";
+      "~^/auth/realms/gardenio/\.well-known/"                                       "";
+    }
+    limit_req_zone $auth_limit_key zone=auth_per_ip:10m rate=10r/s;
+
+    # auth.clonk.tv /gardenio/become/?email=<tenant> (one-click Become,
+    # gd-VIm9kMDswf) opened from another site: the page would turn the admin's
+    # browser into that tenant on a click they never meant. Only the start
+    # (any query) is checked: the return from Keycloak comes back on the
+    # fragment with no query, and may come through GitHub's sign-in, which is
+    # cross-site. Keyed on the whole query, not $arg_email: nginx matches arg
+    # names undecoded, but become.js's URLSearchParams decodes them, so
+    # ?%65mail= would get past an $arg_email check.
+    map "$http_sec_fetch_site:$args" $become_cross_site {
+      default          0;
+      "~^cross-site:." 1;
+    }
+
+    # Upstreams are resolved per request (variables below), so nginx starts
+    # even when a backend Service does not exist yet. 10.43.0.10 = kube-dns.
+    resolver 10.43.0.10 valid=30s ipv6=off;
+
+    server_tokens off;
+    client_max_body_size 1m;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffer_size 16k;
+    proxy_buffers 8 16k;
+
+    ssl_certificate     /etc/nginx/tls/tls.crt;
+    ssl_certificate_key /etc/nginx/tls/tls.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:PUBEDGE:2m;
+    ssl_session_timeout 1h;
+
+    # Plain HTTP (hostPort 80): redirect-only. A browser that types a bare
+    # name, or follows an http:// link, used to hang (nothing listened on 80).
+    # Only the names this edge serves get a 301 to the same host over https;
+    # anything else is closed without a response. No content, no proxying and
+    # no sign-in happen on 80, and the edge probe accepts 80 only when it
+    # answers exactly this way.
+    server {
+      listen 8080 default_server;
+      server_name _;
+      access_log /dev/stdout redacted;
+      return 444;
+    }
+
+    server {
+      listen 8080;
+      server_name api.clonk.tv auth.clonk.tv claimlayer.clonk.tv clonk.tv dashboard.clonk.tv gardenio.clonk.tv grafana.clonk.tv hooks.clonk.tv mux.clonk.tv runners.clonk.tv www.clonk.tv;
+      access_log /dev/stdout redacted;
+      location / { return 301 https://$host$request_uri; }
+    }
+
+    # Anything that is not one of the names below.
+    server {
+      listen 8443 ssl default_server;
+      http2 on;
+      server_name _;
+      access_log /dev/stdout redacted;
+      ssl_reject_handshake on;
+      return 421;
+    }
+
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name claimlayer.clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      if ($public_edge_bad_path) { return 400; }
+
+      location / {
+        set $up_demo claimlayer-demo-auth.claimlayer-demo.svc.cluster.local:80;
+        proxy_pass http://$up_demo;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+      }
+    }
+
+    # clonk.tv: the splash from the landing Service (see the header). No
+    # sign-in and no session: GET and HEAD only, per-IP rate-limited like the
+    # front-door pages on gardenio.clonk.tv, and nothing of the client's
+    # session reaches the landing nginx. The landing image sets the caching
+    # (index.html no-cache, the ?v=<hash> assets a year).
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      if ($public_edge_bad_path) { return 400; }
+      if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+
+      location / {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+
+        set $up_landing gardenio-landing.gardenio.svc.cluster.local:80;
+        proxy_pass http://$up_landing;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+    }
+
+    # www.clonk.tv: redirect only, to the apex on the same path.
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name www.clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      if ($public_edge_bad_path) { return 400; }
+
+      location / { return 301 https://clonk.tv$request_uri; }
+    }
+
+    # hooks.clonk.tv: GitHub App webhook deliveries (cost plan 2026-10-21 C4;
+    # was Traefik on the servers' public IPs). No sign-in: trigger-engine
+    # (/webhooks/) and github-bridge (/webhook, gd-blqlgxJmap) verify each
+    # delivery's HMAC. Defence in depth: only GitHub's `hooks`
+    # IPv4 ranges (`gh api meta --jq .hooks`, 2026-10-11; re-check on failed
+    # deliveries) and only POST. The edge pod sees the real client address
+    # (hostPort, no SNAT), as the per-IP limits above rely on.
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name hooks.clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      location /webhooks/ {
+        allow 192.30.252.0/22;
+        allow 185.199.108.0/22;
+        allow 140.82.112.0/20;
+        allow 143.55.64.0/20;
+        allow 9.234.98.160/28;
+        allow 9.234.98.176/28;
+        allow 9.234.106.48/28;
+        deny all;
+        limit_except POST { deny all; }
+        client_max_body_size 25m;
+        set $up_hooks gardenio-trigger-engine.gardenio.svc.cluster.local:8094;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_pass http://$up_hooks;
+      }
+      # The gardenio-io App webhook (wake on CI). The chart's github-bridge
+      # IngressRoute is on Traefik, which no DNS name reaches.
+      location = /webhook {
+        allow 192.30.252.0/22;
+        allow 185.199.108.0/22;
+        allow 140.82.112.0/20;
+        allow 143.55.64.0/20;
+        allow 9.234.98.160/28;
+        allow 9.234.98.176/28;
+        allow 9.234.106.48/28;
+        deny all;
+        limit_except POST { deny all; }
+        client_max_body_size 25m;
+        set $up_ghbridge gardenio-github-bridge.gardenio.svc.cluster.local:8101;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_pass http://$up_ghbridge;
+      }
+      location / { return 404; }
+    }
+
+    # runners.clonk.tv: the public runner listener (see the header). No
+    # sign-in check and no redirect: the runner token is the credential, and
+    # the daemon judges it. The two forwarding locations each set everything
+    # they need (nginx does not inherit proxy_set_header into a location that
+    # sets its own).
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name runners.clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      if ($public_edge_bad_path) { return 400; }
+      # Bead descriptions and comment bodies can be large.
+      client_max_body_size 8m;
+
+      # Registration: an invite code in the body, no bearer yet. POST only.
+      location = /v1/runners/register {
+        if ($request_method != POST) { return 404; }
+        limit_req zone=runner_register_per_ip burst=9 nodelay;
+        limit_req_status 429;
+
+        set $up_runner_beads gardenio-beads.gardenio.svc.cluster.local:8080;
+        proxy_pass http://$up_runner_beads;
+        proxy_set_header Host              $host;
+        proxy_set_header Connection        "";
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        # Overwrites any client-sent value: on this listener the daemon
+        # refuses every bearer but a runner token (runnerAuthMiddleware).
+        proxy_set_header X-Gardenio-Listener runner;
+        # Nothing from the internet may name an identity, a land or an edge
+        # envelope; the runner's own Authorization goes through.
+        proxy_set_header Cookie                      "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Actor                 "";
+        proxy_set_header X-Fleet                 "";
+        proxy_set_header X-System-Operator       "";
+        proxy_set_header X-Owner-Override        "";
+        proxy_set_header X-Operated-By           "";
+        proxy_set_header X-Edge-Auth-Ts          "";
+        proxy_set_header X-Edge-Auth-Sig         "";
+        proxy_set_header X-Edge-Auth-Version     "";
+        proxy_set_header X-Auth-Request-User     "";
+        proxy_set_header X-Auth-Request-Email    "";
+        proxy_set_header X-Auth-Request-Groups   "";
+        proxy_set_header X-Land-Door             "";
+      }
+
+      # The runner routes: a runner bearer on a route in $runner_route, or
+      # 404 (before the rate limit counts it). The event stream is
+      # Server-Sent Events, so nothing is buffered.
+      location ^~ /v1/ {
+        if ($runner_route = 0) { return 404; }
+        if ($runner_bearer = 0) { return 404; }
+        limit_req zone=runner_per_ip burst=40 nodelay;
+        limit_req_status 429;
+
+        set $up_runner_beads gardenio-beads.gardenio.svc.cluster.local:8080;
+        proxy_pass http://$up_runner_beads;
+        proxy_set_header Host              $host;
+        proxy_set_header Connection        "";
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Gardenio-Listener runner;
+        proxy_set_header Cookie                      "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Actor                 "";
+        proxy_set_header X-Fleet                 "";
+        proxy_set_header X-System-Operator       "";
+        proxy_set_header X-Owner-Override        "";
+        proxy_set_header X-Operated-By           "";
+        proxy_set_header X-Edge-Auth-Ts          "";
+        proxy_set_header X-Edge-Auth-Sig         "";
+        proxy_set_header X-Edge-Auth-Version     "";
+        proxy_set_header X-Auth-Request-User     "";
+        proxy_set_header X-Auth-Request-Email    "";
+        proxy_set_header X-Auth-Request-Groups   "";
+        proxy_set_header X-Land-Door             "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+      }
+
+      # /health, /metrics, every other path.
+      location / { return 404; }
+    }
+
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name auth.clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      if ($public_edge_bad_path) { return 400; }
+      # Inherited by every block below. A login page is one document plus
+      # ~10 resources, so the burst covers a few page loads at once.
+      limit_req zone=auth_per_ip burst=40 nodelay;
+      limit_req_status 429;
+
+      location ^~ /auth/realms/gardenio/ {
+        set $up_kc gardenio-keycloak-runtime.gardenio.svc.cluster.local:8080;
+        proxy_pass http://$up_kc;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Port  443;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+      }
+
+      location ^~ /auth/resources/ {
+        limit_except GET HEAD { deny all; }
+        set $up_kc gardenio-keycloak-runtime.gardenio.svc.cluster.local:8080;
+        proxy_pass http://$up_kc;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Port  443;
+      }
+
+      # Sign-in round trip (start, callback, sign_out) on this host, for the
+      # realm admin console below only.
+      location ^~ /oauth2/ {
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa;
+        proxy_set_header Host                    $host;
+        proxy_set_header X-Forwarded-Proto       https;
+        proxy_set_header X-Forwarded-Host        $host;
+        proxy_set_header X-Forwarded-For         $remote_addr;
+        proxy_set_header X-Auth-Request-Redirect $request_uri;
+        proxy_set_header Authorization           "";
+      }
+
+      # Internal: a client cannot call it directly and read its headers. A 403
+      # (signed in, not in /gardenio-admins) passes through as 403.
+      location = /oauth2/auth {
+        internal;
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa/oauth2/auth?allowed_groups=%2Fgardenio-admins;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length    "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Uri   $request_uri;
+        # forwardauth runs --skip-jwt-bearer-tokens: the console's own bearer
+        # (or a forged one) would otherwise stand in for the cookie session.
+        proxy_set_header Authorization     "";
+      }
+
+      location @signin {
+        if ($edge_signin_scripted) { return 401; }
+        return 302 https://$host/oauth2/start?rd=$scheme://$host$request_uri;
+      }
+
+      # The gardenio realm's admin console and the admin API it calls (owner
+      # decision gd-papvgFfwMf), for Users > <user> > Impersonate
+      # (gardenio/docs/lands/admin-impersonation.md). It must be served on this
+      # host: Keycloak sets the impersonated session's cookie on the host the
+      # console was loaded from. Two checks: the edge sign-in above
+      # (/gardenio-admins), then Keycloak's own admin token, which the console
+      # sends as Authorization and which therefore passes through to Keycloak.
+      # A gardenio-realm token can manage only the gardenio realm, and the
+      # master realm's console and API stay 404 (location / below).
+      location ~ ^/auth/admin/(gardenio/console|realms/gardenio)(/.*)?$ {
+        auth_request /oauth2/auth;
+        error_page 401 = @signin;
+        auth_request_set $edge_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $edge_cookie;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        set $up_kc gardenio-keycloak-runtime.gardenio.svc.cluster.local:8080;
+        proxy_pass http://$up_kc;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Port  443;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+      }
+
+      # Two read-only endpoints outside the realm path that the console calls
+      # on load: the server info, and the realm list (Keycloak answers only the
+      # realms the token may see, so gardenio). Same two checks.
+      location ~ ^/auth/admin/(serverinfo|realms)$ {
+        limit_except GET HEAD { deny all; }
+        auth_request /oauth2/auth;
+        error_page 401 = @signin;
+        auth_request_set $edge_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $edge_cookie;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        set $up_kc gardenio-keycloak-runtime.gardenio.svc.cluster.local:8080;
+        proxy_pass http://$up_kc;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Port  443;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+      }
+
+      # One-click Become (plan gd-0SUIdKXWV3, gd-VIm9kMDswf): a static page
+      # (ConfigMap public-edge-become below) that signs the admin in to the
+      # public client gardenio-become and calls the realm admin API's
+      # impersonation endpoint, same origin, through the console locations
+      # above. It must be on this host for the same reason as the console. The
+      # same /gardenio-admins sign-in check; Keycloak's admin API is still the
+      # real gate (the role and the client's scope). Read-only, no store, and
+      # a CSP that runs only this page's own script and lets it call only this
+      # host.
+      location = /gardenio/become {
+        return 301 https://$host/gardenio/become/$is_args$args;
+      }
+      location ^~ /gardenio/become/ {
+        limit_except GET HEAD { deny all; }
+        error_page 429 = @become_busy;
+        if ($become_cross_site) { return 403 '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>Start Become from /garden</title></head><body><main><h1>Start Become from /garden</h1><p>This link was opened from another site, so it did not run. Continue only if you meant to become this tenant.</p><p><a href="">Continue</a> &middot; <a href="https://gardenio.clonk.tv/garden">Back to /garden</a></p></main></body></html>'; }
+        auth_request /oauth2/auth;
+        error_page 401 = @signin;
+        auth_request_set $edge_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $edge_cookie;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" always;
+        add_header Cache-Control "no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        types {
+          text/html       html;
+          text/javascript js;
+          text/css        css;
+        }
+        default_type text/html;
+        alias /usr/share/nginx/become/;
+        index index.html;
+      }
+      location @become_busy {
+        default_type text/html;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header Retry-After 60 always;
+        return 429 '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>Too many requests</title></head><body><main><h1>Too many requests</h1><p>auth.clonk.tv is limiting requests from your address. Wait a minute, then open Become again from /garden.</p><p><a href="https://gardenio.clonk.tv/garden">Back to /garden</a></p></main></body></html>';
+      }
+
+      # Edge-probe positive control (plan ziti-to-keycloak, Task 1). Open on
+      # purpose and harmless: the external probes must classify it OPEN, or
+      # the probes themselves are broken. Never serve anything else here.
+      location = /__edge_canary {
+        default_type text/plain;
+        return 200 "edge-canary-open\n";
+      }
+
+      # /auth/admin/ (the master console), /auth/admin/master/,
+      # /auth/admin/realms/<any other realm>/, /auth/realms/master, metrics,
+      # health, everything else.
+      location / { return 404; }
+    }
+
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name grafana.clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      if ($public_edge_bad_path) { return 400; }
+
+      # Sign-in round trip (start, callback, sign_out) on this host.
+      location ^~ /oauth2/ {
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa;
+        proxy_set_header Host                    $host;
+        proxy_set_header X-Forwarded-Proto       https;
+        proxy_set_header X-Forwarded-Host        $host;
+        proxy_set_header X-Forwarded-For         $remote_addr;
+        proxy_set_header X-Auth-Request-Redirect $request_uri;
+        proxy_set_header Authorization           "";
+      }
+
+      # Internal: a client cannot call it directly and read its headers. A 403
+      # (signed in, not in /gardenio-admins) passes through as 403.
+      location = /oauth2/auth {
+        internal;
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa/oauth2/auth?allowed_groups=%2Fgardenio-admins;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length    "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Uri   $request_uri;
+        # forwardauth runs --skip-jwt-bearer-tokens: a client-sent bearer JWT
+        # would otherwise sign the request in without a cookie session.
+        proxy_set_header Authorization     "";
+      }
+
+      location @signin {
+        return 302 https://$host/oauth2/start?rd=$scheme://$host$request_uri;
+      }
+
+      # nginx does not inherit proxy_set_header into a location that sets its
+      # own, so this location sets everything it needs.
+      location / {
+        auth_request /oauth2/auth;
+        error_page 401 = @signin;
+        auth_request_set $edge_email $upstream_http_x_auth_request_email;
+
+        # Expire Grafana's own session cookies (gd-JXjqvnKU8u). Grafana's OIDC
+        # login (on 10-12 to 10-19) left grafana_session and
+        # grafana_session_expiry in browsers for up to 30 days. Grafana 11.4's
+        # frontend sees the expiry cookie, POSTs /api/user/auth-tokens/rotate,
+        # gets 401 "user token not found" (auth-proxy users have no token, and
+        # that 401 deletes no cookie) and reloads the page: forever, in every
+        # garden and /costs frame. Auth proxy issues no such cookie, so nothing
+        # valid is lost. Delete these lines only if Grafana ever turns on
+        # auth.proxy enable_login_token or its own login again.
+        # add_header here stops the server-level HSTS inheriting, so restate it.
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header Set-Cookie "grafana_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax" always;
+        add_header Set-Cookie "grafana_session_expiry=; Path=/; Max-Age=0; Secure; SameSite=Lax" always;
+
+        set $up_grafana gardenio-grafana.gardenio.svc.cluster.local:3000;
+        proxy_pass http://$up_grafana;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # The edge's identity overwrites anything the client sent. Grafana
+        # does its own OIDC login (defence in depth); it does not read these.
+        proxy_set_header X-Auth-Request-Email $edge_email;
+        proxy_set_header X-Auth-Request-User  "";
+        proxy_set_header X-Forwarded-Email    "";
+        # Cookie-session host: the client's own Authorization never reaches
+        # the backend (the edge sign-in is the only credential here).
+        proxy_set_header Authorization        "";
+        # Grafana Live is a WebSocket.
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+      }
+    }
+
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name dashboard.clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      if ($public_edge_bad_path) { return 400; }
+
+      # Sign-in round trip (start, callback, sign_out) on this host.
+      location ^~ /oauth2/ {
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa;
+        proxy_set_header Host                    $host;
+        proxy_set_header X-Forwarded-Proto       https;
+        proxy_set_header X-Forwarded-Host        $host;
+        proxy_set_header X-Forwarded-For         $remote_addr;
+        proxy_set_header X-Auth-Request-Redirect $request_uri;
+        proxy_set_header Authorization           "";
+      }
+
+      # Internal: a client cannot call it directly and read its headers. A 403
+      # (signed in, not in /gardenio-admins) passes through as 403.
+      location = /oauth2/auth {
+        internal;
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa/oauth2/auth?allowed_groups=%2Fgardenio-admins;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length    "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Uri   $request_uri;
+        # forwardauth runs --skip-jwt-bearer-tokens: a client-sent bearer JWT
+        # would otherwise sign the request in without a cookie session.
+        proxy_set_header Authorization     "";
+      }
+
+      location @signin {
+        return 302 https://$host/oauth2/start?rd=$scheme://$host$request_uri;
+      }
+
+      # nginx does not inherit proxy_set_header into a location that sets its
+      # own, so this location sets everything it needs.
+      location / {
+        auth_request /oauth2/auth;
+        error_page 401 = @signin;
+        auth_request_set $edge_email $upstream_http_x_auth_request_email;
+
+        set $up_headlamp headlamp.headlamp.svc.cluster.local:80;
+        proxy_pass http://$up_headlamp;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # The edge's identity overwrites anything the client sent. Headlamp
+        # has no login and does not read these.
+        proxy_set_header X-Auth-Request-Email $edge_email;
+        proxy_set_header X-Auth-Request-User  "";
+        proxy_set_header X-Forwarded-Email    "";
+        # Cookie-session host: the client's own Authorization never reaches
+        # the backend (the edge sign-in is the only credential here).
+        proxy_set_header Authorization        "";
+        # Pod logs, exec and resource watches are WebSockets.
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+      }
+    }
+
+    # Script-issued requests (htmx / fetch / XHR) cannot follow the sign-in
+    # redirect: it ends at a cross-origin IdP page, so a 302 makes a write
+    # vanish with no error (gd-C2Sl6ClxAY). They get a plain 401 instead, which
+    # the viewer turns into a "session expired, your draft is kept" notice.
+    # Navigations (Sec-Fetch-Mode: navigate, or none on an old browser) keep
+    # the 302.
+    map "$http_hx_request:$http_sec_fetch_mode" $edge_signin_scripted {
+      default                         0;
+      "~^true:"                       1;
+      "~:(cors|same-origin|no-cors)$" 1;
+    }
+
+    # gardenio.clonk.tv: the beads viewer and admin panel. Same sign-in check
+    # as grafana.clonk.tv, then viewer-authproxy's edge-only listener (8097),
+    # which turns the identity below into the viewer's trust headers. The
+    # signed-in user's own access token goes along so the viewer's writes (the
+    # quick-spawn, escalation approve) are made as that person.
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name gardenio.clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      if ($public_edge_bad_path) { return 400; }
+
+      # The sign-in session cookie is split into ~4KB chunks, and the auth
+      # reply carries the access token plus a refreshed Set-Cookie.
+      large_client_header_buffers 4 32k;
+      proxy_buffer_size       32k;
+      proxy_buffers           8 32k;
+      proxy_busy_buffers_size 64k;
+
+      location ^~ /oauth2/ {
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa;
+        proxy_set_header Host                    $host;
+        proxy_set_header X-Forwarded-Proto       https;
+        proxy_set_header X-Forwarded-Host        $host;
+        proxy_set_header X-Forwarded-For         $remote_addr;
+        proxy_set_header X-Auth-Request-Redirect $request_uri;
+        proxy_set_header Authorization           "";
+      }
+
+      location = /oauth2/auth {
+        internal;
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa/oauth2/auth?allowed_groups=%2Fgardenio-admins,%2Flands-tenants,%2Fproject-claimlayer,%2Fproject-claimlayer%2Fowners,%2Fproject-claimlayer%2Fguests,%2Fproject-scopetest,%2Fproject-scopetest%2Fowners,%2Fproject-scopetest%2Fguests;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length    "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Uri   $request_uri;
+        # forwardauth runs --skip-jwt-bearer-tokens: a client-sent bearer JWT
+        # would otherwise sign the request in without a cookie session.
+        proxy_set_header Authorization     "";
+      }
+
+      # The sign-in check for /lands/ only: the list above plus /invited
+      # (gd-ycE484kLyk). GitHub sign-in is invite-only, so a GitHub registrant
+      # reaches /lands/apply once their email invite is claimed (the Lands
+      # provisioner adds them to /invited), not before; the viewer's
+      # routeApplicant class still keeps them to their own data. The demo
+      # door, = /lands/demo and = /lands/accept, uses the check below instead.
+      # scripts/check-viewer-edge-groups.py fails the build if this list is not
+      # the one above plus /invited, if any location but ^~ /lands/ uses it,
+      # or if any viewer location uses a check with no allowed_groups.
+      location = /oauth2/auth-lands {
+        internal;
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa/oauth2/auth?allowed_groups=%2Fgardenio-admins,%2Flands-tenants,%2Finvited,%2Fproject-claimlayer,%2Fproject-claimlayer%2Fowners,%2Fproject-claimlayer%2Fguests,%2Fproject-scopetest,%2Fproject-scopetest%2Fowners,%2Fproject-scopetest%2Fguests;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length    "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Uri   $request_uri;
+        # forwardauth runs --skip-jwt-bearer-tokens: a client-sent bearer JWT
+        # would otherwise sign the request in without a cookie session.
+        proxy_set_header Authorization     "";
+      }
+
+      # The demo land's door only (gd-T37nCeWMhq = open): any signed-in
+      # account, GitHub registrants with no invite included, so a stranger can
+      # accept the terms at /lands/accept and ask for a demo pass at
+      # /lands/demo. The viewer keeps both to routeApplicant (the caller's own
+      # terms and pass only), and the pass is the real gate
+      # (demo-land.md: 1 per account, a cap on open passes, guests cannot
+      # spawn). No allowed_groups on purpose. scripts/check-viewer-edge-groups.py
+      # fails the build if any location but = /lands/demo and = /lands/accept
+      # uses it, or if it ever gains a group list.
+      location = /oauth2/auth-lands-demo {
+        internal;
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa/oauth2/auth;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length    "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Uri   $request_uri;
+        # forwardauth runs --skip-jwt-bearer-tokens: a client-sent bearer JWT
+        # would otherwise sign the request in without a cookie session.
+        proxy_set_header Authorization     "";
+      }
+
+      location @signin {
+        if ($edge_signin_scripted) { return 401; }
+        return 302 https://$host/oauth2/start?rd=$scheme://$host$request_uri;
+      }
+
+      # Signed in, but in no group the check above admits (a GitHub registrant
+      # before their land, Track B 2.2 step 4): a navigation goes to the front
+      # of house instead of a bare 403. A script still gets the 403.
+      location @lands_front {
+        if ($edge_signin_scripted) { return 403; }
+        return 302 https://$host/lands/;
+      }
+
+      # Signed in, but not invited and in no group the viewer admits: a plain
+      # page that says so, never a redirect (the sign-in would only come back
+      # here). A claimed invite reaches the session within forwardAuth's
+      # cookieRefresh, so "try again" is the honest next step. A script gets
+      # the bare 403. No error_page here: it would loop.
+      location @lands_need_invite {
+        if ($edge_signin_scripted) { return 403; }
+        default_type text/html;
+        add_header Cache-Control "no-store" always;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        return 403 '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>You need an invite</title></head><body style="margin:0;font:16px/1.5 system-ui,sans-serif"><main style="max-width:34rem;margin:12vh auto;padding:0 16px"><h1 style="font-size:1.6rem">You need an invite</h1><p>Gardenio Lands is invite-only. You are signed in, but this account has no invite yet.</p><p>If you were invited by email, sign in with a GitHub account that has that email address, and confirm the address when asked. It can take a few minutes after that before you are let in.</p><p><a href="">Try again</a> &middot; <a href="/oauth2/sign_out?rd=/lands/">Sign out</a> &middot; <a href="/lands/">Gardenio Lands</a></p></main></body></html>';
+      }
+
+      # The Lands front of house (Track B 7.8): invited people and the groups
+      # the viewer admits (/oauth2/auth-lands). The exact matches below (no
+      # session at all) win over this prefix. Same proxying as location /, so
+      # the viewer gets the caller's identity and token.
+      location ^~ /lands/ {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        auth_request /oauth2/auth-lands;
+        error_page 401 = @signin;
+        error_page 403 = @lands_need_invite;
+        auth_request_set $edge_email  $upstream_http_x_auth_request_email;
+        auth_request_set $edge_token  $upstream_http_x_auth_request_access_token;
+        auth_request_set $edge_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $edge_cookie;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # The edge's values overwrite anything the client sent.
+        proxy_set_header X-Auth-Request-Email        $edge_email;
+        proxy_set_header X-Auth-Request-Access-Token $edge_token;
+        proxy_set_header X-Auth-Request-User  "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email    "";
+        proxy_set_header Authorization "";
+      }
+
+      # The demo land's door (gd-T37nCeWMhq = open): any signed-in account
+      # may ask for a demo pass here, through /oauth2/auth-lands-demo; every
+      # other /lands/ path stays invite-only. Same proxying as ^~ /lands/.
+      # GET and POST, the viewer's two routes.
+      location = /lands/demo {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET POST { deny all; }
+        auth_request /oauth2/auth-lands-demo;
+        error_page 401 = @signin;
+        auth_request_set $edge_email  $upstream_http_x_auth_request_email;
+        auth_request_set $edge_token  $upstream_http_x_auth_request_access_token;
+        auth_request_set $edge_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $edge_cookie;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # The edge's values overwrite anything the client sent.
+        proxy_set_header X-Auth-Request-Email        $edge_email;
+        proxy_set_header X-Auth-Request-Access-Token $edge_token;
+        proxy_set_header X-Auth-Request-User  "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email    "";
+        proxy_set_header Authorization "";
+      }
+
+      # The terms page (routeApplicant: the caller's own terms only). The
+      # demo door wants the current terms accepted before it files a pass, so
+      # it is open to any signed-in account like = /lands/demo, or a stranger
+      # would hit "You need an invite" on the way to the pass.
+      location = /lands/accept {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET POST { deny all; }
+        auth_request /oauth2/auth-lands-demo;
+        error_page 401 = @signin;
+        auth_request_set $edge_email  $upstream_http_x_auth_request_email;
+        auth_request_set $edge_token  $upstream_http_x_auth_request_access_token;
+        auth_request_set $edge_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $edge_cookie;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # The edge's values overwrite anything the client sent.
+        proxy_set_header X-Auth-Request-Email        $edge_email;
+        proxy_set_header X-Auth-Request-Access-Token $edge_token;
+        proxy_set_header X-Auth-Request-User  "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email    "";
+        proxy_set_header Authorization "";
+      }
+
+      # nginx's own redirect for a bare /lands would name the listen port
+      # (8443), not 443.
+      location = /lands {
+        return 301 https://$host/lands/;
+      }
+
+      # No session needed (Track B 2.3): the landing page, the three legal
+      # documents and their stylesheet, which the viewer serves as routePublic
+      # (beads-viewer noSessionPatterns) and which carry nothing about the
+      # caller. GET and HEAD only. Nothing of a session reaches the viewer from
+      # here: the cookie and any bearer are dropped and the identity headers
+      # blanked, and viewer-authproxy lets exactly these paths through with no
+      # identity (its $bv_public). Keep the three lists equal.
+      location = /lands/ {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET { deny all; }
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+
+      location = /lands/terms {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET { deny all; }
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+
+      location = /lands/privacy {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET { deny all; }
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+
+      location = /lands/aup {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET { deny all; }
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+
+      location ^~ /lands/static/meadow/ {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET { deny all; }
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+
+      location ^~ /lands/static/homestead/ {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET { deny all; }
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+
+      # The splash (plan gd-EJGA3zDGCk, public since gd-hzRHm1KB5r): one
+      # document for everyone, reading no bead and no viewer, and the two files
+      # it fetches by hash. No session, GET and HEAD only, rate-limited and
+      # stripped of any session like the front of house above; the viewer
+      # serves them without a session (noSessionPatterns) and viewer-authproxy
+      # lets them through with no identity ($bv_public).
+      location = /garden/splash {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET { deny all; }
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+
+      location = /garden/splash/three.module.min.js {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET { deny all; }
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+
+      location = /garden/splash/still.png {
+        limit_req zone=front_door_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        limit_except GET { deny all; }
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+
+      # The Window (plan gd-pz87vf3xsB, PW.5): /w/<token> is a read-only page
+      # on one plan for anyone who holds the link, with no account. The token
+      # in the path is the credential: the viewer hands it to kbeads, which
+      # opens exactly one route for it. No session, GET and HEAD only, and
+      # nothing of a session reaches the viewer, as for the front of house
+      # above. viewer-authproxy lets it through with no identity by its own
+      # ^~ /w/ location, not $bv_public: the viewer serves it from its own
+      # pattern list, not noSessionPatterns. The front door's per-IP request
+      # limit (a visitor needs one page, then one plan.json every 20 s) plus
+      # a per-IP cap on requests in flight. The token reaches no log: the
+      # access log writes /w/- ($log_uri), and this location's error log is
+      # crit-only because nginx's error lines (a 429, an upstream failure)
+      # quote the whole request line.
+      #
+      # /w/<token>/live (PW.7, gd-nBkInNpy3r) is a long-lived event stream
+      # telling the page when the plan changed. It holds one of the ten
+      # connections; the viewer lets one address hold three streams. Never
+      # buffered here: viewer-authproxy honors the viewer's X-Accel-Buffering
+      # but hides that header from this hop, so this location says it itself
+      # (a page or plan.json just passes through unbuffered). The stream
+      # sends a keepalive every 15 s, inside the 60 s proxy_read_timeout of
+      # both hops, and the page falls back to its 20 s poll when it is
+      # refused or lost.
+      location ^~ /w/ {
+        limit_req zone=front_door_per_ip burst=10 nodelay;
+        limit_req_status 429;
+        limit_conn front_door_conn_per_ip 10;
+        limit_conn_status 429;
+        limit_except GET { deny all; }
+        error_log /dev/stderr crit;
+        proxy_buffering off;
+        # The viewer sends these too; the edge makes sure of them, so a link
+        # is never passed on in a Referer or indexed, whatever answers.
+        # add_header here drops the server's, so HSTS is restated.
+        proxy_hide_header Referrer-Policy;
+        proxy_hide_header X-Robots-Tag;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Cookie                      "";
+        proxy_set_header Authorization               "";
+        proxy_set_header X-Auth-Request-Email        "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Auth-Request-User         "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email           "";
+      }
+
+      # Slack account linking (gd-OZJ6H2S3xx): the ONLY path of slack-bridge
+      # exposed here (slackBridge.accountLink.publicURL). /slack/link/start
+      # redirects the person to the Keycloak sign-in and /slack/link/callback
+      # receives the code. No auth_request: the sign-in check below admits
+      # admins and project groups only and would refuse everyone else; the
+      # single-use state the bridge bound to the Slack user (10 min TTL) and the
+      # Keycloak sign-in itself are the authentication. Nothing of the viewer
+      # session reaches the bridge. Moved here from viewer-authproxy's ziti
+      # front door (8443) when ziti was switched off (gd-xNMLrsgajy). ^~ so it
+      # never falls into location /.
+      location ^~ /slack/link/ {
+        set $up_slack gardenio-slack-bridge.gardenio.svc.cluster.local:8090;
+        proxy_pass http://$up_slack;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+      }
+
+      location / {
+        auth_request /oauth2/auth;
+        error_page 401 = @signin;
+        error_page 403 = @lands_front;
+        # Identity and token come from oauth2-proxy's verified reply, never
+        # from the client.
+        auth_request_set $edge_email  $upstream_http_x_auth_request_email;
+        auth_request_set $edge_token  $upstream_http_x_auth_request_access_token;
+        auth_request_set $edge_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $edge_cookie;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+
+        set $up_viewer viewer-authproxy.gardenio.svc.cluster.local:8097;
+        proxy_pass http://$up_viewer;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # The edge's values overwrite anything the client sent.
+        proxy_set_header X-Auth-Request-Email        $edge_email;
+        proxy_set_header X-Auth-Request-Access-Token $edge_token;
+        proxy_set_header X-Auth-Request-User  "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email    "";
+        # No client bearer reaches the backend; viewer-authproxy builds the
+        # Authorization header from the token above.
+        proxy_set_header Authorization "";
+        # The activity feed is Server-Sent Events.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+      }
+    }
+
+    # mux.clonk.tv: the coopmux terminal (a shell into every agent). Same sign-in
+    # check as grafana.clonk.tv (/gardenio-admins ONLY, never widened to a
+    # project group, as the viewer's is; a project-scoped person is refused 403
+    # here; scripts/check-viewer-edge-groups.py fails the build otherwise), then viewer-authproxy's edge-only listener (8448),
+    # which injects the coopmux bearer so the browser never holds it. Published
+    # on the owner's answer to gd-jfXRKAn6Ez (S4b, gd-0e6aSFhxM5). It is its own
+    # host because the viewer and coopmux both serve /api/v1/.
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name mux.clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      if ($public_edge_bad_path) { return 400; }
+
+      large_client_header_buffers 4 32k;
+      proxy_buffer_size       32k;
+      proxy_buffers           8 32k;
+      proxy_busy_buffers_size 64k;
+
+      location ^~ /oauth2/ {
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa;
+        proxy_set_header Host                    $host;
+        proxy_set_header X-Forwarded-Proto       https;
+        proxy_set_header X-Forwarded-Host        $host;
+        proxy_set_header X-Forwarded-For         $remote_addr;
+        proxy_set_header X-Auth-Request-Redirect $request_uri;
+        proxy_set_header Authorization           "";
+      }
+
+      location = /oauth2/auth {
+        internal;
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa/oauth2/auth?allowed_groups=%2Fgardenio-admins;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length    "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Uri   $request_uri;
+        # forwardauth runs --skip-jwt-bearer-tokens: a client-sent bearer JWT
+        # would otherwise sign the request in without a cookie session.
+        proxy_set_header Authorization     "";
+      }
+
+      location @signin {
+        return 302 https://$host/oauth2/start?rd=$scheme://$host$request_uri;
+      }
+
+      # Defence in depth: viewer-authproxy refuses this too. The injected
+      # coopmux token is an admin token; it must not manage credentials.
+      location ^~ /api/v1/credentials {
+        return 403;
+      }
+
+      location / {
+        # Cross-site WebSocket hijack guard (see $mux_bad_origin).
+        if ($mux_bad_origin) { return 403; }
+
+        auth_request /oauth2/auth;
+        error_page 401 = @signin;
+        auth_request_set $edge_email  $upstream_http_x_auth_request_email;
+        auth_request_set $edge_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $edge_cookie;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        # This block sets its own headers, so the server-level ones do not
+        # inherit: the terminal must never be framed.
+        add_header X-Frame-Options DENY always;
+        add_header Content-Security-Policy "frame-ancestors 'none'" always;
+
+        set $up_mux viewer-authproxy.gardenio.svc.cluster.local:8448;
+        proxy_pass http://$up_mux;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+        # The edge's identity overwrites anything the client sent.
+        proxy_set_header X-Auth-Request-Email $edge_email;
+        proxy_set_header X-Auth-Request-User  "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email    "";
+        # Cookie-session host: no client bearer reaches the backend; the
+        # coopmux token is injected by viewer-authproxy.
+        proxy_set_header Authorization        "";
+        # Terminal I/O is a WebSocket plus long-lived streams.
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+      }
+    }
+
+    server {
+      listen 8443 ssl;
+      http2 on;
+      server_name api.clonk.tv;
+      access_log /dev/stdout redacted;
+      add_header Strict-Transport-Security "max-age=31536000" always;
+      if ($public_edge_bad_path) { return 400; }
+      # Bead descriptions and comment bodies can be large.
+      client_max_body_size 8m;
+
+      # Internal: a client cannot call it directly and read its headers. The
+      # request's Authorization header goes through to oauth2-proxy, which
+      # verifies the bearer JWT (--skip-jwt-bearer-tokens). 401 (no or bad
+      # token) and 403 (valid token, not in /gardenio-admins) pass through
+      # unchanged: there is no error_page on this host, so no redirect.
+      location = /oauth2/auth {
+        internal;
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa/oauth2/auth?allowed_groups=%2Fgardenio-admins;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length    "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Uri   $request_uri;
+        # Bearer-only host. oauth2-proxy falls back to the cookie session when
+        # the bearer is not a valid JWT (--bearer-token-login-fallback), and the
+        # _gardenio_oauth2 cookie is shared by every edge host, so a valid
+        # cookie plus a static token in Authorization would pass. No cookie and
+        # no forwarded access token ever reach it from this host.
+        proxy_set_header Cookie                      "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+      }
+
+      # The land door's sign-in check (Door D.2): the same bearer-JWT check,
+      # but it admits a member of the one land the path names, its owners and
+      # its guests (land roles are exclusive, gd-A9avO8cXBr), and nobody else,
+      # /gardenio-admins included. A bearer for another land gets 403.
+      # scripts/check-viewer-edge-groups.py fails the build if this list
+      # changes or another location uses it.
+      location = /oauth2/auth-land {
+        internal;
+        # Unreachable behind the 404 in ^~ /land/; kept so this check can
+        # never ask forwardauth about a group named "/project-".
+        if ($land_door_name = "") { return 403; }
+        # A minted land token is not a JWT: the daemon judges it (below).
+        # auth_request takes only a literal URI, so the branch lives here.
+        if ($land_door_land_token) { rewrite ^ /oauth2/auth-land-token last; }
+        set $up_fa gardenio-forwardauth.gardenio.svc.cluster.local:4180;
+        proxy_pass http://$up_fa/oauth2/auth?allowed_groups=%2Fproject-$land_door_name,%2Fproject-$land_door_name%2Fowners,%2Fproject-$land_door_name%2Fguests;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length    "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Uri   $request_uri;
+        # Bearer only, as for /oauth2/auth above.
+        proxy_set_header Cookie                      "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+      }
+
+      # The land door's land-token check (Door D.18a gd-WTyoLCSMUp), reached
+      # only from /oauth2/auth-land for a bearer $land_door_land_token marks.
+      # It asks the daemon itself, not $land_door_upstream, so the edge's
+      # check stays independent of the land's landgate: GET /v1/me with the
+      # caller's bearer and X-Land-Door. The daemon answers 200 for a land
+      # principal of this land, 403 for another land's or for a fleet or
+      # bridge token, 401 for a token it does not know (expired and revoked
+      # included); auth_request passes 401 and 403 through. Nothing is
+      # cached, so a revoke bites on the next request. The daemon does not
+      # count this check, marked by X-Land-Door-Check, against the land's
+      # rate limit (kbeads isLandDoorAuthCheck); the request it admits is
+      # counted, and every location that forwards a caller blanks the
+      # marker. Nothing but the bearer and the door names an identity: the
+      # land door's blanked set is blanked here too. scripts/check-viewer-edge-groups.py fails
+      # the build if any location auth_requests it directly.
+      location = /oauth2/auth-land-token {
+        internal;
+        if ($land_door_name = "") { return 403; }
+        set $up_beads_me gardenio-beads.gardenio.svc.cluster.local:8080;
+        proxy_pass http://$up_beads_me/v1/me;
+        proxy_method GET;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length    "";
+        proxy_set_header Connection        "";
+        proxy_set_header X-Land-Door       $land_door_name;
+        # Marks this as the door's own admission check, which the daemon
+        # leaves out of the rate limit (kbeads isLandDoorAuthCheck).
+        proxy_set_header X-Land-Door-Check 1;
+        proxy_set_header Cookie                      "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Actor                 "";
+        proxy_set_header X-Fleet                 "";
+        proxy_set_header X-System-Operator       "";
+        proxy_set_header X-Owner-Override        "";
+        proxy_set_header X-Operated-By           "";
+        proxy_set_header X-Edge-Auth-Ts          "";
+        proxy_set_header X-Edge-Auth-Sig         "";
+        proxy_set_header X-Edge-Auth-Version     "";
+        proxy_set_header X-Auth-Request-User     "";
+        proxy_set_header X-Auth-Request-Email    "";
+        proxy_set_header X-Auth-Request-Groups   "";
+        proxy_set_header X-Auth-Request-Preferred-Username "";
+        proxy_set_header X-Forwarded-Email       "";
+        proxy_set_header X-Forwarded-User        "";
+        proxy_set_header X-Trigger-Bead          "";
+        proxy_set_header X-User-Bead-Id          "";
+        proxy_set_header X-No-Owner-Default      "";
+        proxy_set_header X-No-Auto-Parent        "";
+        proxy_set_header X-No-Auto-Inherit       "";
+        proxy_set_header X-Force-Parent-Edge     "";
+      }
+
+      # The land door (Door D.2, owner decision gd-BTHHmA2rYc = edge-route):
+      # /land/<name>/v1/* is the daemon's /v1/* for the members of one land,
+      # so a tenant's kd, gb or gl points BEADS_HTTP_URL at
+      # https://api.clonk.tv/land/<name> and never learns a daemon address.
+      # The caller's own bearer goes through untouched; kbeads verifies it
+      # again and scopes it (scoped_principal.go), this is only the coarse
+      # gate. Only the routes on the land door's allowlist ($land_door_route,
+      # D.18) are forwarded: the Lands API and the daemon routes a tenant's
+      # agent loop (kd and gb) calls. The daemon's SSE streams, token routes,
+      # admin routes and machine-only hooks and embeddings are also 404 by
+      # name here, matched on the decoded path the daemon will route on; the
+      # land's own feed (D.9) has its own location. Everything else under
+      # /land/ is 404.
+      location ^~ /land/ {
+        location ~ "^/land/[a-z][a-z0-9-]{0,62}/v1/(bridge-tokens|fleet-tokens|auth|admin|hooks|embeddings)(/|$)" {
+          return 404;
+        }
+        location ~ "^/land/[a-z][a-z0-9-]{0,62}/v1/(events/stream|bus/events)(/|$)" {
+          return 404;
+        }
+
+        # The land feed (D.9 gd-Z9VVGjvzBk): the map's one event stream,
+        # /lands/v1/lands/<land>/events. It forwards like the door below, with
+        # no proxy buffering. Its per-land limits (new streams a second,
+        # streams open at once) are kbeads', after the sign-in check: here
+        # they would run before it (limit_req and limit_conn are preaccess),
+        # so garbage tokens could spend a land's share. kbeads ends each
+        # stream after five minutes (the access token's lifetime, checked
+        # once at connect); the client resumes with a fresh bearer and its
+        # cursor.
+        location ~ "^/land/[a-z][a-z0-9-]{0,62}/v1/lands/v1/lands/[a-z][a-z0-9-]{0,62}/events$" {
+          if ($land_door_name = "") { return 404; }
+          if ($land_door_route = 0) { return 404; }
+          limit_req zone=api_per_ip burst=20 nodelay;
+          limit_req_status 429;
+          auth_request /oauth2/auth-land;
+
+          set $up_land $land_door_upstream;
+          rewrite ^/land/[^/]+(/v1/.*)$ $1 break;
+          proxy_pass http://$up_land;
+          proxy_set_header Host              $host;
+          proxy_set_header Connection        "";
+          proxy_set_header X-Forwarded-Proto https;
+          proxy_set_header X-Forwarded-Host  $host;
+          proxy_set_header X-Forwarded-For   $remote_addr;
+          proxy_set_header X-Land-Door       $land_door_name;
+          proxy_set_header Cookie                      "";
+          proxy_set_header X-Auth-Request-Access-Token "";
+          proxy_set_header X-Actor                 "";
+          proxy_set_header X-Fleet                 "";
+          proxy_set_header X-System-Operator       "";
+          proxy_set_header X-Owner-Override        "";
+          proxy_set_header X-Operated-By           "";
+          proxy_set_header X-Edge-Auth-Ts          "";
+          proxy_set_header X-Edge-Auth-Sig         "";
+          proxy_set_header X-Edge-Auth-Version     "";
+          proxy_set_header X-Auth-Request-User     "";
+          proxy_set_header X-Auth-Request-Email    "";
+          proxy_set_header X-Auth-Request-Groups   "";
+          # Nor the agent-pod headers kbeads honours for a per-agent token, nor
+          # the admission check's marker (gd-Utbyy4xJRX; landgate scrub).
+          proxy_set_header X-Trigger-Bead          "";
+          proxy_set_header X-User-Bead-Id          "";
+          proxy_set_header X-No-Owner-Default      "";
+          proxy_set_header X-No-Auto-Parent        "";
+          proxy_set_header X-No-Auto-Inherit       "";
+          proxy_set_header X-Force-Parent-Edge     "";
+          proxy_set_header X-Land-Door-Check       "";
+          # Server-Sent Events: every frame goes out as it is written.
+          proxy_buffering off;
+          proxy_cache off;
+          proxy_read_timeout 360s;
+        }
+
+        location ~ "^/land/[a-z][a-z0-9-]{0,62}/v1/" {
+          # The decoded path and the raw request line must name the same
+          # land (see $land_door_name), and the route must be on the land
+          # door's allowlist (see $land_door_route).
+          if ($land_door_name = "") { return 404; }
+          if ($land_door_route = 0) { return 404; }
+          limit_req zone=api_per_ip burst=20 nodelay;
+          limit_req_status 429;
+          auth_request /oauth2/auth-land;
+
+          # set before rewrite: "break" stops the rewrite directives.
+          set $up_land $land_door_upstream;
+          rewrite ^/land/[^/]+(/v1/.*)$ $1 break;
+          proxy_pass http://$up_land;
+          proxy_set_header Host              $host;
+          proxy_set_header Connection        "";
+          proxy_set_header X-Forwarded-Proto https;
+          proxy_set_header X-Forwarded-Host  $host;
+          proxy_set_header X-Forwarded-For   $remote_addr;
+          # The land in the path (gd-eAfptUBh9Z, owner decision gd-zf6eceweED
+          # = per-land audiences): kbeads and landgate then require the
+          # bearer to be minted for exactly this land (aud land-<name>), so a
+          # user of two lands cannot reach the second through the first's
+          # door. It can only narrow, so it needs no signature; this replaces
+          # whatever the client sent.
+          proxy_set_header X-Land-Door       $land_door_name;
+          # As for ^~ /v1/ below: the daemon must take its OIDC path, so
+          # nothing from the internet may name an actor, fleet, operator,
+          # owner override or edge envelope.
+          proxy_set_header Cookie                      "";
+          proxy_set_header X-Auth-Request-Access-Token "";
+          proxy_set_header X-Actor                 "";
+          proxy_set_header X-Fleet                 "";
+          proxy_set_header X-System-Operator       "";
+          proxy_set_header X-Owner-Override        "";
+          proxy_set_header X-Operated-By           "";
+          proxy_set_header X-Edge-Auth-Ts          "";
+          proxy_set_header X-Edge-Auth-Sig         "";
+          proxy_set_header X-Edge-Auth-Version     "";
+          proxy_set_header X-Auth-Request-User     "";
+          proxy_set_header X-Auth-Request-Email    "";
+          proxy_set_header X-Auth-Request-Groups   "";
+          # Nor the agent-pod headers kbeads honours for a per-agent token, nor
+          # the admission check's marker (gd-Utbyy4xJRX; landgate scrub).
+          proxy_set_header X-Trigger-Bead          "";
+          proxy_set_header X-User-Bead-Id          "";
+          proxy_set_header X-No-Owner-Default      "";
+          proxy_set_header X-No-Auto-Parent        "";
+          proxy_set_header X-No-Auto-Inherit       "";
+          proxy_set_header X-Force-Parent-Edge     "";
+          proxy_set_header X-Land-Door-Check       "";
+        }
+
+        return 404;
+      }
+
+      # Never reachable from the internet: token management and admin routes
+      # (machine callers use the in-cluster Service), embeddings, and the two SSE
+      # streams (long-lived: they outlive the 5-minute access token; out of
+      # scope for this host). Exact and ^~ matches
+      # beat the /v1/ prefix below.
+      location ^~ /v1/bridge-tokens { return 404; }
+      location ^~ /v1/fleet-tokens  { return 404; }
+      location ^~ /v1/admin/        { return 404; }
+      location ^~ /v1/embeddings/   { return 404; }
+      location = /v1/events/stream  { return 404; }
+      location = /v1/bus/events     { return 404; }
+
+      # nginx does not inherit proxy_set_header into a location that sets its
+      # own, so this location sets everything it needs. The identity headers
+      # are blanked: the daemon honours X-Operated-By only on static-token
+      # calls and the X-Edge-Auth-* envelope is HMAC-signed, but nothing from
+      # the internet should be able to name them.
+      location ^~ /v1/ {
+        limit_req zone=api_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        auth_request /oauth2/auth;
+
+        set $up_beads gardenio-beads.gardenio.svc.cluster.local:8080;
+        proxy_pass http://$up_beads;
+        proxy_set_header Host              $host;
+        proxy_set_header Connection        "";
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        # A request that got past the edge is JWT-verified, so the daemon must
+        # take its OIDC path. These headers are honoured only on the static
+        # token path: blank them (and the cookie / forwarded access token that
+        # let a static token through the edge fallback) so a client cannot name
+        # an actor, fleet, system operator or owner override.
+        proxy_set_header Cookie                      "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Actor                 "";
+        proxy_set_header X-Fleet                 "";
+        proxy_set_header X-System-Operator       "";
+        proxy_set_header X-Owner-Override        "";
+        proxy_set_header X-Operated-By           "";
+        proxy_set_header X-Edge-Auth-Ts          "";
+        proxy_set_header X-Edge-Auth-Sig         "";
+        proxy_set_header X-Edge-Auth-Version     "";
+        proxy_set_header X-Auth-Request-User     "";
+        proxy_set_header X-Auth-Request-Email    "";
+        proxy_set_header X-Auth-Request-Groups   "";
+        # A caller may not pass a GET /v1/me as the land door's admission
+        # check, which the daemon leaves out of the rate limit.
+        proxy_set_header X-Land-Door-Check       "";
+      }
+
+      location = /health {
+        limit_req zone=api_per_ip burst=20 nodelay;
+        limit_req_status 429;
+        auth_request /oauth2/auth;
+
+        set $up_beads gardenio-beads.gardenio.svc.cluster.local:8080;
+        proxy_pass http://$up_beads;
+        proxy_set_header Host              $host;
+        proxy_set_header Connection        "";
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        # A request that got past the edge is JWT-verified, so the daemon must
+        # take its OIDC path. These headers are honoured only on the static
+        # token path: blank them (and the cookie / forwarded access token that
+        # let a static token through the edge fallback) so a client cannot name
+        # an actor, fleet, system operator or owner override.
+        proxy_set_header Cookie                      "";
+        proxy_set_header X-Auth-Request-Access-Token "";
+        proxy_set_header X-Actor                 "";
+        proxy_set_header X-Fleet                 "";
+        proxy_set_header X-System-Operator       "";
+        proxy_set_header X-Owner-Override        "";
+        proxy_set_header X-Operated-By           "";
+        proxy_set_header X-Edge-Auth-Ts          "";
+        proxy_set_header X-Edge-Auth-Sig         "";
+        proxy_set_header X-Edge-Auth-Version     "";
+        proxy_set_header X-Auth-Request-User     "";
+        proxy_set_header X-Auth-Request-Email    "";
+        proxy_set_header X-Auth-Request-Groups   "";
+      }
+
+      # /metrics, /v1-less paths, everything else.
+      location / { return 404; }
+    }
+---
+# The one-click Become page (plan gd-0SUIdKXWV3, gd-VIm9kMDswf), served by
+# auth.clonk.tv's ^~ /gardenio/become/ location from the mount below. nginx
+# reads these files on every request, so an edit to this ConfigMap goes live
+# within the kubelet's sync (about a minute) with no restart; a change to
+# default.conf above still needs one. Flow and refusals: become.js's header,
+# gardenio/docs/lands/admin-impersonation.md.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: public-edge-become
+  namespace: public-edge
+data:
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="referrer" content="no-referrer">
+    <title>Become a tenant</title>
+    <link rel="stylesheet" href="become.css">
+    <script src="become.js" defer></script>
+    </head>
+    <body>
+    <main>
+    <h1 id="title">Becoming a tenant</h1>
+    <p id="text">Starting.</p>
+    <noscript><p>This page needs JavaScript.</p></noscript>
+    <nav id="links"><a href="https://gardenio.clonk.tv/garden">Back to /garden</a></nav>
+    </main>
+    </body>
+    </html>
+  become.css: |
+    :root { color-scheme: light dark; --ink: #1d2320; --muted: #4c5751; --link: #1f5f8b; --paper: #fbfaf6; }
+    @media (prefers-color-scheme: dark) {
+      :root { --ink: #e6ebe7; --muted: #b3bdb7; --link: #8cc4ec; --paper: #141816; }
+    }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 system-ui, sans-serif; }
+    main { max-width: 34rem; margin: 12vh auto; padding: 0 16px; }
+    h1 { font-size: 1.6rem; margin: 0 0 0.5rem; overflow-wrap: anywhere; }
+    p { color: var(--muted); overflow-wrap: anywhere; }
+    nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; }
+    a { color: var(--link); }
+  become.js: |
+    // One-click Become (plan gd-0SUIdKXWV3, gd-VIm9kMDswf). An admin opens
+    // /gardenio/become/?email=<tenant>; this page signs them in silently to the
+    // public client gardenio-become (PKCE), refuses an unknown email, an admin
+    // and the admin's own account, makes the impersonation call the admin
+    // console's Impersonate button makes, then signs the browser out of
+    // gardenio.clonk.tv so /garden mints the tenant's session from the new SSO
+    // session. Same origin as Keycloak, so no CORS, and Keycloak sets the
+    // impersonated session's cookie on this host. Every failure says what
+    // happened and links back to /garden.
+    (() => {
+      'use strict';
+      const REALM = '/auth/realms/gardenio/protocol/openid-connect';
+      const ADMIN = '/auth/admin/realms/gardenio';
+      const CLIENT = 'gardenio-become';
+      const ADMINS = '/gardenio-admins';
+      const GARDEN = 'https://gardenio.clonk.tv/garden';
+      // Clears the admin's gardenio.clonk.tv cookie and Redis session; /garden
+      // then signs in again and Keycloak answers with the tenant.
+      const DONE = 'https://gardenio.clonk.tv/oauth2/sign_out?rd=%2Fgarden';
+      const HERE = location.origin + '/gardenio/become/';
+      const SAVED = 'gardenio-become';
+      // Group memberships read per user. A user with this many is refused: the
+      // page cannot tell they are not an admin.
+      const MAX_GROUPS = 500;
+      const LOGIN_NEEDED = ['login_required', 'interaction_required', 'consent_required'];
+
+      class Refusal extends Error {
+        constructor(title, text, links) {
+          super(title);
+          this.title = title;
+          this.text = text;
+          this.links = links || [];
+        }
+      }
+
+      function show(title, text, links) {
+        document.getElementById('title').textContent = title;
+        document.getElementById('text').textContent = text;
+        const nav = document.getElementById('links');
+        const items = (links || []).concat([['Back to /garden', GARDEN]]).map(([label, href]) => {
+          const a = document.createElement('a');
+          a.href = href;
+          a.textContent = label;
+          return a;
+        });
+        nav.replaceChildren(...items);
+      }
+
+      function b64url(bytes) {
+        let s = '';
+        for (const b of new Uint8Array(bytes)) s += String.fromCharCode(b);
+        return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      }
+
+      function random(n) {
+        return b64url(crypto.getRandomValues(new Uint8Array(n)));
+      }
+
+      // The access token's sub: who is signed in. Read, not verified: Keycloak
+      // verifies the token on every admin call, this only spots "yourself".
+      function subject(token) {
+        try {
+          const part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+          return JSON.parse(atob(part)).sub || '';
+        } catch (e) {
+          return '';
+        }
+      }
+
+      function checkStatus(res, what) {
+        if (res.ok) return res;
+        if (res.status === 429) {
+          throw new Refusal('Too many requests',
+            'auth.clonk.tv is limiting requests from your address. Wait a minute, then open Become again from /garden.');
+        }
+        if (res.status === 401) {
+          throw new Refusal('Your sign-in ran out',
+            'Open Become again from /garden to sign in again.');
+        }
+        if (res.status === 403) {
+          throw new Refusal('Keycloak refused',
+            'Keycloak answered 403 to ' + what + '. Your account needs the impersonation role, and the ' +
+            'gardenio-become client needs impersonation, view-users and query-users in scope.');
+        }
+        throw new Refusal('Something went wrong', 'Keycloak answered ' + res.status + ' to ' + what + '.');
+      }
+
+      async function call(method, path, token, what) {
+        let res;
+        try {
+          res = await fetch(path, {
+            method,
+            headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+            credentials: 'same-origin',
+            cache: 'no-store',
+          });
+        } catch (e) {
+          throw new Refusal('Could not reach Keycloak', 'The request to ' + what + ' failed: ' + e.message);
+        }
+        return checkStatus(res, what);
+      }
+
+      async function start() {
+        const query = new URLSearchParams(location.search);
+        const email = (query.get('email') || '').trim();
+        if (!/^[^\s@]+@[^\s@]+$/.test(email)) {
+          throw new Refusal('No one to become', 'This link names no tenant. Open Become from a tenant in /garden.');
+        }
+        const state = random(16);
+        const verifier = random(32);
+        const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+        sessionStorage.setItem(SAVED, JSON.stringify({ state, verifier, email }));
+        show('Becoming ' + email, 'Signing you in.');
+        const ask = new URLSearchParams({
+          client_id: CLIENT,
+          redirect_uri: HERE,
+          response_type: 'code',
+          response_mode: 'fragment',
+          scope: 'openid',
+          state,
+          code_challenge: challenge,
+          code_challenge_method: 'S256',
+        });
+        // Silent unless the admin asked to sign in (the link offered below).
+        if (query.get('login') !== '1') ask.set('prompt', 'none');
+        location.replace(REALM + '/auth?' + ask);
+      }
+
+      async function finish(back) {
+        // The code is single-use, but keep it out of history all the same.
+        history.replaceState(null, '', HERE);
+        let saved = null;
+        try {
+          saved = JSON.parse(sessionStorage.getItem(SAVED) || 'null');
+        } catch (e) {
+          saved = null;
+        }
+        sessionStorage.removeItem(SAVED);
+        if (!saved || !saved.state || back.get('state') !== saved.state) {
+          throw new Refusal('This sign-in did not start here', 'Open Become again from /garden.');
+        }
+        const email = saved.email;
+        const error = back.get('error');
+        if (LOGIN_NEEDED.includes(error)) {
+          throw new Refusal('You need to sign in first',
+            'Keycloak needs you to sign in before you can become ' + email + '.',
+            [['Sign in and try again', HERE + '?' + new URLSearchParams({ email, login: '1' })]]);
+        }
+        if (error || !back.get('code')) {
+          throw new Refusal('Sign-in failed', 'Keycloak answered ' + (error || 'no code') + '.');
+        }
+        show('Becoming ' + email, 'Looking them up.');
+
+        let res;
+        try {
+          res = await fetch(REALM + '/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              grant_type: 'authorization_code',
+              code: back.get('code'),
+              redirect_uri: HERE,
+              client_id: CLIENT,
+              code_verifier: saved.verifier,
+            }),
+            credentials: 'same-origin',
+            cache: 'no-store',
+          });
+        } catch (e) {
+          throw new Refusal('Could not reach Keycloak', 'The sign-in failed: ' + e.message);
+        }
+        if (res.status === 400) {
+          throw new Refusal('Sign-in failed', 'Keycloak would not finish the sign-in. Open Become again from /garden.');
+        }
+        const token = (await checkStatus(res, 'the sign-in').json()).access_token;
+        if (!token) throw new Refusal('Sign-in failed', 'Keycloak sent no token.');
+        const me = subject(token);
+
+        const found = await (await call('GET',
+          ADMIN + '/users?' + new URLSearchParams({ email, exact: 'true', briefRepresentation: 'true' }),
+          token, 'the user lookup')).json();
+        const users = (Array.isArray(found) ? found : [])
+          .filter((u) => (u.email || '').toLowerCase() === email.toLowerCase());
+        if (users.length === 0) {
+          throw new Refusal('No such tenant', 'No one in the gardenio realm has the email ' + email + '.');
+        }
+        if (users.length > 1) {
+          throw new Refusal('More than one account', 'More than one account has the email ' + email + ', so Become cannot tell which one you mean.');
+        }
+        const user = users[0];
+        if (!user.id || user.id === me) {
+          throw new Refusal('That is you', 'You cannot become yourself.');
+        }
+
+        const groups = await (await call('GET',
+          ADMIN + '/users/' + encodeURIComponent(user.id) + '/groups?' +
+            new URLSearchParams({ briefRepresentation: 'true', first: '0', max: String(MAX_GROUPS) }),
+          token, 'the group lookup')).json();
+        if (!Array.isArray(groups) || groups.length >= MAX_GROUPS) {
+          throw new Refusal('Could not check ' + email, 'Become could not read all of their groups, so it cannot tell they are not an admin.');
+        }
+        if (groups.some((g) => g.path === ADMINS || String(g.path || '').startsWith(ADMINS + '/'))) {
+          throw new Refusal('That is an admin', email + ' is a gardenio admin. Become works only for tenants.');
+        }
+
+        show('Becoming ' + email, 'Switching your session.');
+        await call('POST', ADMIN + '/users/' + encodeURIComponent(user.id) + '/impersonation', token, 'the impersonation');
+        location.replace(DONE);
+      }
+
+      async function main() {
+        const back = new URLSearchParams(location.hash.replace(/^#/, ''));
+        try {
+          if (back.has('state')) await finish(back);
+          else await start();
+        } catch (e) {
+          if (e instanceof Refusal) show(e.title, e.text, e.links);
+          else show('Something went wrong', String(e && e.message ? e.message : e));
+        }
+      }
+
+      main();
+    })();
+---
+# In-cluster name for the edge (gd-IvwS0KTj8x): pods cannot dial the edge EIP,
+# so a measuring agent pins gardenio.clonk.tv to this ClusterIP (curl --resolve,
+# Chromium --host-resolver-rules) and gets the production TLS, server blocks and
+# auth_request unchanged. No edge rule trusts a pod-network source. Rollback:
+# delete this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: public-edge
+  namespace: public-edge
+  labels: {app.kubernetes.io/name: public-edge}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: public-edge}
+  ports:
+    - {name: https, port: 443, targetPort: 8443, protocol: TCP}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: public-edge
+  namespace: public-edge
+  labels: {app.kubernetes.io/name: public-edge}
+spec:
+  replicas: 1
+  # hostPort: a second pod cannot start beside the first.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: public-edge}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: public-edge}
+    spec:
+      # The ziti edge node: on-demand, static EIP, its own SG.
+      nodeSelector: {gardenio.io/role: ziti-edge}
+      tolerations: [{key: gardenio.io/ziti-edge, operator: Equal, value: "true", effect: NoSchedule}]
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 101, runAsGroup: 101, seccompProfile: {type: RuntimeDefault}}
+      # Class from the gardenio chart (global.systemPriorityClass): the sign-in path,
+      # so a crew burst cannot leave it Pending (gd-2qjxTVMBkC).
+      priorityClassName: gardenio-system-critical
+      containers:
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - {name: https, containerPort: 8443, hostPort: 443, protocol: TCP}
+            # Redirect-only HTTP listener (see the port-80 server blocks).
+            - {name: http, containerPort: 8080, hostPort: 80, protocol: TCP}
+          readinessProbe: {tcpSocket: {port: https}, periodSeconds: 10}
+          livenessProbe: {tcpSocket: {port: https}, periodSeconds: 30}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: conf, mountPath: /etc/nginx/conf.d}
+            - {name: tls, mountPath: /etc/nginx/tls, readOnly: true}
+            - {name: become, mountPath: /usr/share/nginx/become, readOnly: true}
+      volumes:
+        - name: conf
+          configMap: {name: public-edge}
+        - name: become
+          configMap: {name: public-edge-become}
+        - name: tls
+          secret: {secretName: public-edge-tls}

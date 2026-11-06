@@ -1,0 +1,79 @@
+# cert-manager on the gardenio k3s cluster (release cert-manager, namespace
+# cert-manager, chart jetstack/cert-manager v1.16.2). Installed by hand on
+# 2026-09-18; this file is the record of its values from 2026-11-05 on.
+#
+#   helm upgrade cert-manager cert-manager --repo https://charts.jetstack.io \
+#     --version v1.16.2 -n cert-manager -f gardenio/helm/cert-manager/values-k3s.yaml \
+#     --kube-context gardenio-ssm --wait
+#
+# WHY THE WEBHOOK IS PINNED AND DOUBLED (2026-11-05): the gardenio chart
+# renders Certificates and Issuers, so every `helm upgrade gardenio` calls
+# webhook.cert-manager.io. With one unpinned webhook replica on a spot node, a
+# reclaim at 16:51:28Z took the webhook away just as the deployer rolled
+# 2026.309.18: the upgrade failed on "no endpoints available", the --atomic
+# rollback failed on the same call, and the release was left `failed`, which
+# the deployer treats as busy and skips forever. Two replicas on the two
+# on-demand platform agents (spread by hostname) plus a PDB keep it up
+# through a spot reclaim and through one on-demand node going away.
+#
+# BOTH labels, as for postgres in deploy-values/gardenio-k3s.yaml:
+# lifecycle=on-demand alone also matches the on-demand k3s server.
+
+crds:
+  enabled: true
+
+extraArgs:
+  # ACME DNS-01 route53 solver uses the node instance role (see
+  # gardenio/terraform/modules/k3s/main.tf).
+  - --issuer-ambient-credentials
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+tolerations: &agentToleration
+  - effect: NoSchedule
+    key: gardenio.agent
+    operator: Equal
+    value: "true"
+nodeSelector: &onDemandPlatform
+  kubernetes.io/os: linux
+  gardenio.io/lifecycle: on-demand
+  gardenio.io/role: platform
+
+webhook:
+  replicaCount: 2
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  affinity:
+    podAntiAffinity:
+      # preferred, not required: with only two eligible nodes a required rule
+      # deadlocks the rolling update (the surge pod cannot land beside the
+      # old pod it replaces).
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: webhook
+                app.kubernetes.io/instance: cert-manager
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+  tolerations: *agentToleration
+  nodeSelector: *onDemandPlatform
+
+cainjector:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+  tolerations: *agentToleration
+  nodeSelector: *onDemandPlatform
+
+startupapicheck:
+  tolerations: *agentToleration
+  nodeSelector: *onDemandPlatform

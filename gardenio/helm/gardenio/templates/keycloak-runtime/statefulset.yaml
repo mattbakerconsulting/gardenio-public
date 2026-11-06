@@ -1,0 +1,367 @@
+{{- if and .Values.keycloak.enabled .Values.keycloak.runtime.enabled }}
+{{- $runtime := .Values.keycloak.runtime -}}
+{{- $name := include "gardenio.keycloakRuntime.fullname" . -}}
+{{- /* Auto-wire to the in-cluster postgres Service when both are enabled. */ -}}
+{{- $autoWire := and $runtime.db.autoWire .Values.postgres.enabled -}}
+{{- $pgFullname := include "gardenio.postgres.fullname" . -}}
+{{- $pgSecret := .Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .) -}}
+{{- $pgHost := printf "%s.%s.svc.cluster.local" $pgFullname .Release.Namespace -}}
+{{- $kcDb := $runtime.db.database | default "keycloak" -}}
+{{- $theme := $runtime.theme | default dict -}}
+{{- $tls := include "gardenio.keycloakRuntime.tlsEnabled" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.keycloakRuntime.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  replicas: {{ $runtime.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.keycloakRuntime.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.keycloakRuntime.selectorLabels" . | nindent 8 }}
+      {{- if $theme.enabled }}
+      annotations:
+        # Keycloak caches theme templates in production: a theme edit must
+        # restart the pod. The hash covers the theme FILES only (the deployer
+        # stamps it on the theme ConfigMap, gardenio/scripts/
+        # keycloak-theme-configmap.py), so a chart release that touches no
+        # theme file does not restart Keycloak.
+        checksum/theme: {{ include "gardenio.keycloakRuntime.themeChecksum" . | quote }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        # Upstream quay.io/keycloak/keycloak runs as UID 1000 (the `keycloak`
+        # user); the data dir under /opt/keycloak is owned by it. (Bitnami used
+        # 1001.) fsGroup chowns the PVC so the process can write its data dir.
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if or $autoWire $theme.enabled }}
+      initContainers:
+        {{- end }}
+        {{- if $autoWire }}
+        # Bootstrap Keycloak's own logical database on the shared in-cluster
+        # postgres. The postgres StatefulSet only bootstraps one POSTGRES_DB
+        # (beads' DB); Keycloak needs a separate database. Idempotent: skips if
+        # the database already exists. Connects as the postgres superuser.
+        - name: create-db
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.postgres.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              export PGPASSWORD="$POSTGRES_PASSWORD"
+              echo "[kc-create-db] waiting for postgres ${PGHOST}:5432"
+              until pg_isready -h "$PGHOST" -p 5432 -U postgres; do sleep 2; done
+              exists=$(psql -h "$PGHOST" -U postgres -d postgres -tAc \
+                "SELECT 1 FROM pg_database WHERE datname='${KC_DB_NAME}'" || true)
+              if [ "$exists" != "1" ]; then
+                echo "[kc-create-db] creating database ${KC_DB_NAME}"
+                psql -h "$PGHOST" -U postgres -d postgres -v ON_ERROR_STOP=1 \
+                  -c "CREATE DATABASE \"${KC_DB_NAME}\""
+              else
+                echo "[kc-create-db] database ${KC_DB_NAME} already exists"
+              fi
+          env:
+            - name: PGHOST
+              value: {{ $pgHost | quote }}
+            - name: KC_DB_NAME
+              value: {{ $kcDb | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $pgSecret | quote }}
+                  key: password
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+        {{- end }}
+        {{- if $theme.enabled }}
+        # The login theme is a ConfigMap the chart does NOT own (the release
+        # deployer applies it from gardenio/keycloak-theme, gd-qiUiXvTX0k: in
+        # the chart it was stored twice in the 1 MiB Helm release Secret).
+        # ConfigMap keys cannot contain "/", so each file is one key with "/"
+        # encoded as "__"; this copies every key to its real path in an
+        # emptyDir that the keycloak container mounts read-only. A missing or
+        # empty ConfigMap fails the pod here, loudly, instead of serving
+        # Keycloak's stock theme.
+        - name: theme-unpack
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.busyboxImage "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.busyboxImage.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              n=0
+              for f in /theme-src/*; do
+                [ -f "$f" ] || continue
+                rel="$(basename "$f" | sed 's#__#/#g')"
+                mkdir -p "/theme/$(dirname "$rel")"
+                cat "$f" > "/theme/$rel"
+                n=$((n + 1))
+              done
+              [ "$n" -gt 0 ] || { echo "theme-unpack: no theme files in the ConfigMap" >&2; exit 1; }
+              echo "theme-unpack: $n files"
+          volumeMounts:
+            - name: theme-src
+              mountPath: /theme-src
+              readOnly: true
+            - name: theme
+              mountPath: /theme
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"
+        {{- end }}
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.name }}
+      {{- end }}
+      containers:
+        - name: keycloak
+          image: {{ include "gardenio.mirroredImage" (dict "image" $runtime.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ $runtime.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: [ALL]
+          args:
+            - "start"
+            {{- range $runtime.extraStartArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $runtime.service.httpPort | default 8080 }}
+              protocol: TCP
+            {{- if $tls }}
+            - name: https
+              containerPort: {{ $runtime.service.httpsPort | default 8443 }}
+              protocol: TCP
+            {{- end }}
+            - name: management
+              containerPort: {{ $runtime.service.managementPort | default 9000 }}
+              protocol: TCP
+          env:
+            # ── DB connection ──────────────────────────────────────────────
+            - name: KC_DB
+              value: {{ $runtime.db.vendor | default "postgres" | quote }}
+            {{- if $autoWire }}
+            # Auto-wired to the in-cluster postgres Service (postgres.enabled).
+            # KC_DB_URL is a literal jdbc URL — Keycloak takes the user/password
+            # from KC_DB_USERNAME/KC_DB_PASSWORD, so the URL needs no credentials.
+            # ApplicationName names the connections in pg_stat_activity; pgjdbc
+            # does not read PGAPPNAME (gd-rXqkv4rSmG).
+            - name: KC_DB_URL
+              value: {{ printf "jdbc:postgresql://%s:5432/%s?ApplicationName=keycloak" $pgHost $kcDb | quote }}
+            - name: KC_DB_USERNAME
+              value: "postgres"
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $pgSecret | quote }}
+                  key: password
+            {{- else }}
+            # BYO / external-RDS: all three projected from a pre-provisioned Secret.
+            - name: KC_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $runtime.db.existingSecret | quote }}
+                  key: {{ $runtime.db.urlKey | default "url" | quote }}
+            - name: KC_DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $runtime.db.existingSecret | quote }}
+                  key: {{ $runtime.db.usernameKey | default "username" | quote }}
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $runtime.db.existingSecret | quote }}
+                  key: {{ $runtime.db.passwordKey | default "password" | quote }}
+            {{- end }}
+            # ── Bootstrap admin (upstream KC 26 env names) ─────────────────
+            # KC_BOOTSTRAP_ADMIN_* superseded the deprecated KEYCLOAK_ADMIN_*
+            # in Keycloak 26; they create the temporary master-realm admin on
+            # a clean DB (no-op on a DB that already has a master realm).
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $runtime.admin.existingSecret | quote }}
+                  key: {{ $runtime.admin.usernameKey | default "username" | quote }}
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $runtime.admin.existingSecret | quote }}
+                  key: {{ $runtime.admin.passwordKey | default "password" | quote }}
+            # ── HTTP / hostname / proxy ────────────────────────────────────
+            # hostnameUrl (full URL) is the browser-facing frontend; with
+            # hostnameBackchannelDynamic, in-cluster callers keep getting
+            # in-cluster token/jwks/userinfo URLs while the issuer and the
+            # login pages use hostnameUrl (gd-ZbqAlzulHK). Unset = runtime.host,
+            # exactly as before.
+            - name: KC_HOSTNAME
+              value: {{ $runtime.hostnameUrl | default $runtime.host | quote }}
+            {{- if $runtime.hostnameBackchannelDynamic }}
+            {{- if not (hasPrefix "http" ($runtime.hostnameUrl | default "")) }}
+            {{- fail "keycloak.runtime.hostnameBackchannelDynamic needs keycloak.runtime.hostnameUrl set to a full URL (Keycloak refuses to start otherwise)" }}
+            {{- end }}
+            - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              value: "true"
+            {{- end }}
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_HTTP_RELATIVE_PATH
+              value: {{ $runtime.httpRelativePath | default "/auth" | quote }}
+            - name: KC_HTTP_PORT
+              value: {{ $runtime.service.httpPort | default 8080 | quote }}
+            {{- if $tls }}
+            # In-cluster https beside http (gd-XRsosVFAau): the cert for the
+            # Service names, from templates/keycloak-runtime/tls.yaml.
+            # KC_HOSTNAME above is unchanged, so iss is the same on both ports.
+            - name: KC_HTTPS_PORT
+              value: {{ $runtime.service.httpsPort | default 8443 | quote }}
+            - name: KC_HTTPS_CERTIFICATE_FILE
+              value: /opt/keycloak/conf/tls/tls.crt
+            - name: KC_HTTPS_CERTIFICATE_KEY_FILE
+              value: /opt/keycloak/conf/tls/tls.key
+            # The management interface (9000) would inherit https from the
+            # cert above, and the httpGet probes and the metrics scrape below
+            # speak http: keep it on http.
+            - name: KC_HTTP_MANAGEMENT_SCHEME
+              value: "http"
+            {{- end }}
+            - name: KC_PROXY_HEADERS
+              value: {{ $runtime.proxyHeaders | default "xforwarded" | quote }}
+            # ── Health / metrics ───────────────────────────────────────────
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_METRICS_ENABLED
+              value: "true"
+          startupProbe:
+            httpGet:
+              path: {{ printf "%s/health/started" ($runtime.httpRelativePath | default "/auth") }}
+              port: management
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: {{ printf "%s/health/live" ($runtime.httpRelativePath | default "/auth") }}
+              port: management
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: {{ printf "%s/health/ready" ($runtime.httpRelativePath | default "/auth") }}
+              port: management
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml $runtime.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /opt/keycloak/data
+            - name: tmp
+              mountPath: /tmp
+            {{- if $tls }}
+            - name: tls
+              mountPath: /opt/keycloak/conf/tls
+              readOnly: true
+            {{- end }}
+            {{- if $theme.enabled }}
+            # Only the gardenio subdirectory: Keycloak's built-in themes live
+            # beside it in /opt/keycloak/themes and must stay untouched.
+            - name: theme
+              mountPath: {{ printf "/opt/keycloak/themes/%s" ($theme.name | default "gardenio") | quote }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if not $runtime.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if $tls }}
+        # Not optional: Keycloak refuses to start without the cert files it
+        # is told to serve, so the pod waits for cert-manager instead.
+        - name: tls
+          secret:
+            secretName: {{ include "gardenio.keycloakRuntime.tlsSecretName" . | quote }}
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        {{- end }}
+        {{- if $theme.enabled }}
+        # theme-src: the deployer-owned ConfigMap (keys "login__template.ftl"
+        # ...); theme: the tree theme-unpack rebuilds from it.
+        - name: theme-src
+          configMap:
+            name: {{ include "gardenio.keycloakRuntime.themeConfigMapName" . | quote }}
+        - name: theme
+          emptyDir: {}
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" $runtime.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with $runtime.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" $runtime.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+  {{- if $runtime.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if $runtime.persistence.storageClass }}
+        storageClassName: {{ $runtime.persistence.storageClass }}
+        {{- else if .Values.global.storageClass }}
+        storageClassName: {{ .Values.global.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $runtime.persistence.size }}
+  {{- end }}
+{{- end }}

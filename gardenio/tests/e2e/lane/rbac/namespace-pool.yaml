@@ -1,0 +1,346 @@
+# Live-namespace e2e lane: the namespace pool and the runner's identity.
+# OPERATOR-APPLIED (crews never touch the cluster):
+#
+#   kubectl apply -f gardenio/tests/e2e/lane/rbac/namespace-pool.yaml
+#
+# Then prove the boundary from the operator's kubeconfig (every line must
+# print "no"; lane.sh assert-tenant re-checks the same set from inside the
+# runner on every run):
+#
+#   SA=system:serviceaccount:arc-runners:gardenio-e2e-runner
+#   for ns in gardenio-e2e-0 gardenio-e2e-1; do
+#     kubectl auth can-i update   resourcequotas -n $ns --as=$SA
+#     kubectl auth can-i delete   resourcequotas -n $ns --as=$SA
+#     kubectl auth can-i update   limitranges    -n $ns --as=$SA
+#     kubectl auth can-i delete   limitranges    -n $ns --as=$SA
+#     kubectl auth can-i patch    namespaces     -n $ns --as=$SA
+#     kubectl auth can-i escalate roles          -n $ns --as=$SA
+#     kubectl auth can-i bind     roles          -n $ns --as=$SA
+#   done
+#   kubectl auth can-i bind clusterroles --as=$SA
+#
+# The escalate/bind lines matter because the direct verbs alone are a blind
+# spot: a subject with `escalate` on roles (which verbs ["*"] silently
+# includes) can create a Role in its own namespace granting update/delete on
+# resourcequotas and limitranges, bind it to itself, and lift the ceiling
+# while every direct can-i still prints "no" (operator hold on
+# gd-LvbhX557UD). Positive control, in each pool namespace: creating a Role
+# that grants update on resourcequotas AS the runner must be refused by the
+# API's grant-time escalation check (--dry-run=server still runs that check
+# and never persists anything):
+#
+#   kubectl -n $ns --as=$SA create --dry-run=server -f - <<'EOF'
+#   apiVersion: rbac.authorization.k8s.io/v1
+#   kind: Role
+#   metadata: {name: gardenio-e2e-escalation-probe}
+#   rules: [{apiGroups: [""], resources: [resourcequotas], verbs: [update]}]
+#   EOF
+#   # -> Error from server (Forbidden): ... attempting to grant RBAC permissions not currently held
+#
+# Design: docs/superpowers/specs/2026-10-13-e2e-live-namespace-lane-design.md
+# (s4 pool model, s6 RBAC). Task gd-WBz2qt9ADZ. Reviewed by the operator in
+# escalation gd-LXD71HHC8n: core-group resources are ENUMERATED (never "*"),
+# so the runner holds no verb on resourcequotas, limitranges or namespaces,
+# and both pool namespaces enforce Pod Security "baseline". Reviewed again on
+# gd-LvbhX557UD: the rbac.authorization.k8s.io rule names its verbs, so the
+# runner holds neither `escalate` nor `bind` and cannot grant itself what the
+# tenant Role withholds.
+#
+# What this grants, and what it deliberately does not:
+#   * ServiceAccount gardenio-e2e-runner in arc-runners -- the identity the
+#     gardenio-k3s-e2e scale set's runner pods run as
+#     (gardenio/tests/e2e/lane/arc-runners-e2e-values.yaml).
+#   * In EACH pool namespace: a Role listing, resource by resource, what the
+#     chart renders under values-e2e.yaml and what the modules touch, with
+#     every verb on each. RBAC refuses to let a subject grant what it does not
+#     hold, and `helm install` creates the controller's Role (pods, secrets,
+#     persistentvolumeclaims, leases, externalsecrets ...), so the tenant Role
+#     must be a superset of every Role the chart renders. The chart test
+#     gardenio/helm/gardenio/tests/e2e_lane_namespace_pool_test.go renders the
+#     overlay and checks exactly that, that no rule here reaches
+#     resourcequotas, limitranges, namespaces or anything cluster-scoped, and
+#     that the rbac rule grants neither `escalate` nor `bind` (nor "*", which
+#     contains both). Without those two verbs the API's grant-time check is
+#     the fence: the runner can only create Roles whose rules it already
+#     holds, so no Role it writes can ever name the ceiling kinds, and every
+#     RoleBinding it writes must reference a Role it fully holds.
+#   * In EACH pool namespace: a ResourceQuota (the operator's ceiling) and a
+#     LimitRange (default requests, so pods the modules `kubectl run` without
+#     resources still admit under a quota that enforces requests.cpu/memory).
+#     The runner cannot read, raise or delete either: it holds no verb on
+#     resourcequotas or limitranges. values-e2e.yaml turns the chart's own
+#     ResourceQuota and LimitRange off, so `helm install` never needs them.
+#   * Pod Security Admission on both namespaces: enforce=baseline (no
+#     privileged containers, no hostPath/hostNetwork/hostPID/hostIPC, no
+#     hostPorts, no added capabilities beyond the baseline list), warn and
+#     audit at restricted. The runner holds no verb on namespaces, so it
+#     cannot relabel its way out. The controller's plain agent pod passes
+#     baseline (gardenio/controller/internal/podmanager/pss_baseline_test.go);
+#     the DinD and Ziti sidecars do not and are refused at the controller's
+#     admission preflight, which the modules that need them already treat as a
+#     skip (test-sidecar-injection.sh) or that are parked on k3s (gVisor).
+#   * NOTHING cluster-scoped. No ClusterRole, no ClusterRoleBinding, no verbs
+#     on namespaces. That is the O4 boundary (gd-ZYb9OTNwfe).
+#
+# Adding a third pool namespace = copy the gardenio-e2e-1 block, rename, and
+# add the name to LANE_POOL in lane.sh and to the ecr-token-refresh list.
+#
+# Image pulls: pool namespaces need the `ecr` pull Secret. It is written by
+# the ecr-token-refresh CronJob (gardenio/helm/gardenio-ziti/
+# ecr-token-refresh.yaml), whose namespace list and Role/RoleBinding pairs
+# include gardenio-e2e-0 and gardenio-e2e-1. No Secret is in this file.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gardenio-e2e-0
+  labels:
+    gardenio.io/e2e-pool: "true"
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gardenio-e2e-1
+  labels:
+    gardenio.io/e2e-pool: "true"
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gardenio-e2e-runner
+  namespace: arc-runners
+  labels:
+    gardenio.io/e2e-pool: "true"
+# The runner reaches the API with its mounted projected SA token; no
+# long-lived Secret token is created for it.
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gardenio-e2e-tenant
+  namespace: gardenio-e2e-0
+  labels:
+    gardenio.io/e2e-pool: "true"
+rules:
+  # Core group, enumerated. Deliberately absent: resourcequotas, limitranges
+  # (the operator's ceiling), namespaces, nodes, persistentvolumes (cluster-
+  # scoped; a Role could not grant them anyway).
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/exec
+      - pods/attach
+      - pods/portforward
+      - secrets
+      - configmaps
+      - services
+      - endpoints
+      - events
+      - serviceaccounts
+      - serviceaccounts/token
+      - persistentvolumeclaims
+    verbs: ["*"]
+  - apiGroups: ["apps"]
+    resources: [deployments, statefulsets, replicasets, daemonsets, controllerrevisions]
+    verbs: ["*"]
+  - apiGroups: ["batch"]
+    resources: [jobs, cronjobs]
+    verbs: ["*"]
+  - apiGroups: ["policy"]
+    resources: [poddisruptionbudgets]
+    verbs: ["*"]
+  - apiGroups: ["autoscaling"]
+    resources: [horizontalpodautoscalers]
+    verbs: ["*"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: [leases]
+    verbs: ["*"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [networkpolicies, ingresses]
+    verbs: ["*"]
+  # roles/rolebindings: helm install creates the controller's Role and the
+  # adopt-PVCs Job's Role. Namespaced only; clusterroles are not in this group
+  # as a namespaced resource and are not granted. Verbs are NAMED, never "*":
+  # "*" includes `escalate` (write a Role with rules you do not hold) and
+  # `bind` (reference a Role/ClusterRole you do not fully hold), either of
+  # which lets the runner grant itself the ceiling verbs this file withholds.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: [roles, rolebindings]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Inert on k3s (ESO is not installed) but the controller's Role names it, and
+  # RBAC's escalation check needs the grantor to hold every rule it grants.
+  - apiGroups: ["external-secrets.io"]
+    resources: [externalsecrets]
+    verbs: ["*"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: [pods]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gardenio-e2e-tenant
+  namespace: gardenio-e2e-0
+  labels:
+    gardenio.io/e2e-pool: "true"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gardenio-e2e-tenant
+subjects:
+  - kind: ServiceAccount
+    name: gardenio-e2e-runner
+    namespace: arc-runners
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: gardenio-e2e-pool-ceiling
+  namespace: gardenio-e2e-0
+  labels:
+    gardenio.io/e2e-pool: "true"
+spec:
+  hard:
+    pods: "40"
+    requests.cpu: "6"
+    requests.memory: 12Gi
+    persistentvolumeclaims: "10"
+    services: "20"
+    secrets: "40"
+---
+# A quota on requests.cpu/requests.memory rejects any container that states no
+# request. The chart's workloads all do; the modules' `kubectl run` helper pods
+# and any agent pod spawned with a role that omits resources do not, so this
+# LimitRange fills them in. The chart's own LimitRange is off in the overlay.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: gardenio-e2e-pool-defaults
+  namespace: gardenio-e2e-0
+  labels:
+    gardenio.io/e2e-pool: "true"
+spec:
+  limits:
+    - type: Container
+      defaultRequest: {cpu: 50m, memory: 64Mi}
+      default: {cpu: "2", memory: 2Gi}
+      # max.memory is 16Gi, not 8Gi: the controller builds every agent pod with
+      # podmanager.DefaultMemoryLimit (16Gi) and the lane cannot lower it per
+      # pod, so an 8Gi cap refused every agent pod at admission ("maximum
+      # memory usage per Container is 8Gi, but limit is 16Gi"); no e2e module
+      # that boots an agent could pass (gd-eJtv34hQGP, 2026-11-05). The quota's
+      # requests.memory 12Gi still bounds the pool at ~6 agents (2Gi requests).
+      max: {cpu: "4", memory: 16Gi}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gardenio-e2e-tenant
+  namespace: gardenio-e2e-1
+  labels:
+    gardenio.io/e2e-pool: "true"
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/exec
+      - pods/attach
+      - pods/portforward
+      - secrets
+      - configmaps
+      - services
+      - endpoints
+      - events
+      - serviceaccounts
+      - serviceaccounts/token
+      - persistentvolumeclaims
+    verbs: ["*"]
+  - apiGroups: ["apps"]
+    resources: [deployments, statefulsets, replicasets, daemonsets, controllerrevisions]
+    verbs: ["*"]
+  - apiGroups: ["batch"]
+    resources: [jobs, cronjobs]
+    verbs: ["*"]
+  - apiGroups: ["policy"]
+    resources: [poddisruptionbudgets]
+    verbs: ["*"]
+  - apiGroups: ["autoscaling"]
+    resources: [horizontalpodautoscalers]
+    verbs: ["*"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: [leases]
+    verbs: ["*"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [networkpolicies, ingresses]
+    verbs: ["*"]
+  # Named verbs, no escalate/bind: see the gardenio-e2e-0 rule.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: [roles, rolebindings]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: ["external-secrets.io"]
+    resources: [externalsecrets]
+    verbs: ["*"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: [pods]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gardenio-e2e-tenant
+  namespace: gardenio-e2e-1
+  labels:
+    gardenio.io/e2e-pool: "true"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gardenio-e2e-tenant
+subjects:
+  - kind: ServiceAccount
+    name: gardenio-e2e-runner
+    namespace: arc-runners
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: gardenio-e2e-pool-ceiling
+  namespace: gardenio-e2e-1
+  labels:
+    gardenio.io/e2e-pool: "true"
+spec:
+  hard:
+    pods: "40"
+    requests.cpu: "6"
+    requests.memory: 12Gi
+    persistentvolumeclaims: "10"
+    services: "20"
+    secrets: "40"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: gardenio-e2e-pool-defaults
+  namespace: gardenio-e2e-1
+  labels:
+    gardenio.io/e2e-pool: "true"
+spec:
+  limits:
+    - type: Container
+      defaultRequest: {cpu: 50m, memory: 64Mi}
+      default: {cpu: "2", memory: 2Gi}
+      # max.memory is 16Gi, not 8Gi: the controller builds every agent pod with
+      # podmanager.DefaultMemoryLimit (16Gi) and the lane cannot lower it per
+      # pod, so an 8Gi cap refused every agent pod at admission ("maximum
+      # memory usage per Container is 8Gi, but limit is 16Gi"); no e2e module
+      # that boots an agent could pass (gd-eJtv34hQGP, 2026-11-05). The quota's
+      # requests.memory 12Gi still bounds the pool at ~6 agents (2Gi requests).
+      max: {cpu: "4", memory: 16Gi}

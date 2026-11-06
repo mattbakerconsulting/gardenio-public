@@ -1,0 +1,160 @@
+{{/*
+Lands per-land audience scopes (gd-eAfptUBh9Z, owner decision gd-zf6eceweED;
+PR #862 review).
+
+Every land has an optional Keycloak client scope land-<name> whose one mapper
+adds aud land-<name> to the access token (templates/keycloak/client-scopes.yaml
+for the lands the chart knows). For a land made at runtime, the Lands
+provisioner (internal/lands/landscope) writes the same scope as a
+KeycloakClientScope resource in the release namespace and the EDP
+keycloak-operator makes it. The provisioner's Keycloak credential stays
+query-users/query-groups: realm-management manage-clients would be effectively
+realm admin, since kbeads trusts the realm_roles claim and a manage-clients
+credential can add a hardcoded-claim mapper to any client or scope.
+
+This file renders, when the provisioner and Keycloak are on:
+
+  1. Role + RoleBinding <agents>-land-scopes: get, create and update on
+     keycloakclientscopes in the release namespace, for the controller's
+     ServiceAccount. No delete, no status, no other EDP resource: in
+     particular not keycloakclients, so the controller attaches nothing;
+     clients.yaml attaches the scopes it finds (lookup) to
+     keycloak.landScopeClients on the next helm upgrade.
+  2. ValidatingAdmissionPolicy <agents>-land-scopes, which holds every create
+     and update the controller ServiceAccount makes to a KeycloakClientScope
+     (whatever RBAC grants it, agents.clusterAdmin included) to exactly the
+     land scope shape: spec.name land-<land>, resource name
+     gardenio-land-scope-<land> labelled for the land, an optional
+     openid-connect scope of this chart's realm resource, only the
+     land scope attributes, and exactly one oidc-audience-mapper whose only
+     audience is spec.name. A scope of that shape can add an audience to a
+     token that asks for it, and nothing else: no role, group or other claim.
+
+The policy has no off switch while the grant in (1) renders.
+
+Requires Kubernetes 1.30+ for the admission policy.
+*/}}
+{{- if and .Values.agents.enabled .Values.agents.lands.provisioner.enabled .Values.keycloak.enabled }}
+{{- $name := printf "%s-land-scopes" (include "gardenio.agents.fullname" .) }}
+{{- $sa := include "gardenio.agents.serviceAccountName" . }}
+{{- $realm := printf "%s-realm" (include "gardenio.fullname" .) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["v1.edp.epam.com"]
+    resources: ["keycloakclientscopes"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["v1.edp.epam.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["keycloakclientscopes"]
+  matchConditions:
+    - name: only-controller-sa
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:{{ .Release.Namespace }}:{{ $sa }}'
+  variables:
+    - name: spec
+      expression: "has(object.spec) ? object.spec : {}"
+    - name: scopeName
+      expression: "has(variables.spec.name) ? string(variables.spec.name) : ''"
+    - name: labels
+      expression: "has(object.metadata.labels) ? object.metadata.labels : {}"
+    - name: land
+      expression: "'gardenio.io/land' in variables.labels ? string(variables.labels['gardenio.io/land']) : ''"
+    - name: attributes
+      expression: "has(variables.spec.attributes) ? variables.spec.attributes : {}"
+    - name: mappers
+      expression: "has(variables.spec.protocolMappers) ? variables.spec.protocolMappers : []"
+  validations:
+    - expression: >-
+        variables.land.matches('^[a-z][a-z0-9-]{0,57}$') &&
+        variables.scopeName == 'land-' + variables.land
+      message: >-
+        the gardenio controller may only write a land scope: spec.name must be
+        land-<land>, for the land its gardenio.io/land label names.
+    - expression: >-
+        object.metadata.name == 'gardenio-land-scope-' + variables.land &&
+        'gardenio.io/land-scope' in variables.labels && variables.labels['gardenio.io/land-scope'] == 'true' &&
+        'app.kubernetes.io/managed-by' in variables.labels && variables.labels['app.kubernetes.io/managed-by'] == 'gardenio-controller'
+      message: >-
+        a land scope resource is named gardenio-land-scope-<land> and labelled
+        gardenio.io/land=<land>, gardenio.io/land-scope=true and
+        app.kubernetes.io/managed-by=gardenio-controller.
+    - expression: >-
+        variables.spec.all(k, k in ['name', 'realmRef', 'protocol', 'type', 'description', 'attributes', 'protocolMappers'])
+      message: >-
+        a land scope sets only name, realmRef, protocol, type, description,
+        attributes and protocolMappers (never the deprecated default flag).
+    - expression: >-
+        has(variables.spec.type) && variables.spec.type == 'optional' &&
+        has(variables.spec.protocol) && variables.spec.protocol == 'openid-connect'
+      message: >-
+        a land scope is an optional openid-connect scope.
+    - expression: >-
+        has(variables.spec.realmRef) &&
+        variables.spec.realmRef.all(k, k in ['name', 'kind']) &&
+        has(variables.spec.realmRef.name) && variables.spec.realmRef.name == '{{ $realm }}' &&
+        has(variables.spec.realmRef.kind) && variables.spec.realmRef.kind == 'KeycloakRealm'
+      message: >-
+        a land scope belongs to the KeycloakRealm {{ $realm }}.
+    - expression: >-
+        variables.attributes.all(k, k in ['gardenio_land', 'include.in.token.scope', 'display.on.consent.screen']) &&
+        (!('gardenio_land' in variables.attributes) || variables.attributes['gardenio_land'] == variables.land)
+      message: >-
+        a land scope's attributes are only gardenio_land (its land),
+        include.in.token.scope and display.on.consent.screen.
+    - expression: >-
+        size(variables.mappers) == 1 &&
+        variables.mappers.all(m,
+          has(m.protocol) && m.protocol == 'openid-connect' &&
+          has(m.protocolMapper) && m.protocolMapper == 'oidc-audience-mapper' &&
+          has(m.config) &&
+          m.config.all(k, k in ['included.custom.audience', 'access.token.claim', 'id.token.claim', 'introspection.token.claim']) &&
+          'included.custom.audience' in m.config && m.config['included.custom.audience'] == variables.scopeName)
+      message: >-
+        a land scope holds exactly one oidc-audience-mapper, whose only
+        audience is the scope's own name (land-<land>).
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $name }}
+  validationActions: ["Deny"]
+{{- end }}

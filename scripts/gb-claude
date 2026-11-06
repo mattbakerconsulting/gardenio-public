@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# gb-claude — launch Claude Code with the gardenio workflow context in its system
+# prompt, the way coop spawns agents in production.
+#
+# Why this exists: a bare `claude` started by a human (laptop or a plain VM) never
+# goes through coop, so the cacheable system prompt that carries the gardenio
+# workflow rules is never populated. The `gb hook prime` SessionStart hook is
+# intentionally terse — it re-emits only live state (identity, active jacks,
+# claimed work) and points at a system prompt that, without coop, is empty. The
+# result is an agent that has no idea about the SESSION CLOSE PROTOCOL, the
+# kd/gb command surface, advice beads, etc.
+#
+# This wrapper closes that gap: it regenerates `gb prime --system-prompt`
+# (identity + workflow rules + advice + wrap-up) and splices it in via
+# --append-system-prompt-file, mirroring writeSystemPromptFile() in
+# gardenio/controller/cmd/gb/agent_system_prompt.go. Run it instead of `claude`.
+#
+#   gb-claude                 # interactive agent, fully primed
+#   gb-claude -p "..."        # headless, fully primed
+#   any claude flags pass through unchanged.
+#
+# For a full agent run (claim a bead + loop), prefer `gb agent start --local`,
+# which goes through the same system-prompt machinery. Use gb-claude for a quick
+# primed REPL or one-shot headless prompt.
+set -euo pipefail
+
+SP_DIR="${HOME}/.gb"
+SP_FILE="${SP_DIR}/system-prompt.md"
+mkdir -p "$SP_DIR"
+
+# Identify as the local-agent role so prime injects role:local-agent advice.
+# Advice is selected by the agentID PATH (project/role/name), not BOAT_ROLE, so
+# the role must ride in via --for. parts[0]=local keeps a clean base (global +
+# role:local-agent advice) without pulling in the whole project:gardenio fleet's
+# advice; override with GB_AGENT_ID if you want a different scope. --for affects
+# only prime's advice selection — write attribution stays BEADS_OPERATED_BY.
+AGENT_ID="${GB_AGENT_ID:-local/local-agent/$(hostname -s 2>/dev/null || echo box)}"
+export BOAT_ROLE="${BOAT_ROLE:-local-agent}"   # identity line + role-scoped config beads
+
+# Regenerate each launch — advice beads and workflow rules drift over time.
+if gb prime --system-prompt --for "$AGENT_ID" > "$SP_FILE" 2>/dev/null && [ -s "$SP_FILE" ]; then
+  exec claude --append-system-prompt-file="$SP_FILE" "$@"
+else
+  # Best-effort, same as production: if prime fails (e.g. daemon unreachable),
+  # launch without the injected context rather than block the session. The
+  # live-state SessionStart hook still fires.
+  echo "gb-claude: warning: 'gb prime --system-prompt' produced no output; launching claude without injected context" >&2
+  exec claude "$@"
+fi

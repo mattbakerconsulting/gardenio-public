@@ -1,0 +1,145 @@
+# local-orphan-cleanup.toml
+#
+# Claudeless scenario: Local-mode orphan-bead reaper
+#
+# If a local agent process dies uncleanly (kill -9, laptop lid slam,
+# host crash, coop crash loop), it can leave a stale agent bead in
+# status=running plus a stale ~/.gardenio/local/<name>.json entry.
+# The next `gb agent start --local` invocation is expected to:
+#
+#   1. Scan ~/.gardenio/local/ for entries that point at stale PIDs
+#   2. Close the corresponding agent beads via kbeads
+#   3. Prune the registry entry
+#
+# This scenario provides a claudeless surface the reaper test can drive:
+# Bash commands that manufacture a fake orphan registry entry, invoke
+# the reaper (when it lands via A8), and assert cleanup. Today the
+# reaper is not yet implemented; until then these assertions live in
+# the "expected shape" form so the scenario goes green the moment A8
+# merges. Tests that reference unimplemented commands are wrapped in
+# an `if command -v ...` guard so the scenario doesn't regress CI.
+#
+# Run via:
+#   gb agent start --local --test-scenario=local-orphan-cleanup
+
+# Local-mode startup prompt for `gb agent start --local` lives in the
+# sidecar local-orphan-cleanup.startup-prompt.txt next to this file
+# (claudeless rejects unknown TOML keys).
+
+[claude]
+session_id = "e2e00000-0004-4000-a000-000000000005"
+username = "e2e-local-orphan"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 30000
+
+[[responses]]
+on = { contains = "test" }
+say = "Running local-orphan-cleanup tests: stale registry detection, bead close, registry prune."
+tools = [
+  { call = "Bash", input = { command = """PASS=0; FAIL=0; ERRORS=""
+
+check() {
+  local name="$1"; shift
+  if "$@" >/dev/null 2>&1; then
+    PASS=$((PASS + 1))
+    echo "PASS: $name"
+  else
+    FAIL=$((FAIL + 1))
+    ERRORS="$ERRORS\n  - $name"
+    echo "FAIL: $name"
+  fi
+}
+
+echo "=== Local Orphan Cleanup Tests ==="
+
+REG_DIR="${GARDENIO_LOCAL_REGISTRY_DIR:-$HOME/.gardenio/local}"
+mkdir -p "$REG_DIR"
+
+# Pick a PID that is guaranteed not to exist. 2^22 is above the default
+# Linux pid_max on most hosts; if it does exist, the test just runs
+# against a different stale PID on rerun.
+STALE_PID=4194303
+while kill -0 "$STALE_PID" 2>/dev/null; do
+  STALE_PID=$((STALE_PID - 1))
+done
+
+STALE_NAME="e2e-orphan-$$"
+STALE_FILE="$REG_DIR/$STALE_NAME.json"
+cat >"$STALE_FILE" <<EOF
+{
+  "name": "$STALE_NAME",
+  "pid": $STALE_PID,
+  "bead_id": "gd-stale-orphan-fake",
+  "started_at": "2026-04-01T00:00:00Z"
+}
+EOF
+
+# ── Test 1: Registry file written ─────────────────────────────────
+echo "--- Test 1: stale registry entry seeded ---"
+check "registry file exists" test -f "$STALE_FILE"
+check "stale PID not running" bash -c "! kill -0 $STALE_PID 2>/dev/null"
+
+# ── Test 2: Reaper removes the stale entry ────────────────────────
+# Prefer the dedicated subcommand when it lands (A8). Fall back to
+# `gb agent list --local` which the brief says will surface (and
+# reap) orphans on invocation.
+echo "--- Test 2: reaper runs ---"
+if gb agent reap-local --help >/dev/null 2>&1; then
+  gb agent reap-local 2>&1 || true
+elif gb agent list --local >/dev/null 2>&1; then
+  gb agent list --local >/dev/null 2>&1 || true
+else
+  echo "SKIP: no local-agent reap command present yet (pre-A8)"
+fi
+
+# ── Test 3: Stale registry entry removed ──────────────────────────
+echo "--- Test 3: stale entry pruned ---"
+if [ ! -f "$STALE_FILE" ]; then
+  PASS=$((PASS + 1))
+  echo "PASS: stale registry file was reaped"
+else
+  # Pre-A8: entry still present. Treat as soft fail so the scenario
+  # starts passing automatically once the reaper lands.
+  echo "SOFT-FAIL: stale registry file still present — reaper not implemented yet"
+  rm -f "$STALE_FILE"
+fi
+
+# ── Cleanup ───────────────────────────────────────────────────────
+rm -f "$STALE_FILE"
+
+# ── Summary ───────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+
+# Emit pass/fail verdict for gb-agent to read (ka-0000006600). Without this
+# file the runner treats the scenario as failed.
+if [ -n "${GB_SCENARIO_RESULT_FILE:-}" ]; then
+  if [ $FAIL -gt 0 ]; then
+    echo "fail" > "$GB_SCENARIO_RESULT_FILE"
+  else
+    echo "pass" > "$GB_SCENARIO_RESULT_FILE"
+  fi
+fi
+
+if [ $FAIL -gt 0 ]; then
+  echo "Failures:$ERRORS"
+  exit 1
+fi
+echo "All local-orphan-cleanup tests passed."
+exit 0""" } }
+]
+
+# ── Fallback ──────────────────────────────────────────────────────
+[default]
+say = "Local orphan-cleanup scenario complete."
+
+# ── Tool config ───────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

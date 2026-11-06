@@ -1,0 +1,35 @@
+{{/*
+VMServiceScrape for the gitlab-bridge /metrics endpoint (port 9092).
+
+The GitLab webhook door had NO scrape at all until bead ka-0000001045: both
+sibling bridges shipped one (jira-bridge, slack-bridge) and this one did not,
+so nothing in prod ever collected gardenio_gitlab_webhook_deliveries_total —
+the two webhook-liveness panels keyed on it were permanently empty and the
+shipped GitLabWebhookDark deadman alert could not fire from this pod. The
+Deployment's Path A prometheus.io/* pod annotations are not honoured by the
+prod vm-operator stack, which discovers scrape targets from VMServiceScrape
+objects only; the annotations stay in place for annotation-scraping clusters.
+
+Emitted only when both gitlabBridge.enabled and monitoring.victoriaMetrics.
+enabled are true. Parallel with the Path A annotations — both can be enabled
+simultaneously without conflict.
+*/}}
+{{- if and .Values.gitlabBridge.enabled (((.Values.monitoring).victoriaMetrics).enabled) }}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: {{ include "gardenio.fullname" . }}-gitlab-bridge
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gitlab-bridge
+spec:
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gitlab-bridge
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ (((.Values.gitlabBridge.metrics).serviceMonitor).interval) | default .Values.monitoring.victoriaMetrics.interval | default "30s" }}
+{{- end }}

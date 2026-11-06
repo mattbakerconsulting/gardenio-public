@@ -1,0 +1,741 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2025 Matt Baker <fimbaz@gmail.com>
+
+syntax = "proto3";
+package coop.v1;
+
+// Terminal session management and agent orchestration API.
+service Coop {
+  // Terminal
+
+  // Health check. Always available.
+  rpc GetHealth(GetHealthRequest) returns (GetHealthResponse);
+  // Readiness probe.
+  rpc GetReady(GetReadyRequest) returns (GetReadyResponse);
+  // Rendered terminal screen content.
+  rpc GetScreen(GetScreenRequest) returns (GetScreenResponse);
+  // Session status summary.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  // Write text to the PTY.
+  rpc SendInput(SendInputRequest) returns (SendInputResponse);
+  // Write raw bytes to the PTY.
+  rpc SendInputRaw(SendInputRawRequest) returns (SendInputRawResponse);
+  // Send named key sequences to the PTY.
+  rpc SendKeys(SendKeysRequest) returns (SendKeysResponse);
+  // Send a signal to the child process.
+  rpc SendSignal(SendSignalRequest) returns (SendSignalResponse);
+  // Resize the PTY.
+  rpc Resize(ResizeRequest) returns (ResizeResponse);
+  // Stream raw PTY output bytes starting from a byte offset.
+  rpc StreamOutput(StreamOutputRequest) returns (stream OutputChunk);
+  // Stream rendered terminal screen snapshots on each update.
+  rpc StreamScreen(StreamScreenRequest) returns (stream ScreenSnapshot);
+
+  // Agent (requires --agent flag)
+
+  // Current agent state and prompt context.
+  rpc GetAgent(GetAgentRequest) returns (GetAgentResponse);
+  // Send a follow-up message. Only succeeds when state is idle.
+  rpc Nudge(NudgeRequest) returns (NudgeResponse);
+  // Respond to an active prompt.
+  rpc Respond(RespondRequest) returns (RespondResponse);
+  // Stream agent state transitions in real time.
+  rpc StreamAgent(StreamAgentRequest) returns (stream TransitionEvent);
+  // Stream prompt action events in real time.
+  rpc StreamPromptOutcomes(StreamPromptOutcomesRequest) returns (stream PromptOutcomeEvent);
+
+  // Raw streams
+
+  // Stream raw hook FIFO JSON events in real time.
+  rpc StreamRawHooks(StreamRawHooksRequest) returns (stream RawHookEvent);
+  // Stream raw agent JSONL messages (from stdout or log) in real time.
+  rpc StreamRawMessages(StreamRawMessagesRequest) returns (stream RawMessageEvent);
+
+  // Stop hook management
+
+  // Read the current stop hook configuration.
+  rpc GetStopConfig(GetStopConfigRequest) returns (GetStopConfigResponse);
+  // Update the stop hook configuration at runtime.
+  rpc PutStopConfig(PutStopConfigRequest) returns (PutStopConfigResponse);
+  // Resolve a pending stop gate so the agent is allowed to stop.
+  rpc ResolveStop(ResolveStopRequest) returns (ResolveStopResponse);
+  // Stream stop hook verdict events in real time.
+  rpc StreamStopEvents(StreamStopEventsRequest) returns (stream StopEvent);
+
+  // Transcript management
+
+  // List all transcript snapshots.
+  rpc ListTranscripts(ListTranscriptsRequest) returns (ListTranscriptsResponse);
+  // Get a single transcript's content.
+  rpc GetTranscript(GetTranscriptRequest) returns (GetTranscriptResponse);
+  // Catch up from a cursor (transcript number + line offset).
+  rpc CatchupTranscripts(CatchupTranscriptsRequest) returns (CatchupTranscriptsResponse);
+  // Stream transcript save events in real time.
+  rpc StreamTranscriptEvents(StreamTranscriptEventsRequest) returns (stream TranscriptEvent);
+
+  // Start hook management
+
+  // Read the current start hook configuration.
+  rpc GetStartConfig(GetStartConfigRequest) returns (GetStartConfigResponse);
+  // Update the start hook configuration at runtime.
+  rpc PutStartConfig(PutStartConfigRequest) returns (PutStartConfigResponse);
+  // Stream start hook events in real time.
+  rpc StreamStartEvents(StreamStartEventsRequest) returns (stream StartEvent);
+
+  // Recording
+
+  // Get current recording status.
+  rpc GetRecording(GetRecordingRequest) returns (GetRecordingResponse);
+  // Toggle recording on/off.
+  rpc PutRecording(PutRecordingRequest) returns (PutRecordingResponse);
+  // Catch up on missed recording entries.
+  rpc CatchupRecording(CatchupRecordingRequest) returns (CatchupRecordingResponse);
+  // Stream recording entries in real time.
+  rpc StreamRecordingEvents(StreamRecordingEventsRequest) returns (stream RecordingEntryProto);
+
+  // Usage tracking
+
+  // Get cumulative API usage for the current session.
+  rpc GetSessionUsage(GetSessionUsageRequest) returns (GetSessionUsageResponse);
+  // Stream usage update events in real time.
+  rpc StreamUsageEvents(StreamUsageEventsRequest) returns (stream UsageEvent);
+
+  // Profile management
+
+  // Register named credential profiles for rotation.
+  rpc RegisterProfiles(RegisterProfilesRequest) returns (RegisterProfilesResponse);
+  // List all registered profiles with status.
+  rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
+  // Get the current profile rotation mode.
+  rpc GetProfileMode(GetProfileModeRequest) returns (ProfileModeResponse);
+  // Set the profile rotation mode.
+  rpc SetProfileMode(SetProfileModeRequest) returns (ProfileModeResponse);
+  // Stream profile lifecycle events in real time.
+  rpc StreamProfileEvents(StreamProfileEventsRequest) returns (stream ProfileEvent);
+
+  // Session management
+
+  // Switch credentials and restart the agent process.
+  rpc SwitchSession(SwitchSessionRequest) returns (SwitchSessionResponse);
+
+  // Lifecycle
+
+  // Restart the agent process without changing credentials.
+  rpc RestartSession(RestartSessionRequest) returns (RestartSessionResponse);
+  // Initiate graceful coop shutdown.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+
+// -- Terminal -----------------------------------------------------------------
+
+message GetHealthRequest {}
+message GetHealthResponse {
+  // Always "running".
+  string status = 1;
+  // Child process PID, absent if not yet spawned.
+  optional int32 pid = 2;
+  // Seconds since coop started.
+  int64 uptime_secs = 3;
+  // Agent type: "claude", "codex", "gemini", "unknown".
+  string agent = 4;
+  // Number of connected WebSocket clients.
+  int32 ws_clients = 5;
+  // Terminal width.
+  int32 terminal_cols = 6;
+  // Terminal height.
+  int32 terminal_rows = 7;
+  // Whether the session is ready (agent has left Starting state).
+  bool ready = 8;
+  // Agent session ID (UUID).
+  string session_id = 9;
+}
+
+message GetReadyRequest {}
+message GetReadyResponse {
+  bool ready = 1;
+}
+
+message GetScreenRequest {
+  // Include cursor position in the response.
+  bool cursor = 1;
+}
+message GetScreenResponse {
+  // One string per terminal row.
+  repeated string lines = 1;
+  // Terminal width.
+  int32 cols = 2;
+  // Terminal height.
+  int32 rows = 3;
+  // Whether the alternate screen buffer is active.
+  bool alt_screen = 4;
+  // Cursor position (only present when cursor is true).
+  CursorPosition cursor = 5;
+  // Monotonic screen update seq number.
+  uint64 seq = 6;
+}
+
+// 0-indexed cursor position within the terminal grid.
+message CursorPosition {
+  int32 row = 1;
+  int32 col = 2;
+}
+
+message GetStatusRequest {}
+message GetStatusResponse {
+  // Session state: "starting", "running", or "exited".
+  string state = 1;
+  // Child process PID.
+  optional int32 pid = 2;
+  // Seconds since coop started.
+  int64 uptime_secs = 3;
+  // Exit code if the process has exited.
+  optional int32 exit_code = 4;
+  // Current screen seq number.
+  uint64 screen_seq = 5;
+  // Total bytes read from PTY.
+  uint64 bytes_read = 6;
+  // Total bytes written to PTY.
+  uint64 bytes_written = 7;
+  // Number of connected WebSocket clients.
+  int32 ws_clients = 8;
+  // Agent session ID (UUID).
+  string session_id = 9;
+}
+
+message StreamOutputRequest {
+  // Byte offset to start streaming from.
+  uint64 from_offset = 1;
+}
+message OutputChunk {
+  // Raw PTY output bytes.
+  bytes data = 1;
+  // Byte offset in the output stream.
+  uint64 offset = 2;
+}
+
+message StreamScreenRequest {}
+message ScreenSnapshot {
+  // One string per terminal row.
+  repeated string lines = 1;
+  int32 cols = 2;
+  int32 rows = 3;
+  // Whether the alternate screen buffer is active.
+  bool alt_screen = 4;
+  CursorPosition cursor = 5;
+  // Monotonic screen update seq number.
+  uint64 seq = 6;
+}
+
+message SendInputRequest {
+  // Text to write to the PTY.
+  string text = 1;
+  // Append carriage return after text.
+  bool enter = 2;
+}
+message SendInputResponse {
+  int32 bytes_written = 1;
+}
+
+message SendInputRawRequest {
+  // Raw bytes to write to the PTY.
+  bytes data = 1;
+}
+message SendInputRawResponse {
+  int32 bytes_written = 1;
+}
+
+// Named key sequences (case-insensitive). Supported: enter, tab, escape,
+// backspace, delete, space, up, down, left, right, home, end, pageup,
+// pagedown, insert, f1-f12, ctrl-{a..z}.
+message SendKeysRequest {
+  repeated string keys = 1;
+}
+message SendKeysResponse {
+  int32 bytes_written = 1;
+}
+
+message ResizeRequest {
+  // New column count (must be > 0).
+  int32 cols = 1;
+  // New row count (must be > 0).
+  int32 rows = 2;
+}
+message ResizeResponse {
+  int32 cols = 1;
+  int32 rows = 2;
+}
+
+// Signal name (case-insensitive): HUP, INT, QUIT, KILL, USR1, USR2, TERM,
+// CONT, STOP, TSTP, WINCH. Accepts bare names, SIG-prefixed, or numbers.
+message SendSignalRequest {
+  string signal = 1;
+}
+message SendSignalResponse {
+  bool delivered = 1;
+}
+
+
+// -- Agent --------------------------------------------------------------------
+
+// A single question within a multi-question dialog.
+message QuestionContext {
+  // The question text.
+  string question = 1;
+  // Available option labels.
+  repeated string options = 2;
+}
+
+// An answer to a single question within a dialog.
+message QuestionAnswer {
+  // 1-indexed option number.
+  optional int32 option = 1;
+  // Freeform text (used when selecting "Other").
+  optional string text = 2;
+}
+
+// Contextual information about a prompt the agent is presenting.
+// Present when agent state is "prompt".
+message PromptContext {
+  // Prompt type: "permission", "plan", "question", "setup".
+  string type = 1;
+  // Tool name (permission prompts).
+  optional string tool = 2;
+  // Prompt subtype for further classification within a type.
+  // Known subtypes by type:
+  //   permission: "trust", "tool"
+  //   setup: "theme_picker", "terminal_setup", "security_notes",
+  //          "login_success", "login_method", "oauth_login"
+  optional string subtype = 3;
+  reserved 4;  // was auth_url, now folded into input
+  // All questions in a multi-question dialog.
+  repeated QuestionContext questions = 5;
+  // 0-indexed current question; equals questions count at confirm phase.
+  uint32 question_current = 6;
+  // Numbered option labels parsed from the terminal screen (permission/plan prompts).
+  repeated string options = 7;
+  // True when options contains fallback labels (parser couldn't find real options).
+  bool options_fallback = 8;
+  // Truncated tool input JSON (permission prompts).
+  optional string input = 9;
+  // True when all async enrichment (e.g. option parsing) is complete.
+  bool ready = 10;
+}
+
+message GetAgentRequest {}
+message GetAgentResponse {
+  // Agent type.
+  string agent = 1;
+  // Current agent state: starting, working, idle,
+  // prompt, error, parked, exited, unknown.
+  string state = 2;
+  // Sequence number when this state was entered.
+  uint64 since_seq = 3;
+  // Current screen sequence number.
+  uint64 screen_seq = 4;
+  // Which detection tier produced this state.
+  string detection_tier = 5;
+  // Prompt context (present for prompt states).
+  optional PromptContext prompt = 6;
+  // Error description (when state is "error").
+  optional string error_detail = 7;
+  // Error classification (when state is "error").
+  optional string error_category = 8;
+  // Last message extracted from agent output.
+  optional string last_message = 9;
+  // Freeform cause string from the detector that produced the current state.
+  string detection_cause = 10;
+  // Agent session ID (UUID).
+  string session_id = 11;
+  // Why the agent is parked (when state is "parked").
+  optional string parked_reason = 12;
+  // UTC epoch millis when retry is scheduled (when state is "parked").
+  optional uint64 resume_at_epoch_ms = 13;
+}
+
+message NudgeRequest {
+  // Text message to send to the agent.
+  string message = 1;
+}
+message NudgeResponse {
+  // Whether the nudge was written to the PTY.
+  bool delivered = 1;
+  // Agent state at the time of the request.
+  optional string state_before = 2;
+  // Why the nudge was not delivered.
+  optional string reason = 3;
+}
+
+// Respond to an active prompt. Fields used depend on prompt type:
+//   permission: accept or option
+//   plan: accept or option, text (feedback)
+//   question: answers
+//   setup: option
+message RespondRequest {
+  // Accept/deny (permission and plan prompts). Overridden by option when set.
+  optional bool accept = 1;
+  // Freeform text (plan feedback).
+  optional string text = 3;
+  // Structured answers for multi-question dialogs.
+  repeated QuestionAnswer answers = 4;
+  // 1-indexed option number for permission/plan/setup prompts.
+  optional int32 option = 5;
+}
+message RespondResponse {
+  // Whether the response was written to the PTY.
+  bool delivered = 1;
+  // Prompt type at the time of the request.
+  optional string prompt_type = 2;
+  // Why the response was not delivered.
+  optional string reason = 3;
+}
+
+message StreamAgentRequest {}
+
+// Agent state transition event.
+message TransitionEvent {
+  // Previous agent state.
+  string prev = 1;
+  // New agent state.
+  string next = 2;
+  // State sequence number.
+  uint64 seq = 3;
+  // Prompt context (for prompt states).
+  optional PromptContext prompt = 4;
+  // Error text (when next is "error").
+  optional string error_detail = 5;
+  // Error classification (when next is "error").
+  optional string error_category = 6;
+  // Detection source that triggered this transition.
+  optional string cause = 7;
+  // Last message extracted from agent output.
+  optional string last_message = 8;
+  // Why the agent is parked (when next is "parked").
+  optional string parked_reason = 9;
+  // UTC epoch millis when retry is scheduled (when next is "parked").
+  optional uint64 resume_at_epoch_ms = 10;
+}
+
+message StreamPromptOutcomesRequest {}
+// Prompt action event (e.g. user responded to a prompt via API).
+message PromptOutcomeEvent {
+  string source = 1;
+  string type = 2;
+  optional string subtype = 3;
+  optional uint32 option = 4;
+}
+
+
+// -- Stop hook ----------------------------------------------------------------
+
+message GetStopConfigRequest {}
+message GetStopConfigResponse {
+  // Current StopConfig as JSON.
+  string config_json = 1;
+}
+
+message PutStopConfigRequest {
+  // StopConfig as JSON.
+  string config_json = 1;
+}
+message PutStopConfigResponse {
+  bool updated = 1;
+}
+
+message ResolveStopRequest {
+  // JSON body of the signal (freeform).
+  string body_json = 1;
+}
+message ResolveStopResponse {
+  bool accepted = 1;
+}
+
+message StreamStopEventsRequest {}
+// Stop hook verdict event.
+message StopEvent {
+  // Verdict type: signaled, error, safety_valve, blocked, allowed, rejected.
+  string type = 1;
+  // Signal body JSON (when type is "signaled").
+  optional string signal_json = 2;
+  // Error description (when type is "error").
+  optional string error_detail = 3;
+  // Monotonic sequence number.
+  uint64 seq = 4;
+}
+
+
+// -- Start hook ---------------------------------------------------------------
+
+message GetStartConfigRequest {}
+message GetStartConfigResponse {
+  // Current StartConfig as JSON.
+  string config_json = 1;
+}
+
+message PutStartConfigRequest {
+  // StartConfig as JSON.
+  string config_json = 1;
+}
+message PutStartConfigResponse {
+  bool updated = 1;
+}
+
+message StreamStartEventsRequest {}
+// Start hook event.
+message StartEvent {
+  // Source of the lifecycle event (e.g. "start", "resume", "clear").
+  string source = 1;
+  // Session ID if available from the hook data.
+  optional string session_id = 2;
+  // Whether a non-empty script was injected.
+  bool injected = 3;
+  // Monotonic sequence number.
+  uint64 seq = 4;
+}
+
+
+// -- Transcripts --------------------------------------------------------------
+
+// Metadata for a single transcript snapshot.
+message TranscriptMeta {
+  // Transcript number (monotonically increasing).
+  uint32 number = 1;
+  // Timestamp when the snapshot was taken.
+  string timestamp = 2;
+  // Number of lines in the transcript.
+  uint64 line_count = 3;
+  // Size in bytes.
+  uint64 byte_size = 4;
+}
+
+message ListTranscriptsRequest {}
+message ListTranscriptsResponse {
+  repeated TranscriptMeta transcripts = 1;
+}
+
+message GetTranscriptRequest {
+  // Transcript number to retrieve.
+  uint32 number = 1;
+}
+message GetTranscriptResponse {
+  // Transcript number.
+  uint32 number = 1;
+  // Full JSONL content of the transcript.
+  string content = 2;
+}
+
+message CatchupTranscriptsRequest {
+  // Return transcripts after this number.
+  uint32 since_transcript = 1;
+  // Return live lines after this offset.
+  uint64 since_line = 2;
+}
+
+// A transcript with its full line content.
+message CatchupTranscript {
+  uint32 number = 1;
+  string timestamp = 2;
+  repeated string lines = 3;
+}
+
+message CatchupTranscriptsResponse {
+  repeated CatchupTranscript transcripts = 1;
+  repeated string live_lines = 2;
+  uint32 current_transcript = 3;
+  uint64 current_line = 4;
+}
+
+message StreamTranscriptEventsRequest {}
+// Event emitted when a new transcript is saved.
+message TranscriptEvent {
+  uint32 number = 1;
+  string timestamp = 2;
+  uint64 line_count = 3;
+  uint64 seq = 4;
+}
+
+
+// -- Raw streams --------------------------------------------------------------
+
+message StreamRawHooksRequest {}
+// Raw hook FIFO JSON event.
+message RawHookEvent {
+  // The full JSON object from the hook FIFO pipe.
+  string json = 1;
+}
+
+message StreamRawMessagesRequest {}
+// Raw agent JSONL message from stdout or log.
+message RawMessageEvent {
+  // The full JSON object from stdout or the session log.
+  string json = 1;
+  // Origin: "stdout" (Tier 3) or "log" (Tier 2).
+  string source = 2;
+}
+
+
+// -- Usage tracking -----------------------------------------------------------
+
+message GetSessionUsageRequest {}
+message GetSessionUsageResponse {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 cache_read_tokens = 3;
+  uint64 cache_write_tokens = 4;
+  reserved 5; // was total_cost_usd — costUSD was never emitted by Claude Code
+  uint64 request_count = 6;
+  uint64 total_api_ms = 7;
+  int64 uptime_secs = 8;
+}
+
+message StreamUsageEventsRequest {}
+// Cumulative usage snapshot emitted after each API response.
+message UsageEvent {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 cache_read_tokens = 3;
+  uint64 cache_write_tokens = 4;
+  reserved 5; // was total_cost_usd — costUSD was never emitted by Claude Code
+  uint64 request_count = 6;
+  uint64 total_api_ms = 7;
+  uint64 seq = 8;
+}
+
+
+// -- Recording ----------------------------------------------------------------
+
+message GetRecordingRequest {}
+message GetRecordingResponse {
+  bool enabled = 1;
+  string path = 2;
+  uint64 entries = 3;
+}
+
+message PutRecordingRequest {
+  bool enabled = 1;
+}
+message PutRecordingResponse {
+  bool enabled = 1;
+  string path = 2;
+}
+
+message CatchupRecordingRequest {
+  uint64 since_seq = 1;
+}
+message CatchupRecordingResponse {
+  repeated RecordingEntryProto entries = 1;
+}
+
+message StreamRecordingEventsRequest {}
+// A single recording entry with screen snapshot.
+message RecordingEntryProto {
+  uint64 ts = 1;
+  uint64 seq = 2;
+  string kind = 3;
+  // Event-specific detail as JSON.
+  string detail_json = 4;
+  // Full screen snapshot as JSON.
+  string screen_json = 5;
+}
+
+
+// -- Profile management -------------------------------------------------------
+
+// A named credential profile entry.
+message ProfileEntry {
+  // Profile name.
+  string name = 1;
+  // Credential env vars (e.g. ANTHROPIC_API_KEY).
+  map<string, string> credentials = 2;
+  // Optional bead-authoritative health flag pushed by coopmux (ka-0000006430).
+  // false condemns this profile as an in-session rotation target; true clears
+  // it; unset leaves the profile's current usability untouched (fail-open).
+  optional bool usable = 3;
+}
+
+// Status information for a single profile.
+message ProfileInfo {
+  // Profile name.
+  string name = 1;
+  // Status: "active", "available", or "rate_limited".
+  string status = 2;
+  // Remaining cooldown seconds (only when rate_limited).
+  optional uint64 cooldown_remaining_secs = 3;
+}
+
+message RegisterProfilesRequest {
+  // Named credential profiles to register. First entry becomes active.
+  repeated ProfileEntry profiles = 1;
+}
+message RegisterProfilesResponse {
+  // Number of profiles registered.
+  uint32 registered = 1;
+}
+
+message ListProfilesRequest {}
+message ListProfilesResponse {
+  // All registered profiles with current status.
+  repeated ProfileInfo profiles = 1;
+  // Current rotation mode: "auto" or "manual".
+  string mode = 2;
+  // Name of the currently active profile, if any.
+  optional string active_profile = 3;
+}
+
+message GetProfileModeRequest {}
+message SetProfileModeRequest {
+  // "auto" or "manual".
+  string mode = 1;
+}
+message ProfileModeResponse {
+  // Current mode: "auto" or "manual".
+  string mode = 1;
+}
+
+message StreamProfileEventsRequest {}
+// Profile lifecycle event (switch, exhaustion, rotation exhaustion).
+message ProfileEvent {
+  // Event type: "profile:switched", "profile:exhausted", "profile:rotation:exhausted".
+  string event_type = 1;
+  // Previous active profile (profile:switched).
+  optional string from = 2;
+  // New active profile (profile:switched).
+  optional string to = 3;
+  // Profile name (profile:exhausted).
+  optional string profile = 4;
+  // Seconds until retry (profile:rotation:exhausted).
+  optional uint64 retry_after_secs = 5;
+}
+
+
+// -- Session management -------------------------------------------------------
+
+// Switch credentials and restart the agent process.
+// New credentials are merged into the child env. The agent is resumed
+// with --resume to continue the conversation.
+message SwitchSessionRequest {
+  // Credential env vars to merge into the new child process.
+  map<string, string> credentials = 1;
+  // Skip waiting for idle — SIGHUP immediately.
+  bool force = 2;
+  // Named profile to switch to — resolves credentials from registered profiles.
+  optional string profile = 3;
+}
+message SwitchSessionResponse {
+  // Whether the switch was scheduled.
+  bool scheduled = 1;
+}
+
+
+// -- Lifecycle ----------------------------------------------------------------
+
+message RestartSessionRequest {}
+message RestartSessionResponse {
+  // Whether the restart was scheduled.
+  bool scheduled = 1;
+}
+
+message ShutdownRequest {}
+message ShutdownResponse {
+  bool accepted = 1;
+}

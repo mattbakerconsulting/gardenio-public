@@ -1,0 +1,1361 @@
+# The type, view and context configs gardenio registers in the beads daemon.
+# configs() in init.go embeds this file and decodes it strictly. Each key is the
+# config bead's title; its prefix (type:, view:, context:) picks the schema
+# (TypeConfig, ViewConfig, ContextConfig in init_types.go), and the field names
+# are those structs' JSON names. TestInitConfigs_Golden pins the decoded data;
+# after an intentional change, regenerate its golden with GB_UPDATE_GOLDEN=1.
+
+# --- types -----------------------------------------------------------
+#
+# Both are config-kind beads.  The agent type carries lifecycle state
+# that the controller writes back; the project type holds repo metadata
+# used to configure agent pods.
+
+"type:agent":
+  kind: config
+  fields:
+    # Agent identity.
+    - {name: project, type: string}
+    - {name: mode, type: string}
+    # Agent CLI harness override (claude|codex|gemini); the agent layer of the
+    # harness resolution (gd-6SezxhSEEk).
+    - {name: harness, type: enum, values: [claude, codex, gemini]}
+    # Harness the controller resolved at spawn (ADR 0004 section 4);
+    # read-only to consumers, distinct from the override above.
+    - {name: resolved_harness, type: enum, values: [claude, codex, gemini]}
+    - {name: role, type: string}
+    - {name: agent, type: string}
+    # Agent lifecycle state written back by the controller.
+    - {name: agent_state, type: enum, values: [idle, spawning, working, done, failed, rate_limited, budget_exceeded, killed, paused]}
+    # Pod lifecycle state written back by the controller.
+    - {name: pod_phase, type: enum, values: [pending, running, succeeded, failed]}
+    - {name: pod_name, type: string}
+    - {name: pod_namespace, type: string}
+    - {name: pod_ready, type: boolean}
+    - {name: coop_url, type: string}
+    - {name: coop_token, type: string}
+    # Per-agent overrides (optional).
+    - {name: image, type: string}
+    # source_image is the agent image a prewarmed pod was minted
+    # from, stamped by poolmanager.createPrewarmedAgent so a later
+    # release can detect a stale-image warm pod and recycle it
+    # (ka-0000001689). MUST be registered here or every prewarmed
+    # agent create 400s "source_image: unknown field" and the pool
+    # never mints (ka-0000000488).
+    - {name: source_image, type: string}
+    - {name: mock_scenario, type: string}
+    # Agent stop/gate control written by gb stop and gb yield.
+    - {name: stop_requested, type: string}
+    - {name: close_reason, type: string}
+    # Terminal, non-failover credential failure diagnostics
+    # (ka-0000003962). Persisted by the terminal-auth-failure NATS
+    # listener when coop reports an Unauthorized / OutOfCredits error
+    # on a distinct diagnostic subject. Before this, a first-turn
+    # terminal auth failure (e.g. "401 key not allowed to access
+    # model") emitted NO NATS event and NOTHING reached the bead —
+    # the real error string lived only in a live /api/v1/agent poll
+    # that vanished on pod restart, so the 2026-07-25 opus-5 outage
+    # ran ~4.5h fleet-wide with total_errors=0 on every affected
+    # bead. These fields give it a durable home. MUST be registered
+    # here or the field-update PATCH 400s "unknown field".
+    - {name: error_category, type: string}
+    - {name: error_detail, type: string}
+    # The Lands spawn wall's refusal (Track B step 8.3,
+    # internal/lands/wall): the code (land_frozen, lands_paused,
+    # tenant_spawns_off, purse_wall, purse_unknown, land_gone, land_unfenced,
+    # max_live_agents, spawn_rate) and the reason,
+    # stamped with agent_state=budget_exceeded; gb spawn prints them.
+    - {name: spawn_wall, type: string}
+    - {name: spawn_wall_reason, type: string}
+    # The Lands purse watcher (Track B step 8.4,
+    # internal/lands/watcher): when it nudged the agent to push
+    # before a purse-empty suspend (RFC3339), and the reason it
+    # parked it (purse_empty).
+    - {name: purse_nudged_at, type: string}
+    - {name: park_reason, type: string}
+    - {name: gate_satisfied_by, type: string}
+    # Yield tracking for backoff.
+    - {name: yield_count, type: integer}
+    # Advice subscription overrides.
+    - {name: advice_subscriptions, type: "string[]"}
+    - {name: advice_subscriptions_exclude, type: "string[]"}
+    # Auto-assignment control: "true" or "false" (default).
+    - {name: auto_assign, type: boolean}
+    # Structured wrap-up stored by gb stop --wrapup (JSON-serialized string).
+    - {name: wrapup, type: string}
+    # Prior turn's wrap-up, archived by the resume-in-place path
+    # before it nil-deletes `wrapup` (bot_agent_kill.go), so a
+    # resumed agent's card can fall back to the previous turn's
+    # tl;dr instead of rendering blank for the whole resumed turn
+    # (ka-0000003692). MUST be registered before the writer ships:
+    # the kbeads daemon 400s the ENTIRE typed PATCH on an
+    # unregistered field, and the revive write is one atomic PATCH
+    # carrying the closed→in_progress flip, so a 400 here would fail
+    # the whole revive and drop the operator to the cold-mint
+    # fallback. Same binary as the writer (EnsureConfigs runs at
+    # bridge startup), so ordering is a same-MR concern only.
+    - {name: prior_wrapup, type: string}
+    # Thread-spawn metadata (written by handleThreadSpawn).
+    - {name: slack_thread_channel, type: string}
+    - {name: slack_thread_ts, type: string}
+    - {name: spawn_source, type: string}
+    # Custom prompt passed via /spawn "description" → BOAT_PROMPT env var.
+    - {name: prompt, type: string}
+    # Pre-assigned task ID (set by /spawn with ticket or task-first flow).
+    - {name: task_id, type: string}
+    # Agent that spawned this one (gardener name, schedule ID, or "concierge").
+    - {name: spawned_by, type: string}
+    # Human-operator id propagated at spawn time so the pod boots with
+    # BEADS_OPERATED_BY set and downstream client defaults stamp the
+    # operator on every kd/gb call. See R2 §3 hybrid push+pull model.
+    - {name: operated_by, type: string}
+    # Escalation bead ID when the agent was spawned to execute an escalation.
+    - {name: escalation_id, type: string}
+    # Schedule metadata (set by scheduler when spawning scheduled agents).
+    - {name: schedule_id, type: string}
+    - {name: schedule_title, type: string}
+    - {name: schedule_cron, type: string}
+    - {name: schedule_slack_channel, type: string}
+    - {name: schedule_name, type: string}
+    # Live-card footer navigability (ka-0000003131): the resolved
+    # gardener that spawned this agent (human-readable name, not the
+    # gardener bead id) and the human owner it was spawned on behalf
+    # of. Stamped at spawn from the trigger/schedule bead so the
+    # slack-bridge can render "Resolved by: <gardener>" / "Owner:
+    # <human>" on the live agent card without a gardener-bead fetch.
+    - {name: resolved_by, type: string}
+    - {name: owner, type: string}
+    # Scheduled-loop-context fields — rendered by gb prime so the spawned
+    # agent sees "you are run N of M" and the schedule's terminal goal.
+    # Set by scheduler.spawnScheduledAgent; see proposals/
+    # ephemeral-schedules-gardener-primitive.md §2.
+    - {name: schedule_max_runs, type: string}
+    - {name: schedule_runs_spawned, type: string}
+    - {name: schedule_runs_completed, type: string}
+    - {name: schedule_terminal_goal, type: string}
+    - {name: schedule_prior_agent_id, type: string}
+    # Neutral succession back-pointers (persistent-agents Phase 1,
+    # task ka-0000006931, design memo §3.1). prior_agent_id is the
+    # predecessor agent bead ID, written on EVERY recreate — thread
+    # respawn, gardener iteration, and wrapup successor=new alike;
+    # lineage_root_id is the first bead in that chain, stamped at
+    # mint so the viewer can group a whole life-thread by indexed
+    # lookup and bound the per-chain continuation budget. Distinct
+    # from schedule_prior_agent_id (which the gardener path keeps
+    # writing unchanged, its 4 readers + golden tests untouched);
+    # the viewer walk reads prior_agent_id OR schedule_prior_agent_id.
+    - {name: prior_agent_id, type: string}
+    - {name: lineage_root_id, type: string}
+    # The trigger whose live-run lease a decision- or
+    # escalation-resume of a trigger-fired agent holds, read by
+    # the engine's single-live-run gates (triggerLeaseField,
+    # gd-H17IlFclcl). MUST be registered: type:agent has no
+    # allow_additional_fields, so an unregistered key 400s the
+    # whole resume create.
+    - {name: trigger_lease_id, type: string}
+    # Succession INTENT + wake time, written by the idle-TTL park
+    # path (cmd/gb/init_agent_idle_ttl.go idleTTLDespawn) when a
+    # persistent agent's warm window expires: it closes the bead but
+    # stamps successor=same + next_respawn_at so a future wake
+    # scanner (ka-0000004902) can recreate the identity.
+    #
+    # BUG THIS FIXES (ka-0000004509). Neither field was ever
+    # registered here, and type:agent does NOT set
+    # allow_additional_fields — so the daemon 400s the ENTIRE typed
+    # PATCH on an unregistered key. The park write is one atomic
+    # close carrying both, which means the park path has been
+    # silently failing its close for its whole life. Confirmed
+    # against the live prod daemon 2026-08-16: `kd update <agent>
+    # -f successor=same` and `-f next_respawn_at=…` both return
+    # HTTP 400 "unknown field", while the neighbouring
+    # prior_agent_id write succeeds. Consistent with the data —
+    # ZERO agents in a 7-day window carry `successor`,
+    # `next_respawn_at`, or an idle_ttl close_reason.
+    #
+    # Registering them makes the shipped writer's writes land. The
+    # wake scanner that consumes them is still unbuilt, so this
+    # records intent only (design memo: successor=same "records
+    # intent only today") — but a stamped intent that 400s is
+    # strictly worse than one that persists unread, because the
+    # failure is invisible at the call site (the park logs success
+    # off the pre-close log line).
+    - {name: successor, type: string}
+    - {name: next_respawn_at, type: string}
+    # Seat key: the POSITION this agent occupies, derived at spawn
+    # as project/role/<name minus its generated suffix>
+    # (beadsapi.SeatKey, task ka-0000007094). A seat is a name that
+    # keeps getting re-occupied — a positional fact, not a persona —
+    # and this makes it queryable so lineage_root_id can mean "first
+    # occupant of this seat" and the viewer can group a recurring
+    # name's occupancies. MUST be registered here: type:agent has no
+    # allow_additional_fields, so an unregistered key 400s the whole
+    # spawn create.
+    - {name: seat_key, type: string}
+    # Canonical gardener owner, stamped AT SPAWN on every agent bead
+    # (persistent-agents Phase 1, task ka-0000006626, design memo
+    # ka-0000001420 §2.3). Real gardener (trigger) id when spawned by a
+    # gardener; a per-spawn_source synthetic id for ad-hoc vectors
+    # (slack-thread, gitlab-mr-review, jira-mention, …) so the viewer's
+    # "Unowned" bucket is empty by construction. MUST be registered
+    # here or the beadsapi create-choke-point stamp 400s "gardener_id:
+    # unknown field" on every spawn. Written by beadsapi.stampAgentGardenerID.
+    - {name: gardener_id, type: string}
+    # Slack user who triggered the spawn.
+    - {name: slack_user_id, type: string}
+    - {name: slack_spawn_channel, type: string}
+    # User bead ID — resolved from slack_user_id at spawn time.
+    - {name: user_bead_id, type: string}
+    # GitLab MR binding metadata (set by gitlab-bridge agent resolver).
+    - {name: gitlab_mr_url, type: string}
+    - {name: gitlab_project_id, type: string}
+    - {name: gitlab_mr_iid, type: string}
+    - {name: gitlab_mr_source_branch, type: string}
+    # Human exit-survey prompt dedup — set by gb stop after the
+    # bridge posts a rating prompt; later gb stop invocations skip
+    # re-posting when this is present. See bot_human_survey.go.
+    - {name: human_survey_prompt_ts, type: string}
+    # lambda_microvm execution-backend lifecycle (epic ka-0000005010,
+    # Change C5). Stamped by handleNonK8sSpawn after a successful
+    # Backend.Launch and reconciled by the MicroVM lifecycle path
+    # (runtime status instead of pod presence). execution_target names
+    # the resolved backend; runtime_id is the AWS MicroVM id; the
+    # remainder pin the runtime's AWS location + start for status/GC.
+    - {name: execution_target, type: string}
+    - {name: runtime_id, type: string}
+    - {name: runtime_state, type: string}
+    - {name: runtime_account, type: string}
+    - {name: runtime_region, type: string}
+    - {name: runtime_started_at, type: string}
+    # respawnThreadAgent (bot_agent_kill.go) mints the resume bead with
+    # a per-wake-up IdempotencyKey; createBead folds it into
+    # Fields[idempotency_key] before validation, so it must be declared
+    # or every Slack wake-up of a done thread agent 400s
+    # "idempotency_key: unknown field". Same reason type:message
+    # declares it below.
+    - {name: idempotency_key, type: string}
+    # postInterruptedBreadcrumbOnce (init_agent_loop.go) stamps this
+    # dedup marker before posting the "I was interrupted" breadcrumb.
+    # Undeclared, the stamp 400s on every teardown, `marked` is always
+    # false, and the thread gets one breadcrumb per restart cycle —
+    # exactly the duplicate-spam the mark-before-post fix
+    # (ka-0000002138 / ka-0000002080) was written to prevent.
+    - {name: interrupted_breadcrumb_posted, type: string}
+    # CI wait parked on the agent's own bead (plan
+    # wake-on-ci-completion.md §2.1, task gd-AwuRDezONo): written by
+    # `gb wait ci`, read by `gb stop` to park the claimed task, and
+    # resolved by the bridge when the run concludes. Keys are
+    # beadsapi.CIWaitFields; mirrored in the kbeads builtin.
+    - {name: ci_wait_state, type: string}
+    - {name: ci_wait_key, type: string}
+    - {name: ci_wait_workflows, type: string}
+    - {name: ci_wait_task, type: string}
+    - {name: ci_wait_deadline, type: string}
+    - {name: ci_wait_result, type: string}
+    # The resolver's run ledger (beadsapi.FieldCIWaitLedger).
+    - {name: ci_wait_ledger, type: string}
+"type:advice":
+  kind: data
+  fields:
+    - {name: hook_command, type: string}
+    - {name: hook_trigger, type: enum, values: [session-end, before-commit, before-push, before-handoff]}
+    - {name: hook_timeout, type: integer}
+    - {name: hook_on_failure, type: enum, values: [block, warn, ignore]}
+    - {name: subscriptions, type: "string[]"}
+    - {name: subscriptions_exclude, type: "string[]"}
+    # Legacy confidence scoring — no writers since the
+    # confidence/survey subsystem was removed (ka-0000001115);
+    # kept so existing bead data stays schema-valid.
+    - {name: confidence, type: float}
+    - {name: confirmations, type: integer}
+    - {name: last_confirmed, type: string}
+    - {name: source, type: string}
+    - {name: author_agent, type: string}
+    - {name: content_hash, type: string}
+    - {name: memory_category, type: string}
+    - {name: tags, type: string}
+    - {name: supersedes, type: string}
+    - {name: expires_at, type: timestamp}
+"type:memory":
+  kind: data
+  fields:
+    - {name: category, type: enum, values: [insight, pattern, feedback, context, reference, decision_log]}
+    - {name: role, type: string}
+    - {name: project, type: string}
+    - {name: author_agent, type: string}
+    - {name: tags, type: string}
+    - {name: supersedes, type: string}
+    - {name: confidence, type: float}
+    - {name: confirmations, type: integer}
+    - {name: last_confirmed, type: string}
+    - {name: content_hash, type: string}
+    - {name: layer, type: enum, values: [buffer, episodic, semantic]}
+    - {name: strength, type: float}
+    - {name: half_life_days, type: float}
+    - {name: emotional_valence, type: enum, values: [neutral, positive, negative, critical]}
+    - {name: schema_fit, type: float}
+    - {name: retrieval_count, type: integer}
+    - {name: last_retrieved, type: string}
+    - {name: pinned, type: boolean}
+    - {name: outcome_positive, type: integer}
+    - {name: outcome_negative, type: integer}
+    - {name: outcome_score, type: integer}
+    - {name: conflicts_with, type: string}
+    - {name: source, type: string}
+# type:project MUST stay field-for-field consistent with the kbeads
+# builtin (kbeads/internal/server/config.go "type:project"), which is the
+# single source of truth. Every fields[...] key the controller's
+# ProjectInfo parser reads (beadsapi/projects.go) must appear here AND in
+# the builtin, or the daemon 400-rejects project beads carrying it. The
+# projectInfoReadFields drift guard (init_test.go) enforces this.
+"type:project":
+  kind: config
+  fields:
+    - {name: prefix, type: string}
+    - {name: git_url, type: string}
+    - {name: default_branch, type: string}
+    - {name: image, type: string}
+    - {name: storage_class, type: string}
+    - {name: service_account, type: string}
+    # Enable Docker-in-Docker sidecar for this project's agents.
+    - {name: docker, type: boolean}
+    # Enable PostgreSQL sidecar for this project's agents.
+    - {name: postgres, type: boolean}
+    # Pod resource overrides.
+    - {name: cpu_request, type: string}
+    - {name: cpu_limit, type: string}
+    - {name: memory_request, type: string}
+    - {name: memory_limit, type: string}
+    # Per-project secrets, plain env vars, and multi-repo definitions.
+    - {name: secrets, type: json}
+    - {name: env, type: json}
+    - {name: env_json, type: json}
+    - {name: repos, type: json}
+    # Account bead name for LLM provider routing (references a type:account bead).
+    # When set, the controller reads the account bead and configures agent pods
+    # with ANTHROPIC_BASE_URL, model, and LiteLLM virtual key headers.
+    - {name: account, type: string}
+    # Model override for this project's agents, independent of the
+    # account (epic ka-0000005488). Parsed by ProjectInfo.Model.
+    - {name: model, type: string}
+    # Agent CLI harness (claude|codex|gemini). Parsed by ProjectInfo.Harness.
+    - {name: harness, type: enum, values: [claude, codex, gemini]}
+    # Pins every pod in this project to a Kubernetes RuntimeClass
+    # (e.g. "runsc" for gVisor). Parsed by ProjectInfo.RuntimeClassName.
+    - {name: runtime_class, type: string}
+    # Slack channel ID for channel-to-project resolution (/spawn).
+    - {name: slack_channel, type: string}
+    # Per-channel role overrides (JSON: channelID -> role).
+    - {name: channel_roles, type: json}
+    # Per-channel interaction modes (JSON: channelID -> "concierge"|"mention").
+    - {name: channel_modes, type: json}
+    # Per-channel RuntimeClass overrides (JSON: channelID -> runtimeClass).
+    - {name: channel_runtime_class, type: json}
+    # Auto-assignment control: "true" (default) or "false".
+    # Inherited by agents unless overridden on the agent bead.
+    - {name: auto_assign, type: string}
+    # Marks this project as the default for DM-spawned agents.
+    - {name: dm_default, type: boolean}
+    # Prewarmed pool configuration (JSON):
+    # {"enabled":bool, "mode":"job"|"crew", "role":"thread", "min_size":int, "max_size":int}
+    - {name: prewarmed_pool, type: json}
+    # Nudge prompt templates (JSON): role-keyed map of prompt strings.
+    # Keys: "thread", "adhoc", "default", "prewarmed".
+    # Supports {{.Project}}, {{.ProjectHint}}, {{.TaskHint}}, {{.MonorepoHint}}, {{.BoatPrompt}} placeholders.
+    - {name: nudge_prompts, type: json}
+    # ACME ECS/RDS resource-mapping definitions (JSON array).
+    # Parsed by ProjectInfo.ResourceMapping (FSM correlation contract).
+    - {name: resource_mapping, type: json}
+    # Per-project inline Claude config overrides (JSON: category -> raw config).
+    - {name: claude_config, type: json}
+    # Default timezone for schedules in this project (e.g. "America/Los_Angeles").
+    # Used as fallback when a schedule bead has no timezone field set.
+    - {name: default_timezone, type: string}
+    # Per-project schedule toggle. Default true (schedules run).
+    # Set to "false" to pause all schedules for this project.
+    - {name: schedules_enabled, type: boolean}
+    # Per-project trigger toggle. Default true (triggers fire).
+    # Set to "false" to pause all triggers for this project.
+    - {name: triggers_enabled, type: boolean}
+    # Per-project session-resume tri-state ("true"/"false"/unset).
+    # Parsed by ProjectInfo.SessionResume.
+    - {name: session_resume, type: string}
+    # Per-project ultracode/workflow-mode tri-state ("true"/"false"/
+    # unset). Role and per-agent overrides supersede it. Parsed by
+    # ProjectInfo.Ultracode (ka-0000001714).
+    - {name: ultracode, type: string}
+    # Opt-in: mount a projected k8s ServiceAccount token into agent pods
+    # for this project so crews can reach the k8s API. See AUDIT.md §C3
+    # and ka-0000006344 for the security policy.
+    - {name: needs_k8s_api, type: boolean}
+    # OpenZiti per-pod overlay access (epic ka-0000000990). Opt this
+    # project's agents into a task-scoped Ziti lease via the
+    # ziti-access-broker. See docs/ziti-access-broker-integration.md.
+    - {name: ziti_access, type: boolean}
+    - {name: ziti_service_id, type: string}
+    - {name: ziti_bind, type: boolean}
+    - {name: ziti_ttl, type: string}
+    - {name: ziti_optional, type: boolean}
+    # Execution context for agents spawned on this project
+    # ("local", "service_account", or "server").
+    - {name: execution_target, type: string}
+    # Slack card visual system for this project's channels — see
+    # theme.go / gardenio/plans/slack-greenhouse-restyle.md.
+    - {name: card_theme, type: enum, values: [garden, business]}
+    # Land fields (Lands Commons spec §2.1): the channel bead the
+    # land opens on, and whether its new channels default to
+    # mirroring to Slack ("on"/"off"). Written by gb channel seed.
+    - {name: land_default_channel, type: string}
+    - {name: land_slack_mirror, type: enum, values: ["on", "off"]}
+    # "operator" (unset: today's projects) or "tenant" (Lands
+    # Track B spec §3.2).
+    - {name: land_kind, type: enum, values: [operator, tenant]}
+    # The rest of the Track B §3.2 land fields, admin- or
+    # provisioner-written (kbeads builtin type:project has the
+    # meanings). A tenant land keeps land_slack_mirror off.
+    - {name: land_owner_sub, type: string}
+    - {name: land_steward_approves, type: json}
+    - {name: land_application_id, type: string}
+    - {name: land_opened_at, type: timestamp}
+    - {name: land_frozen, type: boolean}  # + who, when (RFC3339), why; gb lands freeze
+    - {name: land_frozen_by, type: string}
+    - {name: land_frozen_at, type: string}
+    - {name: land_frozen_reason, type: string}
+    - {name: github_app, type: enum, values: [fleet, lands]}
+    - {name: github_installation_id, type: string}
+    - {name: max_live_agents, type: integer}
+    - {name: namespace, type: string}
+    # A tenant land's NATS password epoch; bump to revoke (gd-zo4W7Q8Yno).
+    - {name: nats_epoch, type: string}
+    - {name: land_closed_at, type: timestamp}
+    # The land's grant to its steward (steward amendment
+    # 2026-10-23 §4); unset is ask.
+    - {name: steward_authority, type: enum, values: [ask, merge-on-green, operate]}
+    # Per-project budget in US dollars (decision gd-PtNuTyjQoN),
+    # display-only: it drives the scoped "$ remaining", nothing
+    # is paused when it runs out. Unset = no budget; the viewer
+    # editor and projectValidityReport reject 0 and negatives,
+    # so a stored value is always > 0. budget_period is the
+    # window it covers, "month" when unset.
+    - {name: budget_usd, type: float}
+    - {name: budget_period, type: enum, values: [month, "7d"]}
+    # The project's release source (gardenio/docs/releases-design.md
+    # §4): the Go regexp a release tag must match, the named targets
+    # it runs on ([{"name","kind"}]), and the release branch
+    # (default_branch when unset). Parsed by ProjectInfo.ReleaseSource.
+    - {name: release_tag_pattern, type: string}
+    - {name: release_targets, type: json}
+    - {name: release_branch, type: string}
+
+# type:role MUST stay field-for-field consistent with the kbeads
+# builtin (kbeads/internal/server/config.go "type:role"), which is the
+# single source of truth. Every fields[...] key the controller's
+# RoleInfo parser reads (beadsapi/roles.go) must appear here AND in the
+# builtin, or the daemon 400-rejects role beads carrying it. The
+# roleInfoReadFields drift guard (init_test.go) enforces this.
+"type:role":
+  kind: config
+  fields:
+    - {name: secrets, type: json}
+    - {name: env, type: json}
+    - {name: env_json, type: json}
+    - {name: image, type: string}
+    - {name: cpu_request, type: string}
+    - {name: cpu_limit, type: string}
+    - {name: memory_request, type: string}
+    - {name: memory_limit, type: string}
+    - {name: docker, type: boolean}
+    - {name: postgres, type: boolean}
+    - {name: service_account, type: string}
+    - {name: storage_class, type: string}
+    - {name: claude_config, type: json}
+    # Account bead name override for this role (references a
+    # type:account bead). Pins the role to a specific LLM provider
+    # regardless of which project it runs in.
+    - {name: account, type: string}
+    # Model override for agents spawned with this role, independent
+    # of which account they use (epic ka-0000005488). Empty inherits
+    # the account's default model.
+    - {name: model, type: string}
+    # Agent CLI harness (claude|codex|gemini). Parsed by RoleInfo.Harness.
+    - {name: harness, type: enum, values: [claude, codex, gemini]}
+    # Extra harnesses a Slack `--harness`/`--model codex` may pick on
+    # this role (comma-separated claude|codex|gemini), beyond the role's own
+    # resolved harness. Parsed by RoleInfo.AllowedHarnesses.
+    - {name: allowed_harnesses, type: string}
+    # Restricts which accounts pods with this role may use; the
+    # project's round-robin pool is intersected with this list at
+    # pod-spawn time (fail-closed when empty intersection).
+    - {name: account_whitelist, type: json}
+    # Opt a role OUT of the role-pin exhaustion spill (ka-0000001307):
+    # when its pinned account is capacity-exhausted at spawn and the
+    # project has other healthy accounts, the controller normally spills
+    # to the healthy spread pool instead of parking the agent queued.
+    # no_account_spill=true keeps block-and-wait for a lane that MUST
+    # stay pinned. Empty/false = spill allowed (the safer default).
+    - {name: no_account_spill, type: boolean}
+    # Per-role skill toggle (Adam feedback #1, epic ka-0000004989).
+    # enabled_skills is an allow-list: when non-empty, ONLY the
+    # named skills are linked into the workspace (empty = all
+    # discovered skills enabled). disabled_skills is a deny-list:
+    # named skills are never linked. Both name the LINKED skill name
+    # Claude Code discovers (primary skills bare, sibling-repo skills
+    # prefixed "{repo}-"). Consumed in-pod by `gb setup claude`
+    # (symlinkClaudeExtensions), NOT propagated to the pod spec, so
+    # config.RoleInfo intentionally omits them. Accepts a JSON array
+    # or a comma-separated string (parsed by parseStringList, like
+    # account_whitelist).
+    - {name: enabled_skills, type: json}
+    - {name: disabled_skills, type: json}
+    # Per-role sub-agent toggle (ka-0000006908) — the "agents"
+    # subdir analogue of the skill toggle, identical semantics and
+    # shapes: enabled_agents is an allow-list (empty = all
+    # discovered agents enabled), disabled_agents a deny-list
+    # (deny wins). Both name the LINKED agent file Claude Code
+    # discovers (primary entries bare, sibling-repo entries
+    # prefixed "{repo}-"). Consumed in-pod by `gb setup claude`,
+    # not propagated to the pod spec.
+    - {name: enabled_agents, type: json}
+    - {name: disabled_agents, type: json}
+    # Opt-in: mount a projected k8s ServiceAccount token into agent pods
+    # for this role so crews can reach the k8s API. See AUDIT.md §C3
+    # and ka-0000006344 for the security policy.
+    - {name: needs_k8s_api, type: boolean}
+    # Machine client whose secret the controller mounts into this role's
+    # pods, only when allowlisted by GARDENIO_AGENT_MACHINE_CLIENT_MOUNTS
+    # (escalation routing Task 15, C5).
+    - {name: machine_client, type: string}
+    # verifier=true: the chart's read-only verifier ServiceAccount and its
+    # token (P9.2, gd-6ujfeTZfNL).
+    - {name: verifier, type: boolean}
+    # OpenZiti per-pod overlay access (epic ka-0000000990). Role-level
+    # settings take precedence over project-level. See
+    # docs/ziti-access-broker-integration.md.
+    - {name: ziti_access, type: boolean}
+    - {name: ziti_service_id, type: string}
+    - {name: ziti_bind, type: boolean}
+    - {name: ziti_ttl, type: string}
+    - {name: ziti_optional, type: boolean}
+    # Per-role session-resume tri-state ("true"/"false"/unset);
+    # overrides the project setting. Parsed by RoleInfo.SessionResume.
+    - {name: session_resume, type: string}
+    # Per-role ultracode/workflow-mode tri-state ("true"/"false"/
+    # unset); overrides the project setting, per-agent overrides both.
+    # This is where the gardenio-microvms role opts its role-default
+    # MicroVM agents into ultracode. Parsed by RoleInfo.Ultracode
+    # (ka-0000001714).
+    - {name: ultracode, type: string}
+    # Pins pods with this role to a Kubernetes RuntimeClass (e.g.
+    # "runsc" for gVisor). Empty inherits the cluster default.
+    - {name: runtime_class, type: string}
+    # Execution context for agents spawned with this role
+    # ("local", "service_account", or "server").
+    - {name: execution_target, type: string}
+    # Gates non-human spawn of this role behind the escalation
+    # path (roleIsPrivileged, kbeads/internal/server/spawn_authz.go)
+    # and drives the agent detail page's spawn-provenance badge
+    # (gd-jbY5UiWlN4).
+    - {name: privileged, type: boolean}
+
+"type:jira-poller":
+  kind: config
+  fields:
+    - {name: projects, type: string}
+    - {name: statuses, type: string}
+    - {name: issue_types, type: string}
+    - {name: fix_versions, type: string}
+    - {name: required_labels, type: string}
+    - {name: excluded_labels, type: string}
+    - {name: filter_projects, type: string}
+    - {name: custom_jql, type: string}
+    - {name: poll_interval, type: string}
+
+"type:task":
+  kind: issue
+  fields:
+    - {name: jira_key, type: string}
+    - {name: jira_project, type: string}
+    - {name: jira_type, type: string}
+    - {name: jira_status, type: string}
+    - {name: jira_url, type: string}
+    - {name: jira_epic, type: string}
+    - {name: jira_reporter, type: string}
+    - {name: jira_reporter_id, type: string}
+    - {name: jira_reporter_email, type: string}
+    - {name: jira_xlinks, type: string}
+    - {name: mr_url, type: string}
+    - {name: jira_attachment_count, type: string}
+    - {name: jira_has_images, type: string}
+    - {name: jira_has_video, type: string}
+    - {name: jira_link_count, type: string}
+    # Slack attachment fields — set by slack-bridge when files are shared.
+    - {name: slack_attachment_count, type: string}
+    - {name: slack_has_images, type: string}
+    - {name: channel_id, type: string}  # Commons channel of a thread head (channel_stamp.go)
+    - {name: promoted_from, type: string}  # the chat root a mention promoted to this wish head (inbound_compose.go)
+    # GitLab bridge fields — set by gitlab-bridge when MR events are detected.
+    - {name: mr_merged, type: string}
+    - {name: mr_state, type: enum, values: [opened, closed, merged, locked]}
+    - {name: mr_pipeline_status, type: string}
+    - {name: mr_pipeline_url, type: string}
+    - {name: mr_approved, type: string}
+    - {name: mr_approvers, type: string}
+    - {name: mr_has_review_comments, type: string}
+    - {name: gitlab_mr_iid, type: string}
+    - {name: gitlab_project_id, type: string}
+    # Which forge the mr_* fields describe ("github"), set by
+    # github-bridge so the viewer can label the link. Absent means
+    # GitLab; the mr_* names are shared, not forked per forge.
+    - {name: forge, type: string}
+    # Jira comment fields — set by jira-bridge webhook handler.
+    - {name: jira_has_comments, type: string}
+    # Originating Jira comment id of the latest follow-up, so
+    # replies can thread to the comment that triggered the wake
+    # (F3, plan ka-0000007401).
+    - {name: jira_comment_id, type: string}
+    # fsm-triage classification (ka-0000001301): the triage agent
+    # stamps the recommended Affects-Version on its task bead and
+    # JiraSync.syncGBFSMTicket reads it back (via triageClassification)
+    # to write the version FIELD on the one upserted GBFSM ticket
+    # (1:1 reshape ka-0000001491). Must be declared here or the agent's
+    # `kd update -f recommended_affects_version=…` 400s
+    # "unknown field" and the version never reaches GBFSM.
+    - {name: recommended_affects_version, type: string}
+    # GitLab @mention fields — set by gitlab-bridge when an @gardenio mention spawns a task.
+    - {name: mention_author, type: string}
+    - {name: spawn_source, type: string}
+    - {name: gitlab_discussion_id, type: string}
+    - {name: gitlab_mr_source_branch, type: string}
+    # Track A3 (plan ka-0000004007): when a mention is delivered by
+    # NUDGING a live agent instead of spawning a new one, the task
+    # has no linked agent bead — these record which agent covered it
+    # so the A1 catchup watchdog (gitlab_mention_catchup.go) does not
+    # mistake it for an orphan and respawn a redundant crew.
+    - {name: nudged_agent, type: string}
+    - {name: nudge_delivered_at, type: string}
+    # Reopen-attempt accounting (the beadsapi.Reopen*Field constants),
+    # stamped by the stale-reaper and the gb stop-gate when they reopen
+    # or park a stranded task. Listed for completeness only: this map
+    # feeds a config BEAD that field validation never reads. The
+    # registration validation enforces is reopenFields in
+    # kbeads/internal/server/config.go (gd-aJze4IIIEC). String literals,
+    # not the constants, because the bridge-subset guard's AST walk
+    # only recognises `Name: "literal"`.
+    - {name: reopen_attempts, type: string}
+    - {name: reopen_capped, type: string}
+    - {name: reopen_cap_reason, type: string}
+
+# --- users -------------------------------------------------------
+#
+# User identity mapping: centralizes Slack→GitLab→GitHub→email
+# resolution so multiple subsystems can look up cross-platform
+# identities without per-agent ephemeral state.
+
+"type:user":
+  kind: config
+  fields:
+    - {name: slack_id, type: string}
+    - {name: slack_channel_id, type: string}
+    - {name: gitlab_username, type: string}
+    - {name: github_username, type: string}
+    - {name: gitlab_user_id, type: string}
+    - {name: github_user_id, type: string}
+    - {name: email, type: string}
+    - {name: display_name, type: string}
+    - {name: pronouns, type: string}
+    - {name: team, type: string}
+    - {name: jira_user, type: string}
+    - {name: preferences, type: json}
+    - {name: profile_prefs, type: json}
+    - {name: capabilities, type: json}
+    - {name: auth_methods, type: json}
+
+# --- accounts ----------------------------------------------------
+#
+# Credential profiles for agent auth. Projects reference an account
+# by name to inherit provider, base URL, and model settings.
+
+"type:account":
+  kind: config
+  fields:
+    # Provider name (e.g. "anthropic", "openai").
+    - {name: provider, type: string, required: true}
+    # API endpoint override. Empty = default (direct to provider).
+    - {name: base_url, type: string}
+    # How to obtain the token: "coopmux:<account>", "secret:<k8s-secret>", "env:<var>".
+    - {name: credential, type: string, required: true}
+    # Default model for agents using this account.
+    - {name: model, type: string}
+    # Model override for health probes (e.g. "anthropic/claude-haiku-4-5").
+    # Set when the account model needs OAuth forwarding that probes can't provide.
+    - {name: probe_model, type: string}
+    # Per-session budget hint (informational, enforced by provider).
+    - {name: max_budget, type: string}
+    # Fallback account name used when this account's budget is exhausted.
+    - {name: fallback, type: string}
+    # LiteLLM virtual key for budget tracking / usage attribution.
+    # Passed to agents as x-litellm-api-key header.
+    - {name: litellm_key, type: string}
+    # Rotation lifecycle status: "active" (default), "exhausted", "cooldown".
+    - {name: status, type: string}
+    # When the account was last marked exhausted (RFC3339).
+    - {name: exhausted_at, type: string}
+    # Number of times this account has been rotated away from.
+    - {name: rotation_count, type: integer}
+    # When the last rotation involving this account occurred (RFC3339).
+    - {name: last_rotated_at, type: string}
+    # Billing period in hours for auto-reset (e.g. "24" for daily renewal).
+    - {name: billing_period_hours, type: string}
+    # Billing model: "subscription" (default) or "metered". Gates the
+    # out_of_credits recovery-hold (ka-0000003350): subscription accounts
+    # treat out_of_credits as a benign steady-state and always clear the
+    # exhausted flag on recovery; metered (pay-as-you-go) accounts keep the
+    # reactive hold since out_of_credits there is genuinely billing-dead.
+    # Empty/unset resolves to "subscription" (billingType, ratelimit_probe.go).
+    - {name: billing_type, type: string}
+    # Rate-limit probe results (written by ratelimit_probe).
+    # Unified throttle status from API headers: "allowed" or "rejected".
+    - {name: throttle_status, type: string}
+    # 5-hour window utilization ratio (e.g. "0.85").
+    - {name: utilization_5h, type: string}
+    # 7-day window utilization ratio (e.g. "0.49").
+    - {name: utilization_7d, type: string}
+    # Which rate-limit window is the binding constraint.
+    - {name: representative_claim, type: string}
+    # Whether overage spending is allowed: "allowed" or "rejected".
+    - {name: overage_status, type: string}
+    # Reason overage is disabled (e.g. "auto-reload not enabled").
+    - {name: overage_disabled_reason, type: string}
+    # When the probe last checked this account (RFC3339).
+    - {name: probe_checked_at, type: string}
+    # When the current throttle resets (RFC3339), from API headers.
+    - {name: throttle_reset_at, type: string}
+    # Per-window reset timestamps (RFC3339) from API headers — the
+    # binding-window reset above doesn't distinguish 5h vs 7d.
+    - {name: throttle_reset_5h_at, type: string}
+    - {name: throttle_reset_7d_at, type: string}
+    # Spend snapshot taken at last account reset (gb account reset).
+    - {name: spend_at_last_reset, type: string}
+    # When the account was last reset to active (RFC3339).
+    - {name: last_reset_at, type: string}
+    # LiteLLM-enforced budget on the account's virtual key
+    # (bug ka-0000001246), written by spend_sync from /key/info.
+    # spend_limit_usd is max_budget (the account monthly spend limit)
+    # and spend_reset_at is budget_reset_at (RFC3339, when the budget
+    # window resets). Unset when the key carries no budget, so the
+    # dark-lane spend-exhaustion alert reads them as honestly-absent
+    # rather than a fabricated limit.
+    - {name: spend_limit_usd, type: number}
+    - {name: spend_reset_at, type: string}
+    # Accumulated usage metrics from all sessions using this account.
+    - {name: total_input_tokens, type: integer}
+    - {name: total_output_tokens, type: integer}
+    - {name: total_thinking_tokens, type: integer}
+    - {name: total_cache_read_tokens, type: integer}
+    - {name: total_cache_write_tokens, type: integer}
+    - {name: total_cost_usd, type: number}
+    # Daily and weekly cost breakdowns from LiteLLM /spend/logs.
+    - {name: daily_cost_usd, type: number}
+    - {name: weekly_cost_usd, type: number}
+    # Subscription-window spend (ka-0000003343): dollars accrued since
+    # the current 5h / 7d subscription window opened, re-windowed from
+    # the SAME /spend/logs rows against the probe's throttle_reset_*_at
+    # instants (spend_sync.go) rather than the 00:00-UTC calendar day.
+    # These are what the /costs headline bills a subscription account
+    # against, so the number resets on the subscription's own clock.
+    - {name: spend_5h_window_usd, type: number}
+    - {name: spend_7d_window_usd, type: number}
+    # A tenant land's purse stamp (Lands Track B §3.4,
+    # internal/lands/purse): when spend_sync last synced a lands-<land>
+    # account (RFC3339), and a JSON object of each running agent's
+    # live_cost_usd at that moment, so the purse counts only spend
+    # past the synced figure as in flight.
+    - {name: spend_synced_at, type: string}
+    - {name: live_cost_baseline, type: string}
+    # The Lands purse watcher's state (internal/lands/watcher): the
+    # highest notice level said since the last refill, and the
+    # granted credits it last saw, so a rise is a refill.
+    - {name: purse_notice_level, type: string}
+    - {name: purse_granted_seen, type: string}
+    # The watcher's purse snapshot, which the daemon's Lands API
+    # serves as the land's Budget (D.6c): granted and used
+    # credits, ok|wall|unknown, and when the purse was read.
+    - {name: purse_granted_credits, type: string}
+    - {name: purse_used_credits, type: string}
+    - {name: purse_state, type: string}
+    - {name: purse_read_at, type: string}
+    # Why the land's steward is parked (step 9.7): purse_empty
+    # from the watcher's empty-purse post until the purse has
+    # credit again, else empty.
+    - {name: steward_park_reason, type: string}
+    # "true" while the watcher holds the land's LiteLLM key blocked
+    # for a freeze (gd-nHh7M0k3ps), so a thaw lifts only its block.
+    - {name: land_key_blocked, type: string}
+    # Shadow cost fields mirror the canonical values for POC
+    # reconciliation against the Anthropic Console. spend-sync
+    # writes them atomically with the canonical fields, so they
+    # must be registered or kbeads rejects the whole typed update
+    # (HTTP 400 unknown field), freezing the costs page (ka-0000007493).
+    - {name: shadow_total_cost_usd, type: number}
+    - {name: shadow_daily_cost_usd, type: number}
+    - {name: shadow_weekly_cost_usd, type: number}
+    - {name: total_request_count, type: integer}
+    - {name: total_tool_calls, type: integer}
+    - {name: total_errors, type: integer}
+    - {name: total_compactions, type: integer}
+    - {name: session_count, type: integer}
+
+# --- sessions ----------------------------------------------------
+# Coop session beads: gb session register opens, gb session close stamps usage.
+
+"type:session":
+  kind: config
+  fields:
+    - {name: agent, type: string}
+    - {name: agent_bead_id, type: string}
+    - {name: project, type: string}
+    - {name: role, type: string}
+    - {name: hostname, type: string}
+    - {name: session_log, type: string}
+    - {name: started_at, type: string}
+    - {name: ended_at, type: string}
+    - {name: exit_code, type: integer}
+    - {name: resumed, type: boolean}
+    - {name: status, type: enum, values: [active, completed, crashed, retired]}
+    # Usage metrics (populated at session close).
+    - {name: input_tokens, type: integer}
+    - {name: output_tokens, type: integer}
+    # thinking_tokens is an estimate (chars/4 heuristic) already
+    # counted inside output_tokens — see countThinkingTokens.
+    - {name: thinking_tokens, type: integer}
+    - {name: cache_read_tokens, type: integer}
+    - {name: cache_write_tokens, type: integer}
+    - {name: total_cost_usd, type: number}
+    - {name: request_count, type: integer}
+    - {name: tool_call_count, type: integer}
+    - {name: error_count, type: integer}
+    - {name: compaction_count, type: integer}
+    - {name: interrupt_count, type: integer}
+    - {name: last_interrupt_at, type: string}
+
+# --- formulas & molecules ----------------------------------------
+#
+# Formulas are reusable work definitions with variables and steps.
+# Applying a formula creates a molecule (an epic with child issues,
+# variable-substituted).
+
+"type:formula":
+  kind: data
+  fields:
+    # Variable definitions: [{name, description, required, default, type, enum}]
+    - {name: vars, type: json}
+    # Step definitions: [{id, title, type, description, depends_on, labels, priority, condition, assignee}]
+    - {name: steps, type: json}
+    # Default agent to assign molecules to when this formula is poured.
+    - {name: assigned_agent, type: string}
+"type:molecule":
+  kind: issue
+  fields:
+    # ID of the formula bead this molecule was created from.
+    - {name: formula_id, type: string}
+    # Variable values applied during instantiation.
+    - {name: applied_vars, type: json}
+"type:report":
+  kind: data
+  fields:
+    - {name: decision_id, type: string}
+    - {name: report_type, type: string}
+    - {name: content, type: string}
+    - {name: format, type: string}
+    # V2: Sensitivity-aware report fields for escalation results.
+    - {name: escalation_id, type: string}
+    - {name: sensitivity, type: enum, values: [public, internal, sensitive, secret]}
+    - {name: content_type, type: enum, values: [text, json, script_output, credential, structured]}
+    - {name: redacted_summary, type: string}
+    - {name: access_log, type: json}
+    - {name: expires_at, type: string}
+
+# Audit trail: persistent authorization event log.
+"type:audit":
+  kind: data
+  fields:
+    # Who performed the action (email, agent name, or "static").
+    - {name: actor, type: string, required: true}
+    # What operation was attempted.
+    - {name: action, type: enum, required: true, values: [create, update, close, delete, spawn, approve, reject]}
+    # Target bead ID or resource identifier.
+    - {name: resource, type: string}
+    # Bead type of the target resource.
+    - {name: resource_type, type: string}
+    # Whether the action was allowed or denied.
+    - {name: outcome, type: enum, required: true, values: [allow, deny]}
+    # Human-readable reason (denial message, escalation context).
+    - {name: reason, type: string}
+    # How the actor was authenticated.
+    - {name: auth_method, type: enum, values: [oidc, static, fleet, anonymous]}
+    # Client IP address.
+    - {name: source_ip, type: string}
+    # Linked escalation bead (if denial triggered an escalation).
+    - {name: escalation_id, type: string}
+
+# Escalation requests: human-gated privilege escalation pipeline.
+"type:escalation":
+  kind: data
+  fields:
+    # What kind of privileged operation is requested.
+    - {name: operation_type, type: string, required: true}
+    # Machine-parseable operation definition (JSON).
+    - {name: operation_spec, type: json, required: true}
+    # Human-readable background for the request.
+    - {name: context, type: string}
+    # Agent bead ID of the requesting agent.
+    - {name: requesting_agent, type: string}
+    # Task bead ID that triggered the request.
+    - {name: requesting_task, type: string}
+    # V2: The actual runnable script (shell, Python, structured commands).
+    - {name: execution_script, type: string}
+    # V2: What credentials/access the operator needs [{type, identifier, purpose, scope}].
+    - {name: credential_requirements, type: json}
+    # V2: What input data the script expects [{name, type, description, default}].
+    - {name: data_requirements, type: json}
+    # V2: What the escalation will produce [{name, description, sensitivity, format}].
+    - {name: expected_outputs, type: json}
+    # V2: Overall sensitivity classification of escalation results.
+    - {name: sensitivity, type: enum, values: [public, internal, sensitive, secret]}
+    # User bead ID of the approver (not free text).
+    - {name: approved_by, type: string}
+    # Email of the approver, captured at approve-time for display.
+    - {name: approved_by_email, type: string}
+    # Who rejected it: the daemon stamps the authenticated operator.
+    - {name: rejected_by, type: string}
+    # When the escalation was approved (RFC3339).
+    - {name: approved_at, type: string}
+    # How the approval was authenticated.
+    - {name: approval_method, type: enum, values: [web_ui, api_token, cli, policy, coordinator, commons, edge]}
+    # Escalation routing (kbeads escalation_lane.go). All server-stamped lane refs.
+    - {name: approved_as, type: string}
+    - {name: held_by, type: string}
+    - {name: held_at, type: string}
+    - {name: execute_by, type: string}
+    - {name: operator_only, type: boolean}
+    - {name: claimed_by, type: string}
+    - {name: claimed_at, type: string}
+    - {name: handed_up_by, type: string}
+    - {name: handed_up_at, type: string}
+    - {name: hand_up_reason, type: string}
+    # Where the approved operation should execute.
+    - {name: execution_target, type: enum, values: [local, service_account]}
+    # Who/what executed the operation (agent or user bead ID).
+    - {name: executor, type: string}
+    # Execution output (JSON).
+    - {name: result, type: json}
+    # Outcome of the execution.
+    - {name: result_status, type: enum, values: [success, failure, partial]}
+
+# Reaction rules: emoji-to-agent spawn mapping.
+"type:reaction-rule":
+  kind: data
+  fields:
+    - {name: emoji, type: string, required: true}
+    - {name: match, type: string}
+    - {name: role, type: string}
+    - {name: prompt, type: string, required: true}
+    - {name: project, type: string, required: true}
+
+# Saved views: per-operator filter specs authored in the beads-viewer
+# "My Views" page (cmd/beads-viewer/views.go). A view bead stores the
+# filter it captures as string-valued fields (savedViewSpec.toBeadFields)
+# and the /views page lists them with type=view. This type was never
+# registered, so on a strict daemon both the CREATE (400 "unknown bead
+# type view") and, once the server validates the LIST --type filter
+# (ka-0000008041), the list query itself would error — leaving the whole
+# saved-views feature broken. Registering it here makes the feature whole
+# and keeps the type=view list filter valid.
+"type:view":
+  kind: config
+  fields:
+    - {name: source, type: string}
+    - {name: project, type: string}
+    - {name: types, type: string}
+    - {name: statuses, type: string}
+    - {name: labels_filter, type: string}
+    - {name: search, type: string}
+    - {name: sort, type: string}
+    - {name: columns, type: string}
+
+# Trigger beads: source-driven action dispatch (JIRA, GitLab, webhook, etc.).
+"type:trigger":
+  kind: data
+  fields:
+    # Common fields (all sources).
+    - {name: source, type: enum, values: [jira, gitlab, webhook, alert, bead-state, schedule, slack-reaction, account-cost]}
+    - {name: action, type: enum, required: true, values: [spawn_agent, apply_formula, notify, create_bead]}
+    - {name: role, type: string}
+    - {name: project, type: string}
+    - {name: prompt, type: string}
+    - {name: formula_id, type: string}
+    - {name: formula_vars, type: string}
+    - {name: enabled, type: boolean}
+    - {name: max_concurrent, type: string}
+    - {name: cooldown_minutes, type: string}
+    - {name: last_checked, type: string}
+    - {name: allowed_projects, type: string}
+    - {name: allowed_roles, type: string}
+    # JIRA source.
+    - {name: jql, type: string}
+    # GitLab source.
+    - {name: project_path, type: string}
+    - {name: event_type, type: enum, values: [merge_request, pipeline]}
+    - {name: state, type: string}
+    - {name: gitlab_labels, type: string}
+    - {name: author, type: string}
+    - {name: target_branch, type: string}
+    - {name: pipeline_ref, type: string}
+    - {name: pipeline_ref_pattern, type: string}
+    - {name: pipeline_status, type: string}
+    - {name: pipeline_max_age, type: string}
+    - {name: min_duration, type: string}
+    - {name: ignore_failed_statuses, type: string}
+    # Webhook source.
+    - {name: webhook_token, type: string}
+    - {name: webhook_secret, type: string}
+    - {name: conditions, type: string}
+    # Alert source (W3 alerts-in). Reuses the
+    # webhook_token/secret/conditions above. Its router,
+    # alertmanager-bridge, was deleted 2026-10-31 (gd-Y4ZCGr2m2t);
+    # the fields stay registered because kbeads' builtin
+    # type:trigger defines them and existing trigger beads carry them.
+    # alert_route: JSON map of severity → bead type, e.g.
+    # {"page":"decision","warn":"bug","info":"task"}. Shown by
+    # beads-viewer's trigger summary.
+    - {name: alert_route, type: string}
+    # allow_unsigned opts a webhook/alert trigger into accepting
+    # requests without HMAC verification (insecure; e.g. an
+    # Alertmanager that cannot sign). Read by WebhookTriggerSource.
+    - {name: allow_unsigned, type: string}
+    # Bead-state source.
+    - {name: event_types, type: string}
+    # Account source.
+    - {name: condition_type, type: string}
+    - {name: field, type: string}
+    - {name: threshold, type: string}
+    - {name: op, type: string}
+    - {name: account_filter, type: string}
+    # Slack-reaction source.
+    - {name: emoji, type: string}
+    - {name: match, type: string}
+    - {name: channel_filter, type: string}
+    # Schedule source (when used as trigger, not standalone schedule type).
+    - {name: cron, type: string}
+    - {name: timezone, type: string}
+    # Multi-source fan-in (trigger:multi): JSON array of
+    # scheduler.TriggerEntry. Read by bridge/triggers.go
+    # ParseTriggerDef; written by gardenermode.Set.
+    - {name: triggers, type: string}
+    # Backup of the timed-mode cron while a gardener is flipped
+    # to event mode, so --timed restores the exact prior
+    # cadence (gardenermode.Set).
+    - {name: timed_cron, type: string}
+    - {name: last_run, type: string}
+    # The exact match key (fireKey) of the last successfully fired
+    # cron match, written in the same update as last_run. Catch-up
+    # skips any candidate match <= last_match so a restart never
+    # re-fires a match that already spawned (gd-pLf5LSHDEh).
+    - {name: last_match, type: string}
+    # Per-gardener spend roll-up (ka-0000003220). Maintained by the
+    # controller's gardenerSpendSync loop: the summed authoritative
+    # total_cost_usd over this gardener's iteration runs PLUS the crew
+    # (and crew-of-crew) those runs spawned. gardener_spend_usd is the
+    # canonical figure /gardeners sorts on to surface wasteful gardeners;
+    # gardener_spend_synced_at is the RFC3339 timestamp of the last
+    # successful roll-up so the viewer can age-out a stale figure.
+    - {name: gardener_spend_usd, type: number}
+    - {name: gardener_spend_synced_at, type: string}
+
+# Scheduled agents: cron-driven autonomous tasks.
+"type:schedule":
+  kind: config
+  fields:
+    - {name: name, type: string}
+    - {name: cron, type: string, required: true}
+    - {name: project, type: string, required: true}
+    - {name: role, type: string}
+    - {name: prompt, type: string, required: true}
+    - {name: enabled, type: boolean}
+    - {name: timezone, type: string}
+    - {name: slack_channel, type: string}
+    - {name: assign_bead, type: string}
+    - {name: last_run, type: string}
+    - {name: last_agent_id, type: string}
+    - {name: timeout, type: string}
+    - {name: max_concurrent, type: string}
+    - {name: max_retries, type: string}
+    - {name: retry_on_failure, type: string}
+    - {name: consecutive_failures, type: string}
+    - {name: last_checked_agent, type: string}
+    # Ephemeral-schedules-gardener-primitive: run-budget + goal fields.
+    # All optional — absence = legacy unlimited cron behavior.
+    - {name: max_runs, type: string}
+    - {name: runs_spawned, type: string}
+    - {name: runs_completed, type: string}
+    # Second-life budget (bead ka-0000004010): the coarse post-closure
+    # revival cap mirroring terminal-goals max_respawns. max_second_lives
+    # caps how many times a gardener closed-on-max_runs may be reopened;
+    # second_life_count tracks the lives already granted (cumulative).
+    - {name: max_second_lives, type: string}
+    - {name: second_life_count, type: string}
+    - {name: terminal_goal, type: string}
+    - {name: exit_condition, type: string}
+    - {name: on_exit, type: string}
+    - {name: run_timeout, type: string}
+    # Phase 7: trigger_mode selects what fires the schedule.
+    # "cron" (default), "manual", "decision_resolved" (Phase 8),
+    # "bead_closed" (Phase 9). "mail_received" is reserved.
+    - {name: trigger_mode, type: string}
+    # Phase 8: watcher fields for trigger_mode=decision_resolved.
+    # Empty = wildcard (no constraint); non-empty values are
+    # AND-combined into a Match expression on the synthesized
+    # TriggerEntry. See proposal §4 trigger modes table.
+    - {name: watch_project, type: string}
+    - {name: watch_role, type: string}
+    - {name: watch_bead_id, type: string}
+    # Phase 9: extra watcher fields for trigger_mode=bead_closed
+    # (also accepted by decision_resolved). CSV strings: OR
+    # within a CSV, AND across distinct fields.
+    - {name: watch_labels, type: string}
+    - {name: watch_types, type: string}
+    # Phase 9 part 2: watcher fields for trigger_mode=mail_received.
+    # CSVs: watch_channel matches MailSent.Channel (derived from
+    # a `channel:<name>` label on the mail bead); watch_from
+    # matches MailSent.From (the mail bead's CreatedBy).
+    - {name: watch_channel, type: string}
+    - {name: watch_from, type: string}
+    # Per-gardener spend roll-up (ka-0000003220). Legacy gardeners are
+    # type=schedule beads, so the roll-up fields must be registered
+    # here too or gardenerSpendSync's typed update is rejected. See the
+    # matching pair on type:trigger above.
+    - {name: gardener_spend_usd, type: number}
+    - {name: gardener_spend_synced_at, type: string}
+
+# Fleet: multi-namespace bead collection sharing a database.
+"type:fleet":
+  kind: config
+  fields:
+    - {name: namespace, type: string, required: true}
+    - {name: description, type: string}
+    - {name: token_secret, type: string}
+    - {name: created_by_fleet, type: string}
+    - {name: parent_fleet, type: string}
+    - {name: max_agents, type: string}
+    - {name: status, type: enum, values: [active, archived]}
+
+# Dashboard: a Grafana dashboard authored/versioned as a bead. Synced
+# to Grafana by grafana-bridge (epic ka-0000006776, W2 design doc
+# gardenio/docs/research/obs-w2-grafana-bridge.md). Only the small
+# metadata lives in fields; the (large) JSON model is stored as a
+# type=doc bundle artifact attached to the dashboard bead, per the
+# long-form-artifacts-in-a-bundle advice (ka-0000004517).
+"type:dashboard":
+  kind: issue
+  fields:
+    # Grafana dashboard uid — the stable cross-rename identity and
+    # the join key the bridge syncs on.
+    - {name: dashboard_uid, type: string}
+    # Grafana folder the dashboard provisions into ("" = General).
+    - {name: dashboard_folder, type: string}
+    # Grafana version int, carried as the optimistic-concurrency token.
+    - {name: dashboard_version, type: string}
+    # sha256 of the normalized JSON model — cheap change-detection
+    # and the loop-breaker that prevents beads↔Grafana ping-pong.
+    - {name: dashboard_hash, type: string}
+    # Provenance: who last authored this model.
+    - {name: dashboard_source, type: enum, values: [beads, grafana]}
+    # ConfigMap key the model is written under on the
+    # grafana_dashboard="1" ConfigMap (default <uid>.json).
+    - {name: dashboard_configmap_key, type: string}
+    # When true, conflicts open a decision rather than auto-resolving
+    # (see grafana_conflict_policy=manual in the W2 design doc).
+    - {name: dashboard_conflict_critical, type: boolean}
+
+# Alert rule: a vmalert alerting/recording rule authored as a bead
+# (epic ka-0000006776, W3 design doc
+# gardenio/docs/research/obs-w3-alertmanager-bridge.md). Its renderer,
+# alertmanager-bridge, was deleted 2026-10-31 (gd-Y4ZCGr2m2t), so
+# nothing renders these beads into vmalert now; the type stays
+# registered to match kbeads' builtin type:alert_rule.
+"type:alert_rule":
+  kind: issue
+  fields:
+    # alerting fires alerts; recording materializes a new series.
+    - {name: rule_kind, type: enum, values: [alerting, recording]}
+    # PromQL/MetricsQL expression evaluated by vmalert.
+    - {name: rule_expr, type: string}
+    # Pending duration before an alerting rule fires (e.g. "5m");
+    # alerting-only.
+    - {name: rule_for, type: string}
+    # Severity drives both the rendered label and the alerts-in
+    # routing map (page→decision/escalation, warn→bug, info→task).
+    - {name: rule_severity, type: enum, values: [page, warn, info]}
+    # VM rule-group name; rules sharing a group render into one
+    # `groups:` entry.
+    - {name: rule_group, type: string}
+    # Which vmalert renders this rule: in-chart gardenio, or an
+    # advisory-only site env ("site:<env>").
+    - {name: rule_target, type: string}
+    # JSON maps merged into the rendered rule's labels/annotations.
+    - {name: rule_labels, type: string}
+    - {name: rule_annotations, type: string}
+
+# Alert mute: a bead-side silence for a noisy firing alert WITHOUT
+# touching Alertmanager (W3 design §5b,
+# gardenio/docs/research/obs-w3-alertmanager-bridge.md). Its reader,
+# alertmanager-bridge, was deleted 2026-10-31 (gd-Y4ZCGr2m2t), so these
+# beads mute nothing now; the type stays registered to match kbeads'
+# builtin type:alert_mute.
+"type:alert_mute":
+  kind: issue
+  fields:
+    # JSON array of {name,value,regex?} label matchers; a firing
+    # alert is muted when ALL matchers match its labels.
+    - {name: mute_matchers, type: string}
+    # Optional RFC3339 expiry; after this the mute is inert. Empty
+    # = no expiry (mute until the bead is closed).
+    - {name: mute_until, type: timestamp}
+    # Free-text reason recorded for the operator audit trail.
+    - {name: mute_reason, type: string}
+
+# --- views -----------------------------------------------------------
+#
+# Core views used by the controller and by context formulas.
+
+"view:agents:active":
+  filter:
+    status: [open, in_progress, blocked, deferred]
+    type: [agent]
+  sort: updated_at
+  columns: [id, title, status, assignee, fields]
+"view:agents:jobs":
+  filter:
+    status: [open, in_progress, blocked, deferred]
+    type: [agent]
+    labels: ["role:job"]
+  sort: updated_at
+  columns: [id, title, status, fields]
+"view:agents:crew":
+  filter:
+    status: [open, in_progress, blocked, deferred]
+    type: [agent]
+    labels: ["role:crew"]
+  sort: updated_at
+  columns: [id, title, status, assignee, fields]
+"view:agents:reviewers":
+  filter:
+    status: [open, in_progress, blocked, deferred]
+    type: [agent]
+    labels: ["role:reviewer"]
+  sort: updated_at
+  columns: [id, title, status, assignee, fields]
+"view:agents:gardeners":
+  filter:
+    status: [open, in_progress, blocked, deferred]
+    type: [agent]
+    labels: ["role:gardener"]
+  sort: updated_at
+  columns: [id, title, status, assignee, fields]
+"view:decisions:pending":
+  filter:
+    status: [open, in_progress, blocked, deferred]
+    type: [decision]
+  sort: updated_at
+  columns: [id, title, status, labels]
+"view:escalations:pending":
+  filter:
+    status: [open, in_progress]
+    type: [escalation]
+  sort: priority
+  columns: [id, title, status, priority, fields]
+"view:mail:inbox":
+  filter:
+    status: [open, in_progress, blocked, deferred]
+    type: [mail]
+  sort: updated_at
+  columns: [id, title, status, assignee, labels]
+"view:projects":
+  filter:
+    status: [open, in_progress, blocked, deferred]
+    type: [project]
+  sort: title
+  columns: [id, title, labels]
+"view:schedules":
+  filter:
+    status: [open, in_progress]
+    type: [schedule]
+  sort: title
+  columns: [id, title, fields]
+"view:fleets:active":
+  filter:
+    status: [open, in_progress]
+    type: [fleet]
+  sort: title
+  columns: [id, title, status, fields]
+
+"view:audit:recent":
+  filter:
+    status: [open]
+    type: [audit]
+    kind: [data]
+  sort: "-created_at"
+  columns: [id, title, actor, action, resource, outcome]
+  limit: 50
+
+"view:users":
+  filter:
+    status: [open, in_progress]
+    type: [user]
+  sort: title
+  columns: [id, title, slack_id, email, gitlab_username, jira_user, team]
+
+# --- contexts --------------------------------------------------------
+#
+# Rendered by `kd context <name>`.  Each role gets a tailored
+# dashboard that doubles as its session-start priming context.
+
+# Gardener: fleet coordinator — needs the full picture.
+"context:gardener":
+  sections:
+    - {header: "## Active Agents", view: "agents:active", format: table}
+    - {header: "## Active Jobs", view: "agents:jobs", format: list, fields: [id, title, status]}
+    - {header: "## Schedules", view: schedules, format: list, fields: [id, title, fields]}
+    - {header: "## Projects", view: projects, format: table}
+    - {header: "## Pending Decisions", view: "decisions:pending", format: list, fields: [id, title, status]}
+    - {header: "## Inbox", view: "mail:inbox", format: list, fields: [id, title, assignee]}
+# Crew: persistent worker — inbox and blockers only.
+# Hooked work (if any) is surfaced by prime.sh, not here.
+"context:crew":
+  sections:
+    - {header: "## Inbox", view: "mail:inbox", format: list, fields: [id, title, assignee]}
+    - {header: "## Pending Decisions", view: "decisions:pending", format: list, fields: [id, title, status]}
+# Reviewer: MR shepherd — same base dashboard as crew; the
+# advice beads define the actual review workflow.
+"context:reviewer":
+  sections:
+    - {header: "## Inbox", view: "mail:inbox", format: list, fields: [id, title, assignee]}
+    - {header: "## Pending Decisions", view: "decisions:pending", format: list, fields: [id, title, status]}
+# No context:job — a job's entire context is the agent bead
+# itself (title, description, dependencies), shown by prime.sh.
+
+# --- JIRA views and context ----------------------------------------
+
+"view:jira:pending":
+  filter:
+    status: [open, in_progress, blocked, deferred]
+    type: [task]
+    labels: ["source:jira"]
+  sort: priority
+  columns: [id, title, status, assignee, fields]
+
+# JIRA dispatcher: sees pending JIRA tasks, decisions, and inbox.
+"context:jira-dispatcher":
+  sections:
+    - {header: "## Pending JIRA Tasks", view: "jira:pending", format: list, fields: [id, title, status]}
+    - {header: "## Pending Decisions", view: "decisions:pending", format: list, fields: [id, title, status]}
+    - {header: "## Inbox", view: "mail:inbox", format: list, fields: [id, title, assignee]}

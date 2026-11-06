@@ -1,0 +1,35 @@
+{{- /*
+Reconciler-state PVC for trigger-engine (ka-0000001444).
+
+Backs the reconcile-state volume when triggerEngine.reconcile.persistence is
+enabled, so BOTH the trigger:bead reconciler watermark and the SSE
+Last-Event-ID survive a trigger-engine pod kill — the durability the "kill the
+pod, close a blocker while down, confirm dispatch on restart" acceptance test
+requires. Rendered only when the reconciler itself is enabled (stateFile set),
+since an unused PVC would just pin storage. Mirrors slack-bridge/pvc.yaml.
+
+trigger-engine already runs strategy=Recreate unconditionally (ka-0000006285),
+so this ReadWriteOnce claim is never dual-mounted across a rollout.
+*/ -}}
+{{- if and .Values.triggerEngine.enabled .Values.triggerEngine.reconcile.stateFile .Values.triggerEngine.reconcile.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "gardenio.fullname" . }}-trigger-engine-state
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "gardenio.fullname" . }}-trigger-engine
+    app.kubernetes.io/component: trigger-engine
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.triggerEngine.reconcile.persistence.storageClass }}
+  storageClassName: {{ .Values.triggerEngine.reconcile.persistence.storageClass }}
+  {{- else if .Values.global.storageClass }}
+  storageClassName: {{ .Values.global.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.triggerEngine.reconcile.persistence.size | default "100Mi" }}
+{{- end }}

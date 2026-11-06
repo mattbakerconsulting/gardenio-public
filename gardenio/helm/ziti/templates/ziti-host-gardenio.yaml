@@ -1,0 +1,163 @@
+{{- if and .Values.ziti.enabled .Values.ziti.hostGardenio.enabled }}
+# Binds the gardenio ziti services with identity k3s-gardenio-host
+# (role #gardenio-hosts):
+#   gardenio-viewer -> viewer-authproxy.gardenio.svc.cluster.local:8095 (nginx edge, which
+#                      stamps operator identity and forwards to gardenio-beads-viewer:8095)
+#   gardenio-beads  -> gardenio-beads.gardenio.svc.cluster.local:8080
+#   gardenio-grafana -> gardenio-grafana.gardenio.svc.cluster.local:3000
+#
+# Host mode only: this pod never intercepts, it just forwards accepted ziti
+# dials to the in-cluster Services. Dialed from any identity carrying
+# #gc-clients (matthew-laptop, matthew-laptop-win, matthew-phone, gardenio-hq)
+# at gardenio.viewer.ziti:8095 and gardenio.beads.ziti:8080. gardenio-grafana is
+# dialed at gardenio.grafana.ziti:3000 by #gc-admins only (Grafana epic
+# gd-cz4Jm2DebY; spec G1).
+#
+# Keycloak is NOT bound here: its browser-facing hostname is
+# https://auth.clonk.tv/auth (keycloak.runtime.hostnameUrl in
+# deploy-values/gardenio-k3s.yaml), served by public-edge.yaml.
+#
+# The bindings themselves live on the ziti controller (host.v1 configs +
+# Bind policy for #gardenio-hosts, see README.md) — this Deployment needs no
+# per-service config, so adding a service to the list above changes only
+# this comment. It lives in the opt-in gardenio/helm/ziti chart and renders only
+# when ziti.enabled=true (README.md there); the gardenio chart never renders it.
+#
+# This is how gardenio is reached. The chart deliberately renders no Ingress,
+# no LoadBalancer Service and no public route — see deploy-values/gardenio-k3s.yaml,
+# where beadsViewer.devAuthBypass is only safe BECAUSE this is the only path in.
+#
+# Derived from gardenio/helm/ziti/templates/ziti-host-beads.yaml, which is the
+# working prior art on this cluster. Divergences: namespace, identity name,
+# and the toleration — the gardenio pool is tainted gardenio.agent=true:NoSchedule
+# whereas the beads Dolt pod runs on an untainted k3s server node.
+#
+# Install:
+#   kubectl -n gardenio create secret generic ziti-identity \
+#     --from-file=k3s-gardenio-host.json    # enrolled identity, see README
+#   helm upgrade --install gardenio-ziti gardenio/helm/ziti -n default \
+#     --set ziti.enabled=true
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ziti-host
+  namespace: gardenio
+  labels:
+    app: ziti-host
+    app.kubernetes.io/part-of: gardenio
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # one identity, one session at a time
+  selector:
+    matchLabels:
+      app: ziti-host
+  template:
+    metadata:
+      annotations:
+        # The platform spot half of the pool is cluster-autoscaler managed
+        # (gd-AEm6o8aWkF, 2026-10-11). This pod is the access path; never let
+        # a scale-down evict it even if the nodeSelector below is ever lost.
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+      labels:
+        app: ziti-host
+    spec:
+      # The gardenio node pool is tainted; without this the pod lands nowhere.
+      tolerations:
+        - key: "gardenio.agent"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      # HA phase 1 (gd-kU2wuaNHMJ): was landing wherever the taint above let
+      # it, including the spot side of the pool. Pin to the on-demand
+      # platform pair alongside the rest of the control plane it fronts.
+      # BOTH labels required — lifecycle=on-demand alone also matches the
+      # on-demand k3s server (etcd + traefik + the beads Dolt volume).
+      nodeSelector:
+        gardenio.io/lifecycle: on-demand
+        gardenio.io/role: platform
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 2171
+        runAsGroup: 2171
+        seccompProfile:
+          type: RuntimeDefault
+      # The image's entrypoint looks for <ZITI_IDENTITY_BASENAME>.json in
+      # /ziti-edge-tunnel and wants it writable (cert renewals are written
+      # back), so copy the Secret into an emptyDir first.
+      initContainers:
+        - name: copy-identity
+          image: busybox:1.37
+          command: ["sh", "-c", "cp /secret/k3s-gardenio-host.json /ziti-edge-tunnel/ && chmod 600 /ziti-edge-tunnel/k3s-gardenio-host.json"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: identity
+              mountPath: /secret
+              readOnly: true
+            - name: identity-dir
+              mountPath: /ziti-edge-tunnel
+      # Class from the gardenio chart (global.systemPriorityClass): the access path,
+      # so a crew burst cannot leave it Pending (gd-2qjxTVMBkC).
+      priorityClassName: gardenio-system-critical
+      containers:
+        - name: ziti-edge-tunnel
+          image: openziti/ziti-edge-tunnel:1.19.1
+          args: ["run-host"]
+          env:
+            - name: ZITI_IDENTITY_BASENAME
+              value: k3s-gardenio-host
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: identity-dir
+              mountPath: /ziti-edge-tunnel
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+      volumes:
+        - name: identity
+          secret:
+            secretName: ziti-identity
+        - name: identity-dir
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+# PDB only (gd-27vcHmrurh) — no topologySpreadConstraints/podAntiAffinity:
+# this pod holds a single enrolled-identity ziti session and runs
+# strategy:Recreate ("one identity, one session at a time" above), so it is
+# architecturally single-replica forever; a spread/anti-affinity block would
+# be dead YAML. maxUnavailable, NOT minAvailable (ka-0000001453): on a
+# 1-replica Deployment minAvailable:1 == maxUnavailable:0, which makes the
+# eviction API refuse the pod forever and wedges a managed-nodegroup drain.
+# maxUnavailable:1 only blocks eviction while the pod is currently unhealthy.
+#
+# STAYS AT 1 IN PHASE 2 TOO (gd-bOJa10GcA6, epic gd-StII9fmzym): that task's
+# "stateless edge" wording named both ziti-host proxies alongside
+# beads-viewer/viewer-authproxy, but this pod is not stateless — it is one
+# enrolled OpenZiti identity's bind session. Two replicas would mean two
+# pods racing to hold that single session, which is exactly what
+# strategy:Recreate exists to prevent even during a rollout. Left at 1
+# deliberately; flagged back to the epic rather than raised.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ziti-host
+  namespace: gardenio
+  labels:
+    app: ziti-host
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: ziti-host
+{{- end }}

@@ -1,0 +1,998 @@
+{{template "layout" .}}
+{{define "title"}}Deck · Beads Viewer{{end}}
+{{define "content"}}
+{{/* /deck — the mobile card-deck triage surface (plan ka-0000000492 Step 4,
+     task ka-0000000701). One plan at a time, full-bleed, showing the ONE thing
+     it needs from a human. Answer it or skip it.
+
+     THE TWO RULES, both load-bearing:
+
+     1. SWIPE NAVIGATES, TAP COMMITS. Skip/Back are GET links; Answer is a POST
+        form. deck_swipe.js (Step 5) only ever .click()s the [data-deck-skip] /
+        [data-deck-back] controls below — it has no path to a write verb, so a
+        mis-swipe cannot resolve a decision, dispatch crew, or start a build.
+
+     2. WORKS WITH JS OFF. Every control here is a real link or a real form
+        carrying the cursor in its URL. htmx and swipe are enhancement only.
+        This is also why deck position survives layout.html's 401 force-reload
+        — the position lives in ?at=, not in JS memory.
+
+     ANSWER-IN-PLACE (fixes decision ka-0000001748's bug). The answer and
+     Approve&build forms carry a hidden from_card=1 and target closest .deck-card
+     with hx-swap=outerHTML. The plan-scoped resolve/build handlers branch on
+     that flag and re-render the LEAN deck_card fragment back into the slot
+     (renderDeckCard) — its now-resolved next question, an "all clear" face, or
+     an error card — instead of the cockpit #plan-decisions / gardener panel that
+     would corrupt the deck's stack tracking. With JS off, a full POST redirects
+     (303) back to the deck rather than stranding on a layout-less fragment.
+
+     Bag: Cards, Position, Total, Skipped, IsOperator, ProjectFilter, Projects,
+          Error, Empty, BackURL, SkipURL. */}}
+<span class="wide-page" hidden></span>
+<style>
+  /* The deck is the one PHONE-FIRST surface in the viewer: sized for a thumb
+     first and allowed to grow on a desktop, rather than a desktop layout
+     squeezed down. Every interactive target here is >= 44px (the measured
+     failure on /plans was 100% of targets under 44px). Scoped under .deck-* so
+     none of it leaks into the rest of the viewer. */
+  .deck-wrap { max-width: 34rem; margin: 0 auto; padding: 0 0.5rem 5.5rem; }
+
+  /* Header: deliberately ~3 lines tall. /plans spent over a thousand px of
+     chrome before the first card at 390px; the deck's entire chrome budget is
+     one line of progress plus one scope selector. */
+  .deck-head { display: flex; align-items: center; justify-content: space-between;
+               gap: 0.5rem; flex-wrap: wrap; margin: 0 0 0.6rem; }
+  .deck-progress { font-size: 0.85rem; opacity: 0.75; font-variant-numeric: tabular-nums; }
+  .deck-scope { display: flex; align-items: center; gap: 0.35rem; }
+  .deck-scope select { min-height: 44px; font-size: 0.85rem; border-radius: 8px;
+                       border: 1px solid var(--rule, #d7dbe0); background: var(--card-bg, #fff);
+                       color: inherit; padding: 0 0.5rem; }
+  /* Dark scope-select surface (ka-0000005352 iter-85): the project selector lives
+     in .deck-head, NOT inside .deck-card, so the card's dark --card-bg (below)
+     never reaches it — it inked background: var(--card-bg, #fff) and stayed a
+     white pill on the near-black page. Give it the same dark card surface. */
+  html[data-skin^="dark"] .deck-scope select { --card-bg: #14181d; border-color: rgba(160,170,185,0.22); }
+  .deck-scope noscript button { min-height: 44px; }
+
+  /* The stack. Cards are absolutely stacked so the next one is already painted
+     behind the active one — a skip reveals it with no layout shift and no
+     network hop. */
+  .deck-stack { position: relative; min-height: 24rem; }
+  .deck-slot { display: none; }
+  .deck-slot.is-active { display: block; }
+  /* JS-off fallback: with no script to manage the stack, show every card as a
+     plain vertical list (the task's "degrades to a vertical list of the same
+     cards with the same buttons"). .deck-js is set by the inline script below,
+     so this rule applies exactly when scripting is unavailable. */
+  .deck-stack:not(.deck-js) .deck-slot { display: block; margin-bottom: 0.85rem; }
+
+  .deck-card { border: 1px solid var(--rule, #d7dbe0); border-radius: 14px;
+               background: var(--card-bg, #fff); padding: 1rem;
+               display: flex; flex-direction: column; gap: 0.75rem;
+               box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  /* Dark card surface (ka-0000005352 iter-85) — the SAME root bug iter-16
+     (ka-0000007937) fixed on the /plans INDEX card and iter-18 fixed on the
+     cockpit, one surface over that was NEVER themed: .deck-card inks
+     `background: var(--card-bg, #fff)`, but NO skin defines --card-bg (the dark
+     skin sets --bg/--text, never --card-bg). So on the dark skin every /deck card
+     rendered a pure-#fff rectangle on the near-black page, and the dense chips the
+     iter-66..84 folds built rode that white fill with light-mode ink. Define
+     --card-bg on the deck card here (the same #14181d --bg-alt-family tone the
+     index card uses) so the card AND every var(--card-bg,#fff) fallback INSIDE it
+     (the .deck-card-foot option bar) theme for dark; the light-only chip inks
+     below are lifted to the bright dark palette in the same pass (the header
+     .deck-scope select, which sits OUTSIDE the card, gets its own rule above).
+     The /deck PACES capture only ever rendered the LIGHT skin (the standing audit
+     lesson ka-0000007937), so this white-island regression was structurally
+     invisible to the audit — the coverage guard added this iter
+     (plans_dark_coverage_test.go) now reds any future light-only card chip at
+     author time. Color/surface only. */
+  html[data-skin^="dark"] .deck-card { --card-bg: #14181d; border-color: rgba(160,170,185,0.22); }
+  .deck-card-head { display: flex; flex-direction: column; gap: 0.4rem; }
+  .deck-card-title { font-size: 1.05rem; line-height: 1.35; font-weight: 600; margin: 0; }
+  .deck-card-title a { color: inherit; text-decoration: none; }
+  .deck-card-title a:hover { text-decoration: underline; }
+  /* Badge cover (badges plan gd-pQZO9ie11D, step 9): the plan's badge picture
+     (gb badge --upload) heads the card as a centred square, the one place on
+     the deck a large picture belongs. The title keeps the arms run; a plan
+     with no badge draws no cover. */
+  .deck-card-cover { display: block; width: 7rem; height: 7rem; margin: 0 auto 0.6rem;
+                     border-radius: 14px; object-fit: cover; }
+  .deck-card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem;
+                    margin: 0; font-size: 0.75rem; }
+  /* "Last change" freshness stamp (ka-0000005352 iter-86) — the deck twin of the
+     index card head's .plan-card-updated. Calm muted by default; loud-red (light
+     #a3282a / dark #ff8a8a, the SAME tones the index .plan-card-updated-stale +
+     the deck-card-crew-stuck use) once an ACTIVE plan crosses the 7d no-move bar
+     (FreshnessStale), so a dead plan pops out of the deck. */
+  .deck-card-updated { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .deck-card-updated.deck-card-updated-stale { color: #a3282a; font-weight: 600; }
+  html[data-skin^="dark"] .deck-card-updated.deck-card-updated-stale { color: #ff8a8a; }
+
+  /* Priority pill — one of the three fields the acceptance criteria pins on
+     every card (title, status, priority). P0/P1 read as loud, P2 neutral,
+     P3/P4 quiet, so scanning the deck surfaces the urgent plans by color. */
+  .deck-prio { display: inline-flex; align-items: center; font-weight: 600;
+               font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 6px;
+               border: 1px solid currentColor; }
+  /* P0 solid-fill split (ka-0000005352 iter-36) — the deck twin of the /plans
+     index pill, so a critical plan pops the same on both surfaces. P0 loud SOLID
+     red (white text, #fff on #c62828 = 5.62:1 AA), P1 the tinted-red outline. */
+  .deck-prio-0 { color: #fff; background: #c62828; border-color: #c62828; }
+  .deck-prio-1 { color: #a3282a; background: rgba(229,57,53,0.10); }
+  .deck-prio-2 { color: #8a5a00; background: rgba(255,152,0,0.10); }
+  .deck-prio-3, .deck-prio-4 { color: #4a5568; background: rgba(120,120,120,0.10); }
+
+  /* Authoring-lifecycle chip (ka-0000005352 iter-28): the deck card renders the
+     SAME draft/ready/building/complete lifecycle chip the /plans index + cockpit
+     show, but the per-state palette lived only in plans.html + plan_detail.html —
+     so on the deck it fell through to layout.html's faded generic `.chip`
+     (opacity 0.6), reading identical across all four states. Mirror the index
+     palette (+ dark override, iter-17/18 legibility norm) so a plan's lifecycle
+     stage reads at a glance here too. The value itself is reconciled against the
+     epic's terminal status in Go (planLifecycleChipState, this iteration), so a
+     terminal plan shows only the truthful `complete` here, never a stale
+     "building". opacity:1 lifts the generic-chip veil so the tinted state reads. */
+  .plan-lifecycle-chip { opacity: 1; text-transform: uppercase; letter-spacing: 0.04em;
+                         padding: 0.1rem 0.5rem; font-size: 0.7rem; }
+  .plan-lifecycle-chip-draft { background: rgba(120,120,120,0.12); border-color: rgba(120,120,120,0.4); color: #555; }
+  .plan-lifecycle-chip-ready { background: rgba(33,150,243,0.12); border-color: rgba(33,150,243,0.5); color: #1e4a72; }
+  .plan-lifecycle-chip-building { background: rgba(76,175,80,0.16); border-color: rgba(76,175,80,0.55); color: #256029; }
+  .plan-lifecycle-chip-complete { background: rgba(96,125,139,0.16); border-color: rgba(96,125,139,0.5); color: #37474f; }
+  .plan-lifecycle-chip-abandoned { background: rgba(158,110,60,0.14); border-color: rgba(158,110,60,0.5); color: #7a4a1e; }
+  html[data-skin^="dark"] .plan-lifecycle-chip-draft { background: rgba(160,170,185,0.14); border-color: rgba(160,170,185,0.4); color: #b8c2d0; }
+  html[data-skin^="dark"] .plan-lifecycle-chip-ready { background: rgba(88,166,255,0.16); border-color: rgba(88,166,255,0.5); color: #58a6ff; }
+  html[data-skin^="dark"] .plan-lifecycle-chip-building { background: rgba(76,175,80,0.18); border-color: rgba(110,231,183,0.5); color: #6ee7b7; }
+  html[data-skin^="dark"] .plan-lifecycle-chip-complete { background: rgba(96,125,139,0.2); border-color: rgba(160,170,185,0.4); color: #b8c2d0; }
+  html[data-skin^="dark"] .plan-lifecycle-chip-abandoned { background: rgba(200,150,90,0.16); border-color: rgba(200,150,90,0.45); color: #d0a06e; }
+  /* Dark P0 solid-fill (iter-36) — deck twin of the index dark rule so a critical
+     plan pops the same on both surfaces under the dark skin (#fff on #d32f2f = 4.98:1 AA). */
+  html[data-skin^="dark"] .deck-prio-0 { color: #fff; background: #d32f2f; border-color: #ff8a8a; }
+  /* Dark P1-P4 pills (ka-0000005352 iter-85) — deck twins of the index card's
+     html[data-skin^="dark"] .plan-prio-chip-1..4 (plans.html), which the deck
+     dropped: the light inks (#a3282a red / #8a5a00 amber / #4a5568 slate) read
+     ~2.5:1 on the (now-dark) card. Lift to the SAME bright dark palette the index
+     prio pills use (#ff8a8a / #f5d578 / #b8c2d0) so a P1 pops and a P3/P4 reads
+     quiet identically on both surfaces. */
+  html[data-skin^="dark"] .deck-prio-1 { color: #ff8a8a; }
+  html[data-skin^="dark"] .deck-prio-2 { color: #f5d578; }
+  html[data-skin^="dark"] .deck-prio-3, html[data-skin^="dark"] .deck-prio-4 { color: #b8c2d0; }
+
+  /* The reason line — the deck's promise that the top card deserves the top
+     slot, stated rather than assumed. Tinted per attention tier so the tier is
+     legible without reading. */
+  .deck-reason { font-size: 0.8rem; padding: 0.4rem 0.6rem; border-radius: 8px;
+                 border-left: 3px solid currentColor; margin: 0; }
+  .deck-reason-0 { color: #8a5a00; background: rgba(255,152,0,0.10); }
+  .deck-reason-1 { color: #a3282a; background: rgba(229,57,53,0.10); }
+  .deck-reason-2 { color: #1e4a72; background: rgba(33,150,243,0.10); }
+  .deck-reason-3 { color: #6a4a00; background: rgba(120,120,120,0.10); }
+  /* Both dark skins (Homestead 2.3): the reasons ride the deck card's dark paper. */
+  html[data-skin^="dark"] .deck-reason-0 { color: #f5d578; }
+  html[data-skin^="dark"] .deck-reason-1,
+  html[data-skin^="dark"] .deck-blocked-link { color: #ff8a8a; }
+  html[data-skin^="dark"] .deck-reason-2 { color: #58a6ff; }
+  html[data-skin^="dark"] .deck-reason-3 { color: #e0b25a; }
+
+  /* Live-crew tally on the deck card face (ka-0000005352 iter-66) — the deck
+     twin of the /plans index chip's plan-card-crew idiom, so the two plan
+     surfaces read the same crew. A dense one-line "● N crew · M working"
+     summary; the working/queued/done facets are muted context, the ⚠ stuck
+     facet is the one loud red the operator must act on. A tap opens the cockpit
+     crew roster (data-deck-no-swipe on the anchor keeps a starting tap from
+     being read as a drag). */
+  .deck-card-crew { display: inline-flex; align-items: center; flex-wrap: wrap;
+                    gap: 0.3rem; font-size: 0.8rem; color: #4a5568;
+                    text-decoration: none; }
+  .deck-card-crew:hover { text-decoration: underline; }
+  .deck-card-crew-total { font-weight: 600; }
+  .deck-card-crew-working { opacity: 0.9; }
+  /* Working RUNTIME age ("· 4h") + "(K starting)" booting sub-qualifier on the
+     "· M working" facet (ka-0000005352) — the deck twin of the index card's
+     plan-card-crew-working-age / plan-card-crew-starting spans, muted context so
+     the runtime reads as a small ride-along on the working count, not an alarm.
+     tabular-nums so the age digits do not jitter as they tick. */
+  .deck-card-crew-working-age { opacity: 0.92; font-variant-numeric: tabular-nums; }
+  .deck-card-crew-starting { opacity: 0.8; font-variant-numeric: tabular-nums; }
+  .deck-card-crew-queued { opacity: 0.85; }
+  /* Queued + stuck wait-age ("· 12m" / "· 6h") + loud stale-tint on the "· N
+     queued" / "· ⚠ N" facets (ka-0000005352 iter-80) — the deck twin of the
+     index card's plan-card-crew-queued-age/-queued-stale and
+     plan-card-crew-stuck-age/-stuck-stale spans. The age reads a small muted
+     ride-along (tabular-nums so the digits don't jitter as they tick); the stale
+     class recolors the WHOLE facet loud red once the oldest crew crosses the
+     pool-starved / long-wedged bar, so a starved or aging plan pops out of the
+     deck exactly as it does on the index board. */
+  .deck-card-crew-queued-age { opacity: 0.92; font-variant-numeric: tabular-nums; }
+  .deck-card-crew-queued-stale { color: #a3282a; font-weight: 600; opacity: 1; }
+  .deck-card-crew-done { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  .deck-card-crew-stuck { color: #a3282a; font-weight: 600; }
+  .deck-card-crew-stuck-age { opacity: 0.92; font-variant-numeric: tabular-nums; }
+  .deck-card-crew-stuck-stale { color: #d32f2f; font-weight: 700; }
+  /* Cumulative crew SPEND ("· $12.34") facet on the crew face (ka-0000005352) —
+     the deck twin of the index card's plan-card-crew-spend span, calm muted
+     context (how much budget the plan has burned, not an alarm). tabular-nums so
+     the dollar digits do not jitter as they tick. */
+  .deck-card-crew-spend { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  /* Green pulsing live-dot, matching the index card's plan-card-crew-dot. */
+  .deck-card-crew-dot { width: 0.45rem; height: 0.45rem; border-radius: 50%;
+                    background: #4caf50; flex: 0 0 auto;
+                    animation: deck-crew-pulse 2s ease-in-out infinite; }
+  @keyframes deck-crew-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) { .deck-card-crew-dot { animation: none; } }
+  html[data-skin^="dark"] .deck-card-crew { color: #9aa4b2; }
+  html[data-skin^="dark"] .deck-card-crew-stuck { color: #ff8a8a; }
+  html[data-skin^="dark"] .deck-card-crew-queued-stale { color: #ff8a8a; }
+  html[data-skin^="dark"] .deck-card-crew-stuck-stale { color: #ff5a5a; }
+
+  /* Live-crew click-through FACE strips (ka-0000005352 iter-81): the deck twin of
+     the index card's plan-card-crew-face avatar pills (plans.html). One tappable
+     initials pill per crew — green working · red stuck · slate queued — each a
+     click-through to the agent's terminal, so an operator triaging the /deck can
+     reach a SPECIFIC crew (esp. a stuck one) without the crew roster the deck has
+     no room for. Reuses the index face vocabulary + AA-cleared color pairs so the
+     two surfaces read the same. The pill height (1.3rem, a shade taller than the
+     index's 1.15rem) gives a more thumb-friendly tap target on mobile while staying
+     compact; each strip flex-wraps so a wide roster stacks rather than overflowing
+     the narrow card. */
+  .deck-card-crew-faces { display: inline-flex; align-items: center; gap: 0.25rem;
+                          flex-wrap: wrap; margin-top: 0.3rem; }
+  .deck-card-crew-faces-stuck, .deck-card-crew-faces-queued { margin-left: 0.1rem; }
+  .deck-card-crew-face { display: inline-flex; align-items: center; justify-content: center;
+                         min-width: 1.3rem; height: 1.3rem; padding: 0 0.3rem; border-radius: 999px;
+                         font-size: 0.62rem; font-weight: 700; line-height: 1; letter-spacing: 0.01em;
+                         text-decoration: none; text-transform: uppercase; font-variant-numeric: tabular-nums;
+                         color: #256029; background: rgba(76,175,80,0.18);
+                         border: 1px solid rgba(76,175,80,0.55); flex: 0 0 auto; white-space: nowrap; }
+  .deck-card-crew-face:hover, .deck-card-crew-face:focus { border-color: rgba(76,175,80,0.9);
+                         background: rgba(76,175,80,0.3); outline: none; }
+  /* Step "#N" tag inside a face — the WHAT beside the WHO, matching the index avatar
+     + cockpit roster. A shade lighter than the initials (context, not identity),
+     hairline-separated; opacity 0.85 keeps it ≥AA on the green pill. Inherits the
+     pill tint via currentColor so a stuck face's tag reads red like its initials. */
+  .deck-card-crew-face-step { margin-left: 0.18rem; padding-left: 0.18rem; opacity: 0.85;
+                         font-weight: 600; font-variant-numeric: tabular-nums;
+                         border-left: 1px solid currentColor; }
+  .deck-card-crew-face-more { color: #555; background: rgba(120,120,120,0.12);
+                         border-style: dashed; border-color: rgba(120,120,120,0.5); }
+  .deck-card-crew-face-more:hover, .deck-card-crew-face-more:focus { border-color: rgba(120,120,120,0.8);
+                         background: rgba(120,120,120,0.22); }
+  .deck-card-crew-face-stuck { color: #a3282a; background: rgba(211,47,47,0.14);
+                         border-color: rgba(211,47,47,0.55); }
+  .deck-card-crew-face-stuck:hover, .deck-card-crew-face-stuck:focus { border-color: rgba(211,47,47,0.9);
+                         background: rgba(211,47,47,0.26); }
+  .deck-card-crew-face-stuck.deck-card-crew-face-more { color: #555; background: rgba(120,120,120,0.12);
+                         border-color: rgba(120,120,120,0.5); }
+  .deck-card-crew-face-queued { color: #45505f; background: rgba(100,116,139,0.16);
+                         border-color: rgba(100,116,139,0.55); }
+  .deck-card-crew-face-queued:hover, .deck-card-crew-face-queued:focus { border-color: rgba(100,116,139,0.9);
+                         background: rgba(100,116,139,0.28); }
+  .deck-card-crew-face-queued.deck-card-crew-face-more { color: #555; background: rgba(120,120,120,0.12);
+                         border-color: rgba(120,120,120,0.5); }
+  html[data-skin^="dark"] .deck-card-crew-face { color: #6ee7b7; background: rgba(76,175,80,0.22); border-color: rgba(110,231,183,0.6); }
+  html[data-skin^="dark"] .deck-card-crew-face-more { color: #b8c2d0; background: rgba(160,170,185,0.14); border-color: rgba(160,170,185,0.5); }
+  html[data-skin^="dark"] .deck-card-crew-face-stuck { color: #ff8a8a; background: rgba(211,47,47,0.2); border-color: rgba(255,138,138,0.6); }
+  html[data-skin^="dark"] .deck-card-crew-face-queued { color: #c3cdda; background: rgba(148,163,184,0.2); border-color: rgba(148,163,184,0.6); }
+  html[data-skin^="dark"] .deck-card-crew-face-queued.deck-card-crew-face-more { color: #b8c2d0; background: rgba(160,170,185,0.14); border-color: rgba(160,170,185,0.5); }
+
+  /* Step-progress facet on the deck card face (ka-0000005352 iter-67): the
+     compact "N/M steps · X%" the /plans index card + the cockpit both show, but
+     the /deck mobile card face carried NOTHING about how far along the plan is.
+     The deck is a decision queue — an operator answering a plan's question here
+     needs the "how much is already built" context that colors the answer (a
+     decision on a 0% just-started plan is not the same decision on a 90%
+     nearly-done one). Calm muted, tabular-nums so the counts don't jitter as the
+     stack flips. Rendered in the meta row beside the crew tally (its sibling
+     iter-66 signal), a plain span (not a link — the whole card already links to
+     the cockpit and the crew chip covers the click-through). */
+  .deck-card-steps { font-size: 0.78rem; color: #4a5568; opacity: 0.9;
+                     font-variant-numeric: tabular-nums; white-space: nowrap; }
+  html[data-skin^="dark"] .deck-card-steps { color: #9aa4b2; }
+
+  /* Phase-position milestone (ka-0000005352 iter-90): the deck twin of the index
+     card's .plan-progress-phase facet (plans.html:273) — "· phase 2/5" for a
+     multi-phase plan. Calm muted marker (context like the step-progress facet, NOT
+     a red alarm), tabular-nums so the N/M reads clean beside "N/M steps · X%",
+     nowrap so it never breaks mid-facet. Inherits the themed deck-card-steps ink
+     (opacity/size only, no color: declaration), so the dark-skin path needs no
+     override and the iter-85 dark-coverage guard is untouched. */
+  .deck-card-phase { font-size: 0.72rem; opacity: 0.72; white-space: nowrap;
+                     font-variant-numeric: tabular-nums; }
+
+  /* Per-status step-BREAKDOWN tally (ka-0000005352 iter-84): the deck twin of the
+     index card's .plan-step-tally-* pills (plans.html) — "▶ N in progress · ⛔ N
+     blocked", loud orange / red matching the index vocabulary so an operator reads
+     the same disposition on both surfaces. Compact chip-strip footprint (adds
+     signal, not a row); nowrap keeps each glyph+count whole. */
+  .deck-card-step-tally { display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap; }
+  .deck-card-step-tally-item { font-size: 0.7rem; line-height: 1; padding: 0.1rem 0.32rem; border-radius: 999px;
+                               border: 1px solid currentColor; font-variant-numeric: tabular-nums; }
+  .deck-card-step-tally-inprogress { color: #8a5a00; background: rgba(255,152,0,0.14); border-color: rgba(255,152,0,0.55); }
+  .deck-card-step-tally-blocked { color: #a3282a; background: rgba(229,57,53,0.12); border-color: rgba(229,57,53,0.55); }
+  html[data-skin^="dark"] .deck-card-step-tally-inprogress { color: #f5d578; border-color: rgba(245,213,120,0.5); }
+  html[data-skin^="dark"] .deck-card-step-tally-blocked { color: #ff8a8a; border-color: rgba(255,138,138,0.5); }
+  /* Ghost-done marker (ka-0000005352 iter-84): the deck twin of the index's
+     .plan-steps-done — CALM green (the healthy-complete opposite of the red ⚠/⛔
+     tiers), reusing the index marker's hue so the two surfaces agree. */
+  .deck-card-steps-done { display: inline-flex; align-items: center; gap: 0.2rem; font-size: 0.7rem; line-height: 1;
+                          padding: 0.1rem 0.32rem; border-radius: 999px; white-space: nowrap;
+                          color: #2e7d32; background: rgba(76,175,80,0.14); border: 1px solid rgba(76,175,80,0.55); }
+  html[data-skin^="dark"] .deck-card-steps-done { color: #6ee7b7; background: rgba(76,175,80,0.16); border-color: rgba(110,231,183,0.5); }
+
+  /* Current-or-next STEP chip (ka-0000005352 iter-83) — the deck twin of the
+     index card's plan-card-step chip (plans.html). A flex row: a kind pill
+     (NOW/BLOCKED/NEXT) + step "#N" + an ellipsized title + an optional
+     running/wedge age. The whole chip is a deep-link into the cockpit anchored at
+     the step, affordant on hover like every other deck link. Reuses the SAME
+     kind-color vocabulary + stale-tint the index card carries so the two surfaces
+     read as one. */
+  .deck-card-step { display: flex; align-items: baseline; gap: 0.4rem;
+                    margin-top: 0.35rem; font-size: 0.82rem; min-width: 0;
+                    text-decoration: none; color: inherit; border-radius: 6px;
+                    padding: 0.12rem 0.2rem; margin-left: -0.2rem;
+                    transition: background 0.15s ease; }
+  .deck-card-step:hover, .deck-card-step:focus { background: rgba(33,150,243,0.1); outline: none; }
+  .deck-card-step:hover .deck-card-step-title,
+  .deck-card-step:focus .deck-card-step-title { text-decoration: underline; opacity: 1; }
+  .deck-card-step-kind { font-weight: 600; font-size: 0.68rem; text-transform: uppercase;
+                    letter-spacing: 0.02em; padding: 0.05rem 0.35rem; border-radius: 999px;
+                    white-space: nowrap; flex: 0 0 auto; }
+  .deck-card-step-kind-now { background: rgba(255,152,0,0.16); color: #8a5a00; }
+  .deck-card-step-kind-next { background: rgba(33,150,243,0.14); color: #16559a; }
+  .deck-card-step-kind-blocked { background: rgba(229,57,53,0.12); color: #a3282a; }
+  .deck-card-step-num { color: #5c5c5c; flex: 0 0 auto; }
+  .deck-card-step-title { opacity: 0.85; overflow: hidden; text-overflow: ellipsis;
+                    white-space: nowrap; min-width: 0; }
+  .deck-card-step-age { flex: 0 0 auto; color: #5c5c5c;
+                    font-variant-numeric: tabular-nums; }
+  /* Stale variant: an in_progress step running (now-stale) OR a blocked step
+     wedged (blocked-stale) past the 24h bar tints the whole chip loud red +
+     un-dims the age, the SAME bar + tone the index card uses. */
+  .deck-card-step-now-stale, .deck-card-step-blocked-stale { background: rgba(229,57,53,0.08); }
+  .deck-card-step-now-stale:hover, .deck-card-step-now-stale:focus,
+  .deck-card-step-blocked-stale:hover, .deck-card-step-blocked-stale:focus { background: rgba(229,57,53,0.14); }
+  .deck-card-step-now-stale .deck-card-step-title,
+  .deck-card-step-now-stale .deck-card-step-num,
+  .deck-card-step-blocked-stale .deck-card-step-title,
+  .deck-card-step-blocked-stale .deck-card-step-num { color: #a3282a; opacity: 1; }
+  .deck-card-step-now-stale .deck-card-step-age,
+  .deck-card-step-blocked-stale .deck-card-step-age { color: #a3282a; font-weight: 600; }
+  html[data-skin^="dark"] .deck-card-step-num,
+  html[data-skin^="dark"] .deck-card-step-age { color: #9aa4b2; }
+  html[data-skin^="dark"] .deck-card-step-kind-now { color: #f5d578; background: rgba(255,152,0,0.18); }
+  html[data-skin^="dark"] .deck-card-step-kind-next { color: #58a6ff; background: rgba(33,150,243,0.18); }
+  html[data-skin^="dark"] .deck-card-step-kind-blocked { color: #ff8a8a; background: rgba(229,57,53,0.16); }
+  html[data-skin^="dark"] .deck-card-step-now-stale .deck-card-step-title,
+  html[data-skin^="dark"] .deck-card-step-now-stale .deck-card-step-num,
+  html[data-skin^="dark"] .deck-card-step-now-stale .deck-card-step-age,
+  html[data-skin^="dark"] .deck-card-step-blocked-stale .deck-card-step-title,
+  html[data-skin^="dark"] .deck-card-step-blocked-stale .deck-card-step-num,
+  html[data-skin^="dark"] .deck-card-step-blocked-stale .deck-card-step-age { color: #ff8a8a; }
+
+  .deck-question { font-size: 0.95rem; line-height: 1.45; margin: 0;
+                   overflow-wrap: anywhere; }
+  /* The long-prompt disclosure. The summary is a >=44px tap target in its own
+     right, and the marker is styled to read as an affordance rather than a
+     stray triangle. */
+  .deck-question-details > summary { cursor: pointer; list-style: none;
+                   padding: 0.1rem 0; min-height: 44px; }
+  .deck-question-details > summary::-webkit-details-marker { display: none; }
+  .deck-question-more { font-size: 0.78rem; opacity: 0.7; white-space: nowrap;
+                   border-bottom: 1px dotted currentColor; }
+  .deck-question-details[open] .deck-question-more { display: none; }
+  .deck-question-rest { margin: 0.4rem 0 0; opacity: 0.9; }
+
+  /* Answer buttons: full-width, >=48px, generous gaps. Every open decision
+     option already carries a `short` label (median ~15 chars), so these fit a
+     phone without re-authoring anything. */
+  .deck-options { list-style: none; margin: 0; padding: 0; display: flex;
+                  flex-direction: column; gap: 0.5rem; }
+  .deck-opt-form { margin: 0; }
+  .deck-opt-btn { display: block; width: 100%; min-height: 48px;
+                  padding: 0.7rem 0.9rem; font-size: 0.95rem; font-weight: 500;
+                  text-align: left; border-radius: 10px; cursor: pointer;
+                  border: 1px solid rgba(33,150,243,0.5);
+                  background: rgba(33,150,243,0.08); color: inherit; }
+  .deck-opt-btn:hover, .deck-opt-btn:focus { border-color: rgba(33,150,243,0.9);
+                  background: rgba(33,150,243,0.16); outline: none; }
+  .deck-opt-btn[disabled] { opacity: 0.5; cursor: progress; }
+  .deck-opt-key { display: inline-block; min-width: 1.4em; opacity: 0.55;
+                  font-variant-numeric: tabular-nums; }
+  .deck-opt-static { display: block; padding: 0.7rem 0.9rem; border-radius: 10px;
+                     border: 1px dashed var(--rule, #d7dbe0); font-size: 0.95rem; opacity: 0.8; }
+
+  /* Action affordances for the non-question tiers. "Approve & build" is the one
+     genuinely destructive-ish action on the deck, so it is a POST form with an
+     hx-confirm — never reachable by a gesture. */
+  .deck-action-form { margin: 0; }
+  .deck-action-btn { display: block; width: 100%; min-height: 48px; padding: 0.7rem 0.9rem;
+                     font-size: 0.95rem; font-weight: 600; border-radius: 10px; cursor: pointer;
+                     border: 1px solid rgba(76,175,80,0.6); background: rgba(76,175,80,0.14);
+                     color: inherit; }
+  .deck-action-btn:hover, .deck-action-btn:focus { border-color: rgba(76,175,80,0.95); outline: none; }
+  /* Escalations are READ-ONLY in v1: the write verb is capability-gated and
+     lives in the slack-bridge binary, so the card deep-links out instead of
+     offering an action that would fail. */
+  .deck-blocked-link { display: block; min-height: 48px; padding: 0.7rem 0.9rem;
+                       font-size: 0.9rem; border-radius: 10px; text-decoration: none;
+                       border: 1px solid rgba(229,57,53,0.5); background: rgba(229,57,53,0.08);
+                       color: #a3282a; }
+
+  /* The lean deck_card fragment (Step 3) that an answer-in-place swap brings in
+     carries its OWN class names (deck-card-question / -options / -opt-btn /
+     -error / -allclear). Style them to match the inline card so a swapped-in
+     card is not unstyled — the two must be visually indistinguishable. */
+  .deck-card-question { font-size: 0.95rem; line-height: 1.45; margin: 0; overflow-wrap: anywhere; }
+  .deck-card-options { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+  .deck-card-opt { margin: 0; }
+  .deck-card-opt-form { margin: 0; }
+  .deck-card-opt-btn { display: block; width: 100%; min-height: 48px; padding: 0.7rem 0.9rem;
+                       font-size: 0.95rem; font-weight: 500; text-align: left; border-radius: 10px;
+                       cursor: pointer; border: 1px solid rgba(33,150,243,0.5);
+                       background: rgba(33,150,243,0.08); color: inherit; }
+  .deck-card-opt-btn:hover, .deck-card-opt-btn:focus { border-color: rgba(33,150,243,0.9);
+                       background: rgba(33,150,243,0.16); outline: none; }
+  .deck-card-opt-static { display: block; padding: 0.7rem 0.9rem; border-radius: 10px;
+                       border: 1px dashed var(--rule, #d7dbe0); font-size: 0.95rem; opacity: 0.8; }
+  .deck-card-decision-open { display: inline-block; margin-top: 0.35rem; font-size: 0.75rem; }
+  .deck-card-full-link { min-height: 44px; display: inline-flex; align-items: center; text-decoration: none; }
+  .deck-card-error { font-size: 0.85rem; padding: 0.5rem 0.7rem; border-radius: 8px;
+                     border: 1px solid rgba(229,57,53,0.5); background: rgba(229,57,53,0.10);
+                     color: #a3282a; margin: 0; }
+  .deck-card-allclear { font-size: 0.9rem; padding: 0.5rem 0.7rem; border-radius: 8px;
+                        border: 1px solid rgba(76,175,80,0.5); background: rgba(76,175,80,0.10);
+                        color: #2e6b31; margin: 0; }
+  /* Dark overrides (ka-0000005352 iter-85): the empty-state all-clear banner
+     (#2e6b31 green, ~2.5:1 on dark) and the swap-error banner (#a3282a red) rode
+     light ink on the now-dark card. Lift to the bright dark palette (#6ee7b7 /
+     #ff8a8a) the index card's own success/error signals use. */
+  html[data-skin^="dark"] .deck-card-allclear { color: #6ee7b7; }
+  html[data-skin^="dark"] .deck-card-error { color: #ff8a8a; }
+
+  .deck-card-foot { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
+                    font-size: 0.8rem; }
+  .deck-card-foot a { min-height: 44px; display: inline-flex; align-items: center; }
+
+  /* The nav bar pins to the bottom — thumb reach on a phone, and it stays put
+     while the card scrolls. */
+  .deck-nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+              display: flex; gap: 0.5rem; padding: 0.6rem 0.75rem;
+              padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px));
+              background: var(--card-bg, #fff); border-top: 1px solid var(--rule, #d7dbe0); }
+  .deck-nav a, .deck-nav span { flex: 1; min-height: 48px; display: inline-flex;
+              align-items: center; justify-content: center; gap: 0.35rem;
+              border-radius: 10px; border: 1px solid var(--rule, #d7dbe0);
+              text-decoration: none; color: inherit; font-size: 0.9rem; }
+  .deck-nav a:hover, .deck-nav a:focus { border-color: var(--accent, #b9851b); outline: none; }
+  .deck-nav .is-disabled { opacity: 0.35; }
+
+  .deck-empty { text-align: center; padding: 3rem 1rem; }
+  .deck-empty-glyph { font-size: 2.5rem; display: block; margin-bottom: 0.5rem; }
+  .deck-hint { font-size: 0.75rem; opacity: 0.6; text-align: center; margin: 0.75rem 0 0; }
+
+  /* Desktop gets the same deck, just centered — the keyboard hints become the
+     primary affordance there (j/k to flip, 1-9 to answer). */
+  @media (min-width: 48rem) {
+    .deck-nav { position: static; border: 0; padding: 0.75rem 0 0; background: none; }
+    .deck-wrap { padding-bottom: 2rem; }
+  }
+</style>
+
+<div class="deck-wrap">
+  <div class="deck-head">
+    <span class="deck-progress">
+      {{if .Empty}}Deck empty{{else}}<strong id="deck-pos">{{add .Position 1}}</strong> of {{.Total}}{{if .Skipped}} · {{.Skipped}} skipped{{end}}{{end}}
+    </span>
+    {{/* Scope selector. A plain GET form so it works with JS off; the inline
+         script below auto-submits it on change for a one-tap feel. */}}
+    <form class="deck-scope" method="get" action="{{.BasePath}}/deck" data-deck-no-swipe>
+      <label for="deck-project" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap">Project</label>
+      <select id="deck-project" name="project">
+        <option value="">All projects</option>
+        {{range .Projects}}
+        <option value="{{.}}" {{if eq . $.ProjectFilter}}selected{{end}}>{{.}}</option>
+        {{end}}
+      </select>
+      <noscript><button type="submit" class="bead-action">Go</button></noscript>
+    </form>
+  </div>
+
+  {{if .Error}}<div class="banner banner-error">{{.Error}}</div>{{end}}
+
+  {{if .Empty}}
+  <div class="deck-empty">
+    <span class="deck-empty-glyph">✓</span>
+    <p><strong>Nothing is waiting on a human.</strong></p>
+    <p class="meta">No open questions, blocking escalations, plans ready to build, or stalled work
+      {{if .ProjectFilter}}in <code>{{.ProjectFilter}}</code>{{end}}.</p>
+    <p><a class="bead-action" href="{{.BasePath}}/plans">Open the full plans index &rarr;</a></p>
+  </div>
+  {{else}}
+
+  {{/* The deck root. deck_swipe.js binds to these data-* attributes and nothing
+       else; data-deck-nav-events opts into the cancelable deck:navigate event so
+       the inline script below can take over navigation when JS is available. */}}
+  <div class="deck-stack" id="deck" data-deck data-deck-nav-events
+       data-deck-position="{{.Position}}" data-deck-total="{{.Total}}">
+    {{range $i, $c := .Cards}}
+    <div class="deck-slot{{if eq $i $.Position}} is-active{{end}}" data-deck-slot="{{$i}}" data-plan-id="{{$c.PlanID}}">
+      {{/* Only the ACTIVE card carries data-deck-card, so a swipe can only ever
+           drag the frontmost one (the module's DOM contract). */}}
+      <article class="deck-card"{{if eq $i $.Position}} data-deck-card{{end}}>
+        {{with $c.Badge}}<img class="deck-card-cover" src="{{$.BasePath}}{{.Src}}" alt="" width="112" height="112" loading="lazy" decoding="async">{{end}}
+        <header class="deck-card-head">
+          <h2 class="deck-card-title">{{- with $c.Heraldry}}<span class="heraldry-slot">{{heraldry . 40}}</span>{{end -}}
+            <a href="{{$.BasePath}}/plans/{{$c.PlanID}}">{{$c.Title}}</a></h2>
+          <p class="deck-card-meta">
+            <span class="chip chip-status chip-status-{{$c.Status}}">{{$c.Status}}</span>
+            <span class="deck-prio deck-prio-{{$c.Priority}}" title="Priority {{$c.Priority}} (0 = highest)">P{{$c.Priority}}</span>
+            {{if $c.PlanState}}<span class="chip plan-lifecycle-chip plan-lifecycle-chip-{{$c.PlanState}}">{{$c.PlanState}}</span>{{end}}
+            {{if $c.Project}}<span class="chip chip-type">{{$c.Project}}</span>{{end}}
+            {{/* Step-progress facet (ka-0000005352 iter-67): "N/M steps · X%" — the
+                 progress the /plans index card + cockpit both show, so an operator
+                 triaging a decision on the deck sees how far along the plan is (a
+                 0% plan's question is not the same as a 90% plan's). Rides the SAME
+                 StepsClosed/StepsTotal/PctDone on the enriched row, zero extra
+                 fetch. Gated on StepsTotal>0 so a no-steps plan adds no ink. */}}
+            {{if gt $c.StepsTotal 0}}<span class="deck-card-steps" title="{{$c.StepsClosed}} of {{$c.StepsTotal}} steps done">{{$c.StepsClosed}}/{{$c.StepsTotal}} steps · {{$c.PctDone}}%</span>{{end}}
+            {{/* Phase-position milestone (ka-0000005352 iter-90): for a MULTI-PHASE
+                 plan, WHICH phase of how many is currently in flight — "· phase 2/5",
+                 the SAME facet the /plans index card face carries (plan_card.html,
+                 .plan-progress-phase, iter-58) but the /deck card DROPPED. The
+                 deck-card-steps facet above names how far through the TASKS a plan is
+                 (N/M · X%, iter-67) and the NOW/NEXT chip below names ONE step, but
+                 neither answers WHICH PHASE the plan is on — the coarse lifecycle
+                 milestone the mission names ("add lifecycle/step-breakdown signals").
+                 $c.PhaseCur/$c.PhaseTotal ride the SAME planPhasePosition on the
+                 enriched row the index reads (derived off the same Grid), so the facet
+                 can never disagree with the index and costs zero extra daemon call.
+                 Calm neutral (a milestone marker, context like the step-progress facet
+                 — NOT a red attention alarm), reusing the deck-card-steps muted ink +
+                 size. Gated on PhaseTotal>=2 (the index's own gate) so a single-phase
+                 or pure-flat plan adds no ink. Static <span> → no data-deck-no-swipe. */}}
+            {{if ge $c.PhaseTotal 2}}<span class="deck-card-phase" title="This multi-phase plan is on phase {{$c.PhaseCur}} of {{$c.PhaseTotal}} — the earliest phase still carrying an unfinished step">· phase {{$c.PhaseCur}}/{{$c.PhaseTotal}}</span>{{end}}
+            {{/* Per-status step-BREAKDOWN tally (ka-0000005352 iter-84): the
+                 "▶ N in progress · ⛔ N blocked" pills the /plans index card face
+                 carries (plan_card.html) but the /deck card DROPPED. The deck-card-
+                 steps facet above names how FAR a plan is (N/M · X%, iter-67) but not
+                 WHICH disposition its open steps are in — a 4/10 plan with 3 steps
+                 actively running read identically to a 4/10 plan with 3 steps BLOCKED
+                 (the second needs a human). Fold the SAME two pills reading the SAME
+                 $c.StepsInProgress/$c.StepsBlocked the index tally reads (planIndexEnrich's
+                 tallyPlanGrid, already on the enriched row the deck builds from) — zero
+                 Go beyond the field fold, zero extra daemon call, deck↔index agree by
+                 construction (advice ka-0000005924). Each pill renders only when non-
+                 zero (or-guarded so a plan with nothing in flight and nothing blocked
+                 adds no ink); loud orange ▶ / red ⛔ matching the index vocabulary. */}}
+            {{if or $c.StepsInProgress $c.StepsBlocked}}<span class="deck-card-step-tally" aria-label="Step status breakdown">
+              {{- if $c.StepsInProgress}}<span class="deck-card-step-tally-item deck-card-step-tally-inprogress" title="{{$c.StepsInProgress}} step{{if ne $c.StepsInProgress 1}}s{{end}} in progress">&#x25b6; {{$c.StepsInProgress}}</span>{{end}}
+              {{- if $c.StepsBlocked}}<span class="deck-card-step-tally-item deck-card-step-tally-blocked" title="{{$c.StepsBlocked}} step{{if ne $c.StepsBlocked 1}}s{{end}} blocked">&#x26d4; {{$c.StepsBlocked}}</span>{{end}}
+            </span>{{end}}
+            {{/* Ghost-done marker (ka-0000005352 iter-84, the deck twin of the index's
+                 iter-41 marker): a calm "✓ steps done" pill on a plan whose RENDERED
+                 steps are ALL closed (100% face) but whose epic status is still non-
+                 terminal — finished its steps yet never closed out. The index card face
+                 carries it; the deck showed a full "N/N steps · 100%" facet that read
+                 identically to a genuinely mid-flight plan. Reads CALM green (a healthy
+                 complete state, the deliberate opposite of the red ⚠/⛔ tiers), reusing
+                 the index marker's hue. StepsAllDone already folds the !planStatusTerminal
+                 guard (a genuinely CLOSED/DEFERRED plan renders nothing) and is mutually
+                 exclusive with the in-flight tally above by construction. */}}
+            {{if $c.StepsAllDone}}<span class="deck-card-steps-done" title="All {{$c.StepsClosed}} rendered step{{if ne $c.StepsClosed 1}}s{{end}} done, but this plan is still open — it may be ready to close or need a wrap-up">&#x2713; steps done</span>{{end}}
+            {{/* "Last change" freshness stamp (ka-0000005352 iter-86): the deck twin
+                 of the /plans index card head stamp (.plan-card-updated) + the peek
+                 header (.plan-peek-updated). The deck previously rendered the WIDE
+                 "7 hours ago" (Ago) with NO stale-tint; the index + peek both render
+                 the COMPACT "7h"/"2d"/"1w" (AgoCompact) AND tint loud-red when an
+                 ACTIVE plan has gone >7d-dead (FreshnessStale). So a 3-week-dead plan
+                 read calm — and wider — on the deck than on the index. Fold the SAME
+                 AgoCompact + FreshnessStale already on the enriched row (zero extra
+                 fetch), mirroring the index markup: compact face, loud tint gated on
+                 FreshnessStale (non-terminal-only, so a genuinely finished plan's
+                 honest "3 weeks ago" stays calm history), the precise instant + stale
+                 reason in the tooltip. Gated on AgoCompact so an undatable plan renders
+                 no stamp, exactly like the index card. */}}
+            {{if $c.AgoCompact}}<span class="meta deck-card-updated{{if $c.FreshnessStale}} deck-card-updated-stale{{end}}" title="Last change {{$c.AgoRFC}}{{if $c.FreshnessStale}} — this plan has not moved in over a week (stale){{end}}" aria-label="updated {{$c.Ago}}">{{$c.AgoCompact}}</span>{{end}}
+          </p>
+        </header>
+
+        {{if $c.Reason}}<p class="deck-reason deck-reason-{{$c.Tier}}">{{$c.Reason}}</p>{{end}}
+
+        {{/* Live-crew tally (ka-0000005352 iter-66): surface the crew the plan's
+             gardener has dispatched right on the deck card face — the mission's
+             "surface live crew on EACH card (not just the cockpit)". The index
+             card + peek drawer both carry it; the /deck mobile card was the last
+             plan-card surface showing NOTHING, so an operator could answer a
+             plan's question here without ever seeing N crew are already working
+             (or stuck) on it. The SAME reconciled planCrewRollup the index chip
+             reads (rides the enriched row, reconcileTerminal quiets a terminal
+             plan) — zero extra fetch. A crew-less plan renders no line (Crew.Any).
+             The live-dot (green, pulsing) shows only while a crew is working now,
+             reusing the index chip's plan-card-crew-dot idiom; the working/queued/
+             stuck facets render only when non-zero. Deep-links to the cockpit crew
+             roster; data-deck-no-swipe keeps a tap that starts on it from being
+             read as a drag. */}}
+        {{with $c.Crew}}{{if .Any}}
+        <a class="deck-card-crew{{if .HasLive}} deck-card-crew-live{{end}}" data-deck-no-swipe
+           href="{{$.BasePath}}/plans/{{$c.PlanID}}#plan-crew"
+           title="{{.Total}} crew agent{{if ne .Total 1}}s{{end}} dispatched onto this plan's steps{{if .Working}} — {{.Working}} working now{{if .HasStarting}} ({{.Starting}} still starting up){{end}}{{if .WorkingOldestAge}} (longest running {{.WorkingOldestAge}}){{end}}{{end}}{{if .Idle}}, {{.Idle}} queued{{if .QueuedOldestAge}} (oldest {{.QueuedOldestAge}}{{if .QueuedOldestStale}}, pool starved{{end}}){{end}}{{end}}{{if .Done}}, {{.Done}} done{{end}}{{if .HasOpenStuck}}, {{.OpenStuck}} stuck{{if .StuckOldestAge}} (oldest stuck {{.StuckOldestAge}}{{if .StuckOldestStale}}, stale{{end}}){{end}}{{end}}{{if .HasSpend}}. {{.SpendLabel}} spent so far{{end}}. Open the crew roster.">
+          {{if .HasLive}}<span class="deck-card-crew-dot" aria-hidden="true"></span>{{end}}
+          <span class="deck-card-crew-total">{{.Total}} crew</span>
+          {{/* Working facet with the runtime age ("· 4h") + "(K starting)" booting
+               sub-qualifier (ka-0000005352) — the deck twin of the index card's
+               plan-card-crew-working facet (plan_card.html) and the cockpit roster's
+               plan-crew-count-working chip (plan_crew.html, MR !7217). The deck was
+               the LAST plan-card surface whose "· M working" facet was still count-
+               only: a crew grinding a step for 4h read identically to one that had
+               just begun. Both WorkingOldestAge (longest-running live crew's elapsed
+               RUNTIME, aged on CreatedAt not last-activity so a heartbeating crew does
+               not read ~0s) and HasStarting (0<K<M live crew still BOOTING in the
+               spawning agent_state) already ride the deckCardItem.Crew planCrewRollup
+               the inline card renders (iter-66) — so this is a template-only fold, zero
+               Go wiring and zero extra daemon call, and the three surfaces agree by
+               construction. Calm muted (context, not an alarm — a genuinely wedged crew
+               is re-bucketed to the loud ⚠ stuck facet). Each sub-span renders only
+               when derivable, so a set with none / an undatable working crew reads
+               count-only exactly as before. */}}
+          {{if .Working}}<span class="deck-card-crew-working">· {{.Working}} working{{if .HasStarting}} <span class="deck-card-crew-starting" aria-label="{{.Starting}} still starting up">({{.Starting}} starting)</span>{{end}}{{if .WorkingOldestAge}} <span class="deck-card-crew-working-age">{{.WorkingOldestAge}}</span>{{end}}</span>{{end}}
+          {{/* Queued + stuck wait-age + stale-tint (ka-0000005352 iter-80) — the
+               deck twin of the index card's queued ("· N queued 12m", iter-32) and
+               stuck ("· ⚠ N 6h", iter-13/29) facets. The deck rendered both COUNT-
+               ONLY while the index card face AND the cockpit roster fold the oldest
+               crew's wait-age + a loud stale-tint onto each: a crew queued 2m (the
+               pool will slot it) read identically to one queued 3h (the pool is
+               starved), and a crew wedged 6m read identically to one wedged days. The
+               /deck is a standalone triage card with NO crew roster below, so the
+               urgency was doubly hidden. Fold the SAME two facets, reading the SAME
+               .Crew (planCrewRollup already on deckCardItem.Crew, iter-66):
+               QueuedOldestAge/QueuedOldestStale + StuckOldestAge/StuckOldestStale are
+               the identical projections the index chip reads (derived once in
+               planCrewBulk over the SAME crew beads), so this is a template+CSS-only
+               fold — zero Go, zero extra fetch — and deck↔index↔cockpit agree by
+               construction (advice ka-0000005924). Each age span renders only when
+               derivable, so an undatable set reads count-only exactly as before; the
+               stale class recolors the whole facet loud once the oldest crew crosses
+               the pool-starved / long-wedged bar. */}}
+          {{if .Idle}}<span class="deck-card-crew-queued{{if .QueuedOldestStale}} deck-card-crew-queued-stale{{end}}">· {{.Idle}} queued{{if .QueuedOldestAge}} <span class="deck-card-crew-queued-age">{{.QueuedOldestAge}}</span>{{end}}</span>{{end}}
+          {{if .HasDoneFacet}}<span class="deck-card-crew-done">· {{.Done}} done</span>{{end}}
+          {{if .HasOpenStuck}}<span class="deck-card-crew-stuck{{if .StuckOldestStale}} deck-card-crew-stuck-stale{{end}}">· &#x26a0; {{.OpenStuck}}{{if .StuckOldestAge}} <span class="deck-card-crew-stuck-age">{{.StuckOldestAge}}</span>{{end}}</span>{{end}}
+          {{/* Cumulative crew SPEND facet (ka-0000005352 iter-77) — the deck twin
+               of the index card's plan-card-crew-spend facet (plan_card.html, iter-12)
+               and the cockpit roster's plan-crew-count-spend chip (plan_crew.html).
+               The deck crew face rendered working/queued/done/stuck but HID the
+               cumulative spend in the tooltip only ("· $N spent so far"), while both
+               the index card FACE and the cockpit roster header render it on the face.
+               The /deck is a standalone triage card with NO crew roster below it, so
+               spend was doubly hidden — an operator triaging the deck could not see how
+               much budget a plan has burned without hovering. Fold the SAME "· $N" facet
+               reading the SAME .Crew (planCrewRollup already on deckCardItem.Crew, iter-66):
+               HasSpend()/SpendLabel() are the identical projections the index chip + roster
+               read, so the three surfaces agree by construction (advice ka-0000005924), zero
+               Go and zero extra daemon call. Calm muted (context like the done facet, not an
+               alarm); rendered only when spend is known (HasSpend), so a plan whose crew have
+               not yet reported cost reads exactly as before. */}}
+          {{if .HasSpend}}<span class="deck-card-crew-spend">· {{.SpendLabel}}</span>{{end}}
+        </a>
+        {{/* Live-crew click-through FACE strips (ka-0000005352 iter-81): the deck
+             twin of the index card's working (ka-0000002189/iter-15), stuck
+             (ka-0000003793/iter-29), and queued (iter-53) avatar strips. The crew
+             TALLY above answers "how many are working / stuck / queued"; these
+             strips answer WHO — one click-through avatar per crew, each deep-linking
+             to that agent's live terminal (or bead page). On the /deck — a standalone
+             mobile triage surface with NO crew roster below (unlike the index card,
+             which has the cockpit a click away, and the peek, which embeds the full
+             roster) and NO hover — WHICH crew is stuck, and the terminal to jump to
+             and unstick it, was doubly unreachable: only the loud "· ⚠ N" count, no
+             way to reach the specific pod. Fold the SAME three strips reading the
+             SAME .Faces / .StuckFaces / .QueuedFaces already on deckCardItem.Crew
+             (planCrewRollup, iter-66) — with the identical FacesHidden /
+             StuckFacesHidden / QueuedFacesHidden "+N" overflow to the cockpit roster
+             the index uses. Template + CSS only, zero Go, zero extra daemon call;
+             deck↔index agree by construction (advice ka-0000005924). Each face carries
+             data-deck-no-swipe so a tap that STARTS on an avatar opens its terminal
+             instead of being read as a card swipe (the same guard the crew tally
+             anchor + every deck link carries). Each strip renders only when its crew
+             disposition exists (.Faces / .HasStuck / .HasQueuedFaces), so a plan with
+             only-finished (or no) crew adds no avatars. The step "#N" tag inside each
+             pill names the plan STEP the crew works (the WHAT beside the WHO), matching
+             the index avatar + cockpit roster. Green working · red stuck · slate queued,
+             reusing the index face vocabulary. */}}
+        {{if .Faces}}
+        <span class="deck-card-crew-faces" role="group" aria-label="Live crew working now">
+          {{range .Faces}}<a class="deck-card-crew-face" data-deck-no-swipe href="{{.URL}}"{{if .External}} target="_blank" rel="noopener"{{end}}
+             title="{{.Name}} — working now{{if .StepNumber}} on step #{{.StepNumber}}{{if .StepTitle}}: {{.StepTitle}}{{end}}{{end}}. {{if .External}}Open its live terminal.{{else}}Open its bead page.{{end}}"
+             aria-label="Live crew {{.Name}}, working now{{if .StepNumber}} on step {{.StepNumber}}{{if .StepTitle}} {{.StepTitle}}{{end}}{{end}}">{{.Initials}}{{if .StepNumber}}<span class="deck-card-crew-face-step" aria-hidden="true">#{{.StepNumber}}</span>{{end}}</a>{{end}}
+          {{if .FacesHidden}}<a class="deck-card-crew-face deck-card-crew-face-more" data-deck-no-swipe href="{{$.BasePath}}/plans/{{$c.PlanID}}#plan-crew"
+             title="{{.FacesHidden}} more crew working now — open the crew roster">+{{.FacesHidden}}</a>{{end}}
+        </span>
+        {{end}}
+        {{if .HasStuck}}
+        <span class="deck-card-crew-faces deck-card-crew-faces-stuck" role="group" aria-label="Stuck crew needing attention">
+          {{range .StuckFaces}}<a class="deck-card-crew-face deck-card-crew-face-stuck" data-deck-no-swipe href="{{.URL}}"{{if .External}} target="_blank" rel="noopener"{{end}}
+             title="{{.Name}} — stuck (rate-limited / failing){{if .StepNumber}} on step #{{.StepNumber}}{{if .StepTitle}}: {{.StepTitle}}{{end}}{{end}}. {{if .External}}Open its live terminal to unstick it.{{else}}Open its bead page.{{end}}"
+             aria-label="Stuck crew {{.Name}}, needs attention{{if .StepNumber}} on step {{.StepNumber}}{{if .StepTitle}} {{.StepTitle}}{{end}}{{end}}">{{.Initials}}{{if .StepNumber}}<span class="deck-card-crew-face-step" aria-hidden="true">#{{.StepNumber}}</span>{{end}}</a>{{end}}
+          {{if .StuckFacesHidden}}<a class="deck-card-crew-face deck-card-crew-face-stuck deck-card-crew-face-more" data-deck-no-swipe href="{{$.BasePath}}/plans/{{$c.PlanID}}#plan-crew"
+             title="{{.StuckFacesHidden}} more stuck crew — open the crew roster">+{{.StuckFacesHidden}}</a>{{end}}
+        </span>
+        {{end}}
+        {{if .HasQueuedFaces}}
+        <span class="deck-card-crew-faces deck-card-crew-faces-queued" role="group" aria-label="Queued crew waiting on a pod slot">
+          {{range .QueuedFaces}}<a class="deck-card-crew-face deck-card-crew-face-queued" data-deck-no-swipe href="{{.URL}}"{{if .External}} target="_blank" rel="noopener"{{end}}
+             title="{{.Name}} — queued (dispatched onto a step, waiting on a pod slot){{if .StepNumber}} on step #{{.StepNumber}}{{if .StepTitle}}: {{.StepTitle}}{{end}}{{end}}. {{if .External}}Open its live terminal.{{else}}Open its bead page.{{end}}"
+             aria-label="Queued crew {{.Name}}, waiting on a pod slot{{if .StepNumber}} on step {{.StepNumber}}{{if .StepTitle}} {{.StepTitle}}{{end}}{{end}}">{{.Initials}}{{if .StepNumber}}<span class="deck-card-crew-face-step" aria-hidden="true">#{{.StepNumber}}</span>{{end}}</a>{{end}}
+          {{if .QueuedFacesHidden}}<a class="deck-card-crew-face deck-card-crew-face-queued deck-card-crew-face-more" data-deck-no-swipe href="{{$.BasePath}}/plans/{{$c.PlanID}}#plan-crew"
+             title="{{.QueuedFacesHidden}} more queued crew — open the crew roster">+{{.QueuedFacesHidden}}</a>{{end}}
+        </span>
+        {{end}}
+        {{end}}{{end}}
+
+        {{/* Current-or-next STEP chip (ka-0000005352 iter-83): the "NOW/NEXT #N
+             <title>" chip the /plans index card face carries (plan_card.html,
+             CurrentOrNextStep) but the /deck card DROPPED. The deck already names
+             how far along a plan is ("N/M steps · X%", iter-67) and WHO is on it
+             (crew tally + faces, iter-66/80/81), but not WHICH step is in flight —
+             the single most actionable "what is happening right now" signal an
+             operator triaging the deck needs. A 40%-done plan whose live step is
+             #13 "e2e bug fix" (or one wedged/blocked awaiting a human) read
+             identically to any other 40% plan. Fold the SAME chip reading the SAME
+             $c.CurrentStep (planCardStep) the index renders — planIndexEnrich
+             already picked + planStatusTerminal-guarded it on the enriched row the
+             deck builds from, so it costs ZERO extra daemon call and deck↔index
+             agree by construction (advice ka-0000005924). Reuses the index's exact
+             step-kind vocabulary: NOW (in_progress, orange) · BLOCKED (red) · NEXT
+             (calm blue), plus the running-age (NowAge) / wedge-age (BlockedAge) +
+             the loud stale tint (NowStale/BlockedStale) past the 24h bar, so a
+             long-grinding or long-wedged step pops. Deep-links into the cockpit
+             anchored at the step (#step-{ID}), data-deck-no-swipe so a tap that
+             starts on it opens the step instead of being read as a swipe. Gated on
+             .ID (a nil CurrentStep on a terminal/step-less plan renders nothing,
+             exactly like the index). Template + CSS only, zero Go beyond the
+             field fold. */}}
+        {{with $c.CurrentStep}}{{if .ID}}
+        <a class="deck-card-step deck-card-step-{{.Kind}}{{if .NowStale}} deck-card-step-now-stale{{end}}{{if .BlockedStale}} deck-card-step-blocked-stale{{end}}" data-deck-no-swipe
+           href="{{$.BasePath}}/plans/{{$c.PlanID}}#step-{{.ID}}"
+           title="{{.KindTitle}}: {{.Title}}{{if .NowAge}} — running {{.NowAge}}{{if .NowStale}} (stale){{end}}{{end}}{{if .BlockedAge}} — blocked {{.BlockedAge}}{{if .BlockedStale}} (stale){{end}}{{end}} — open the plan and jump to this step">
+          <span class="deck-card-step-kind deck-card-step-kind-{{.Kind}}">{{.KindLabel}}</span>
+          <span class="deck-card-step-num">#{{.Number}}</span>
+          <span class="deck-card-step-title">{{.Title}}</span>
+          {{if .NowAge}}<span class="deck-card-step-age" aria-label="running {{.NowAge}}">· {{.NowAge}}</span>{{end}}
+          {{if .BlockedAge}}<span class="deck-card-step-age" aria-label="blocked {{.BlockedAge}}">· {{.BlockedAge}}</span>{{end}}
+        </a>
+        {{end}}{{end}}
+
+        {{/* THE CARD FACE. A decision card asks its question with tappable
+             answers; the other tiers offer their single action. */}}
+        {{if $c.Decision}}
+        {{$dec := $c.Decision}}
+        <section class="deck-card-decision" data-decision-id="{{$dec.ID}}">
+          {{/* A long prompt collapses its tail behind a native <details> so the
+               ANSWER BUTTONS stay above the fold — measured against live prod,
+               real gardener prompts otherwise push every option off a 390x844
+               screen. <details> and not a JS toggle, because the no-JS contract
+               holds here too. */}}
+          {{if $c.QuestionRest}}
+          <details class="deck-question-details" data-deck-no-swipe>
+            <summary class="deck-question">{{$c.QuestionLead}} <span class="deck-question-more">more</span></summary>
+            <p class="deck-question deck-question-rest">{{$c.QuestionRest}}</p>
+          </details>
+          {{else}}
+          <p class="deck-question">{{$c.QuestionLead}}</p>
+          {{end}}
+          {{/* The agent's context sits between the question and the answers
+               (gd-PNtilz1bgs); past ~600 chars it clamps so the first answers
+               stay near the fold. */}}
+          {{$dec.Context.Block}}
+          {{$dec.Evidence}}
+          {{if $dec.Options}}
+          <ul class="deck-options" aria-label="Answer options">
+            {{range $oi, $o := $dec.Options}}
+            <li>
+              {{if $.IsOperator}}
+              {{/* One-tap answer. Same route the cockpit and peek use, so no new
+                   write verb and no new authorization surface. from_card=1 tells
+                   the handler to re-render the LEAN deck card back into the slot
+                   (renderDeckCard) instead of the cockpit panel — the fix for
+                   decision ka-0000001748. hx-confirm is deliberately absent (an
+                   answer is reversible by the gardener asking again) but the
+                   button is a real submit, so a swipe can never reach it. */}}
+              <form class="deck-opt-form" method="post"
+                    action="{{$.BasePath}}/plans/{{$c.PlanID}}/decisions/{{$dec.ID}}/resolve"
+                    hx-post="{{$.BasePath}}/plans/{{$c.PlanID}}/decisions/{{$dec.ID}}/resolve"
+                    hx-target="closest .deck-card" hx-swap="outerHTML"
+                    hx-disabled-elt="find button" data-deck-no-swipe>
+                <input type="hidden" name="from_card" value="1">
+                <input type="hidden" name="option_id" value="{{$o.ID}}">
+                <button type="submit" class="deck-opt-btn" data-deck-answer="{{add $oi 1}}">
+                  <span class="deck-opt-key">{{add $oi 1}}</span>
+                  {{if $o.Short}}{{$o.Short}}{{else if $o.Label}}{{$o.Label}}{{else}}{{$o.ID}}{{end}}
+                  {{if $o.Description}}<span class="opt-desc">{{$o.Description}}</span>{{end}}
+                </button>
+              </form>
+              {{else}}
+              <span class="deck-opt-static">{{if $o.Short}}{{$o.Short}}{{else if $o.Label}}{{$o.Label}}{{else}}{{$o.ID}}{{end}}{{if $o.Description}}<span class="opt-desc">{{$o.Description}}</span>{{end}}</span>
+              {{end}}
+            </li>
+            {{end}}
+          </ul>
+          {{end}}
+        </section>
+        {{else if eq $c.Tier 2}}
+        {{/* Ready-to-build: one tap approves the plan and starts its gardener.
+             This is the heaviest action on the deck, so it carries an
+             hx-confirm AND is operator-gated at the route. from_card=1 keeps the
+             in-place refresh on the deck card. */}}
+        {{if $.IsOperator}}
+        <form class="deck-action-form" method="post" action="{{$.BasePath}}/plans/{{$c.PlanID}}/build"
+              hx-post="{{$.BasePath}}/plans/{{$c.PlanID}}/build"
+              hx-confirm="Approve this plan and start building it?"
+              hx-target="closest .deck-card" hx-swap="outerHTML"
+              hx-disabled-elt="find button" data-deck-no-swipe>
+          <input type="hidden" name="from_card" value="1">
+          <button type="submit" class="deck-action-btn">Approve &amp; build</button>
+        </form>
+        {{end}}
+        {{else if $c.Escalations}}
+        {{/* READ-ONLY by design (v1): escalation resolution is capability-gated
+             and implemented in the slack-bridge binary, not the viewer. */}}
+        <a class="deck-blocked-link" data-deck-no-swipe
+           href="{{if $c.EscalationID}}{{$.BasePath}}/{{$c.EscalationID}}{{else}}{{$.BasePath}}/escalations{{end}}">
+          ⛔ Blocked — tap to review {{if $c.EscalationID}}{{$c.EscalationID}}{{else}}the escalation{{end}} &rarr;
+        </a>
+        {{end}}
+
+        <footer class="deck-card-foot">
+          {{/* data-deck-up wires the "swipe UP to open the cockpit" flick
+               (deck_swipe.js Step 5b): an upward flick .click()s this link. It
+               stays a plain GET <a href> so a tap/keyboard/JS-off reach the same
+               place and the gesture can never commit. */}}
+          <a class="deck-card-full-link" data-deck-up data-deck-no-swipe href="{{$.BasePath}}/plans/{{$c.PlanID}}">Open full cockpit &rarr;</a>
+        </footer>
+      </article>
+    </div>
+    {{end}}
+  </div>
+
+  {{/* Navigation. REAL LINKS carrying the cursor, so Back/Skip work with JS off,
+       survive a reload, and give the browser a sane history. deck_swipe.js
+       clicks exactly these two elements on a committed swipe. */}}
+  <nav class="deck-nav" aria-label="Deck navigation">
+    {{if gt .Position 0}}
+    <a href="{{.BackURL}}" data-deck-back rel="prev">&larr; Back</a>
+    {{else}}
+    <span class="is-disabled" aria-disabled="true">&larr; Back</span>
+    {{end}}
+    {{if lt (add .Position 1) .Total}}
+    <a href="{{.SkipURL}}" data-deck-skip rel="next">Skip &rarr;</a>
+    {{else}}
+    <span class="is-disabled" aria-disabled="true">Skip &rarr;</span>
+    {{end}}
+  </nav>
+
+  <p class="deck-hint">Swipe or <kbd>j</kbd>/<kbd>k</kbd> to flip · <kbd>1</kbd>–<kbd>9</kbd> to answer · swipe up opens the plan · swipe never commits</p>
+  {{end}}
+</div>
+
+{{/* Deck driver. Hand-written IIFE in the viewer's idiom (no bundler, no build
+     step). PURE ENHANCEMENT: with this script absent or failed, the page above
+     is still a working vertical list of cards with real links and real forms.
+
+     It does these things and deliberately nothing else:
+       1. marks the stack .deck-js so the CSS switches from list to stack;
+       2. flips cards CLIENT-SIDE on skip/back — the cards are already in the
+          DOM, so a flip is instant with no network hop, while the URL is kept
+          in sync via history.replaceState so a reload still lands here;
+       3. binds j/k (flip) and 1-9 (answer);
+       4. after an htmx answer swaps a card, advances to the next card — UNLESS
+          the swapped-in card carries an error, which must stay put to be read.
+
+     THE SAFETY RULE IS PRESERVED HERE TOO: the only thing a gesture or a j/k
+     key can do is change which slot is visible. Answering is always an explicit
+     .click() on a real submit button the user pressed. */}}
+<script>
+(function () {
+  'use strict';
+  var deck = document.getElementById('deck');
+  if (!deck) return;
+  var slots = Array.prototype.slice.call(deck.querySelectorAll('[data-deck-slot]'));
+  if (!slots.length) return;
+
+  // Switch the CSS from the JS-off vertical list to the one-at-a-time stack.
+  deck.classList.add('deck-js');
+
+  var pos = parseInt(deck.getAttribute('data-deck-position'), 10) || 0;
+  var posLabel = document.getElementById('deck-pos');
+
+  // Keep the URL honest so a reload (including layout.html's 401 re-auth
+  // force-reload) resumes on the same card. replaceState, not pushState, for
+  // a flip — the Back/Skip anchors already give real history entries when JS
+  // is off, and we don't want every flip stacking a history entry.
+  function syncURL() {
+    try {
+      var u = new URL(window.location.href);
+      if (pos > 0) u.searchParams.set('at', String(pos));
+      else u.searchParams.delete('at');
+      window.history.replaceState(null, '', u.toString());
+    } catch (_) { /* older browsers: the flip still works, just not resumable */ }
+  }
+
+  function show(next) {
+    if (next < 0 || next >= slots.length) return;
+    slots[pos].classList.remove('is-active');
+    var oldCard = slots[pos].querySelector('.deck-card');
+    if (oldCard) oldCard.removeAttribute('data-deck-card');
+    pos = next;
+    slots[pos].classList.add('is-active');
+    // Only the frontmost card is draggable — deck_swipe.js's DOM contract.
+    var newCard = slots[pos].querySelector('.deck-card');
+    if (newCard) newCard.setAttribute('data-deck-card', '');
+    if (posLabel) posLabel.textContent = String(pos + 1);
+    syncURL();
+    window.scrollTo(0, 0);
+  }
+
+  // deck_swipe.js dispatches this on a committed swipe. We preventDefault to
+  // take over navigation (the module then suppresses its fallback .click()),
+  // so a swipe flips instantly in-page instead of following the anchor.
+  deck.addEventListener('deck:navigate', function (ev) {
+    var dir = ev.detail && ev.detail.direction;
+    var next = dir === 'back' ? pos - 1 : pos + 1;
+    if (next < 0 || next >= slots.length) return; // let the disabled state stand
+    ev.preventDefault();
+    show(next);
+  });
+
+  // The nav anchors: intercept so a tap flips in-page, but leave them as real
+  // hrefs so middle-click / JS-off / crawlers all still work.
+  function bindNav(sel, delta) {
+    var el = document.querySelector(sel);
+    if (!el) return;
+    el.addEventListener('click', function (ev) {
+      if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.button) return; // let the browser handle it
+      var next = pos + delta;
+      if (next < 0 || next >= slots.length) return;
+      ev.preventDefault();
+      show(next);
+    });
+  }
+  bindNav('[data-deck-skip]', 1);
+  bindNav('[data-deck-back]', -1);
+
+  // Keyboard: j/k (and arrows) flip; 1-9 press the matching answer button on
+  // the ACTIVE card. Ignored while typing in a field.
+  document.addEventListener('keydown', function (ev) {
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    var t = ev.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+    var k = ev.key;
+    if (k === 'j' || k === 'ArrowDown' || k === 'ArrowRight') { ev.preventDefault(); show(pos + 1); return; }
+    if (k === 'k' || k === 'ArrowUp' || k === 'ArrowLeft')  { ev.preventDefault(); show(pos - 1); return; }
+    if (k >= '1' && k <= '9') {
+      var btn = slots[pos].querySelector('[data-deck-answer="' + k + '"]');
+      if (btn) { ev.preventDefault(); btn.click(); }
+    }
+  });
+
+  // After an htmx answer swaps a slot's card, advance to the next card — the
+  // answered one is done, and stopping on it would make every answer cost an
+  // extra tap. But a card that swapped in carrying .deck-card-error (e.g. a
+  // failed Approve & build — "no gardener bound") must STAY PUT so the operator
+  // can read the error; auto-advancing would flash it and drop the card.
+  document.body.addEventListener('htmx:afterSwap', function (ev) {
+    if (!deck.contains(ev.target)) return;
+    // Re-read the slots: the swap replaced one of them.
+    slots = Array.prototype.slice.call(deck.querySelectorAll('[data-deck-slot]'));
+    var landed = ev.target.querySelector ? ev.target.querySelector('.deck-card-error') : null;
+    if (ev.target.classList && ev.target.classList.contains('deck-card-error')) landed = ev.target;
+    if (landed) return; // an error card holds the operator's place
+    if (pos + 1 < slots.length) show(pos + 1);
+  });
+
+  // Auto-submit the project scope selector (one tap instead of two). The
+  // <noscript> Go button covers the JS-off case.
+  var scope = document.getElementById('deck-project');
+  if (scope) scope.addEventListener('change', function () { scope.form.submit(); });
+
+  syncURL();
+})();
+</script>
+{{end}}

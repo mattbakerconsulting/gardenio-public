@@ -1,0 +1,176 @@
+# trigger-source-account-fires.toml
+#
+# Claudeless scenario: a trigger:account spend-threshold bead fires once when an
+# account bead's total_cost_usd crosses the threshold → notify action → audit
+# bead with outcome=allow.
+#
+# Epic ka-0000004568 / task ka-0000003167:
+#   "claudeless coverage for account-threshold source fire."
+#
+# The account source has no external HTTP dependency — it reads account beads
+# (type=account) straight from the daemon and compares a numeric field against
+# the trigger's threshold. It is, however, not registered in the standalone
+# `trigger-engine` binary, so this scenario drives it through the
+# `trigger-probe` test binary, which registers the REAL AccountTriggerSource on
+# a REAL TriggerEngine pointed at the in-test daemon and runs one EvaluateSource.
+#
+# Unlike jira/gitlab there is no `gb trigger create account` subcommand, so the
+# trigger bead is created directly with `kd create --type=trigger`. The same
+# field schema AccountTriggerSource.LoadTriggers parses (condition_type / field /
+# threshold / op) is set here.
+#
+# Steps:
+#   1. Seed an account bead (type=account) with total_cost_usd over threshold.
+#   2. Create a trigger:account bead: condition_type=spend_threshold,
+#      field=total_cost_usd, threshold=100, op=>=, action=notify.
+#   3. Run `trigger-probe --source=account --trigger=<id>` (sentinel-seeded,
+#      one EvaluateSource).
+#   4. Assert an audit bead (type=event, label=trigger:<id>, outcome=allow,
+#      source=account) exists.
+#
+# Skips gracefully when go / sources / daemon env are unavailable.
+
+[claude]
+session_id = "e2e00000-000a-4000-a000-000000000012"
+username = "e2e-trigger-account-fires"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 60000
+
+[[responses]]
+on = "*"
+say = "Running trigger-source-account-fires: spend threshold crossed → notify action observed."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-probe ─────────────────────
+PROBE_BIN=""
+if command -v trigger-probe >/dev/null 2>&1; then
+  PROBE_BIN=$(command -v trigger-probe)
+elif [ -x /usr/local/bin/trigger-probe ]; then
+  PROBE_BIN=/usr/local/bin/trigger-probe
+elif [ -x /tmp/trigger-probe ]; then
+  PROBE_BIN=/tmp/trigger-probe
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-probe from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-probe ./cmd/trigger-probe/ ) || {
+    echo "SKIP: trigger-probe build failed"; exit 0;
+  }
+  PROBE_BIN=/tmp/trigger-probe
+else
+  echo "SKIP: trigger-probe binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-probe: $PROBE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then echo "SKIP: BEADS_HTTP_URL not set"; exit 0; fi
+if [ -z "${BEADS_TOKEN:-}" ]; then echo "SKIP: BEADS_TOKEN not set"; exit 0; fi
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+
+# ── Setup ──────────────────────────────────────────────────────────
+TAG="e2e-acct-$$-$(date +%s)"
+ACCT_NAME="probe-acct-$$"
+echo "tag: $TAG  account: $ACCT_NAME"
+
+# Seed an account bead with total_cost_usd above the trigger threshold.
+ACCT_OUT=$(kd create "$ACCT_NAME" \
+  --type=account \
+  --http-url "$BEADS_HTTP_URL" \
+  -f "total_cost_usd=150" \
+  -f "provider=anthropic" \
+  -f "credential=secret:e2e-nonexistent-credential" \
+  -l "e2e:true" -l "e2e:claudeless" -l "e2e-tag:$TAG" \
+  --json 2>&1) || { fail "kd create account" "$ACCT_OUT"; exit 1; }
+ACCT_ID=$(echo "$ACCT_OUT" | jq -r '.id // .ID // empty')
+if [ -z "$ACCT_ID" ]; then fail "extract account id" "out=$ACCT_OUT"; exit 1; fi
+echo "account bead: $ACCT_ID"
+
+# Create the trigger:account spend-threshold bead. No `gb trigger create
+# account` subcommand exists, so build it directly with the field schema
+# AccountTriggerSource.LoadTriggers parses.
+TRIG_OUT=$(kd create "$TAG" \
+  --type=trigger --kind=data \
+  --http-url "$BEADS_HTTP_URL" \
+  -f "action=notify" \
+  -f "condition_type=spend_threshold" \
+  -f "field=total_cost_usd" \
+  -f "threshold=100" \
+  -f "op=>=" \
+  -f "prompt=account {{account_name}} spend {{value}}" \
+  -l "trigger:account" -l "e2e:claudeless" -l "e2e-tag:$TAG" \
+  --json 2>&1) || { fail "kd create trigger:account" "$TRIG_OUT"; exit 1; }
+TRIG_ID=$(echo "$TRIG_OUT" | jq -r '.id // .ID // empty')
+if [ -z "$TRIG_ID" ]; then fail "extract trigger id" "out=$TRIG_OUT"; exit 1; fi
+echo "trigger: $TRIG_ID"
+
+cleanup() {
+  for bid in $(kd list --type=event -l "trigger:$TRIG_ID" --json 2>/dev/null | jq -r '.[].id'); do
+    kd close "$bid" >/dev/null 2>&1 || true
+  done
+  kd close "$TRIG_ID" >/dev/null 2>&1 || true
+  kd close "$ACCT_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ── Fire the source via the probe ──────────────────────────────────
+PROBE_LOG=/tmp/trigger-probe-account-$$.log
+if ! "$PROBE_BIN" \
+    --source=account \
+    --trigger="$TRIG_ID" \
+    --http-url="$BEADS_HTTP_URL" \
+    --token="$BEADS_TOKEN" >"$PROBE_LOG" 2>&1; then
+  fail "trigger-probe exited non-zero"
+  echo "--- probe log ---"; cat "$PROBE_LOG"; echo "--- end ---"
+  exit 1
+fi
+pass "trigger-probe ran one account EvaluateSource cycle"
+
+# ── Assert: audit bead recorded with outcome=allow ─────────────────
+DEADLINE=$(( $(date +%s) + 20 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  AUDIT=$(kd list --type=event -l "trigger:$TRIG_ID" --json 2>/dev/null | \
+    jq -c '[.[] | select(.fields.outcome=="allow" and .fields.source=="account")][0] // empty' 2>/dev/null)
+  if [ -n "$AUDIT" ] && [ "$AUDIT" != "null" ]; then
+    FIRED=1
+    pass "account audit bead recorded with outcome=allow"
+    echo "  audit: $(echo "$AUDIT" | jq -c '{id, fields: {source: .fields.source, action: .fields.action, outcome: .fields.outcome, match_key: .fields.match_key}}')"
+    # spend_threshold match key shape: spend:<account>:<field>:<threshold-int>
+    MK=$(echo "$AUDIT" | jq -r '.fields.match_key')
+    case "$MK" in
+      spend:${ACCT_NAME}:total_cost_usd:*) pass "audit match_key is the spend-threshold key ($MK)" ;;
+      *) fail "unexpected match_key" "got=$MK" ;;
+    esac
+    break
+  fi
+  sleep 1
+done
+
+if [ "$FIRED" = "0" ]; then
+  fail "account trigger fired within 20s"
+  echo "--- probe log ---"; cat "$PROBE_LOG"; echo "--- end ---"
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "trigger-source-account-fires: spend threshold crossed → notify action observed OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "trigger-source-account-fires scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

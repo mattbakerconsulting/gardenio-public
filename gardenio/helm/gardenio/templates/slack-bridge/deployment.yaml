@@ -1,0 +1,655 @@
+{{- if .Values.slackBridge.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.fullname" . }}-slack-bridge
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: slack-bridge
+spec:
+  replicas: {{ .Values.slackBridge.replicaCount | default 1 }}
+  {{- if .Values.slackBridge.persistence.enabled }}
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: slack-bridge
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: slack-bridge
+        component: slack-bridge
+      annotations:
+        {{- include "gardenio.doNotDisrupt" . | nindent 8 }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9093"
+        prometheus.io/path: "/metrics"
+    spec:
+      {{- if .Values.slackBridge.bouncer.enabled }}
+      serviceAccountName: {{ include "gardenio.fullname" . }}-slack-bridge
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: slack-bridge
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.slackBridge.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.slackBridge.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8090
+              protocol: TCP
+            - name: metrics
+              containerPort: 9093
+              protocol: TCP
+            {{- if .Values.landNamespaces.enabled }}
+            # The land listener: gb say and gb thread for tenant land pods,
+            # the one bridge port a land's NetworkPolicy reaches
+            # (landns.BridgeLandPort, gd-pXik57wZA9).
+            - name: land
+              containerPort: 8091
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- include "gardenio.otelTracingEnv" . | nindent 12 }}
+            {{- /* Deploy-environment name — the cross-estate join key every
+                   gardenio series carries. The bridge stamps it as the `env`
+                   label on gardenio_resume_latency_seconds{path=cold} so its
+                   cold-resume samples share the resume-latency dashboard's $env
+                   filter with the controller's thaw-path series (task
+                   ka-0000004119 / C7). Mirrors the controller deployment. */}}
+            {{- if .Values.global.env }}
+            - name: GARDENIO_ENV
+              value: {{ .Values.global.env | quote }}
+            {{- end }}
+            # Beads daemon connection
+            - name: BEADS_HTTP_ADDR
+              value: "http://{{ include "gardenio.beads.host" . }}:{{ include "gardenio.beads.httpPort" . }}"
+            {{- /* Bridge auth (ka-0000005187 / decision ka-0000001054): when a
+                   bridge token secret is set, use the per-bridge token so kbeads
+                   attributes writes as fleet:slack-bridge. Falls back to the
+                   static daemon token when unset (legacy / dev). Secret name
+                   resolves via the fleet→bridge rename helper (ka-0000005788). */}}
+            {{- $bridgeTokenSecret := include "gardenio.beads.bridgeTokenSecretName" . }}
+            {{- if $bridgeTokenSecret }}
+            - name: BEADS_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $bridgeTokenSecret }}
+                  key: slack-bridge
+            {{- else if .Values.beads.tokenSecret }}
+            - name: BEADS_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.tokenSecretName" . }}
+                  key: token
+            {{- end }}
+            {{- /* Machine principal (gd-Hc34EENbO9 component 4): the bridge's own
+                 Keycloak service account carries ONLY its background writes (the
+                 config seed and the dm delivery writes), per call; BEADS_DAEMON_TOKEN
+                 above stays the client's credential for everything else, and there
+                 is no operated-by relay (a person's Slack writes ride that person's
+                 own token via accountLink). The secret is a file, never an env var;
+                 its Secret is operator-created and optional, so a missing Secret
+                 still starts the pod and the machine writes fail closed
+                 (auth_unavailable). Same contract as templates/trigger-engine. */}}
+            {{- if .Values.slackBridge.machinePrincipal.enabled }}
+            - name: BEADS_OIDC_TOKEN_URL
+              value: {{ include "gardenio.keycloak.tokenURL" . | quote }}
+            - name: BEADS_OIDC_CLIENT_ID
+              value: {{ .Values.slackBridge.machinePrincipal.clientId | quote }}
+            - name: BEADS_OIDC_CLIENT_SECRET_FILE
+              value: /var/run/secrets/gardenio-machine/clientSecret
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            # The token URL is the keycloak-runtime https port: trust its CA
+            # (gd-lYPZlslOM7).
+            - name: BEADS_OIDC_CA_FILE
+              value: {{ include "gardenio.keycloakRuntime.caFile" . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Edge-auth HMAC key (ka-0000007637): when set, the bridge
+                   signs an edge-auth envelope on daemon calls triggered by a
+                   Slack interaction, asserting the human Slack user as the
+                   operator. The daemon's EdgeAuthMiddleware then stamps
+                   AuthIdentity{Type:"edge", Subject:"slack:U…"}, which
+                   satisfies ownership on decision beads whose bead.OperatedBy
+                   matches. Uses the same secret as DAEMON_HMAC_KEY on the
+                   beads daemon so envelopes round-trip. Wires automatically
+                   when edgeAuth.enabled — no separate config needed. */}}
+            {{- if .Values.edgeAuth.enabled }}
+            - name: SLACK_BRIDGE_EDGE_AUTH_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.edgeAuth.hmacSecretName" . }}
+                  key: {{ .Values.edgeAuth.hmacKey.secretKey | default "hmac-key" }}
+                  {{- /* dryRun: secret may not exist yet — mark optional so
+                         the pod can start even before the operator provisions
+                         gardenio-<env>-edge-auth-hmac. (ka-0000000726) */}}
+                  optional: {{ .Values.edgeAuth.dryRun | default false }}
+            {{- /* Split v2 envelope key (gd-h2tQrOwjGJ): the bridge's
+                   act-as-person envelope is v2, so it must sign with the key
+                   the daemon verifies v2 with. Unset falls back to the shared
+                   key. */}}
+            {{- if .Values.edgeAuth.hmacKey.secretKeyV2 }}
+            - name: SLACK_BRIDGE_EDGE_AUTH_HMAC_KEY_V2
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.edgeAuth.hmacSecretName" . }}
+                  key: {{ .Values.edgeAuth.hmacKey.secretKeyV2 }}
+                  optional: {{ .Values.edgeAuth.dryRun | default false }}
+            {{- end }}
+            {{- end }}
+            # NATS connection
+            {{- if .Values.slackBridge.natsURL }}
+            - name: NATS_URL
+              value: {{ .Values.slackBridge.natsURL | quote }}
+            {{- else if .Values.nats.enabled }}
+            - name: NATS_URL
+              value: {{ include "gardenio.natsURL" . | quote }}
+            {{- end }}
+            {{- if .Values.agents.natsTokenSecret }}
+            - name: COOP_NATS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.agents.natsTokenSecret }}
+                  key: token
+                  optional: true
+            {{- else if .Values.nats.auth.subjectIsolation.enabled }}
+            {{- /* Hookstream subscribes hooks.> / coop.events.> — full-access
+                   infra client under subject isolation (ka-0000006513). The
+                   username makes the shared secret a user PASSWORD: multi-user
+                   server entries only support user/password (ka-0000000002). */}}
+            - name: COOP_NATS_USER
+              value: infra
+            - name: COOP_NATS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.fullname" . }}-nats-infra-creds
+                  key: token
+            {{- end }}
+            # Shared bearer token for /api/slack/* and /api/permission/*
+            # agent endpoints. When unset, those endpoints require an OIDC
+            # admin role instead (fail-closed — no fall-open on no-roles).
+            {{- if .Values.slackBridge.agentTokenSecret }}
+            - name: SLACK_BRIDGE_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.slackBridge.agentTokenSecret | quote }}
+                  key: token
+            {{- end }}
+            # Slack credentials
+            {{- if .Values.slackBridge.slack.botToken }}
+            {{- fail "slackBridge.slack.botToken plaintext value is removed for security (AUDIT §J6) — use slackBridge.slack.secretName pointing at a K8s Secret with key 'bot-token'." }}
+            {{- end }}
+            {{- if .Values.slackBridge.slack.secretName }}
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.slackBridge.slack.secretName }}
+                  key: bot-token
+            {{- end }}
+            {{- if .Values.slackBridge.slack.signingSecret }}
+            {{- fail "slackBridge.slack.signingSecret plaintext value is removed for security (AUDIT §J6) — use slackBridge.slack.secretName pointing at a K8s Secret with key 'signing-secret'." }}
+            {{- end }}
+            {{- if .Values.slackBridge.slack.secretName }}
+            - name: SLACK_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.slackBridge.slack.secretName }}
+                  key: signing-secret
+                  optional: true
+            {{- end }}
+            # Slack App Token (for Socket Mode)
+            {{- if .Values.slackBridge.slack.appToken }}
+            {{- fail "slackBridge.slack.appToken plaintext value is removed for security (AUDIT §J6) — use slackBridge.slack.secretName pointing at a K8s Secret with key 'app-token'." }}
+            {{- end }}
+            {{- if .Values.slackBridge.slack.secretName }}
+            - name: SLACK_APP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.slackBridge.slack.secretName }}
+                  key: app-token
+                  optional: true
+            {{- end }}
+            {{- if .Values.slackBridge.slack.channel }}
+            - name: SLACK_CHANNEL
+              value: {{ .Values.slackBridge.slack.channel | quote }}
+            {{- end }}
+            - name: SLACK_LISTEN_ADDR
+              value: ":8090"
+            {{- if .Values.landNamespaces.enabled }}
+            - name: SLACK_BRIDGE_LAND_LISTEN_ADDR
+              value: ":8091"
+            {{- end }}
+            - name: STATE_PATH
+              value: "/data/slack-bridge-state.json"
+            {{- if .Values.slackBridge.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.slackBridge.logLevel | quote }}
+            {{- end }}
+            # Threading mode
+            {{- if .Values.slackBridge.slack.threadingMode }}
+            - name: SLACK_THREADING_MODE
+              value: {{ .Values.slackBridge.slack.threadingMode | quote }}
+            {{- end }}
+            # Agent cards in user-owned threads (off|owned|all). Default off:
+            # only emitted when explicitly set so the bridge default holds.
+            {{- if .Values.slackBridge.slack.threadCards }}
+            - name: SLACK_THREAD_CARDS
+              value: {{ .Values.slackBridge.slack.threadCards | quote }}
+            {{- end }}
+            # Bare ka-XXX preview (Phase 2 stretch of the link-unfurl plan,
+            # ka-0000000852). When true, a human message that types a bare bead
+            # id draws a compact threaded preview card. Default off — the env is
+            # only emitted when explicitly enabled so the bridge's own "off"
+            # default (zero behavior change) holds.
+            {{- if .Values.slackBridge.slack.bareIDPreview }}
+            - name: SLACK_BARE_ID_PREVIEW_ENABLED
+              value: "true"
+            {{- end }}
+            # Bead-link hydration (slack_link_hydrate.go, gd-jciXhNJYAu). When
+            # true, bare bead ids in outgoing Slack text render as type glyph +
+            # short name links and messages naming 3+ beads get a References
+            # footer. Default off — the env is only emitted when enabled so the
+            # bridge's own "off" default (id-labelled links) holds.
+            {{- if .Values.slackBridge.slack.linkHydrate }}
+            - name: SLACK_LINK_HYDRATE_ENABLED
+              value: "true"
+            {{- end }}
+            # Link-unfurl per-channel allowlist (link_unfurl.go). A pasted
+            # gardenio viewer link is unfurled into a rich preview card ONLY in
+            # the channels listed here (comma-separated channel ids). Empty/unset
+            # (default) disables unfurling everywhere — the env is only emitted
+            # when the allowlist is non-empty, so the bridge's own "off" default
+            # holds.
+            {{- if .Values.slackBridge.slack.linkUnfurlChannels }}
+            - name: SLACK_LINK_UNFURL_CHANNELS
+              value: {{ .Values.slackBridge.slack.linkUnfurlChannels | quote }}
+            {{- end }}
+            # Dashboard
+            {{- if .Values.slackBridge.dashboard.enabled }}
+            - name: SLACK_DASHBOARD
+              value: "true"
+            {{- end }}
+            {{- if .Values.slackBridge.dashboard.channel }}
+            - name: SLACK_DASHBOARD_CHANNEL
+              value: {{ .Values.slackBridge.dashboard.channel | quote }}
+            {{- end }}
+            {{- if .Values.slackBridge.dashboard.interval }}
+            - name: SLACK_DASHBOARD_INTERVAL
+              value: {{ .Values.slackBridge.dashboard.interval | quote }}
+            {{- end }}
+            # GitLab /unreleased command (replaces GitHub integration)
+            {{- if .Values.slackBridge.gitlab.baseURL }}
+            - name: GITLAB_BASE_URL
+              value: {{ .Values.slackBridge.gitlab.baseURL | quote }}
+            {{- else if .Values.gitlabBridge.gitlab.baseURL }}
+            - name: GITLAB_BASE_URL
+              value: {{ .Values.gitlabBridge.gitlab.baseURL | quote }}
+            {{- end }}
+            {{- if .Values.slackBridge.gitlab.apiToken }}
+            {{- fail "slackBridge.gitlab.apiToken plaintext value is removed for security (AUDIT §J6) — use slackBridge.gitlab.secretName (or fall back to gitlabBridge.gitlab.secretName)." }}
+            {{- end }}
+            {{- if .Values.slackBridge.gitlab.secretName }}
+            - name: GITLAB_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.slackBridge.gitlab.secretName }}
+                  key: {{ .Values.slackBridge.gitlab.secretKey | default "api-token" }}
+            {{- else if .Values.gitlabBridge.gitlab.secretName }}
+            - name: GITLAB_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gitlabBridge.gitlab.secretName }}
+                  key: {{ .Values.gitlabBridge.gitlab.secretKey | default "token" }}
+            {{- end }}
+            {{- if .Values.slackBridge.gitlab.projectPath }}
+            - name: UNRELEASED_REPOS
+              value: {{ .Values.slackBridge.gitlab.projectPath | quote }}
+            {{- else if .Values.gardenioRepo }}
+            - name: UNRELEASED_REPOS
+              value: {{ .Values.gardenioRepo | quote }}
+            {{- end }}
+            {{- if .Values.agents.enabled }}
+            - name: CONTROLLER_URL
+              value: "http://{{ include "gardenio.agents.fullname" . }}:8091"
+            {{- if .Values.agents.controllerApi.tokenSecret }}
+            # Shared bearer token the bridge attaches on state-mutating controller
+            # :8091 calls (pool/assign, freeze/interrupt, microvm/resume). Same
+            # Secret the controller reads to enforce. Opt-in: unset => no header,
+            # controller stays open (see agents.controllerApi in values.yaml).
+            - name: CONTROLLER_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.agents.controllerApi.tokenSecret }}
+                  key: token
+            {{- end }}
+            {{- end }}
+            {{- /*
+              COOPMUX_PUBLIC_URL — derived via gardenio.link.coopmuxPublicURL
+              (R3, ka-0000006743). Tier-1 explicit slackBridge.coopmuxPublicURL
+              wins; else unified-derived; else legacy
+              https://<coopmux.ingress.host>/mux (only when coopmux.enabled +
+              ingress.host). Byte-identical while unifiedHost.enabled=false.
+            */ -}}
+            {{- $coopmuxPublicURL := include "gardenio.link.coopmuxPublicURL" . -}}
+            {{- if ne $coopmuxPublicURL "" }}
+            - name: COOPMUX_PUBLIC_URL
+              value: {{ $coopmuxPublicURL | quote }}
+            {{- end }}
+            {{- /*
+              BEADS_WEB_URL: the web host Slack bridge links to for bead
+              references. Derived via gardenio.link.beadsWebURL — tier-1 explicit
+              slackBridge.beadsWebURL override; else unified-host-derived
+              (beads-viewer under /beads).
+            */ -}}
+            {{- $beadsWebURL := include "gardenio.link.beadsWebURL" . -}}
+            {{- if ne $beadsWebURL "" }}
+            - name: BEADS_WEB_URL
+              value: {{ $beadsWebURL | quote }}
+            {{- end }}
+            # Beads viewer (read-only UI with /b/<bead-id> deep links). Derived
+            # via gardenio.link.beadsViewerURL: tier-1 explicit
+            # slackBridge.beadsViewerURL wins; else unified-derived; else prefer
+            # the AVA-gated host (beadsViewer.avaIngress.host) — the canonical
+            # URL users should land on — falling back to the legacy ingress.host
+            # only when the AVA host is not configured. Distinct from
+            # BEADS_WEB_URL.
+            {{- $beadsViewerURL := include "gardenio.link.beadsViewerURL" . -}}
+            {{- if ne $beadsViewerURL "" }}
+            - name: BEADS_VIEWER_URL
+              value: {{ $beadsViewerURL | quote }}
+            {{- end }}
+            {{- /* The public runner listener (templates/beads/runner-ingress.yaml,
+                   or runnerRoute.publicURL where another edge serves it),
+                   quoted as --daemon in the /runner invite DM. Unset, the DM
+                   tells the invitee to ask their operator for it. */}}
+            {{- $runnerRoute := .Values.beads.ingress.runnerRoute | default dict }}
+            {{- if $runnerRoute.publicURL }}
+            - name: GARDENIO_RUNNER_PUBLIC_URL
+              value: {{ $runnerRoute.publicURL | quote }}
+            {{- else if and $runnerRoute.enabled $runnerRoute.host }}
+            - name: GARDENIO_RUNNER_PUBLIC_URL
+              value: {{ printf "https://%s" $runnerRoute.host | quote }}
+            {{- end }}
+            {{- /* The viewer's in-cluster Service (gd-qnF6mJZtkQ): the Commons
+                   mirror fetches a message's attachments from the viewer's
+                   machine file route on the bridge's machine principal and
+                   uploads them into Slack. Without the machine principal the
+                   bridge keeps posting viewer links. The NetworkPolicies admit
+                   this one hop (slack-bridge egress, beads-viewer ingress). */}}
+            {{- if .Values.beadsViewer.enabled }}
+            - name: BEADS_VIEWER_INTERNAL_URL
+              value: {{ printf "http://%s-beads-viewer.%s.svc:%v" (include "gardenio.fullname" .) .Release.Namespace (.Values.beadsViewer.service.port | default 8095) | quote }}
+            {{- end }}
+            {{- /* Commons card actions (gd-na5unRTCaP): the viewer forwards the
+                   signed-in person's bearer to POST /api/conversation/inbound,
+                   and bridgeRBAC verifies it here. SLACK_BRIDGE_OIDC_COMMONS_ONLY
+                   scopes that verification to POST /api/conversation/inbound,
+                   so every other /api/* web route stays 403 as with no OIDC.
+                   Issuer and audience default to the ones kbeads verifies the
+                   same tokens with. */}}
+            {{- if and .Values.beadsViewer.enabled .Values.slackBridge.commonsActions.enabled }}
+            {{- $caOIDC := .Values.slackBridge.commonsActions.oidc | default dict }}
+            - name: OIDC_ISSUER_URL
+              value: {{ required "slackBridge.commonsActions.oidc.issuerURL is required when commonsActions.enabled and no Keycloak issuer derives" ($caOIDC.issuerURL | default (include "gardenio.keycloak.issuerURL" .)) | quote }}
+            - name: OIDC_CLIENT_ID
+              value: {{ required "slackBridge.commonsActions.oidc.clientID (or keycloak.oidcAudience) is required when commonsActions.enabled" ($caOIDC.clientID | default .Values.keycloak.oidcAudience) | quote }}
+            - name: SLACK_BRIDGE_OIDC_COMMONS_ONLY
+              value: "true"
+            {{- end }}
+            # JIRA linkifier — when set, the bridge rewrites bare JIRA keys
+            # (e.g. PIH-1234) in outgoing chat.* messages into clickable links.
+            # Falls back to jiraBridge.jira.{baseURL,projects} when slackBridge
+            # does not override.
+            {{- if .Values.slackBridge.jira.baseURL }}
+            - name: JIRA_BASE_URL
+              value: {{ .Values.slackBridge.jira.baseURL | quote }}
+            {{- else if .Values.jiraBridge.jira.baseURL }}
+            - name: JIRA_BASE_URL
+              value: {{ .Values.jiraBridge.jira.baseURL | quote }}
+            {{- end }}
+            {{- if .Values.slackBridge.jira.projectKeys }}
+            - name: JIRA_PROJECT_KEYS
+              value: {{ .Values.slackBridge.jira.projectKeys | quote }}
+            {{- else if .Values.jiraBridge.jira.projects }}
+            - name: JIRA_PROJECT_KEYS
+              value: {{ .Values.jiraBridge.jira.projects | quote }}
+            {{- end }}
+            {{- if .Values.slackBridge.defaultDMProject }}
+            - name: DEFAULT_DM_PROJECT
+              value: {{ .Values.slackBridge.defaultDMProject | quote }}
+            {{- end }}
+            {{- if .Values.slackBridge.gardenerOnInvite }}
+            - name: GARDENER_ON_INVITE
+              value: "true"
+            {{- end }}
+            # Mention permission gate
+            {{- if .Values.slackBridge.mentionGate.enabled }}
+            - name: MENTION_GATE_ENABLED
+              value: "true"
+            {{- end }}
+            {{- with .Values.slackBridge.mentionGate.keycloak }}
+            {{- if .url }}
+            - name: KEYCLOAK_URL
+              value: {{ .url | quote }}
+            {{- end }}
+            {{- if .realm }}
+            - name: KEYCLOAK_REALM
+              value: {{ .realm | quote }}
+            {{- end }}
+            {{- if .clientID }}
+            - name: KEYCLOAK_CLIENT_ID
+              value: {{ .clientID | quote }}
+            {{- end }}
+            {{- if .secretName }}
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: client-secret
+            {{- end }}
+            {{- if .mentionRole }}
+            - name: KEYCLOAK_MENTION_ROLE
+              value: {{ .mentionRole | quote }}
+            {{- end }}
+            {{- end }}
+            # Slack account linking (gd-OZJ6H2S3xx): human Slack writes carry
+            # the linked person's own Keycloak token. See values.yaml
+            # slackBridge.accountLink for the operator prerequisites.
+            {{- with .Values.slackBridge.accountLink }}
+            {{- if .enabled }}
+            - name: SLACK_LINK_ENABLED
+              value: "true"
+            - name: SLACK_LINK_PUBLIC_URL
+              value: {{ required "slackBridge.accountLink.publicURL is required when accountLink.enabled" .publicURL | quote }}
+            - name: SLACK_LINK_ISSUER_URL
+              value: {{ required "slackBridge.accountLink.issuerURL is required when accountLink.enabled" .issuerURL | quote }}
+            - name: SLACK_LINK_CLIENT_ID
+              value: {{ .clientId | quote }}
+            - name: SLACK_LINK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .clientSecretName }}
+                  key: clientSecret
+            - name: SLACK_LINK_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .keySecretName }}
+                  key: key
+            {{- if .storePath }}
+            - name: SLACK_LINK_STORE_PATH
+              value: {{ .storePath | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            # Channel router
+            {{- if .Values.slackBridge.router }}
+            - name: SLACK_ROUTER_CONFIG
+              value: {{ .Values.slackBridge.router | toJson | quote }}
+            {{- end }}
+            # Bouncer (IP whitelist management)
+            {{- if .Values.slackBridge.bouncer.enabled }}
+            - name: BOUNCER_ENABLED
+              value: "true"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- if .Values.slackBridge.bouncer.middlewares }}
+            - name: BOUNCER_MIDDLEWARES
+              value: {{ .Values.slackBridge.bouncer.middlewares | quote }}
+            {{- end }}
+            {{- end }}
+            # SCIF gate-alert channel (ka-0000002770 / epic ka-0000007110): the
+            # dedicated SCIF gate-alerts channel id the pending/open watcher
+            # (ScifGateAlert) posts to. Empty channel => the watcher ships dark
+            # (no-op).
+            {{- if .Values.slackBridge.scifGateAlert }}
+            {{- if .Values.slackBridge.scifGateAlert.channel }}
+            - name: SCIF_GATE_ALERT_CHANNEL
+              value: {{ .Values.slackBridge.scifGateAlert.channel | quote }}
+            {{- end }}
+            {{- if .Values.slackBridge.scifGateAlert.portalUrl }}
+            - name: SCIF_GATE_ALERT_PORTAL_URL
+              value: {{ .Values.slackBridge.scifGateAlert.portalUrl | quote }}
+            {{- end }}
+            {{- end }}
+            # Escalation re-notification cadence (ka-0000004385): the bridge
+            # auto-pingbacks stalled open escalations at 12h/24h/48h then
+            # doubling, and alerts the operator queue channel past 48h.
+            {{- if .Values.slackBridge.escalationPingback }}
+            {{- if .Values.slackBridge.escalationPingback.sweepInterval }}
+            - name: ESCALATION_PINGBACK_SWEEP_INTERVAL
+              value: {{ .Values.slackBridge.escalationPingback.sweepInterval | quote }}
+            {{- end }}
+            {{- if .Values.slackBridge.escalationPingback.queueChannel }}
+            - name: SLACK_ESCALATION_QUEUE_CHANNEL
+              value: {{ .Values.slackBridge.escalationPingback.queueChannel | quote }}
+            {{- end }}
+            {{- if .Values.slackBridge.escalationPingback.queueMention }}
+            - name: SLACK_ESCALATION_QUEUE_MENTION
+              value: {{ .Values.slackBridge.escalationPingback.queueMention | quote }}
+            {{- end }}
+            {{- end }}
+            # Consolidated staleness digest (ka-0000006001): OFF by default. Set
+            # to "on" (default 20m sweep) or a duration (e.g. "15m") to post ONE
+            # scannable digest of stale open P0/P1 escalations to the queue channel.
+            {{- if .Values.slackBridge.escalationStaleDigest }}
+            - name: ESCALATION_STALE_DIGEST
+              value: {{ .Values.slackBridge.escalationStaleDigest | quote }}
+            {{- end }}
+            # Tenant support (Lands §6.1): who a tenant's #support post DMs.
+            {{- with .Values.slackBridge.landsSupport }}
+            {{- if .operator }}
+            - name: LANDS_SUPPORT_OPERATOR
+              value: {{ .operator | quote }}
+            {{- end }}
+            {{- if .pointerChannel }}
+            - name: LANDS_SUPPORT_POINTER_CHANNEL
+              value: {{ .pointerChannel | quote }}
+            {{- end }}
+            {{- end }}
+            # CORS allowed origins for SSE endpoints.
+            # Explicit value takes precedence; falls back to ingress host.
+            {{- if .Values.slackBridge.corsAllowedOrigins }}
+            - name: CORS_ALLOWED_ORIGINS
+              value: {{ .Values.slackBridge.corsAllowedOrigins | quote }}
+            {{- else if .Values.slackBridge.ingress.host }}
+            - name: CORS_ALLOWED_ORIGINS
+              value: "https://{{ .Values.slackBridge.ingress.host }}"
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: "{{ .Values.global.coverage.mountPath }}/slack-bridge"
+            {{- end }}
+          # startupProbe gates livenessProbe: while it is failing, K8s does
+          # not run livenessProbe and will not restart the container. With
+          # failureThreshold:30 + periodSeconds:5 the bridge has up to 150s
+          # to come up before liveness can kill it. Avoids early-startup
+          # CrashLoopBackOff during helm upgrade --wait. (ka-0000007729)
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: state
+              mountPath: /data
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+            {{- if .Values.slackBridge.machinePrincipal.enabled }}
+            - name: machine-client-secret
+              mountPath: /var/run/secrets/gardenio-machine
+              readOnly: true
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            {{- include "gardenio.keycloakRuntime.caVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.slackBridge.resources | nindent 12 }}
+      volumes:
+        - name: state
+          {{- if .Values.slackBridge.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.fullname" . }}-slack-bridge-state
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+        {{- if .Values.slackBridge.machinePrincipal.enabled }}
+        # Machine-principal client secret (gd-Hc34EENbO9). optional: the operator
+        # creates the Secret by hand; without it the pod still starts and the
+        # machine writes fail closed with auth_unavailable in the log.
+        - name: machine-client-secret
+          secret:
+            secretName: {{ .Values.slackBridge.machinePrincipal.secretName | quote }}
+            optional: true
+        {{- if include "gardenio.keycloak.inClusterCA" . }}
+        {{- include "gardenio.keycloakRuntime.caVolume" . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.slackBridge.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.slackBridge.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.slackBridge.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

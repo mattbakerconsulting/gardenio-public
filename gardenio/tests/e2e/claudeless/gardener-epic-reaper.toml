@@ -1,0 +1,468 @@
+# gardener-epic-reaper.toml
+#
+# Claudeless scenario for the gardener-epic-reaper sweep (task ka-0000000102,
+# MR !6424): an OPEN gardener trigger whose PINNED epic is CLOSED is auto-closed
+# (reaped), while a STANDING / manual / non-gardener trigger on the same closed
+# epic must SURVIVE.
+#
+# WHY THIS MODULE EXISTS (the coverage gap, ka-0000007500):
+#   gardener_epic_reaper_test.go asserts all 10 branches over a FAKE daemon
+#   (mockTriggerDaemon). The four existing gardener-stop-* claudeless scenarios
+#   (-no-progress, -wall-clock, -hard-stop-consecutive-failures,
+#   -loop-end-bead-query) cover stop CONDITIONS on a RUNNING gardener — they all
+#   drive scheduler.enforceStopSpec, a completely different code path. NOTHING
+#   exercised the epic-close REAPING of a gardener trigger against a real daemon,
+#   nor its skip guards.
+#
+#   The reaper's whole reason for existing is that the stop-condition path
+#   CANNOT reach these gardeners: once the epic is CLOSED the cron preflight
+#   bead_query is permanently false, so the loop never runs again to reach its
+#   own stop entry. That makes this sweep the ONLY mechanism covering the
+#   quadrant — and it had zero live coverage.
+#
+# Risk this locks down (bidirectional, and both directions are expensive):
+#   - UNDER-reap → a dead gardener lingers open forever, consuming cron slots and
+#     re-firing agents on a finished epic (the standing-container drain trap this
+#     sprint exists to fight; audit ka-0000001071 found 4 in one cycle).
+#   - OVER-reap → a STANDING gardener that is legitimately pinned to a closed epic
+#     gets killed. That is bug ka-0000006241 / operator decision ka-0000000928,
+#     the incident where a give-up close "systematically reaped exactly the
+#     gardeners that must never die," taking the release lane dark.
+#
+# Engine code covered:
+#   - gardenio/controller/internal/bridge/gardener_epic_reaper.go
+#     SweepClosedEpicGardeners: OPEN type=trigger roster → isGardenerTrigger →
+#       manual/isE2EFixture guards → gardenerIsStanding (machine marker) →
+#       TerminalGoalDeclaresStanding (PROSE) → gardenerFrontierEpic → epic
+#       GetBead status=="closed" → cohort.
+#     reapOneClosedEpicGardener: audit AddComment, then CloseBead stamping
+#       gardener_terminated_slot=loop_end + gardener_terminated_kind=epic_closed,
+#       then gardenerDisarmOnClose (typed enabled=false).
+#   - Driven through the REAL standalone `trigger-engine` binary against the REAL
+#     kbeads daemon, so ParseTriggerDef, the daemon roster query, the epic
+#     GetBead resolution, and every write are production paths.
+#
+# WHY A REAL trigger-engine SUBPROCESS (and not trigger-probe):
+#   Unlike the resume-or-escalate gate — which needed a surgical one-gardener
+#   probe seam because it runs per-trigger inside evalOne — the reaper IS a
+#   fleet-wide sweep hanging off Evaluate(). Its roster query is exactly the
+#   thing under test, so narrowing it to one bead would test a different
+#   function. Precedent: gardener-cron-floor-preflight-suppress.toml builds and
+#   runs the same binary the same way. runTriggerEngine calls Evaluate() ONCE
+#   IMMEDIATELY at startup (cmd/trigger-engine/main.go), and the sweep's throttle
+#   permits a first-ever run, so ONE short-lived subprocess is sufficient — no
+#   cron boundary, no reconcile tick. Measured ~5s end-to-end against a live
+#   daemon, so unlike the reconcile-bound gardener-trigger-* family it needs NO
+#   ka-0000005245 shard-timeout quarantine and runs in the default suite.
+#
+# BLAST RADIUS — why running a fleet-wide MUTATING sweep here is safe:
+#   1. GARDENER_EPIC_REAPER_ENABLED ships DEFAULT-OFF (envBoolDefault(...,false))
+#      and the Helm chart never sets it, so the LIVE in-cluster trigger-engine
+#      has this sweep OFF. We opt in only for our own short-lived subprocess.
+#      That also makes this module the ONLY coverage of the armed path anywhere
+#      above the unit layer — the rollout-discipline evidence ka-0000003021 asks
+#      for before an operator arms a destructive close path in prod.
+#   2. The e2e daemon is a per-run namespace (gardenio-e2e-N) with
+#      its own Postgres — never the prod beads DB.
+#   3. Leg 5 reads the sweep's own reap log and asserts the reaped ID set
+#      contains our positive fixture and NONE of our three negatives, so an
+#      over-reap is attributed to specific IDs rather than inferred from a count
+#      (the count itself is namespace-shared state we do not own — see leg 5).
+#   4. GARDENER_EPIC_REAPER_NOTIFY=false so the sweep cannot post to Slack, and
+#      the subprocess is killed in the EXIT trap.
+#
+# FIXTURE-LABEL ASYMMETRY (subtle, load-bearing, and the reason leg 3 exists):
+#   Sibling gardener scenarios defend their fixtures with a `fixture:e2e:` label,
+#   which the live engine's LoadTriggers skips. We CANNOT do that on the POSITIVE
+#   gardener: isE2EFixture is one of the reaper's own skip guards, so the label
+#   would suppress the very behavior under test (that guard is leg 3's subject).
+#   Instead the positive gardener is defended by construction:
+#     - cron '0 0 1 1 *' (Jan 1) — never fires on any realistic e2e clock;
+#     - NO trigger:schedule / trigger:multi label, so NO TriggerSource's
+#       LoadTriggers (which filter on those labels) ever loads it — the live
+#       engine cannot fire it, heal it, or race our assertions. The reaper finds
+#       it anyway because its roster queries type=trigger DIRECTLY, unfiltered by
+#       source label. That asymmetry is itself worth locking in.
+#
+# Legs (one sweep run covers all of them — the negatives are same-run controls,
+# so a sweep that silently no-ops cannot pass by simply failing to reap):
+#   1. POSITIVE / category C: enabled gardener + CLOSED epic → reaped. Asserts
+#      status=closed AND gardener_terminated_kind=epic_closed AND the audit
+#      comment naming the epic AND disarm (enabled=false).
+#   2. NEGATIVE / standing-by-PROSE on a CLOSED epic → SURVIVES. The
+#      ka-0000001526 trap: prose-declared standing with NO machine marker, the
+#      exact shape that slips past gardenerIsStanding.
+#   3. NEGATIVE / E2E fixture on a CLOSED epic → SURVIVES.
+#   4. NEGATIVE / gardener on an OPEN epic → SURVIVES (trigger-reviver territory).
+#   5. CONTAINMENT (from the engine log): reaped == min(cohort, per-run cap 20)
+#      (no silently-failed close writes), the reap log names our positive, and
+#      names none of the three negatives.
+#
+# Guards 1+2 are the load-bearing pair: together they prove the sweep
+# discriminates rather than closing (or skipping) everything it sees. A mutation
+# that drops the prose check reds leg 2; one that drops the closed-epic test reds
+# leg 4; one that inverts the enable gate reds leg 1.
+#
+# The per-run cap, the once-per-hour throttle, and the pause-aware skips are
+# internal states not reproducible in a single-shot subprocess run; they stay
+# locked by gardener_epic_reaper_test.go's cap/throttle/pause cases. This module
+# owns the live reap↔survive discrimination.
+
+[claude]
+session_id = "e2e00000-000c-4000-a000-00000000000d"
+username = "e2e-gardener-epic-reaper"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 240000
+
+[[responses]]
+on = "*"
+say = "Running gardener-epic-reaper: closed-epic gardener is reaped; standing/fixture/open-epic gardeners survive."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-engine ─────────────────────
+TE_BIN=""
+if command -v trigger-engine >/dev/null 2>&1; then
+  TE_BIN=$(command -v trigger-engine)
+elif [ -x /usr/local/bin/trigger-engine ]; then
+  TE_BIN=/usr/local/bin/trigger-engine
+elif [ -x /tmp/trigger-engine ]; then
+  TE_BIN=/tmp/trigger-engine
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-engine from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-engine ./cmd/trigger-engine/ ) || {
+    echo "SKIP: trigger-engine build failed"; exit 0;
+  }
+  TE_BIN=/tmp/trigger-engine
+else
+  echo "SKIP: trigger-engine binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-engine: $TE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL not set (must run inside e2e shard)"; exit 0
+fi
+if [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_TOKEN not set"; exit 0
+fi
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if ! command -v jq >/dev/null 2>&1; then echo "SKIP: jq not present"; exit 0; fi
+
+PROJECT="${KD_PROJECT:-gardenio}"
+TAG="e2e-cer-$$-$(date +%s)"
+echo "tag: $TAG  project: $PROJECT"
+
+# A live gardeners-pause / triggers-pause gate makes the sweep skip entirely,
+# which would read as "reaped nothing" and fail leg 1 for a reason that has
+# nothing to do with the reaper. Detect it up front and SKIP loudly instead of
+# reporting a false failure.
+PAUSED=$(kd list --type=gate --status=open --json 2>/dev/null | \
+  jq -r '[.[]? | select(.title=="gardeners-pause" or .title=="triggers-pause")] | length' 2>/dev/null || echo 0)
+if [ "${PAUSED:-0}" != "0" ]; then
+  echo "SKIP: a gardeners-pause/triggers-pause gate is open — the sweep is pause-aware and would skip"
+  exit 0
+fi
+
+# ── Setup: two epics (one CLOSED, one OPEN) ────────────────────────
+# NOTE on `2>"$ERR_LOG"` (not the sibling scenarios' `2>&1 | jq`): kd writes
+# advisory warnings to STDERR — e.g. "warning: failed to wire parent-task dep …"
+# when the invoking session holds a claimed task. Merging stderr into the jq
+# pipe makes the very first `jq -r .id` die with "Invalid numeric literal" and
+# the scenario aborts at setup with a misleading "create epic" failure. Keep
+# stderr out of the pipe and surface it only on failure.
+ERR_LOG=/tmp/cer-gd-stderr-$$.log
+: >"$ERR_LOG"
+
+# Install the cleanup trap BEFORE the first create, not after the last one.
+# Every id is declared empty up front and the trap skips empties, so a failure
+# PART-WAY through setup (a 500 on one create, a jq hiccup) still reaps whatever
+# already exists. Registering the trap after the creates — the sibling
+# scenarios' shape — leaks every bead made before the failing line; that is
+# exactly how a mid-setup abort left three orphan `cer-*` epics open while
+# this module was being developed. Fixtures live in the shared e2e namespace, so
+# a leak is not inert: it becomes a bystander in a later run's sweep roster.
+CLOSED_EPIC=""; OPEN_EPIC=""
+REAP_ID=""; PROSE_ID=""; FIXTURE_ID=""; OPEN_ID=""
+TE_PID=""
+cleanup() {
+  if [ -n "$TE_PID" ]; then
+    kill "$TE_PID" 2>/dev/null || true
+    wait "$TE_PID" 2>/dev/null || true
+  fi
+  for id in "$REAP_ID" "$PROSE_ID" "$FIXTURE_ID" "$OPEN_ID"; do
+    [ -n "$id" ] && kd update "$id" -f "enabled=false" >/dev/null 2>&1 || true
+    [ -n "$id" ] && kd close "$id" >/dev/null 2>&1 || true
+  done
+  for id in "$CLOSED_EPIC" "$OPEN_EPIC"; do
+    [ -n "$id" ] && kd close "$id" >/dev/null 2>&1 || true
+  done
+  rm -f "$ERR_LOG"
+}
+trap cleanup EXIT
+
+CLOSED_EPIC=$(kd create "cer-closed-epic-$TAG" --type=epic \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "project:$PROJECT" \
+  --json 2>>"$ERR_LOG" | jq -r '.id // empty')
+if [ -z "$CLOSED_EPIC" ]; then fail "create closed epic" "$(tail -3 "$ERR_LOG")"; exit 1; fi
+
+OPEN_EPIC=$(kd create "cer-open-epic-$TAG" --type=epic \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "project:$PROJECT" \
+  --json 2>>"$ERR_LOG" | jq -r '.id // empty')
+if [ -z "$OPEN_EPIC" ]; then fail "create open epic" "$(tail -3 "$ERR_LOG")"; exit 1; fi
+
+# mk_gardener <name-suffix> <epic> <terminal-goal> [extra kd args...]
+#
+# Deliberately NO trigger:schedule / trigger:multi label: every TriggerSource's
+# LoadTriggers filters on one of those, so no source can load (and therefore no
+# live engine can fire or heal) these fixtures. The reaper's roster queries
+# type=trigger directly, so it still sees them — the asymmetry documented in the
+# header. cron Jan-1 is the second belt.
+mk_gardener() {
+  _sfx="$1"; _epic="$2"; _goal="$3"; shift 3
+  _blob=$(jq -nc --arg g "$_goal" --arg e "$_epic" \
+    '{name:"cer-gardener",terminal_goal:$g,assign_bead:$e}')
+  kd create "cer-gardener-$_sfx-$TAG" --type=trigger --kind=data \
+    -l "role:gardener" -l "gardener-epic:$_epic" \
+    -l "e2e:claudeless" -l "e2e-tag:$TAG" \
+    -f "enabled=true" -f "role=gardener" -f "project=$PROJECT" \
+    -f "action=notify" -f "prompt=cer fixture" \
+    -f "cron=0 0 1 1 *" -f "timezone=UTC" \
+    -f "gardener=$_blob" "$@" --json 2>>"$ERR_LOG" | jq -r '.id // empty'
+}
+
+# (1) POSITIVE — category C: enabled + inert, pinned to the CLOSED epic. Its
+# terminal_goal is deliberately epic-bounded prose so NEITHER standing detector
+# fires; this is the gardener that MUST be reaped.
+REAP_ID=$(mk_gardener "reap" "$CLOSED_EPIC" "Drive all children of $CLOSED_EPIC to closed, then retire.")
+if [ -z "$REAP_ID" ]; then fail "create positive gardener" "$(tail -3 "$ERR_LOG")"; exit 1; fi
+
+# (2) NEGATIVE — standing declared in PROSE ONLY, no machine marker. Matches
+# standingDeclRe ("STANDING ... guard" — nature noun within the 5-word window).
+STANDING_GOAL="STANDING monthly measure-only guard against CI-minute spend. Do NOT stale-stop for the closed parent epic: operator explicitly revived this standing guard."
+PROSE_ID=$(mk_gardener "prose" "$CLOSED_EPIC" "$STANDING_GOAL")
+if [ -z "$PROSE_ID" ]; then fail "create prose-standing gardener" "$(tail -3 "$ERR_LOG")"; exit 1; fi
+
+# (3) NEGATIVE — E2E fixture on the CLOSED epic (isE2EFixture guard).
+FIXTURE_ID=$(mk_gardener "fixture" "$CLOSED_EPIC" "Drive $CLOSED_EPIC to closed." -l "fixture:e2e:gardener-epic-reaper")
+if [ -z "$FIXTURE_ID" ]; then fail "create fixture gardener" "$(tail -3 "$ERR_LOG")"; exit 1; fi
+
+# (4) NEGATIVE — gardener on the OPEN epic (trigger-reviver's territory).
+OPEN_ID=$(mk_gardener "openepic" "$OPEN_EPIC" "Drive all children of $OPEN_EPIC to closed, then retire.")
+if [ -z "$OPEN_ID" ]; then fail "create open-epic gardener" "$(tail -3 "$ERR_LOG")"; exit 1; fi
+
+echo "positive(reap): $REAP_ID"
+echo "negatives: prose=$PROSE_ID fixture=$FIXTURE_ID open-epic=$OPEN_ID"
+
+# ── Arm the reap condition: CLOSE the epic ─────────────────────────
+# This is the mutation under test. Until now the closed-epic gardeners were
+# pinned to an OPEN epic and were NOT reapable.
+kd close "$CLOSED_EPIC" >/dev/null 2>&1 || { fail "close the epic"; exit 1; }
+EPIC_STATUS=$(kd show "$CLOSED_EPIC" --json 2>/dev/null | jq -r '.status // empty')
+if [ "$EPIC_STATUS" != "closed" ]; then
+  fail "epic did not reach status=closed" "got '$EPIC_STATUS'"; exit 1
+fi
+echo "closed epic $CLOSED_EPIC at $(date -u +%FT%TZ)"
+
+# Pre-assertion: every gardener is still OPEN before the sweep runs. Without this
+# a fixture that was somehow born closed would make leg 1 pass vacuously.
+for id in "$REAP_ID" "$PROSE_ID" "$FIXTURE_ID" "$OPEN_ID"; do
+  ST=$(kd show "$id" --json 2>/dev/null | jq -r '.status // empty')
+  if [ "$ST" != "open" ]; then
+    fail "pre-sweep: gardener $id is '$ST', expected open"; exit 1
+  fi
+done
+pass "pre-sweep: all 4 gardener fixtures open, anchor epic closed"
+
+# ── Run the sweep: one short-lived trigger-engine ──────────────────
+# GARDENER_EPIC_REAPER_ENABLED=true is the opt-in the live fleet does NOT have
+# (default-off, unset in Helm) — this subprocess is the only armed reaper here.
+# NOTIFY=false keeps it off Slack. Every OTHER mutating sweep is explicitly
+# DISABLED so that any close we observe is attributable to the reaper alone and
+# not to a sibling sweep — the CONTROL that makes leg 1 mean what it claims.
+TE_LOG=/tmp/trigger-engine-cer-$$.log
+BEADS_HTTP_ADDR="$BEADS_HTTP_URL" \
+  BEADS_DAEMON_TOKEN="$BEADS_TOKEN" \
+  GARDENER_EPIC_REAPER_ENABLED=true \
+  GARDENER_EPIC_REAPER_NOTIFY=false \
+  CLOSED_ENABLED_DRAIN_ENABLED=false \
+  GARDENER_LIVENESS_ENABLED=false \
+  GARDENER_POURING_STALL_ENABLED=false \
+  DARK_LANE_ENABLED=false \
+  CREDENTIAL_WEDGE_ENABLED=false \
+  ORPHAN_SWEEP_ENABLED=false \
+  TRIGGER_POLL_INTERVAL=5s \
+  LISTEN_ADDR=":0" \
+  LOG_LEVEL=info \
+  "$TE_BIN" >"$TE_LOG" 2>&1 &
+TE_PID=$!
+echo "trigger-engine pid: $TE_PID (reaper ARMED, sibling sweeps disabled)"
+
+# Wait for the sweep to complete. Evaluate() runs immediately at startup, so the
+# reaper's single pass lands within seconds; poll the positive fixture up to 90s.
+DEADLINE=$(( $(date +%s) + 90 ))
+REAPED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  ST=$(kd show "$REAP_ID" --json 2>/dev/null | jq -r '.status // empty')
+  if [ "$ST" = "closed" ]; then REAPED=1; break; fi
+  # A crashed engine will never reap; fail fast rather than burn the deadline.
+  if ! kill -0 "$TE_PID" 2>/dev/null; then
+    echo "trigger-engine exited early"; break
+  fi
+  sleep 3
+done
+
+# ── Leg 1: POSITIVE — the closed-epic gardener was reaped ───────────
+if [ "$REAPED" = "1" ]; then
+  pass "closed-epic gardener was REAPED (status=closed)"
+else
+  fail "closed-epic gardener was NOT reaped within 90s" "status=$(kd show "$REAP_ID" --json 2>/dev/null | jq -r '.status // empty')"
+  echo "--- trigger-engine log (tail) ---"; tail -40 "$TE_LOG" 2>/dev/null || true
+  exit 1
+fi
+
+# The close must be legible as an intentional lifecycle retirement, not a
+# generic close: kind=epic_closed is what `gb gardener status` and the drain
+# sweep's backfill key on.
+REAP_JSON=$(kd show "$REAP_ID" --json 2>/dev/null)
+KIND=$(echo "$REAP_JSON" | jq -r '.fields.gardener_terminated_kind // empty')
+SLOT=$(echo "$REAP_JSON" | jq -r '.fields.gardener_terminated_slot // empty')
+if [ "$KIND" = "epic_closed" ]; then
+  pass "close stamped gardener_terminated_kind=epic_closed"
+else
+  fail "gardener_terminated_kind is '$KIND', expected epic_closed"
+fi
+if [ "$SLOT" = "loop_end" ]; then
+  pass "close stamped gardener_terminated_slot=loop_end"
+else
+  fail "gardener_terminated_slot is '$SLOT', expected loop_end"
+fi
+
+# Disarmed so the retired lane does not re-enter the closed+enabled phantom
+# class the drain sweep exists to clean up (bug ka-0000001423). `enabled` is
+# boolean-typed, so accept either JSON false or the string "false".
+ENABLED=$(echo "$REAP_JSON" | jq -r '.fields.enabled | tostring')
+if [ "$ENABLED" = "false" ]; then
+  pass "reaped gardener was DISARMED (enabled=false)"
+else
+  fail "reaped gardener still armed (enabled=$ENABLED)" "would re-enter the closed+enabled phantom class"
+fi
+
+# The audit comment must name the epic that caused the reap — the provenance an
+# operator needs to reverse it.
+if kd show "$REAP_ID" 2>/dev/null | grep -q "$CLOSED_EPIC"; then
+  pass "audit comment names the closed epic ($CLOSED_EPIC)"
+else
+  fail "no audit comment naming the closed epic" "reap is unexplainable to an operator"
+fi
+
+# ── Legs 2-4: NEGATIVES — the skip guards held ─────────────────────
+# Same sweep run, so a sweep that reaped nothing at all cannot pass these by
+# accident: leg 1 already proved it reaped.
+check_survived() {
+  _id="$1"; _what="$2"; _why="$3"
+  _st=$(kd show "$_id" --json 2>/dev/null | jq -r '.status // empty')
+  if [ "$_st" = "open" ]; then
+    pass "$_what SURVIVED the sweep (still open)"
+  else
+    fail "$_what was WRONGLY reaped (status=$_st)" "$_why"
+  fi
+}
+
+check_survived "$PROSE_ID"   "prose-declared standing gardener on a CLOSED epic" \
+  "repeats ka-0000006241 — the incident that took the release lane dark"
+check_survived "$FIXTURE_ID" "E2E-fixture gardener on a CLOSED epic" \
+  "isE2EFixture guard breached; frozen fixtures must never be auto-closed"
+check_survived "$OPEN_ID"    "gardener on an OPEN epic" \
+  "over-reap into trigger-reviver's uncovered-lane territory"
+
+# ── Leg 5: CONTAINMENT / no-partial-failure, read from the engine log ──
+# The engine logs JSON lines (slog JSONHandler in cmd/trigger-engine), so parse
+# with jq rather than grepping for a key=value shape that never appears. The
+# sweep is throttled to once per hour and Evaluate() runs immediately at startup,
+# so exactly ONE completion line is emitted per subprocess lifetime — and it
+# necessarily ran AFTER our epic close (we closed it before spawning the engine).
+#
+# Two assertions here, both independent of how many unrelated beads happen to
+# live in the namespace:
+#   (a) reaped == closed_epic_cohort — every classified gardener was actually
+#       closed. This is the partial-write / silent-zero guard: the sweep's own
+#       "cohort non-empty but reaped 0" warning class means every close write
+#       failed, which would otherwise look like a passing skip.
+#   (b) the reaped ID set contains our POSITIVE and none of our three NEGATIVES.
+#       This is the log-level twin of legs 2-4: it catches an over-reap even if a
+#       bystander re-created a bead, and pins the attribution to specific IDs.
+#
+# The global cohort size is reported for diagnosis but deliberately NOT asserted
+# to be 1: a full-shard run shares the namespace with sibling scenarios whose
+# own cleanup closes their epics, so another scenario's leftover gardener can
+# legitimately be in the cohort. Asserting an exact global count would make this
+# module flaky on a state we do not own.
+COMPLETE=$(jq -Rc 'fromjson? | select(.msg=="gardener-epic-reaper: complete")' "$TE_LOG" 2>/dev/null | tail -1 || true)
+if [ -z "$COMPLETE" ]; then
+  fail "no 'gardener-epic-reaper: complete' line in the engine log" "sweep may not have run at all"
+  echo "--- trigger-engine log (tail) ---"; tail -40 "$TE_LOG" 2>/dev/null || true
+else
+  echo "sweep: $COMPLETE"
+  N_REAPED=$(echo "$COMPLETE" | jq -r '.reaped')
+  N_COHORT=$(echo "$COMPLETE" | jq -r '.closed_epic_cohort')
+  if [ "$N_COHORT" -ge 1 ] 2>/dev/null; then
+    pass "sweep classified a non-empty closed-epic cohort ($N_COHORT)"
+  else
+    fail "sweep cohort is '$N_COHORT', expected >=1" "our positive fixture should have been classified"
+  fi
+  # Expect reaped == min(cohort, per-run cap), NOT the raw cohort. The sweep caps
+  # itself at closedEpicReaperCap (20) per run and defers the remainder to the
+  # next run, logging "hit per-run cap". A cohort >20 therefore reaps exactly 20
+  # and is CORRECT — asserting against the raw cohort would red this module on
+  # shared-namespace state we do not own rather than on any real defect.
+  N_EXPECT="$N_COHORT"
+  if [ "$N_COHORT" -gt 20 ] 2>/dev/null; then N_EXPECT=20; fi
+  if [ "$N_REAPED" = "$N_EXPECT" ]; then
+    pass "no partial failures: reaped ($N_REAPED) == min(cohort $N_COHORT, cap 20)"
+  else
+    fail "reaped ($N_REAPED) != expected ($N_EXPECT) for cohort $N_COHORT" "some close writes failed silently"
+  fi
+
+  REAPED_IDS=$(jq -Rr 'fromjson? | select(.msg=="gardener-epic-reaper: reaped gardener on closed epic") | .gardener' "$TE_LOG" 2>/dev/null || true)
+  echo "reaped ids: $(echo "$REAPED_IDS" | tr '\\n' ' ')"
+  if echo "$REAPED_IDS" | grep -Fxq "$REAP_ID"; then
+    pass "containment: reap log names our positive fixture ($REAP_ID)"
+  else
+    fail "reap log does not name our positive fixture" "the observed close came from some other path"
+  fi
+  LEAKED=""
+  for id in "$PROSE_ID" "$FIXTURE_ID" "$OPEN_ID"; do
+    if echo "$REAPED_IDS" | grep -Fxq "$id"; then LEAKED="$LEAKED $id"; fi
+  done
+  if [ -z "$LEAKED" ]; then
+    pass "containment: no skip-guarded gardener appears in the reap log"
+  else
+    fail "skip-guarded gardener(s) were reaped:$LEAKED" "a skip guard leaked"
+  fi
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "gardener-epic-reaper OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-epic-reaper scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

@@ -1,0 +1,118 @@
+# rule_files is rewritten at runtime by
+# TestAdviceBudgetAlert_R4TripwireFires (advice_budget_alert_test.go): the
+# placeholder below is replaced with the path to the helm-rendered
+# PrometheusRule spec. To run this proof by hand:
+#   helm template test gardenio/helm/gardenio --show-only templates/advice-budget-alert.yaml \
+#     --set agents.metrics.prometheusRule.adviceBudget.enabled=true | yq eval '.spec' - > /tmp/advice_rules.yaml
+#   sed 's#__RULES_FILE__#/tmp/advice_rules.yaml#' this-file > /tmp/advice_test.yaml
+#   promtool test rules /tmp/advice_test.yaml
+#
+# R4 tripwire (ka-0000002748): the alerts must FIRE when a real archetype's
+# abbreviated-render demand crosses ~80% of budget (48000 B) or the open pool
+# crosses ~450, and stay QUIET at today's levels (~42 KB render / ~354 pool).
+# Default `for: 30m`, so series sustain the value ≥ 30m and eval at 35m.
+rule_files:
+  - __RULES_FILE__
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------
+  # POSITIVE: an archetype render demand past the 48000-byte tripwire fires
+  # AdvicePrimeRenderApproachingBudget (and NOT the pool alert).
+  # ---------------------------------------------------------------------------
+  - name: render_over_80pct_fires
+    interval: 1m
+    input_series:
+      - series: 'gardenio_advice_prime_render_bytes{project="gardenio", role="crew"}'
+        values: '49000x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: AdvicePrimeRenderApproachingBudget
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              component: gardenio
+              subsystem: advice
+              project: gardenio
+              role: crew
+            exp_annotations:
+              summary: "Advice render for gardenio/crew is past 80% of the abbreviated byte budget"
+              runbook_url: "https://github.com/mattbakerconsulting/gardenio/blob/main/gardenio/docs/advice-hygiene.md"
+              description: |
+                The abbreviated-render demand for archetype
+                gardenio/crew is
+                49000 bytes — past the
+                48000-byte tripwire (80% of the
+                60000-byte abbreviated budget gb prime
+                enforces). This is the R4 leading indicator (ka-0000002748): act
+                NOW — before the demand crosses 100% and gb prime starts dropping
+                advice into the "... N more … not shown" footer for every agent of
+                that (project, role). Trim the matched pool (`gb advice audit
+                --project gardenio --role crew
+                --top 10`, advice-cut ka-0000004903 / supersession compaction R3)
+                or raise the budget only if trimming is exhausted (deferred Option
+                A, ka-0000002665).
+      - eval_time: 35m
+        alertname: AdviceOpenPoolApproachingCap
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # NEGATIVE: today's heaviest real render (~42 KB = 70%) must NOT fire.
+  # ---------------------------------------------------------------------------
+  - name: render_at_todays_level_quiet
+    interval: 1m
+    input_series:
+      - series: 'gardenio_advice_prime_render_bytes{project="gardenio", role="crew"}'
+        values: '42000x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: AdvicePrimeRenderApproachingBudget
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # POSITIVE: open pool past the 450-item tripwire fires
+  # AdviceOpenPoolApproachingCap (and NOT the render alert).
+  # ---------------------------------------------------------------------------
+  - name: open_pool_over_450_fires
+    interval: 1m
+    input_series:
+      - series: 'gardenio_advice_open_total'
+        values: '460x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: AdviceOpenPoolApproachingCap
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              component: gardenio
+              subsystem: advice
+            exp_annotations:
+              summary: "Open advice pool is 460 — approaching the 500-item cap"
+              runbook_url: "https://github.com/mattbakerconsulting/gardenio/blob/main/gardenio/docs/advice-hygiene.md"
+              description: |
+                The open, real (non-fixture, non-expired) advice pool is
+                460 beads — past the
+                450-item tripwire, approaching the
+                500-item server-side cap. Above the cap, advice
+                is silently dropped BEFORE budget logic runs (F10, the risk R1
+                addresses). Drain the pool via supersession/expiry compaction (R3,
+                adviceSweeper) or retire stale advice (`gb advice audit`), and
+                confirm R1's paginated cap has shipped. Today ~354 — this should
+                be quiet unless growth accelerated.
+      - eval_time: 35m
+        alertname: AdvicePrimeRenderApproachingBudget
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # NEGATIVE: today's open pool (~354) must NOT fire.
+  # ---------------------------------------------------------------------------
+  - name: open_pool_at_todays_level_quiet
+    interval: 1m
+    input_series:
+      - series: 'gardenio_advice_open_total'
+        values: '354x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: AdviceOpenPoolApproachingCap
+        exp_alerts: []

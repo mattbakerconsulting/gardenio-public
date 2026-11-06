@@ -1,0 +1,137 @@
+# local-prime-fetch.toml
+#
+# Claudeless scenario: Prime hook fetches workflow context in local mode
+#
+# A laptop agent started via `gb agent start --local` must see the same
+# workflow context a K8s agent sees: project roster, open work, advice, and
+# its claimed assignment (if any). This scenario asserts:
+#
+#   Test 1: `gb hook prime` exits 0 (prime path is callable outside K8s)
+#   Test 2: Prime output contains a system-reminder tag (injection format)
+#   Test 3: Prime output mentions the agent's actor name
+#   Test 4: `gb hook check-mail` exits 0 when no mail is queued
+#   Test 5: Prime output points at the system-prompt-loaded workflow context
+#           (the full "Beads Workflow Context" body is delivered via the
+#           cacheable system prompt — see TestOutputPrimeForHook_TrimmedExcludes
+#           StaticRules — so the hook channel only emits the pointer line)
+#
+# These guard the local SessionStart hook pipeline — the most common
+# silent-failure mode is the prime command returning empty output when run
+# off-cluster, leaving the agent with no context. Runner: test-local-mode.sh
+# (A4).
+#
+# Run via:
+#   gb agent start --local --test-scenario=local-prime-fetch
+
+# Local-mode startup prompt for `gb agent start --local` lives in the
+# sidecar local-prime-fetch.startup-prompt.txt next to this file
+# (claudeless rejects unknown TOML keys).
+
+[claude]
+session_id = "e2e00000-0004-4000-a000-000000000002"
+username = "e2e-local-prime"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+[[responses]]
+on = { contains = "test" }
+say = "Running local-prime-fetch tests: prime exit code, injection format, actor identity, mail check."
+tools = [
+  { call = "Bash", input = { command = """PASS=0; FAIL=0; ERRORS=""
+
+check() {
+  local name="$1"; shift
+  if "$@" >/dev/null 2>&1; then
+    PASS=$((PASS + 1))
+    echo "PASS: $name"
+  else
+    FAIL=$((FAIL + 1))
+    ERRORS="$ERRORS\n  - $name"
+    echo "FAIL: $name"
+  fi
+}
+
+# Helper: grep PRIME_OUT for a literal substring. Done as a function so we
+# pass it through `check` as `$@` without re-quoting through bash -c — the
+# previous form (bash -c "echo \\"$PRIME_OUT\\" | grep ...") closed its
+# outer quotes mid-command, leaving $PRIME_OUT unquoted and word-split into
+# positional args. See gd-m7Rewmo2x8.
+prime_has() {
+  printf '%s\\n' "$PRIME_OUT" | grep -qF -- "$1"
+}
+
+echo "=== Local Prime Fetch Tests ==="
+
+# ── Test 1: gb hook prime exits 0 ─────────────────────────────────
+echo "--- Test 1: prime exit code ---"
+PRIME_OUT=$(gb hook prime 2>&1)
+rc=$?
+check "gb hook prime exits 0" test $rc -eq 0
+
+# ── Test 2: Output wraps in <system-reminder> ─────────────────────
+echo "--- Test 2: system-reminder wrapper ---"
+check "prime output contains <system-reminder>" prime_has '<system-reminder>'
+
+# ── Test 3: Output mentions the actor name ────────────────────────
+echo "--- Test 3: actor identity surfaced ---"
+ACTOR="${KD_ACTOR:-${BEADS_AGENT_NAME:-}}"
+if [ -n "$ACTOR" ]; then
+  check "prime output mentions actor $ACTOR" prime_has "$ACTOR"
+else
+  echo "SKIP: no KD_ACTOR/BEADS_AGENT_NAME set"
+fi
+
+# ── Test 4: check-mail hook exits 0 with empty queue ──────────────
+echo "--- Test 4: check-mail empty ---"
+gb hook check-mail >/dev/null 2>&1
+rc=$?
+check "gb hook check-mail exits 0 on empty mail" test $rc -eq 0
+
+# ── Test 5: workflow context pointer present ──────────────────────
+# The minimal-prime hook contract (prime_shared.go:outputPrimeForHook)
+# trims static rules out of the SessionStart channel — they live in the
+# cacheable system prompt instead — and leaves a pointer line so the
+# agent knows where to find them. Assert the pointer, not the full
+# "Beads Workflow Context" header.
+echo "--- Test 5: workflow-context pointer ---"
+check "prime output points at the system-prompt workflow context" \
+  prime_has 'loaded in the system prompt'
+
+# ── Summary ───────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+
+# Emit pass/fail verdict for gb-agent to read (ka-0000006600). Without this
+# file the runner treats the scenario as failed — a bare `exit 1` here is
+# invisible to gb-agent because it only kills the bash subprocess inside a
+# claudeless tool call, not claudeless or coop themselves.
+if [ -n "${GB_SCENARIO_RESULT_FILE:-}" ]; then
+  if [ $FAIL -gt 0 ]; then
+    echo "fail" > "$GB_SCENARIO_RESULT_FILE"
+  else
+    echo "pass" > "$GB_SCENARIO_RESULT_FILE"
+  fi
+fi
+
+if [ $FAIL -gt 0 ]; then
+  echo "Failures:$ERRORS"
+  exit 1
+fi
+echo "All local-prime-fetch tests passed."
+exit 0""" } }
+]
+
+# ── Fallback ──────────────────────────────────────────────────────
+[default]
+say = "Local prime-fetch scenario complete."
+
+# ── Tool config ───────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

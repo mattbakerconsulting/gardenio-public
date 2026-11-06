@@ -1,0 +1,125 @@
+{{- /*
+  W1 — external remote-write ingest for vmsingle (epic ka-0000006776, task ka-0000002192).
+
+  Exposes ONLY vmsingle's write endpoints through Traefik so an out-of-cluster
+  vmagent (the site-deployment vmagent's second remote-write) can push a
+  site-allow-listed metric stream into this gardenio vmsingle. This is the
+  gardenio (receiver) side of the config-flip; the site (sender) side is advisory
+  terragrunt a human lands in site-deployment (docs/obs-w1-site-remote-write.md).
+
+  vmsingle has no built-in auth and the query/admin surface (/api/v1/query,
+  /api/v1/admin/tsdb/delete_series, /vmui, ...) is destructive, so we expose ONLY
+  the write paths in vmsingle.ingest.pathPrefixes, fronted by basicAuth (+ an
+  optional IP allow-list and rate-limit). Queries stay in-cluster (Grafana →
+  ClusterIP). Design: docs/research/obs-w1-victoria-to-grafana.md §5 path 2.
+*/}}
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.vmsingle.enabled .Values.vmsingle.ingest.enabled }}
+{{- $fullname := include "gardenio.vmsingle.fullname" . -}}
+{{- $host := required "vmsingle.ingest.host is required when vmsingle.ingest.enabled" .Values.vmsingle.ingest.host -}}
+{{- $prefixes := .Values.vmsingle.ingest.pathPrefixes | default (list "/api/v1/write") -}}
+{{- $auth := .Values.vmsingle.ingest.auth -}}
+{{- if and $auth.enabled (not $auth.secretName) -}}
+{{- fail "vmsingle.ingest.auth.secretName is required when vmsingle.ingest.auth.enabled (provision via externalSecrets.vmsingleIngest or out-of-band)" -}}
+{{- end -}}
+{{- $matchPrefixes := list -}}
+{{- range $prefixes }}
+{{- $matchPrefixes = append $matchPrefixes (printf "PathPrefix(`%s`)" .) -}}
+{{- end -}}
+{{- $pathMatch := join " || " $matchPrefixes -}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-ingest
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmsingle.labels" . | nindent 4 }}
+spec:
+  # Default web/websecure preserves the legacy shape. Environments whose shared
+  # web/websecure entrypoints ride an INTERNAL load balancer (prod-gardenio-eks:
+  # internal-scheme NLB behind AWS Verified Access) are unreachable by the
+  # out-of-cluster site vmagent, so they bind the dedicated internet-facing
+  # entrypoint instead (e.g. `webhooks`). The host must ALSO be published on
+  # that edge's Service via terraform webhook_edge_hostname — external-dns
+  # sources only Service/Ingress, never IngressRoute CRDs, so an entrypoint flip
+  # alone yields NXDOMAIN. Bug ka-0000005734.
+  entryPoints:
+    {{- range .Values.vmsingle.ingest.entryPoints | default (list "web" "websecure") }}
+    - {{ . }}
+    {{- end }}
+  routes:
+    - match: Host(`{{ $host }}`) && ({{ $pathMatch }})
+      kind: Rule
+      priority: 100
+      services:
+        - name: {{ $fullname }}
+          port: 8428
+      middlewares:
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if .Values.vmsingle.ingest.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ingest-ipwhitelist
+        {{- end }}
+        {{- if $auth.enabled }}
+        - name: {{ $fullname }}-ingest-auth
+        {{- end }}
+        {{- if .Values.vmsingle.ingest.rateLimit.enabled }}
+        - name: {{ $fullname }}-ingest-ratelimit
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if $auth.enabled }}
+---
+# basicAuth — native to both OSS Traefik and vmagent remote-write (`basic_auth:`),
+# so the receiver side needs no new binary. The htpasswd blob lives in the
+# referenced Secret under key `users` (provision via externalSecrets.vmsingleIngest).
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ingest-auth
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmsingle.labels" . | nindent 4 }}
+spec:
+  basicAuth:
+    secret: {{ $auth.secretName }}
+    removeHeader: true
+{{- end }}
+{{- if .Values.vmsingle.ingest.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ingest-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmsingle.labels" . | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.vmsingle.ingest.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.vmsingle.ingest.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if .Values.vmsingle.ingest.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ingest-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmsingle.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ .Values.vmsingle.ingest.rateLimit.average }}
+    burst: {{ .Values.vmsingle.ingest.rateLimit.burst }}
+{{- end }}
+{{- end }}

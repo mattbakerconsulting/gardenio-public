@@ -1,0 +1,125 @@
+# mail-nudge-delivery.toml
+#
+# Claudeless scenario: Mail delivery and inject queue drain
+#
+# Tests the check-mail.sh and drain-queue.sh hook pipeline without
+# requiring a live kbeads server for the core path tests. Exercises:
+#
+#   Test 1: check-mail.sh exits 0 when no agent identity set
+#   Test 2: check-mail.sh does not create queue without identity
+#   Test 3: drain-queue.sh exits 0 on empty/missing queue
+#   Test 4: drain-queue.sh drains JSONL content and removes file
+#   Test 5: drain-queue.sh --quiet suppresses stderr on missing queue
+#   Test 6: Queue round-trip (write → drain → verify removed)
+#
+# Run via: claudeless --scenario tests/e2e/claudeless/mail-nudge-delivery.toml \
+#          --dangerously-skip-permissions -p "Run all mail-nudge-delivery tests"
+
+[claude]
+session_id = "e2e00000-0003-4000-a000-000000000001"
+username = "e2e-mail-test"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+# ── All tests in a single turn ────────────────────────────────────
+[[responses]]
+on = { contains = "test" }
+say = "Running mail-nudge-delivery hook tests: check-mail identity guard, drain-queue pipeline, round-trip."
+tools = [
+  { call = "Bash", input = { command = """PASS=0; FAIL=0; ERRORS=""
+HOOKS_DIR="gardenio/images/agent/hooks"
+QUEUE_FILE="/tmp/inject-queue.jsonl"
+
+check() {
+  local name="$1"; shift
+  if "$@" >/dev/null 2>&1; then
+    PASS=$((PASS + 1))
+    echo "PASS: $name"
+  else
+    FAIL=$((FAIL + 1))
+    ERRORS="$ERRORS\n  - $name"
+    echo "FAIL: $name"
+  fi
+}
+
+echo "=== Mail Nudge Delivery Tests ==="
+
+# ── Test 1: check-mail.sh exits 0 without agent identity ──────
+echo "--- Test 1: check-mail.sh no-identity exit ---"
+rm -f "$QUEUE_FILE"
+(unset BEADS_AGENT_NAME; bash "$HOOKS_DIR/check-mail.sh" 2>/dev/null)
+rc=$?
+check "check-mail.sh exits 0 without identity" test $rc -eq 0
+
+# ── Test 2: No queue created without identity ─────────────────
+echo "--- Test 2: No queue without identity ---"
+check "No queue file created without identity" test ! -f "$QUEUE_FILE"
+
+# ── Test 3: drain-queue.sh exits 0 on missing queue ──────────
+echo "--- Test 3: drain-queue.sh missing queue ---"
+rm -f "$QUEUE_FILE"
+bash "$HOOKS_DIR/drain-queue.sh" >/dev/null 2>&1
+rc=$?
+check "drain-queue.sh exits 0 on missing queue" test $rc -eq 0
+
+# ── Test 4: drain-queue.sh drains content and removes file ────
+echo "--- Test 4: drain-queue.sh drains and removes ---"
+TEST_TAG="e2e-mail-test-$$-$(date +%s)"
+echo '{"type":"mail","content":"Test mail '"$TEST_TAG"'"}' > "$QUEUE_FILE"
+check "Queue file created" test -f "$QUEUE_FILE"
+DRAIN_OUT=$(bash "$HOOKS_DIR/drain-queue.sh" 2>/dev/null)
+rc=$?
+check "drain-queue.sh exits 0" test $rc -eq 0
+check "drain output contains test tag" bash -c "echo \"$DRAIN_OUT\" | grep -qF \"$TEST_TAG\""
+check "Queue file removed after drain" test ! -f "$QUEUE_FILE"
+
+# ── Test 5: drain-queue.sh --quiet suppresses stderr ──────────
+echo "--- Test 5: drain-queue.sh --quiet ---"
+rm -f "$QUEUE_FILE"
+STDERR=$(bash "$HOOKS_DIR/drain-queue.sh" --quiet 2>&1 1>/dev/null)
+rc=$?
+check "drain-queue.sh --quiet exits 0" test $rc -eq 0
+check "drain-queue.sh --quiet no stderr" test -z "$STDERR"
+
+# ── Test 6: Queue round-trip (multi-entry) ────────────────────
+echo "--- Test 6: Queue round-trip ---"
+rm -f "$QUEUE_FILE"
+RT_TAG="roundtrip-$$-$(date +%s)"
+echo '{"type":"test","content":"First entry '"$RT_TAG"'"}' > "$QUEUE_FILE"
+echo '{"type":"test","content":"Second entry '"$RT_TAG"'"}' >> "$QUEUE_FILE"
+LINES_BEFORE=$(wc -l < "$QUEUE_FILE")
+check "Queue has 2 entries" test "$LINES_BEFORE" -eq 2
+RT_OUT=$(bash "$HOOKS_DIR/drain-queue.sh" 2>/dev/null)
+check "Round-trip output contains tag" bash -c "echo \"$RT_OUT\" | grep -qF \"$RT_TAG\""
+RT_COUNT=$(echo "$RT_OUT" | grep -cF "$RT_TAG" || true)
+check "Round-trip output has both entries" test "$RT_COUNT" -eq 2
+check "Queue file removed after round-trip" test ! -f "$QUEUE_FILE"
+
+# ── Cleanup ──────────────────────────────────────────────────
+rm -f "$QUEUE_FILE"
+
+# ── Summary ──────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  echo "Failures:$ERRORS"
+  exit 1
+fi
+echo "All mail-nudge-delivery tests passed."
+exit 0""" } }
+]
+
+# ── Fallback ────────────────────────────────────────────────────
+[default]
+say = "Mail nudge delivery test complete. All hooks verified."
+
+# ── Tool config ─────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

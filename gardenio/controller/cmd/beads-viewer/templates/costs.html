@@ -1,0 +1,588 @@
+{{template "layout" .}}
+{{define "title"}}Costs · Beads Viewer{{end}}
+
+{{/* One x-check corroboration badge (costs_trust.go, ka-0000008212). Dot is
+     nil for a pair that is neither registered nor published, so callsites can
+     `{{template "costs-trust-badge" .Trust.Badge "pair"}}` unconditionally. */}}
+{{define "costs-trust-badge"}}{{if .}}<span class="chip costs-trust-chip costs-trust-{{.Level}}" title="{{.Title}}">{{.Label}}: {{if .HasScore}}{{.Score}} {{end}}{{.LevelWord}}</span>{{end}}{{end}}
+
+{{define "content"}}
+<span class="wide-page" hidden></span>
+<h1>Costs
+  {{if .Summary.TotalCount}}<span class="meta">({{.Summary.TotalCount}} accounts)</span>{{end}}
+  <span class="bead-row-spacer"></span>
+  {{/* The same charts as the garden's Costs panel (plan gd-gh5J0vVbJP step 2.3), beside the fleet's figures there. */}}
+  <a class="meta" href="{{.BasePath}}/garden?costs=fleet">See it in the garden →</a>
+  <a class="meta" href="{{.BasePath}}/costs">refresh ↻</a>
+</h1>
+
+{{if .Error}}
+<div class="banner banner-error">{{.Error}}</div>
+{{end}}
+
+{{if .Truncated}}
+<div class="banner banner-warn">Showing first {{.Limit}} accounts.</div>
+{{end}}
+
+{{/* Summary card renders unconditionally so /costs has a stable shape even
+     before account data arrives — the empty state otherwise had no signal.
+     Stats are wrapped in a <dl> so each label/value pair is parsable by
+     downstream readers (ka-0000001844). */}}
+<section class="costs-summary">
+  <div class="costs-summary-row">
+    {{/* Subscription headline (ka-0000003343): for a subscription fleet the
+         headline bills against the two rolling subscription windows Matt asked
+         for — the 5h limit and the week — chosen primary by representative_claim,
+         because the old "Today" number bucketed to 00:00 UTC and reset on a
+         clock unrelated to the subscription. The calendar-day figure is DEMOTED
+         to a small, explicitly-labelled "UTC day" line so it stops masquerading
+         as the bill. A metered-only fleet (SubscriptionCount 0, or no probe has
+         written a window figure yet) keeps the calendar-day "Today" headline —
+         correct for pay-as-you-go. */}}
+    {{if .Summary.SubscriptionCount}}
+    <div class="costs-summary-today">
+      <div class="meta">{{.Summary.PrimaryBillLabel}}</div>
+      <div class="costs-summary-total">{{printf "$%.2f" .Summary.PrimaryBillUSD}}</div>
+      {{if .Summary.SecondaryBillHas}}
+      <div class="meta costs-summary-progress">{{.Summary.SecondaryBillLabel}} {{printf "$%.2f" .Summary.SecondaryBillUSD}}</div>
+      {{end}}
+      <div class="meta costs-summary-utcday">UTC day (resets 00:00 UTC) {{printf "$%.2f" .Summary.GrandTotalUSD}} · {{.Summary.DayProgressPct}}% elapsed</div>
+      {{/* The subscription windows and the calendar day both descend from the
+           LiteLLM bill, so the bill-conservation x-check qualifies them
+           (costs_trust.go). */}}
+      <div class="costs-trust-inline">{{template "costs-trust-badge" .Trust.Badge "bill-conservation"}}</div>
+    </div>
+    {{else}}
+    <div class="costs-summary-today">
+      <div class="meta">Today</div>
+      <div class="costs-summary-total">{{printf "$%.2f" .Summary.GrandTotalUSD}}</div>
+      <div class="meta costs-summary-progress">{{.Summary.DayProgressPct}}% of day elapsed</div>
+      {{/* Today/rate/week all descend from the LiteLLM bill, so the
+           bill-conservation x-check qualifies them (costs_trust.go). */}}
+      <div class="costs-trust-inline">{{template "costs-trust-badge" .Trust.Badge "bill-conservation"}}</div>
+    </div>
+    {{end}}
+    <div class="costs-summary-side">
+      {{/* Rate is the rolling-window fleet rate (ka-0000002806) — it agrees
+           with the spend-rate chart below within rounding. "—" when vmsingle
+           has no sample (matching the chart's empty state); "$0.00/h" is a
+           real quiet-window reading and renders as such. The 1h moving average
+           (ka-0000001327) is shown alongside it: the 24h window smooths
+           variable load, the 1h window reacts to the hour-to-hour swings. */}}
+      {{if .Summary.HourlyRateAvailable}}
+      <div><span class="meta">rate (24h avg)</span> {{printf "$%.2f" .Summary.HourlyRateUSD}}/h <span class="meta">rolling</span></div>
+      {{else}}
+      <div><span class="meta">rate (24h avg)</span> <span class="meta">—</span></div>
+      {{end}}
+      {{if .Summary.HourlyRate1hAvailable}}
+      <div><span class="meta">rate (1h avg)</span> {{printf "$%.2f" .Summary.HourlyRate1hUSD}}/h <span class="meta">reactive</span></div>
+      {{else}}
+      <div><span class="meta">rate (1h avg)</span> <span class="meta">—</span></div>
+      {{end}}
+      <div><span class="meta">week</span> {{printf "$%.2f" .Summary.WeeklyTotalUSD}}</div>
+      {{if .Summary.HourlyRateAvailable}}
+      <div><span class="meta">projected</span> {{printf "$%.2f" .Summary.ProjectedTodayUSD}} <span class="meta">if pace holds 24h</span></div>
+      {{end}}
+      {{/* Measure-twice cross-check (ka-0000003343, advice ka-0000005924): the
+           5h window is a sub-interval of the 7d window, so bill-5h ≤ bill-7d must
+           hold across every checked account. A violation (usually a stale
+           throttle_reset_7d_at) is surfaced, never silently resolved. */}}
+      {{if .Summary.BillXCheckAccounts}}
+        {{if .Summary.BillXCheckViolations}}
+        <div><span class="chip chip-throttled" title="5h-window bill exceeds 7d-window bill on {{.Summary.BillXCheckViolations}} account(s) — the 5h window is a sub-interval of the 7d window, so this means a windowed sum is wrong (often a stale throttle_reset_7d_at). The two derivations disagree.">bill x-check: {{.Summary.BillXCheckViolations}}/{{.Summary.BillXCheckAccounts}} drift</span></div>
+        {{else}}
+        <div><span class="meta" title="On all {{.Summary.BillXCheckAccounts}} checked account(s) the 5h-window bill ≤ the 7d-window bill, as it must (the 5h window is a sub-interval of the 7d). Two window sums off the same /spend/logs stream reconcile.">bill x-check: {{.Summary.BillXCheckAccounts}}/{{.Summary.BillXCheckAccounts}} ok</span></div>
+        {{end}}
+      {{end}}
+    </div>
+  </div>
+  <dl class="costs-summary-stats" aria-label="Fleet summary">
+    <dt>active</dt><dd>{{.Summary.ActiveCount}}</dd>
+    <dt>throttled</dt><dd{{if .Summary.ThrottledCount}} class="chip chip-throttled"{{end}}>{{.Summary.ThrottledCount}}</dd>
+    <dt>total accounts</dt><dd>{{.Summary.TotalCount}}</dd>
+    {{if .Summary.WithSpendCount}}
+    <dt>with spend</dt><dd>{{.Summary.WithSpendCount}}</dd>
+    {{end}}
+    {{if .Summary.OverageCount}}
+    <dt>overage</dt><dd class="chip chip-throttled">{{.Summary.OverageCount}}</dd>
+    {{end}}
+    {{if .Summary.TotalSessions}}
+    <dt>sessions</dt><dd>{{.Summary.TotalSessions}}</dd>
+    {{end}}
+    {{if gt .Summary.AvgPerActiveUSD 0.0}}
+    <dt>avg/active</dt><dd>{{printf "$%.2f" .Summary.AvgPerActiveUSD}}</dd>
+    {{end}}
+    {{if gt .Summary.CostPerSessionUSD 0.0}}
+    <dt>$/session</dt><dd>{{printf "$%.3f" .Summary.CostPerSessionUSD}}</dd>
+    {{end}}
+    {{if gt .Summary.TotalCostAllUSD 0.0}}
+    <dt>lifetime</dt><dd>{{printf "$%.2f" .Summary.TotalCostAllUSD}}</dd>
+    {{end}}
+    {{if .Summary.MaxUtil5hPct}}
+    <dt>max 5h util</dt><dd{{if ge .Summary.MaxUtil5hPct 90}} class="chip chip-throttled"{{end}}>{{.Summary.MaxUtil5hPct}}%</dd>
+    {{end}}
+    {{if .Summary.MaxUtil7dPct}}
+    <dt>max 7d util</dt><dd{{if ge .Summary.MaxUtil7dPct 90}} class="chip chip-throttled"{{end}}>{{.Summary.MaxUtil7dPct}}%</dd>
+    {{end}}
+    <dt>updated</dt><dd class="meta">{{.Summary.LastUpdated}}</dd>
+  </dl>
+  {{/* Month projection band — projects from the 7-day average daily rate,
+       NOT a true month-to-date sum (we have no per-day cost history). Labeled
+       as a 7d-avg projection so it isn't mistaken for measured MTD. Only
+       renders when we have at least one weekly-spend datapoint. */}}
+  {{if gt .Summary.MTDProjectionUSD 0.0}}
+  <dl class="costs-summary-month" aria-label="Month projection (7d-avg basis)">
+    <dt>month-so-far (7d-avg proj)</dt><dd>{{printf "$%.2f" .Summary.MTDProjectionUSD}}</dd>
+    <dt>projected month (7d-avg)</dt><dd>{{printf "$%.2f" .Summary.ProjectedMonthUSD}}</dd>
+    <dt>month</dt><dd class="meta">day {{.Summary.MonthDayOfMonth}}/{{.Summary.MonthDaysInMonth}} · {{.Summary.MonthProgressPct}}%</dd>
+  </dl>
+  {{end}}
+</section>
+
+{{/* Trust strip (C6, ka-0000008212 — plan ka-0000003747, decision
+     ka-0000000925: both surfaces). Per-pair x-check corroboration badges from
+     gardenio_xcheck_agreement{pair} — the C2 sweep's "double-check principle"
+     scores (1.00 = two independent derivations of the same quantity agree
+     exactly). Levels mirror the C5 CostXCheckDrift alert's PER-PAIR floors
+     (costsTrustPairFloors, kept in lockstep with values.yaml pairThresholds):
+     ok ≥ the pair's own floor, drift below it. A
+     pair above its own tuned-below-0.95 floor reads corroborated with a
+     "structurally low, within band" tooltip (ka-0000007295). A pair with no
+     sample this cycle reads "unverified" (muted, never green) — no sweep data
+     is not agreement. Individual badges also appear inline next to the numbers
+     they qualify; this strip is the complete set + the drill-down link. */}}
+{{with .Trust}}
+<section class="costs-trust-strip" aria-label="Cost trust (x-check corroboration)">
+  <div class="costs-trust-head">
+    <span class="costs-trust-title">Trust</span>
+    <span class="meta">x-check corroboration · 1.00 = two independent derivations agree</span>
+    {{if .DashboardURL}}
+    <span class="bead-row-spacer"></span>
+    <a class="meta" href="{{.DashboardURL}}" target="_blank" rel="noopener"
+       title="Per-pair agreement history + side A/B overlays">x-check board ↗</a>
+    {{end}}
+  </div>
+  <div class="costs-trust-badges">
+    {{range .Badges}}
+    <span class="chip costs-trust-chip costs-trust-{{.Level}}" title="{{.Title}}">{{.Label}}: {{if .HasScore}}{{.Score}} {{end}}{{.LevelWord}}</span>
+    {{end}}
+  </div>
+  {{if not .AnyPresent}}
+  <p class="meta costs-trust-note">
+    {{if .Queried}}No x-check scores published yet — the cost-audit sweep has not
+    completed a cycle here (see {{.SweepDoc}}; cadence GARDENIO_XCHECK_SWEEP_INTERVAL).
+    {{else}}Trust scores unavailable — no metrics upstream is configured for this
+    viewer (see {{.SweepDoc}}).{{end}}
+    Until scores arrive, every cost number on this page is single-source and unverified.
+  </p>
+  {{end}}
+</section>
+{{end}}
+
+{{/* Interactive multi-axis cost explorer (operator decision ka-0000000742 option
+     "costs-page", promoted to the top of /costs in ka-0000001479). This is the
+     headline "chonky per-agent cost" surface: it queries the per-agent
+     reconciled spend counter (gardenio_agent_spend_usd_total{agent,project,role,
+     model,account}) live from vmsingle and ranks spend by any dimension, with
+     filter dropdowns and clickable rows (agent→bead, role→hub, project→page).
+     It is rendered FIRST — directly under the summary, ABOVE the Grafana
+     time-series embeds — because it is the genuinely-interactive, data-rich
+     answer to "who is spending what", and it works with no Grafana session.
+
+     Lazy-loaded on first reveal (server-side vmsingle instant query); the
+     controls inside re-request the table in place on every change. Trigger is
+     `intersect once`, NOT `revealed once` (ka-0000003717): htmx's `revealed`
+     never fires for a shell already in the viewport that is never scrolled
+     past. `intersect` (IntersectionObserver) fires at first paint, so the
+     section always resolves to the controls+table or the unavailable note. */}}
+{{/* The explorer ranks PER-AGENT attributed spend, so the agent-spend-parity
+     x-check (P10: stateful settled counter vs stateless /spend/logs recompute)
+     qualifies it. The badge sits OUTSIDE the htmx swap host so it survives the
+     fragment's innerHTML swaps. */}}
+<div class="costs-trust-inline costs-trust-explorer">{{template "costs-trust-badge" .Trust.Badge "agent-spend-parity"}}</div>
+<div id="costs-rollup-host"
+     hx-get="{{.BasePath}}/costs/rollup"
+     hx-trigger="intersect once"
+     hx-swap="innerHTML">
+  <section class="costs-rollup-interactive" aria-label="Interactive cost rollup">
+    <h2>Cost explorer <span class="meta">per-agent spend · filter &amp; roll up</span></h2>
+    <p class="empty">Loading cost explorer&hellip;</p>
+  </section>
+</div>
+
+{{/* Spend over time — embedded Grafana solo panels (task ka-0000002791, epic
+     ka-0000006518). The operator ACCEPTED the /costs Grafana candidate
+     (uid=gardenio-costs-candidate, dashboard bead ka-0000005371, decision
+     ka-0000007043), so the two former inline ECharts cards (fleet-spend-rate +
+     agent-spend-over-time) are now embedded Grafana panels instead. These sit
+     BELOW the interactive explorer above: the explorer answers "who spent how
+     much" (a ranked snapshot), these charts answer "when" (the time series).
+
+     The embeds are built server-side via the shared grafanaembed.HTML helper
+     (costs.go renderCostsChartPanels), the SAME scroll-fixed builder /charts
+     and the `:::grafana` directive use — so the iframe contract (scrolling=no
+     + .grafana-embed-frame{overflow:hidden}, MR !4566) cannot regress here.
+     Each panel reuses the viewer session under the unified host's /grafana —
+     no second login. When GRAFANA_BASE_URL is unset the embeds degrade to the
+     quiet link-card fallback. The PromQL behind each panel lives in the Grafana
+     dashboard model (synced from the dashboard bead via grafana-bridge), which
+     mirrors the kbeads chart catalog (charts_catalog.go ids fleet-spend-rate /
+     agent-spend-over-time) verbatim. */}}
+<section class="costs-chart-cards" aria-label="Spend over time">
+  <h2 class="costs-charts-section-head">Spend over time
+    <span class="meta">time-series charts</span>
+    {{if .GrafanaBaseURL}}
+    <span class="bead-row-spacer"></span>
+    <a class="costs-charts-grafana-link" href="{{.GrafanaBaseURL}}/d/gardenio-costs-candidate" target="_blank" rel="noopener"
+       title="Open Grafana — reuses your current session, no second login">Open in Grafana ↗</a>
+    {{end}}
+  </h2>
+  {{range .ChartPanels}}
+  <div class="costs-chart-card">
+    <div class="costs-chart-head">
+      <h3 class="costs-chart-title">{{.Title}}
+        <span class="meta costs-chart-scope">{{.Scope}}</span>
+        {{/* Corroboration badge for the x-check pair qualifying THIS panel's
+             numbers (costs.go costsGrafanaPanels TrustPair). */}}
+        {{if .TrustPair}}{{template "costs-trust-badge" $.Trust.Badge .TrustPair}}{{end}}
+      </h3>
+    </div>
+    {{.Embed}}
+    {{if .Note}}<p class="meta costs-chart-note">{{.Note}}</p>{{end}}
+  </div>
+  {{end}}
+</section>
+
+<style>
+  /* --- Trust strip + badges (C6, ka-0000008212) --------------------------- */
+  .costs-trust-strip {
+    padding: 0.55rem 1rem 0.65rem;
+    margin: 0.5rem 0 1rem;
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    border-radius: 6px;
+    background: rgba(128, 128, 128, 0.05);
+  }
+  .costs-trust-head { display: flex; align-items: baseline; gap: 0.4rem; margin-bottom: 0.35rem; }
+  .costs-trust-title { font-weight: 600; font-size: 0.95rem; }
+  .costs-trust-badges { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+  .costs-trust-note { margin: 0.4rem 0 0; font-size: 0.8em; }
+  .costs-trust-inline { margin-top: 0.25rem; }
+  .costs-trust-explorer { margin: 0 0 -0.35rem; }
+  {{/* Chip levels. help-cursor because the tooltip carries the reading guide.
+       Colors follow the chip-type-* convention (layout.html): translucent
+       background + explicit accessible foreground per level. "unverified" is
+       deliberately MUTED, not colored — absence of sweep data must not read
+       as either health or alarm. */}}
+  .costs-trust-chip { opacity: 1; font-size: 0.78em; padding: 0.1rem 0.5rem; border-radius: 999px; cursor: help; white-space: nowrap; }
+  .costs-trust-ok         { background: rgba(67,160,71,0.14);  border-color: rgba(67,160,71,0.45);  color: #2c6f30; }
+  .costs-trust-drift      { background: rgba(214,69,69,0.14);  border-color: rgba(214,69,69,0.5);   color: #a83232; font-weight: 600; }
+  .costs-trust-unverified { background: rgba(128,128,128,0.1); border-color: rgba(128,128,128,0.3); color: var(--text-muted, #595959); }
+  html[data-skin="dark-terminal"] .costs-trust-ok    { color: #7ec97f; }
+  html[data-skin="dark-terminal"] .costs-trust-drift { color: #ff8a80; }
+
+  .costs-charts-section-head { display: flex; align-items: baseline; gap: 0.4rem; margin: 1.25rem 0 0.5rem; font-size: 1.15rem; }
+  .costs-chart-card {
+    padding: 0.75rem 1rem;
+    margin: 0.5rem 0 1rem;
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    border-radius: 6px;
+    background: rgba(128, 128, 128, 0.05);
+  }
+  .costs-chart-head { margin-bottom: 0.4rem; }
+  .costs-chart-title { font-size: 1rem; margin: 0; }
+  .costs-chart-scope { margin-left: 0.4rem; font-size: 0.78em; }
+  /* The embedded Grafana iframe sits flush in the card — drop the grafana-embed
+     helper's own outer margin so it doesn't double the card padding (mirrors
+     /charts .charts-panel .grafana-embed). */
+  .costs-chart-card .grafana-embed { margin: 0; }
+  {{/* No opacity here: `.meta` color already de-emphasizes this note, and
+       layering opacity on top blended it to ~3.85:1 against the card's
+       near-white background — below the WCAG AA 4.5:1 floor, the only
+       serious/critical axe violation on /costs (ka-0000006369). Font-size
+       + muted color carry the de-emphasis without failing contrast. */}}
+  .costs-chart-note { margin: 0.4rem 0 0; font-size: 0.76em; }
+  /* Provenance note under a rollup heading (e.g. "By model"). Matches the
+     interactive rollup partial's .costs-rollup-note so the two read alike. */
+  .costs-rollup-note { margin: 0.2rem 0 0.5rem; font-size: 0.78em; }
+  .costs-rollup-note code { font-size: 0.95em; }
+  .costs-charts-grafana-link-line { margin: 0.25rem 0 0.5rem; text-align: right; }
+  .costs-charts-grafana-link {
+    font-weight: 600;
+    padding: 0.15rem 0.6rem;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    border-radius: 4px;
+    background: rgba(128, 128, 128, 0.06);
+    color: inherit;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .costs-charts-grafana-link:hover,
+  .costs-charts-grafana-link:focus { border-color: rgb(25, 118, 210); text-decoration: none; }
+  html[data-skin="dark-terminal"] .costs-charts-grafana-link:hover,
+  html[data-skin="dark-terminal"] .costs-charts-grafana-link:focus { border-color: rgb(56, 178, 255); }
+</style>
+
+{{if .Providers}}
+<section class="costs-rollup" aria-label="Spend by provider">
+  <h2>By provider <span class="meta">({{len .Providers}})</span></h2>
+  <ul class="bead-list costs-provider-list">
+    {{range .Providers}}
+    <li class="bead-row costs-provider-row">
+      <div class="cost-row-head">
+        <span class="chip chip-type">{{.Provider}}</span>
+        <span class="meta">{{.AccountCount}} acct{{if ne .AccountCount 1}}s{{end}}</span>
+        {{if .ThrottledCount}}<span class="chip chip-throttled">{{.ThrottledCount}} throttled</span>{{end}}
+        <span class="bead-row-spacer"></span>
+        <span class="cost-row-spend">{{printf "$%.2f" .DailyUSD}}</span>
+        {{if .SharePct}}<span class="meta">{{.SharePct}}%</span>{{end}}
+      </div>
+      <dl class="bead-row-meta">
+        <dt>week</dt><dd>{{printf "$%.2f" .WeeklyUSD}}</dd>
+        <dt>lifetime</dt><dd>{{printf "$%.2f" .TotalUSD}}</dd>
+        {{if .AvgUtil7dHas}}<dt>avg 7d util</dt><dd>{{.AvgUtil7dPct}}%</dd>{{end}}
+      </dl>
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{end}}
+
+{{if .Models}}
+<section class="costs-rollup" aria-label="Spend by model">
+  <h2>By model <span class="meta">({{len .Models}})</span></h2>
+  <p class="meta costs-rollup-note">Real LiteLLM bill by effective model — the <code>model:</code> spend tag corrected per session (haiku/fable roles on an opus-default account land in their own bucket), refreshed ~5&nbsp;min. Today = 24h rolling; reconciles with the by-model cost explorer below.</p>
+  <ul class="bead-list costs-model-list">
+    {{range .Models}}
+    <li class="bead-row costs-model-row">
+      <div class="cost-row-head">
+        <span class="chip chip-type">{{.Model}}</span>
+        <span class="bead-row-spacer"></span>
+        <span class="cost-row-spend">{{printf "$%.2f" .DailyUSD}}</span>
+        {{if .SharePct}}<span class="meta">{{.SharePct}}%</span>{{end}}
+      </div>
+      <dl class="bead-row-meta">
+        <dt>week</dt><dd>{{printf "$%.2f" .WeeklyUSD}}</dd>
+        <dt>lifetime</dt><dd>{{printf "$%.2f" .TotalUSD}}</dd>
+      </dl>
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{end}}
+
+{{if .Hottest}}
+<section class="costs-rollup" aria-label="Hottest utilization">
+  <h2>Hottest utilization <span class="meta">({{len .Hottest}})</span></h2>
+  <ul class="bead-list costs-hottest-list">
+    {{range .Hottest}}
+    <li class="bead-row costs-hottest-row{{if .IsThrottled}} bead-row-throttled{{end}}">
+      <div class="cost-row-head">
+        <a class="bead-row-title" href="{{$.BasePath}}/{{.ID}}">{{.Name}}</a>
+        {{if .Provider}}<span class="chip chip-type">{{.Provider}}</span>{{end}}
+        {{if .IsThrottled}}<span class="chip chip-throttled">throttled</span>{{end}}
+        <span class="bead-row-spacer"></span>
+        <span class="cost-row-spend">{{.Util5hPct}}%</span>
+      </div>
+      {{if .Util5hHas}}
+      <div class="cost-bar-row cost-bar-compact">
+        <span class="cost-bar-label">5h: {{.Util5hPct}}%</span>
+        <div class="cost-bar"><div class="cost-bar-fill" style="width: {{.Util5hPct}}%"></div></div>
+        {{if .Reset5hCountdown}}<span class="meta">{{.Reset5hCountdown}}</span>{{end}}
+      </div>
+      {{end}}
+      {{if .Util7dHas}}
+      <div class="cost-bar-row cost-bar-compact">
+        <span class="cost-bar-label">7d: {{.Util7dPct}}%</span>
+        <div class="cost-bar"><div class="cost-bar-fill" style="width: {{.Util7dPct}}%"></div></div>
+        {{if .Reset7dCountdown}}<span class="meta">{{.Reset7dCountdown}}</span>{{end}}
+      </div>
+      {{end}}
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{end}}
+
+{{if .TopSpenders}}
+<section class="costs-rollup" aria-label="Top spenders today">
+  <h2>Top spenders today <span class="meta">({{len .TopSpenders}})</span></h2>
+  <ul class="bead-list costs-top-list">
+    {{range .TopSpenders}}
+    <li class="bead-row costs-top-row{{if .IsThrottled}} bead-row-throttled{{end}}">
+      <div class="cost-row-head">
+        <a class="bead-row-title" href="{{$.BasePath}}/{{.ID}}">{{.Name}}</a>
+        {{if .Provider}}<span class="chip chip-type">{{.Provider}}</span>{{end}}
+        {{if .IsThrottled}}<span class="chip chip-throttled">throttled</span>{{end}}
+        <span class="bead-row-spacer"></span>
+        <span class="cost-row-spend">{{.DailyUSD}}</span>
+        {{if .SharePct}}<span class="meta">{{.SharePct}}%</span>{{end}}
+      </div>
+      <dl class="bead-row-meta">
+        <dt>week</dt><dd>{{.WeeklyUSD}}</dd>
+      </dl>
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{end}}
+
+{{if .Throttled}}
+<section class="costs-rollup" aria-label="Currently throttled">
+  <h2>Throttled now <span class="meta">({{len .Throttled}})</span></h2>
+  <ul class="bead-list costs-throttled-list">
+    {{range .Throttled}}
+    <li class="bead-row bead-row-throttled costs-throttled-row">
+      <div class="cost-row-head">
+        <a class="bead-row-title" href="{{$.BasePath}}/{{.ID}}">{{.Name}}</a>
+        {{if .Provider}}<span class="chip chip-type">{{.Provider}}</span>{{end}}
+        <span class="chip chip-throttled">{{.ThrottleLabel}}</span>
+        <span class="bead-row-spacer"></span>
+        {{if .ThrottleReset}}<span class="meta">{{.ThrottleReset}}</span>{{end}}
+      </div>
+      {{if .Util5hHas}}
+      <div class="cost-bar-row cost-bar-compact">
+        <span class="cost-bar-label">5h: {{.Util5hPct}}%</span>
+        <div class="cost-bar"><div class="cost-bar-fill" style="width: {{.Util5hPct}}%"></div></div>
+        {{if .Reset5hCountdown}}<span class="meta">{{.Reset5hCountdown}}</span>{{end}}
+      </div>
+      {{end}}
+      {{if .Util7dHas}}
+      <div class="cost-bar-row cost-bar-compact">
+        <span class="cost-bar-label">7d: {{.Util7dPct}}%</span>
+        <div class="cost-bar"><div class="cost-bar-fill" style="width: {{.Util7dPct}}%"></div></div>
+        {{if .Reset7dCountdown}}<span class="meta">{{.Reset7dCountdown}}</span>{{end}}
+      </div>
+      {{end}}
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{end}}
+
+{{if .Accounts}}
+<h2>Accounts <span class="meta">({{len .Accounts}})</span></h2>
+<ul class="bead-list costs-accounts-grid">
+  {{range .Accounts}}
+  <li class="bead-row{{if .IsThrottled}} bead-row-throttled{{end}}">
+    <div class="bead-row-top">
+      <div class="bead-row-text">
+        <div class="cost-row-head">
+          {{if .IsThrottled}}<span class="chip chip-throttled">{{.ThrottleLabel}}</span>{{end}}
+          <a class="bead-row-title" href="{{$.BasePath}}/{{.ID}}"
+             hx-get="{{$.BasePath}}/{{.ID}}"
+             hx-trigger="mouseover once"
+             hx-target="none"
+             hx-swap="none">{{.Name}}</a>
+          <span class="bead-row-spacer"></span>
+          {{if .HasSpend}}<span class="cost-row-spend">{{printf "$%.2f" .DailyCostUSD}}</span>{{end}}
+        </div>
+        <div class="chip-strip" aria-label="Account meta">
+          {{if .Provider}}<span class="chip chip-type">{{.Provider}}</span>{{end}}
+          {{if .Model}}<span class="meta">{{.Model}}</span>{{end}}
+          {{if .Status}}<span class="meta cost-status-{{.Status}}">{{.Status}}</span>{{end}}
+          {{if .ProbeAgo}}<span class="bead-row-spacer"></span><span class="meta">probed {{.ProbeAgo}}</span>{{end}}
+        </div>
+
+        {{if .Util5hHas}}
+        <div class="cost-bar-row">
+          <span class="cost-bar-label">5h: {{.Util5hPct}}%</span>
+          <div class="cost-bar"><div class="cost-bar-fill" style="width: {{.Util5hPct}}%"></div></div>
+          {{/* Bill against the current 5h window (ka-0000003343): spend since the
+               window opened (throttle_reset_5h_at − 5h), on the subscription's
+               clock — shown next to utilization and the reset countdown. */}}
+          {{if .Bill5hHas}}<span class="cost-row-spend">{{printf "$%.2f" .Bill5hUSD}}</span>{{end}}
+          {{if .Reset5hCountdown}}<span class="meta">{{.Reset5hCountdown}}</span>{{else if .ThrottleReset}}<span class="meta">{{.ThrottleReset}}</span>{{end}}
+        </div>
+        {{end}}
+        {{if .Util7dHas}}
+        <div class="cost-bar-row">
+          <span class="cost-bar-label">7d: {{.Util7dPct}}%</span>
+          <div class="cost-bar"><div class="cost-bar-fill" style="width: {{.Util7dPct}}%"></div></div>
+          {{if .Bill7dHas}}<span class="cost-row-spend">{{printf "$%.2f" .Bill7dUSD}}</span>{{end}}
+          {{if .Reset7dCountdown}}<span class="meta">{{.Reset7dCountdown}}</span>{{else if and .IsThrottled .ThrottleReset}}<span class="meta">{{.ThrottleReset}}</span>{{end}}
+        </div>
+        {{end}}
+
+        {{if .HasOverage}}
+        <div class="banner banner-warn">overage: {{.OverageStatus}}{{if .OverageReason}} ({{.OverageReason}}){{end}}</div>
+        {{end}}
+
+        {{if .HasSpend}}
+        <dl class="bead-row-meta">
+          <dt>total</dt><dd>{{printf "$%.2f" .TotalCostUSD}}</dd>
+          {{if gt .WeeklyCostUSD 0.0}}<dt>week</dt><dd>{{printf "$%.2f" .WeeklyCostUSD}}</dd>{{end}}
+          {{if gt .SinceResetSpend 0.0}}<dt>since reset</dt><dd>{{printf "$%.2f" .SinceResetSpend}}</dd>{{end}}
+          {{if and (gt .TotalCostUSD 0.0) .SessionCount}}<dt>$/session</dt><dd>{{printf "$%.3f" (.CostPerSession)}}</dd>{{end}}
+        </dl>
+        {{end}}
+
+        {{if .HasUsage}}
+        <dl class="bead-row-meta">
+          {{if .SessionCount}}<dt>sessions</dt><dd>{{.SessionCount}}</dd>{{end}}
+          {{if .TotalOutputTokens}}<dt>out tokens</dt><dd class="meta">{{.TotalOutputTokens}}</dd>{{end}}
+        </dl>
+        {{end}}
+      </div>
+    </div>
+  </li>
+  {{end}}
+</ul>
+{{else if not .Error}}
+<h2>Accounts <span class="meta">(0)</span></h2>
+<div class="costs-empty">
+  <p class="empty">No accounts &mdash; waiting for account data from kbeads.</p>
+  <p class="meta">
+    Each account is a <code>type=account</code> bead synced by the gardenio
+    controller from the credential broker. Spend, utilization, and throttle
+    state are written back by the <code>spend_sync</code> daemon. When this
+    page is empty, the controller has not yet observed any open / in_progress
+    account beads on this daemon.
+  </p>
+  <ul class="costs-empty-actions">
+    <li><a href="{{.BasePath}}/health">Check controller health &amp; sync status →</a></li>
+    <li><a href="{{.BasePath}}/?type=account&amp;status=open,in_progress">Search account beads →</a></li>
+    <li><a href="{{.BasePath}}/agents">View active agents →</a></li>
+  </ul>
+</div>
+
+<h3 class="costs-scaffold-head">Planned shape <span class="meta">(scaffold preview)</span></h3>
+<p class="meta costs-scaffold-blurb">
+  Once accounts are populated, each card shows provider/model, 5h and 7d
+  utilization bars, daily / weekly / total spend, session counts, and
+  throttle / overage state.
+</p>
+<ul class="bead-list costs-scaffold" aria-hidden="true">
+  {{range .ScaffoldNames}}
+  <li class="bead-row costs-scaffold-row">
+    <div class="bead-row-top">
+      <div class="bead-row-text">
+        <div class="cost-row-head">
+          <span class="bead-row-title costs-scaffold-name">{{.}}</span>
+          <span class="bead-row-spacer"></span>
+          <span class="cost-row-spend costs-scaffold-spend">$&mdash;.&mdash;&mdash;</span>
+        </div>
+        <div class="chip-strip">
+          <span class="chip chip-type costs-scaffold-chip">provider</span>
+          <span class="meta">model</span>
+          <span class="meta">status</span>
+        </div>
+        <div class="cost-bar-row">
+          <span class="cost-bar-label">5h: &mdash;%</span>
+          <div class="cost-bar"><div class="cost-bar-fill costs-scaffold-fill" style="width: 0%"></div></div>
+        </div>
+        <div class="cost-bar-row">
+          <span class="cost-bar-label">7d: &mdash;%</span>
+          <div class="cost-bar"><div class="cost-bar-fill costs-scaffold-fill" style="width: 0%"></div></div>
+        </div>
+        <div class="bead-row-meta">
+          <span>total $&mdash;.&mdash;&mdash;</span>
+          <span>week $&mdash;.&mdash;&mdash;</span>
+          <span class="meta">&mdash; sessions</span>
+        </div>
+      </div>
+    </div>
+  </li>
+  {{end}}
+</ul>
+{{end}}
+{{end}}

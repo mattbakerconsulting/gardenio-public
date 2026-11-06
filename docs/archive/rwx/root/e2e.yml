@@ -1,0 +1,3471 @@
+on:
+  dispatch:
+    - key: gardenio-e2e
+      init:
+        commit-sha: ${{ event.git.sha }}
+        # golden-gating run: the gVisor PoC substrate tasks (freeze-thaw,
+        # armed-guard, rehydration, rehydrate-ack) ABSORB non-zero exits here
+        # so a rotating PoC-substrate flake (ka-0000007234) can never red the
+        # release suite or block golden promotion / prod deploy. Their real
+        # regressions are still caught hard by the dedicated gardenio-gvisor-*
+        # dispatches below (golden-gate=false).
+        golden-gate: "true"
+        # require-substrate=false: an absent gvisor-poc substrate is a clean SKIP
+        # here, never a hard fail (ka-0000000847 / ka-0000003662). Only the
+        # gardenio-gvisor-readiness dispatch sets this "true" (the go/no-go gate,
+        # task ka-0000002867) — there an absent substrate is a NO-GO.
+        require-substrate: "false"
+        # require-outbox-rig=false: an absent sandbox rig is today's clean skip-PASS
+        # for the live outbox security matrix (ka-0000007489). The operator flips it
+        # "true" on a SCHEDULED readiness run AFTER provisioning the sandbox creds,
+        # turning outbox_rig_guard's absent-rig skip into a hard NO-GO FAIL — the
+        # standing regression gate for T-1to1/T-upsert/T-link + T3/T7/T10/T11/T12.
+        # DORMANT here (default false) so behaviour is unchanged until armed.
+        require-outbox-rig: ${{ event.dispatch.params.require-outbox-rig }}
+        # require-slack-ui=false: an absent real-user Slack rig is today's clean
+        # skip-PASS for the slack-ui Playwright module (ka-0000006398). The
+        # operator flips it "true" on a SCHEDULED readiness run AFTER the
+        # test-Slack workspace/app/user + storageState secret are provisioned
+        # (escalation ka-0000001279), turning test-slack-ui.sh's absent-rig skip
+        # into a hard FAIL so a silent skip can never masquerade as green once
+        # the harness is meant to be live. DORMANT here (default false).
+        require-slack-ui: ${{ event.dispatch.params.require-slack-ui }}
+        namespace: ${{ event.dispatch.params.namespace }}
+        instance-id: ${{ event.dispatch.params.instance-id }}
+        keep: ${{ event.dispatch.params.keep }}
+        only: ${{ event.dispatch.params.only }}
+        skip: ${{ event.dispatch.params.skip }}
+        captain-poison-module: ${{ event.dispatch.params.captain-poison-module }}
+        version: ${{ event.dispatch.params.version }}
+        ref-name: ${{ event.dispatch.params.ref-name }}
+        host-domain: ${{ event.dispatch.params.host-domain }}
+      params:
+        - key: instance-id
+          name: Ephemeral instance ID
+          description: |
+            Targets the per-instance ephemeral namespace
+            (gardenio-rwx-<instance-id>) deployed by gardenio-deploy-rwx.
+            GitLab CI passes $CI_COMMIT_SHORT_SHA. When set, takes
+            precedence over the legacy `namespace` param.
+          default: ""
+          required: false
+        - key: namespace
+          name: K8s namespace (legacy override)
+          description: |
+            Direct namespace override. Kept for back-compat with ad-hoc
+            dispatches that target a specific namespace by name. Prefer
+            instance-id for the standard ephemeral flow. Empty = derive
+            from instance-id (or fall back to gardenio-rwx-<short-sha>).
+          default: ""
+          required: false
+        - key: keep
+          name: Keep namespace
+          description: Keep namespace after tests (for debugging)
+          default: "false"
+          required: false
+        - key: only
+          name: Only module
+          description: Run only this test module (e.g. decisions-yield, gate-system)
+          default: ""
+          required: false
+        - key: skip
+          name: Skip modules
+          description: Comma-separated modules to skip
+          default: ""
+          required: false
+        - key: require-outbox-rig
+          name: Require outbox sandbox rig (no silent skip)
+          description: |
+            "true" makes an absent sandbox rig/seat a HARD FAIL in the live
+            outbox security matrix (test-jira-outbox-{positive,negative}.sh)
+            instead of today's skip-PASS (ka-0000007489). Set only on a
+            SCHEDULED readiness run AFTER the sandbox creds are provisioned
+            into the E2E namespace. Default "" (dormant → skip-clean).
+          default: ""
+          required: false
+        - key: require-slack-ui
+          name: Require real-user Slack rig (no silent skip)
+          description: |
+            "true" makes an absent real-user Slack rig a HARD FAIL in the
+            slack-ui Playwright module (test-slack-ui.sh) instead of today's
+            skip-PASS (ka-0000006398). Set only on a SCHEDULED readiness run
+            AFTER the test-Slack workspace/app/user + storageState secret are
+            provisioned into the E2E namespace (escalation ka-0000001279).
+            Default "" (dormant → skip-clean).
+          default: ""
+          required: false
+        - key: captain-poison-module
+          name: Captain poison module
+          description: |
+            Plant a first-attempt failure in the named module to verify Captain's
+            targeted-retry path (ka-0000000510). Module fails on first run via a
+            sentinel and passes on subsequent runs. Empty = disabled.
+          default: ""
+          required: false
+        - key: version
+          name: Calver version (tag pipelines)
+          description: |
+            Calver (e.g. 2026.124.4) — when set, install-coop-claudeless pulls
+            coop:<version>-rc instead of coop:main-<sha7>. Tag-push pipelines
+            should pass this so install-coop-claudeless does not race the
+            main-push docker.yml build (ka-0000000436).
+          default: ""
+          required: false
+        - key: ref-name
+          name: Git ref-name
+          description: |
+            Bare ref-name ($CI_COMMIT_TAG or $CI_COMMIT_REF_NAME from GitLab CI).
+            Calver tags (20*) cause install-coop-claudeless to derive the -rc
+            tag automatically when --param version is omitted. Mirrors the
+            derivation in .rwx/deploy-rwx.yml verify-images (ka-0000000436).
+          default: ""
+          required: false
+        - key: host-domain
+          name: DNS domain suffix
+          description: |
+            DNS domain the deployed hosts hang off of. Defaults to the legacy
+            lab domain (app.e2e.dev.acme.example). Pass aws-poc.gardenio.acme.example to
+            route AWS creds/cluster to the POC account (ka-0000005509) — must
+            match the host-domain the canary was deployed with.
+          default: ""
+          required: false
+      title: E2E Tests
+    # ── Opt-in gVisor freeze/thaw dispatch (ka-0000001895) ───────────────
+    # Dedicated dispatch for the runsc checkpoint/restore state-fidelity
+    # module. Separate from gardenio-e2e because it targets the gvisor-poc
+    # namespace + node pool (not the per-instance gardenio-rwx ns) and needs
+    # no beads/coop/token plumbing — just kubectl against the live cluster.
+    # Trigger:  rwx dispatch gardenio-gvisor-freeze-thaw --param commit-sha=<sha>
+    - key: gardenio-gvisor-freeze-thaw
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: this module HARD-GATES (golden-gate=false) so a
+        # real freeze/thaw regression fails the dedicated run (ka-0000007234).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor freeze/thaw E2E
+    # ── Opt-in gVisor N-container sidecar-barrier dispatch (ka-0000004828) ─
+    # Dedicated dispatch for the N-container (sidecar) freeze/thaw COUNT-GATED
+    # BARRIER. freeze-thaw covers a SINGLE-container sandbox; this covers the
+    # controller's real multi-container path (freezethaw.go:1957 roster capture +
+    # count cross-check, freezethaw_node.go:2943 barrier restore) that was UNIT-only.
+    # Builds a harness-owned multi-container runsc sandbox (sandbox + agent + dind
+    # subs, one shared sentry), checkpoints the whole pod, then proves on the live
+    # substrate: container_count==len(subs)+1 baked into the statefile, the barrier
+    # HOLDS the guest frozen with N-1 subs restored + RELEASES on the Nth, both subs'
+    # RAM+FILE state survive name-keyed, and an off-roster sub is refused. Like
+    # freeze-thaw it targets the gvisor-poc ns + node pool and needs only kubectl.
+    # Trigger:  rwx dispatch gardenio-gvisor-sidecar-barrier --param commit-sha=<sha>
+    - key: gardenio-gvisor-sidecar-barrier
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor N-container sidecar-barrier E2E
+    # ── Opt-in gVisor boot-wedge armed-guard dispatch (ka-0000000584) ────
+    # Dedicated dispatch for the boot-wedge armed-watcher liveness guard /
+    # freeze fail-safe module. Like freeze-thaw it targets the gvisor-poc ns +
+    # node pool and needs only kubectl. Asserts the END-TO-END fail-safe path:
+    # an un-armed sandbox the guard refuses to freeze is LEFT RUNNING (the
+    # boot-wedge is never minted), and the both-armed positive control proceeds
+    # to a real checkpoint that persists a snapshot.
+    # Trigger:  rwx dispatch gardenio-gvisor-armed-guard --param commit-sha=<sha>
+    - key: gardenio-gvisor-armed-guard
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor boot-wedge armed-guard E2E
+    # ── Opt-in gVisor multi-cycle re-freeze dispatch (ka-0000001878) ─────
+    # Dedicated dispatch for the multi-cycle freeze→thaw→re-freeze story. Like
+    # freeze-thaw it targets the gvisor-poc ns + node pool and needs only
+    # kubectl. Proves the runsc substrate re-checkpoints a thawed process, that
+    # a node-local re-freeze destroys the prior snapshot (the single-shot hazard
+    # the Snapshot.Consumed guard prevents), and that fidelity holds across both
+    # cycles. The controller guard semantics are asserted by the Go unit tests
+    # freezethaw_refreeze_guard_test.go; this is their live-substrate companion.
+    # Trigger:  rwx dispatch gardenio-gvisor-multicycle-refreeze --param commit-sha=<sha>
+    - key: gardenio-gvisor-multicycle-refreeze
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-substrate: "false"
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor multi-cycle re-freeze E2E
+    # ── Opt-in gVisor rehydration C1–C5 dispatch (ka-0000005803) ─────────
+    # Dedicated dispatch for the rehydration correctness-contract module. Like
+    # freeze-thaw it targets the gvisor-poc ns + node pool. The module's
+    # contract-shape assertions run without the substrate, but this dispatch
+    # exercises the opt-in runsc-lifecycle + CloudTrail assertions too.
+    # Trigger:  rwx dispatch gardenio-gvisor-rehydration --param commit-sha=<sha>
+    - key: gardenio-gvisor-rehydration
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor rehydration C1–C5 E2E
+    # ── Opt-in <1s resume-latency standing gate dispatch (ka-0000006324 / C7) ─
+    # Dedicated dispatch for the standing TIMED resume-latency regression gate.
+    # Like the other gvisor dispatches it targets the gvisor-poc ns + node pool.
+    # Operator mandate (Matt Baker, thread 1780804147.560279): the <1s resume
+    # result is guarded forever by this timed e2e module, not only proven once by
+    # the overnight benchmark (ka-0000003577).
+    # Trigger:  rwx dispatch gardenio-resume-latency --param commit-sha=<sha>
+    - key: gardenio-resume-latency
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Defined so the shared gVisor PoC tasks resolve their golden-gate ref
+        # (they already absorb unconditionally; this run targets resume-latency).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: "<1s resume-latency standing gate E2E"
+    # ── Opt-in <20s user-response standing gate dispatch (ka-0000000107 / C4) ──
+    # Dedicated dispatch for the standing TIMED user-visible-response regression
+    # gate. Like the other gvisor dispatches it targets the gvisor-poc ns + node
+    # pool. The user-visible companion to gardenio-resume-latency: asserts the <20s
+    # SLO for the COLD / RESUMING / MID-FREEZE first-response paths (epic
+    # ka-0000008235). The MID-FREEZE leg exercises the C2 interrupt invariant
+    # (ka-0000005834).
+    # Trigger:  rwx dispatch gardenio-userresponse-latency --param commit-sha=<sha>
+    - key: gardenio-userresponse-latency
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Defined so the shared gVisor PoC tasks resolve their golden-gate ref.
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: "<20s user-response standing gate E2E"
+    # ── Opt-in gVisor thaw rehydrate-ack RELEASE dispatch (ka-0000006321) ──
+    # Dedicated dispatch for the rehydrate-ack RELEASE gate on the real substrate.
+    # Like the other gvisor dispatches it targets the gvisor-poc ns + node pool.
+    # Closes the gap the 4 open P1 rehydrate-ack bugs share (blocks ka-0000007916):
+    # drives a REAL frozen→thawed agent onto a live Pod B and asserts the REAL
+    # controller gate (thawepoch.WaitForAcks) RELEASES — both coop+gb consumers ack
+    # the current epoch — WITHIN deadline, with Pod B alive (the ka-0000007916
+    # symptom is a fail-close while Pod B stays alive the whole window).
+    # Trigger:  rwx dispatch gardenio-gvisor-rehydrate-ack --param commit-sha=<sha>
+    - key: gardenio-gvisor-rehydrate-ack
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor thaw rehydrate-ack RELEASE E2E
+    # ── Opt-in gVisor resume-INTO-POOL ACCEPTANCE GATE dispatch (ka-0000003295) ──
+    # Dedicated dispatch for the EPIC ACCEPTANCE GATE (epic ka-0000007532): freeze
+    # an active agent → resume its snapshot INTO a CLAIMED prewarmed pool member
+    # (not a fresh Pod B) → assert /work + RAM + gb/coop rehydrate-ack RELEASE within
+    # THAW_REHYDRATE_DEADLINE all hold on the one resumed agent, for BOTH a
+    # claudeless and an active-Claude variant. Like the other gvisor dispatches it
+    # targets the gvisor-poc ns + node pool and HARD-GATES (golden-gate=false).
+    # Trigger:  rwx dispatch gardenio-gvisor-resume-into-pool --param commit-sha=<sha>
+    - key: gardenio-gvisor-resume-into-pool
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gvisor-rehydrate-ack block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor freeze→resume-into-pool ACCEPTANCE GATE E2E
+    # ── Opt-in gVisor C2 interruptible-freeze dispatch (ka-0000004367) ───
+    # Dedicated dispatch for the C2 interruptible-freeze RELEASE path on the real
+    # substrate. Like the other gvisor dispatches it targets the gvisor-poc ns +
+    # node pool. Closes the gap the production-readiness epic (ka-0000004667)
+    # cites: the C2 path (ka-0000005834) is unit-tested only — nothing drove a
+    # real freeze on real runsc, fired a real POST /api/v1/freeze/interrupt
+    # through the genuine handler mid-checkpoint, and asserted the five C2
+    # invariants (abort, sandbox-still-running, agent-still-serving, no orphaned
+    # image, no snapshot persisted) end-to-end. The dedicated freeze-interrupt-
+    # probe drives the GENUINE FreezeThawManager + AbortFreeze + the shared
+    # FreezeInterruptHandler against the live PoC sandbox; a regression in any
+    # of those Go internals (or the endpoint wire contract) fails THIS dispatch.
+    # Trigger:  rwx dispatch gardenio-gvisor-freeze-interrupt --param commit-sha=<sha>
+    - key: gardenio-gvisor-freeze-interrupt
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-substrate: "false"
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor C2 interruptible-freeze (re-nudge mid-FREEZE) E2E
+    # ── Opt-in gb-stop-suspend dispatch (ka-0000000910) ──────────────────
+    # Dedicated dispatch for the gb-stop → SUSPEND module. Unlike the direct-
+    # runsc siblings, this drives the REAL gb stop → bead agent_state=stopping →
+    # AgentStop → controller `runsc checkpoint --leave-running` → persisted
+    # snapshot + freeze_latency sample chain that MR !4327 introduced (fast-hot-
+    # resume epic ka-0000003080). It needs the gvisor-poc ns + node pool AND a
+    # freeze/thaw-enabled controller watching the seeded agent beads. GVISOR_E2E=1
+    # flips the module from self-SKIP to assert; it SKIPs LOUD (still exit 0) if
+    # the runsc RuntimeClass / gvisor-poc perms / controller are absent.
+    # Trigger:  rwx dispatch gardenio-gb-stop-suspend --param commit-sha=<sha>
+    - key: gardenio-gb-stop-suspend
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # RWX validates EVERY `init.*` reference across the WHOLE definition at run
+        # start and hard-errors on any key not declared here — even for tasks this
+        # dispatch never executes. The shared tasks in the graph (kubeconfig,
+        # verify-cluster, install-coop-claudeless, the outbox/slack-ui matrices)
+        # reference the full gardenio-e2e init key set, so a dedicated dispatch that
+        # declared only commit-sha/golden-gate/require-substrate died in init and
+        # NEVER reached its module (ka-0000002157 — this dispatch had never once
+        # run green). Declare the whole set with dedicated-dispatch defaults:
+        #   - host-domain="" → default america-e2e vault (acct 234567890123), the
+        #     substrate these gVisor dispatches run against (kubeconfig task).
+        #   - namespace/instance-id="" → verify-cluster derives gardenio-rwx-<sha>.
+        #   - version/ref-name="" → install-coop-claudeless derives the main-<sha>
+        #     coop tag.
+        #   - require-outbox-rig/require-slack-ui="false" → those matrices stay a
+        #     clean skip (this dispatch is not their readiness gate).
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gb stop → SUSPEND (freeze) + successor-chain E2E
+    # ── Opt-in project-level runtime_class inheritance dispatch (ka-0000001145) ─
+    # Dedicated dispatch for the project-runtime-class module. Coverage backfill
+    # for the merged capability (commit e0de71cb, task ka-0000006969, epic
+    # ka-0000007417): a type=project bead's `runtime_class` field pins EVERY agent
+    # in that project to that RuntimeClass (e.g. runsc → gVisor) with precedence
+    # global<project<role<agent. The module's CONTRACT leg (the precedence +
+    # gVisor-routing decision table over bash predicates) runs substrate-free in
+    # every gardenio-e2e shard; this dispatch flips GVISOR_E2E=1 to also drive the
+    # REAL chain: seed an ephemeral project bead with runtime_class=runsc, let the
+    # controller load it into its cache + spawn a plain agent, and assert the pod
+    # pins runsc + lands in the gVisor ns purely from project inheritance (plus an
+    # agent-override negative control). Needs the gvisor-poc ns + node pool AND a
+    # controller with GVISOR_NAMESPACE set watching the seeded beads. GVISOR_E2E=1
+    # flips the module from self-SKIP to assert; it SKIPs LOUD (still exit 0) if
+    # the runsc RuntimeClass / gvisor-poc perms / controller are absent. Like the
+    # sibling gvisor dispatches it HARD-GATES (golden-gate=false).
+    # Trigger:  rwx dispatch gardenio-project-runtime-class --param commit-sha=<sha>
+    - key: gardenio-project-runtime-class
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: project-level runtime_class inheritance E2E
+    # ── Opt-in /plans wake-over-a-husk dispatch (ka-0000003650) ───────────
+    # Dedicated dispatch for scenario 4 of test-plans-wake-button.sh: the live-
+    # cluster guard for the adopt-or-replace fix (bug ka-0000006228, MR !5439).
+    # It parks a plan-captain assistant, plants a stale pod squatting the
+    # deterministic canonical name, POSTs /plans/{id}/assistant/prompt, and
+    # asserts a FRESH Running coop pod comes up under that name (new UID, no
+    # DeletionTimestamp) with session_resume intact — i.e. the wake is NOT
+    # silently swallowed over a prior incarnation's husk. Because plan-captain
+    # pins runtime_class=runsc, the woken pod routes to the gVisor namespace, so
+    # this needs (a) the runsc RuntimeClass + gVisor ns AND (b) a live controller
+    # watching the beads + the beads-viewer (for the POST) — i.e. the prod-shaped
+    # singleton, NOT the per-instance ephemeral gardenio-rwx ns. PLANS_WAKE_POD_E2E=1
+    # flips the module from the graph-only scenarios 1-3 to the live scenario 4;
+    # it SKIPs LOUD (still exit 0) when the substrate / controller / viewer is
+    # absent. Like the sibling gvisor dispatches it HARD-GATES (golden-gate=false).
+    # Trigger:  rwx dispatch gardenio-plans-wake-pod --param commit-sha=<sha>
+    - key: gardenio-plans-wake-pod
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # The viewer + a live freeze/thaw controller live on the prod-shaped
+        # SINGLETON / prod, not the per-instance ephemeral gardenio-rwx-<sha>. An
+        # operator targets that namespace here (e.g. --param namespace=gardenio for
+        # prod); empty falls back to the module's gardenio-rwx default (which then
+        # self-SKIPs cleanly — no viewer there).
+        namespace: ${{ event.dispatch.params.namespace }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+        - key: namespace
+          name: K8s namespace (viewer + controller)
+          description: "Namespace hosting the beads-viewer + a live freeze/thaw controller (singleton/prod). Empty → module default (gardenio-rwx)."
+          default: ""
+          required: false
+      title: /plans wake-over-a-husk (adopt-or-replace) E2E
+    # ── Opt-in gVisor duplicate/concurrent-spawn DEDUP dispatch (ka-0000007641) ─
+    # Dedicated dispatch for the E2E acceptance of the re-nudge mid-THAW design's
+    # DEDUP decision (gardenio/docs/renudge-mid-thaw-coordination.md §DEDUP,
+    # decision child ka-0000005125; single-flight impl child ka-0000005830): a 2nd
+    # wake racing an in-flight thaw must produce exactly ONE Pod B / ONE runsc
+    # restore (the ka-0000007549 double-Pod-B class). The module's CONTRACT leg
+    # (the DEDUP guard-chain decision table) runs substrate-free in every shard;
+    # this dedicated dispatch flips GVISOR_E2E=1 to also drive REAL concurrent
+    # Pod-B creates on the gvisor-poc node. Like the sibling gvisor dispatches it
+    # HARD-GATES (golden-gate=false). Under the readiness go/no-go
+    # (REQUIRE_SUBSTRATE=1, ka-0000002867) an absent substrate is a NO-GO; here it
+    # SKIPs LOUD (PoC-substrate flakes must not red the release pipeline,
+    # ka-0000000847).
+    # Trigger:  rwx dispatch gardenio-gvisor-duplicate-concurrent-spawn --param commit-sha=<sha>
+    - key: gardenio-gvisor-duplicate-concurrent-spawn
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor duplicate/concurrent-spawn DEDUP E2E
+    # ── Opt-in abort-races-completion (TOCTOU) dispatch (ka-0000000996) ──
+    # Dedicated dispatch for the abort-races-completion (TOCTOU) module. Drives
+    # the REAL controller freeze → snapshot Put → POST /api/v1/freeze/interrupt
+    # discard chain against the gvisor-poc substrate, proving a snapshot persisted
+    # microseconds before an abort is discarded + its image reaped while the agent
+    # stays live. Needs a controller with FREEZE_THAW_ENABLED=true,
+    # FREEZE_INTERRUPT_ENABLED=true, FREEZE_POST_PUT_DELAY>0 (the deterministic
+    # post-Put test seam). Like the other gvisor dispatches it HARD-GATES.
+    # Trigger:  rwx dispatch gardenio-gvisor-abort-races --param commit-sha=<sha>
+    - key: gardenio-gvisor-abort-races
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor abort-races-completion (TOCTOU) E2E
+    # ── Opt-in re-nudge mid-THAW coordination dispatch (ka-0000001841) ──
+    # Dedicated dispatch for the re-nudge mid-THAW module. Drives the REAL
+    # FreezeThawManager.Thaw single-flight + IsThawing (impl ka-0000005830 /
+    # design ka-0000005125, MR !4719) on the gvisor-poc substrate beside a REAL
+    # runsc-restored Pod B: a 2nd concurrent thaw must JOIN the in-flight one (one
+    # restore, no duplicate Pod B — the ka-0000005680 admit-fail class), IsThawing
+    # is true in-flight (the signal the bridge buffer holds the mid-thaw nudge on)
+    # and clears on release, and a sequential wake runs a FRESH restore (negative
+    # control). Builds cmd/renudge-thaw-probe from source — the GENUINE manager
+    # code, not a bash re-implementation. Like the other gvisor dispatches it
+    # HARD-GATES (golden-gate=false) and needs only kubectl + a Go toolchain.
+    # Trigger:  rwx dispatch gardenio-gvisor-renudge-thaw --param commit-sha=<sha>
+    - key: gardenio-gvisor-renudge-thaw
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor re-nudge mid-THAW coordination E2E
+    # ── Opt-in controller-restart mid-freeze/mid-thaw dispatch (ka-0000002295) ──
+    # Dedicated dispatch for the controller-RESTART durability module. This is the
+    # CONTROLLER-PROCESS durability concern, distinct from the node-runsc siblings:
+    # (a) the GENUINE ConfigMapSnapshotStore (ka-0000001694) must survive a real
+    # controller bounce between freeze and thaw — proven across TWO separate OS
+    # processes against the LIVE API server (proc1 persists + exits; a FRESH proc2
+    # recovers + trusts the complete record, rejects a half one); and (b) DrainThaws
+    # + the WithoutCancel-detached post-commit ctx (main.go:909, ka-0000001355 /
+    # ka-0000004088) keep an in-flight thaw alive across a controller-roll ctx cancel
+    # (Pod B not orphaned). Builds cmd/ftrestart-probe from source — the GENUINE store
+    # + manager code, not a bash re-implementation. Like the other gvisor dispatches
+    # it HARD-GATES (golden-gate=false) and needs only kubectl + a Go toolchain +
+    # configmap RBAC in ns gvisor-poc (no privileged node pod — durability is a
+    # controller↔API-server property).
+    # Trigger:  rwx dispatch gardenio-gvisor-controller-restart --param commit-sha=<sha>
+    - key: gardenio-gvisor-controller-restart
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # Dedicated dispatch: HARD-GATES (golden-gate=false).
+        golden-gate: "false"
+        # require-substrate=false: absent substrate → clean SKIP, not a hard
+        # fail (ka-0000000847). Per-feature dispatches are not the go/no-go.
+        require-substrate: "false"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor controller-restart mid-freeze/mid-thaw E2E
+    # ── gVisor PRODUCTION-READINESS go/no-go gate (ka-0000002867) ──────────
+    # The single hard-fail dispatch that gates flipping FreezeThawEnabled for
+    # real agents (epic ka-0000004667, exit criterion 4). UNLIKE every other
+    # dispatch above, this one sets require-substrate=true: the gvisor lifecycle
+    # tasks (substrate-ready preflight + freeze-thaw, armed-guard, rehydration,
+    # rehydrate-ack, resume-latency, userresponse-latency, gb-stop-suspend) run
+    # with REQUIRE_SUBSTRATE=1, so an absent/cold gvisor-poc substrate is a NO-GO
+    # HARD FAIL (exit 1) rather than a silent SKIP. A readiness signal cannot rest
+    # on tests that skipped. golden-gate=false so every gvisor regression also
+    # hard-fails here. The gvisor-substrate-ready task runs FIRST and stands up /
+    # asserts the substrate (provokes Karpenter + warm-node gate).
+    # Trigger:  rwx dispatch gardenio-gvisor-readiness --param commit-sha=<sha>
+    - key: gardenio-gvisor-readiness
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        # HARD-GATE every gvisor regression here (golden-gate=false) AND make an
+        # absent substrate a NO-GO (require-substrate=true). This is the go/no-go.
+        golden-gate: "false"
+        require-substrate: "true"
+        # ── Full init key set backfill (ka-0000001304) ──────────────────
+        # RWX validates EVERY init.* reference across the WHOLE definition
+        # at run start; shared tasks (kubeconfig, verify-cluster, install-
+        # coop-claudeless, the outbox/slack-ui + shard matrices) reference
+        # the full gardenio-e2e key set, so a dedicated dispatch that omits
+        # any of them dies in init before its module ever runs. Declare the
+        # whole set with dedicated-dispatch defaults (empty strings +
+        # require-*=false). Model: the gardenio-gb-stop-suspend block above.
+        require-outbox-rig: "false"
+        require-slack-ui: "false"
+        namespace: ""
+        instance-id: ""
+        keep: "false"
+        only: ""
+        skip: ""
+        captain-poison-module: ""
+        version: ""
+        ref-name: ""
+        host-domain: ""
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to test. Defaults to the dispatched ref's HEAD."
+          default: ""
+          required: false
+      title: gVisor PRODUCTION-READINESS gate (no-silent-skip)
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      # Local `rwx run` defaults to hard-gating so an interactive gVisor run
+      # surfaces real failures; set --init golden-gate=true to mimic golden.
+      golden-gate: "false"
+      # Local default: absent substrate → clean SKIP. Set --init
+      # require-substrate=true to dry-run the readiness go/no-go gate locally.
+      require-substrate: "false"
+      # Local default: absent sandbox rig → clean SKIP for the outbox matrix. Set
+      # --init require-outbox-rig=true to dry-run the outbox readiness gate locally
+      # (ka-0000007489) — needs the sandbox creds present, else it hard-fails.
+      require-outbox-rig: ""
+      namespace: ""
+      instance-id: ""
+      keep: "false"
+      only: ""
+      skip: ""
+      captain-poison-module: ""
+      version: ""
+      ref-name: ""
+      require-slack-ui: ""
+      host-domain: ""
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: code
+    # ── MUST stay `call: git/clone` — captain depends on it (ka-0000005446) ──
+    # DO NOT replace this with the hand-rolled retry-wrapped clone used
+    # elsewhere (docker.yml `code`, release-DAG workflows). Unlike every
+    # other .rwx/*.yml, this run invokes `captain run` (the four e2e-shard-*
+    # tasks). Captain determines the git repository from the RUN-LEVEL
+    # `RWX_GIT_REPOSITORY_URL` metadata that ONLY the `git/clone` package
+    # emits — the hand-rolled `git init && git fetch` clone does not (and
+    # cannot) set that run metadata. With it absent, every shard aborts at
+    # `captain run` with `Invalid configuration: Missing git repository url`
+    # before a single test runs, failing the whole release e2e suite and
+    # blocking promote/deploy-prod/create-release.
+    #
+    # This is exactly what happened when ka-0000001787 ("fan out git-clone
+    # retry wrapper to remaining clone sites", commit e7968083c) swapped this
+    # task to the hand-rolled clone: the next release pipeline (#2749346849,
+    # tag 2026.223.6) reddened all four e2e shards. The retry-wrapper fan-out
+    # is correct for the ~24 clone sites that do NOT run captain; e2e.yml is
+    # the sole exception and must be excluded from that fan-out.
+    call: git/clone 2.0.7
+    with:
+      repository: https://oauth2:${{ secrets.GITLAB_CLONE_TOKEN }}@gitlab.com/Acme/Platform/gardenio.git
+      ref: ${{ init.commit-sha }}
+
+  # ── Install Go toolchain ────────────────────────────────────────────
+  - key: go
+    call: golang/install 1.2.1
+    with:
+      go-version: "1.25"
+
+  # ── Install Captain CLI (flaky-test manager) ────────────────────────
+  # Captain wraps run-shard.sh per shard to add automatic retries,
+  # quarantine semantics, and aggregated failure summaries (ka-0000004315).
+  # Configuration lives at .captain/config.yml; quarantine list at
+  # .captain/quarantines/gardenio-e2e.yml. See those files for behaviour.
+  - key: install-captain
+    call: rwx/install-captain 1.1.6
+
+  # ── Install the chart-pinned VictoriaLogs binary ────────────────────
+  # Arms the idp-audit-fieldcontract E2E gate (ka-0000004993, parent epic
+  # ka-0000007128). test-idp-audit-fieldcontract.sh drives the e2e-tagged
+  # auditxform field-cardinality proof against a REAL victoria-logs-prod, but
+  # shard containers ship no such binary, so the module LOUD-SKIPs everywhere
+  # by default (the require-outbox-rig / require-slack-ui dormant-until-armed
+  # shape). This task provisions victoria-logs-prod so the module becomes a HARD
+  # gate on the ONE shard whose `use:` list carries it (e2e-shard-1 — the module
+  # is pinned to shard 1 in run-shard.sh's shard_for() to match this coupling).
+  #
+  # The version is SOURCED from the chart pin (helm values.yaml
+  # vlsingle.image.tag), never hard-coded here, so there is a single source of
+  # truth and the E2E binary can never drift from the version the chart ships —
+  # the same discipline install-claude uses for the claude pin. VictoriaLogs
+  # ships on its OWN v1.x line, independent of the VM stack (v1.108.1).
+  #
+  # We fetch the upstream GitHub release tarball (its sole member is exactly
+  # `victoria-logs-prod`) rather than `crane export`-ing the mirrored image
+  # (.rwx/mirror.yml:133 mirror/victoria-logs:v1.52.0): the release fetch needs
+  # no registry creds and no per-image push-skew poll, and this task is cached
+  # (filter on e2e-system-deps.lock) so the fetch is off the per-shard critical
+  # path — it runs once in the cached deps layer, exactly like install-k8s-tools.
+  - key: install-victoria-logs
+    use: code
+    run: |
+      set -euo pipefail
+      # Single source of truth: read the pinned tag straight from the chart so
+      # this binary always matches vlsingle.image.tag. The awk finds the
+      # victoria-logs image block and returns the first `tag:` under it.
+      VL_TAG=$(awk '/^ *repository: victoria-logs$/{f=1} f && /tag:/{gsub(/[" ]/,"",$2); print $2; exit}' \
+        gardenio/helm/gardenio/values.yaml)
+      if [ -z "$VL_TAG" ]; then
+        echo "FATAL: could not read victoria-logs tag from gardenio/helm/gardenio/values.yaml"
+        exit 1
+      fi
+      echo "Chart-pinned VictoriaLogs tag: $VL_TAG"
+
+      URL="https://github.com/VictoriaMetrics/VictoriaLogs/releases/download/${VL_TAG}/victoria-logs-linux-amd64-${VL_TAG}.tar.gz"
+      echo "Fetching $URL"
+      curl -sfL "$URL" -o /tmp/victoria-logs.tar.gz
+      # The tarball's sole member is `victoria-logs-prod`.
+      sudo tar -xzf /tmp/victoria-logs.tar.gz -C /usr/local/bin victoria-logs-prod
+      sudo chmod +x /usr/local/bin/victoria-logs-prod
+      rm -f /tmp/victoria-logs.tar.gz
+
+      # Smoke-check: the binary runs AND its self-reported version carries the
+      # chart-pinned tag, so a wrong/renamed release asset fails LOUD here in the
+      # cached deps layer instead of silently at module time.
+      VER=$(/usr/local/bin/victoria-logs-prod --version 2>&1 | head -1)
+      echo "victoria-logs-prod --version: $VER"
+      case "$VER" in
+        *"$VL_TAG"*) echo "OK: victoria-logs-prod matches chart pin $VL_TAG" ;;
+        *) echo "FATAL: victoria-logs-prod version '$VER' does not carry chart pin $VL_TAG"; exit 1 ;;
+      esac
+    filter:
+      - .rwx/e2e-system-deps.lock
+      - gardenio/helm/gardenio/values.yaml
+
+  # ── Install kubectl + AWS CLI ───────────────────────────────────────
+  - key: install-k8s-tools
+    run: |
+      # kubectl
+      KUBE_VERSION=$(curl -sSfL https://dl.k8s.io/release/stable.txt)
+      curl -sSfL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl
+      sudo install /tmp/kubectl /usr/local/bin/kubectl
+      kubectl version --client
+      # AWS CLI
+      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+      (cd /tmp && unzip -q awscliv2.zip && sudo ./aws/install)
+      rm -rf /tmp/awscliv2.zip /tmp/aws
+      aws --version
+    filter:
+      - .rwx/e2e-system-deps.lock
+
+  # ── Configure kubeconfig for EKS ────────────────────────────────────
+  - key: kubeconfig
+    use: install-k8s-tools
+    run: |
+      # Phase 2/B acct-133 cred routing (ka-0000005509, decision ka-0000005742 =
+      # explicit-override; ka-0000002380). When this e2e run targets the
+      # consolidated prod (prod-gardenio-eks) or legacy POC (poc-gardenio-eks)
+      # staging cluster, swap the AWS creds + EKS cluster from the gardenio-main
+      # vault (POC_*, acct 123456789012) over the default-vault values (legacy
+      # america-e2e 234567890123). Both prod and aws-poc live in the SAME acct
+      # 133 so they share the gardenio-main creds; only the cluster name differs
+      # (prod → prod-gardenio-eks literal; aws-poc → vault POC_EKS_CLUSTER =
+      # poc-gardenio-eks). The kubeconfig written here is inherited by the
+      # downstream e2e tasks via `use:`, and its `aws eks get-token` exec runs
+      # with each task's own AWS_* env — so every cluster-touching task swaps the
+      # same way. Gated on host-domain so legacy dispatches are byte-identical.
+      case "${INIT_HOST_DOMAIN:-}" in
+        prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+          if [ -z "${POC_AWS_ACCESS_KEY_ID:-}" ] || [ -z "${POC_AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "ERROR: host-domain=${INIT_HOST_DOMAIN} selects the gardenio-main vault, but POC_* creds are empty — vault not seeded (ka-0000001325/T8)"
+            exit 1
+          fi
+          export AWS_ACCESS_KEY_ID="$POC_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$POC_AWS_SECRET_ACCESS_KEY"
+          if [ "${INIT_HOST_DOMAIN}" = "prod.gardenio.acme.example" ]; then
+            EKS_CLUSTER="prod-gardenio-eks"
+          else
+            if [ -z "${POC_EKS_CLUSTER:-}" ]; then
+              echo "ERROR: host-domain=aws-poc but POC_EKS_CLUSTER empty — vault not seeded (ka-0000001325/T8)"
+              exit 1
+            fi
+            EKS_CLUSTER="$POC_EKS_CLUSTER"
+          fi
+          export EKS_CLUSTER
+          echo "=== acct-133 cred routing: gardenio-main vault creds + cluster=$EKS_CLUSTER (host-domain=$INIT_HOST_DOMAIN) ==="
+          ;;
+      esac
+
+      # ── Host-domain ↔ AWS-account mismatch guard (ka-0000000433) ─────────
+      # Assert the AWS creds now active authenticate to the account the
+      # host-domain routing expects, so a forgotten/wrong host-domain param
+      # HARD-FAILS here instead of quietly running e2e against the WRONG cluster
+      # (the retired america-e2e-eks 234567890123 vs the consolidated
+      # prod-gardenio-eks 123456789012 — the P4.3b 502 class, ka-0000007004). The
+      # kubeconfig written below is inherited by every downstream e2e task via
+      # `use:`, so guarding here covers the whole run. Ported from
+      # .rwx/migration-acceptance.yml. Empty/legacy host-domains map to 909 (the
+      # default-vault E2E_* creds — e.g. the gardenio-gvisor-* dispatches that
+      # share this task and pass no host-domain); prod/aws-poc map to 133 (the
+      # gardenio-main POC_* creds swapped in above). Only a NON-EMPTY
+      # unrecognized value is a hard FATAL.
+      case "${INIT_HOST_DOMAIN:-}" in
+        prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+          EXPECTED_ACCOUNT="123456789012" ;;
+        app.e2e.dev.acme.example|gardenio.app.e2e.dev.acme.example|"")
+          EXPECTED_ACCOUNT="234567890123" ;;
+        *)
+          echo "FATAL: unrecognized host-domain='${INIT_HOST_DOMAIN:-<empty>}'. Accepted: prod.gardenio.acme.example / aws-poc.gardenio.acme.example (acct 123456789012) or app.e2e.dev.acme.example / gardenio.app.e2e.dev.acme.example (acct 234567890123). Refusing to guess a cred/account pairing."
+          exit 1 ;;
+      esac
+      ACTUAL_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+      if [ -z "$ACTUAL_ACCOUNT" ]; then
+        echo "FATAL: aws sts get-caller-identity failed — creds not usable (host-domain=${INIT_HOST_DOMAIN:-<empty>})."
+        exit 1
+      fi
+      if [ "$ACTUAL_ACCOUNT" != "$EXPECTED_ACCOUNT" ]; then
+        echo "FATAL: creds authenticate to account $ACTUAL_ACCOUNT but host-domain=${INIT_HOST_DOMAIN:-<empty>} expects $EXPECTED_ACCOUNT — cred/cluster account mismatch. Refusing to run e2e against the wrong account (ka-0000000433)."
+        exit 1
+      fi
+      echo "=== AWS account verified: $ACTUAL_ACCOUNT (matches host-domain=${INIT_HOST_DOMAIN:-<empty>} routing) ==="
+
+      # claudemore R4-SEC-5 (F7): empty-string vault guard for the real MODEL
+      # credential. A vault/secret referenced-but-not-provisioned resolves to the
+      # empty string and stays silent until a 401/403 at inference time — deep
+      # inside the run, after minutes of setup. This guard fails LOUD at dispatch
+      # instead, mirroring the POC_* AWS-cred check above.
+      #
+      # It is INERT for every run today: CI carries zero model creds, so the
+      # opt-in flag CLAUDEMORE_MODEL_CRED_REQUIRED is unset and the block is a
+      # no-op — no RWX secret is referenced here, so a claudemore-less dispatch
+      # can never break on it. When Phase 1 (ka-0000005323) wires a real model
+      # credential, it sets CLAUDEMORE_MODEL_CRED_REQUIRED=1 and passes the cred
+      # as CLAUDEMORE_MODEL_CRED (from a provisioned secret) in this task's env;
+      # the guard then hard-fails if that secret resolved empty.
+      if [ "${CLAUDEMORE_MODEL_CRED_REQUIRED:-}" = "1" ]; then
+        if [ -z "${CLAUDEMORE_MODEL_CRED:-}" ]; then
+          echo "ERROR: CLAUDEMORE_MODEL_CRED_REQUIRED=1 but CLAUDEMORE_MODEL_CRED is empty — the model-credential vault/secret is referenced but not provisioned (would 401/403 at inference). Seed the secret or unset CLAUDEMORE_MODEL_CRED_REQUIRED (claudemore R4-SEC-5)."
+          exit 1
+        fi
+        echo "=== claudemore model-cred guard: CLAUDEMORE_MODEL_CRED present (len=${#CLAUDEMORE_MODEL_CRED}) ==="
+      fi
+      aws eks update-kubeconfig --name "$EKS_CLUSTER" --region us-east-1
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      EKS_CLUSTER: ${{ secrets.E2E_EKS_CLUSTER }}
+      # Phase 2 POC creds from the non-default gardenio-main vault (ka-0000005509).
+      POC_AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      POC_AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      POC_EKS_CLUSTER: ${{ vaults.gardenio-main.secrets.E2E_EKS_CLUSTER }}
+      INIT_HOST_DOMAIN: ${{ init.host-domain }}
+
+  # ── Build gb from source ─────────────────────────────────────────────
+  - key: go-deps
+    use: [code, go]
+    run: cd gardenio/controller && go mod download
+    filter:
+      - gardenio/controller/go.mod
+      - gardenio/controller/go.sum
+      # controller replace => ../clicreds local module (ka-0000003839).
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+
+  - key: build-gb
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/gb ./cmd/gb/
+      sudo install /tmp/gb /usr/local/bin/gb
+      gb --version || true
+    filter:
+      - "gardenio/controller/cmd/gb/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      - "gardenio/controller/**/*.html"
+      - "gardenio/controller/**/*.md"
+      - "gardenio/controller/**/web/**"
+      # cmd/gb imports the local clicreds module (ka-0000003839).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build beads-viewer from source ───────────────────────────────────
+  # Pre-built + PATH-installed for the `grafana-directive` shard module
+  # (ka-0000007821), which boots the REAL beads-viewer against a stub daemon
+  # to assert the :::grafana markdown directive renders an iframe (configured)
+  # / degraded note (unconfigured). The shard task's `use:` list carries no Go
+  # toolchain, so the module's from-source fallback would skip_all in CI —
+  # this task guarantees a binary is present. Module-mode build (GOWORK=off)
+  # from the controller dir, exactly like build-gb. The viewer templates +
+  # embedded web assets need the same html/md/web globs build-gb uses.
+  - key: build-beads-viewer
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/beads-viewer ./cmd/beads-viewer/
+      sudo install /tmp/beads-viewer /usr/local/bin/beads-viewer
+      test -x /usr/local/bin/beads-viewer
+    filter:
+      - "gardenio/controller/cmd/beads-viewer/**/*.go"
+      - "gardenio/controller/cmd/beads-viewer/**/*.html"
+      - "gardenio/controller/internal/**/*.go"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      - "gardenio/controller/**/*.html"
+      - "gardenio/controller/**/*.md"
+      # templates/static holds .js/.css/.png (pwa icons) with ZERO .html and is
+      # NOT under a web/ dir, so none of the globs above match it — RWX would
+      # materialize an EMPTY templates/static/ and `//go:embed templates/static`
+      # (cmd/beads-viewer/templates.go:8) hard-fails "no matching files found"
+      # BEFORE any e2e module runs (ka-0000005865). docker.yml:355-356 +
+      # microvm-image.yml:118-119 build the same binary and carry the js/css
+      # globs; .png is added here since 5 PWA icons embed too.
+      - "gardenio/controller/**/*.js"
+      - "gardenio/controller/**/*.css"
+      - "gardenio/controller/**/*.png"
+      - "gardenio/controller/**/web/**"
+      # controller replace => ../clicreds local module (ka-0000003839).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build kd from source ────────────────────────────────────────────
+  - key: ka-deps
+    use: [code, go]
+    run: cd kbeads && go mod download
+    filter:
+      - kbeads/go.mod
+      - kbeads/go.sum
+      # kbeads replace => ../gardenio/clicreds local module (ka-0000003839).
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+
+  - key: build-kd
+    use: ka-deps
+    run: |
+      cd kbeads
+      CGO_ENABLED=0 go build -o /tmp/kd ./cmd/kd/
+      sudo install /tmp/kd /usr/local/bin/kd
+      kd --version || true
+    filter:
+      - "kbeads/cmd/kd/**/*.go"
+      - "kbeads/internal/**/*.go"
+      - "kbeads/gen/**/*.go"
+      - "kbeads/go.mod"
+      - "kbeads/go.sum"
+      - "kbeads/**/*.sql"
+      # cmd/kd imports the local clicreds module (ka-0000003839).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build trigger-engine from source ─────────────────────────────────
+  # Used by the trigger-source-* claudeless scenarios (ka-0000002354) which
+  # spawn a short-lived trigger-engine subprocess against the in-test beads
+  # daemon to drive the real evaluation→action loop end-to-end. The scenarios
+  # auto-skip when the binary is missing, but pre-installing it via the shard
+  # `use:` lists ensures they actually run on every release.
+  - key: build-trigger-engine
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/trigger-engine ./cmd/trigger-engine/
+      sudo install /tmp/trigger-engine /usr/local/bin/trigger-engine
+      # Verify the binary is on PATH without executing it. trigger-engine has
+      # no --help flag and starts the engine on any invocation, which hangs
+      # waiting for a beads daemon in the build context (ka-0000006573).
+      command -v trigger-engine
+      test -x /usr/local/bin/trigger-engine
+    filter:
+      - "gardenio/controller/cmd/trigger-engine/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      - "gardenio/controller/internal/bridge/web/**"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      # controller replace => ../clicreds local module (ka-0000003839).
+      # Without these globs the trigger build tasks omit gardenio/clicreds
+      # from their materialized layer and `go build` fails with
+      # "replacement directory ../clicreds does not exist" (ka-0000005437).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build trigger-probe from source ──────────────────────────────────
+  # Used by the trigger-source-{jira,gitlab,account,slack-reaction}-fires
+  # claudeless scenarios (ka-0000003167). Those four sources are not registered
+  # in the standalone trigger-engine binary and need an external dependency it
+  # cannot supply (a JiraClient/GitLabClient HTTP API, an in-process reaction
+  # buffer, or account beads), so trigger-probe wires the REAL source + REAL
+  # engine + REAL beadsapi.Client against a stub HTTP server / buffered event and
+  # fires exactly one EvaluateSource cycle. The scenarios auto-skip when the
+  # binary is missing, but pre-installing it via the shard `use:` lists ensures
+  # they run on every release. trigger-probe is test-only — it ships in no
+  # release Makefile / Dockerfile target.
+  - key: build-trigger-probe
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/trigger-probe ./cmd/trigger-probe/
+      sudo install /tmp/trigger-probe /usr/local/bin/trigger-probe
+      # Confirm flag parsing works without a daemon: missing required flags
+      # exits 2 with a usage message rather than hanging.
+      # NOTE: capture first rather than piping straight into grep. RWX runs
+      # this block under `set -o pipefail`, so `trigger-probe | grep -q` would
+      # surface trigger-probe's exit 2 (fatal on missing flags) instead of
+      # grep's exit 0 — the || branch fired even when grep matched.
+      probe_out=$(/usr/local/bin/trigger-probe 2>&1 || true)
+      echo "$probe_out" | grep -q "required" || {
+        echo "trigger-probe smoke check failed: $probe_out"; exit 1;
+      }
+      test -x /usr/local/bin/trigger-probe
+    filter:
+      - "gardenio/controller/cmd/trigger-probe/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      - "gardenio/controller/internal/bridge/web/**"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      # controller replace => ../clicreds local module (ka-0000003839).
+      # Without these globs the trigger build tasks omit gardenio/clicreds
+      # from their materialized layer and `go build` fails with
+      # "replacement directory ../clicreds does not exist" (ka-0000005437).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build jira-conv-probe from source ────────────────────────────────
+  # Used by the `jira-conversational` shard module (ka-0000003999, epic
+  # ka-0000007401) to exercise the jira-bridge CONVERSATIONAL round-trip
+  # (mention->spawn->reply->squawk->follow-up + FSM negative) end-to-end WITHOUT
+  # a live jira-bridge, a live Jira, or real agent pods. Like trigger-probe it
+  # wires the REAL bridge components (JiraWebhookHandler / JiraMentionHandler /
+  # JiraReplyAPI / JiraSquawkForwarder / JiraAgentResolver) against a STUB Jira
+  # httptest server + an in-process mock daemon, so SpawnAgent is a recorded call
+  # and no controller ever mints a pod. The module falls back to an in-shell
+  # `go build` if this binary is absent, but pre-installing it via the shard
+  # `use:` list keeps the build cached + smoke-checked. trigger-probe-style:
+  # test-only, ships in no release Makefile/Dockerfile target.
+  - key: build-jira-conv-probe
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/jira-conv-probe ./cmd/jira-conv-probe/
+      sudo install /tmp/jira-conv-probe /usr/local/bin/jira-conv-probe
+      test -x /usr/local/bin/jira-conv-probe
+    filter:
+      - "gardenio/controller/cmd/jira-conv-probe/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      # internal/bridge/web.go has //go:embed web/* — the HTML assets under
+      # web/ are not *.go files, so the internal/**/*.go glob does not
+      # materialize them and the controller build fails with
+      # "pattern web/*: no matching files found" (ka-0000005393). Mirror
+      # build-trigger-engine / build-trigger-probe.
+      - "gardenio/controller/internal/bridge/web/**"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      # controller replace => ../clicreds local module (ka-0000003839).
+      # Without these globs the build omits gardenio/clicreds from its
+      # materialized layer and `go build` fails with "replacement directory
+      # ../clicreds does not exist" (ka-0000005437).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build jira-syncback-probe from source ────────────────────────────
+  # Used by the `jira-syncback-denybydefault` shard module (ka-0000005719,
+  # coverage-backfill epic ka-0000000958) to exercise the jira-bridge SYNC-BACK
+  # write path (JiraSync.handleUpdated/handleClosed) end-to-end WITHOUT a live
+  # jira-bridge, a live Jira, or a real daemon. Like jira-conv-probe it wires the
+  # REAL bridge.JiraSync (with the SAME config-driven WritePolicy production
+  # wires) onto a REAL bridge.SSEStream against a STUB Jira httptest server that
+  # records outbound REST per issue key — so "did the sync-back write?" is a
+  # recorded call and no controller ever mints a pod. Asserts the deny-by-default
+  # project allowlist + the source:jira-dark early-return (ka-0000005143). The
+  # module falls back to an in-shell `go build` if this binary is absent, but
+  # pre-installing it via the shard `use:` list keeps the build cached +
+  # smoke-checked. trigger-probe-style: test-only, ships in no release
+  # Makefile/Dockerfile target.
+  - key: build-jira-syncback-probe
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/jira-syncback-probe ./cmd/jira-syncback-probe/
+      sudo install /tmp/jira-syncback-probe /usr/local/bin/jira-syncback-probe
+      test -x /usr/local/bin/jira-syncback-probe
+    filter:
+      - "gardenio/controller/cmd/jira-syncback-probe/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      # internal/bridge/web.go has //go:embed web/* — see build-jira-conv-probe.
+      - "gardenio/controller/internal/bridge/web/**"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      # controller replace => ../clicreds local module (see build-jira-conv-probe).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build gitlab-prov-probe from source ──────────────────────────────
+  # Used by the `gitlab-dark-provenance` shard module (ka-0000005448, E-PROV
+  # epic) to exercise the forward-provenance stack — GitLabSync host scoping, the
+  # upstream webhook merge GATE, the scoped GitLabUpstreamPoller, the
+  # UpstreamAcceptanceReconciler, and the MRBacklinkReconciler peel guard —
+  # end-to-end WITHOUT a live gitlab-bridge, a live GitLab, or real agent pods.
+  # Like trigger-probe / jira-conv-probe it wires the REAL bridge components
+  # against STUB GitLab httptest servers + an in-process mock daemon, so every
+  # provenance write is a recorded call and no controller ever mints a pod. The
+  # module falls back to an in-shell `go build` if this binary is absent, but
+  # pre-installing it via the shard `use:` list keeps the build cached +
+  # smoke-checked. trigger-probe-style: test-only, ships in no release
+  # Makefile/Dockerfile target.
+  - key: build-gitlab-prov-probe
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/gitlab-prov-probe ./cmd/gitlab-prov-probe/
+      sudo install /tmp/gitlab-prov-probe /usr/local/bin/gitlab-prov-probe
+      test -x /usr/local/bin/gitlab-prov-probe
+    filter:
+      - "gardenio/controller/cmd/gitlab-prov-probe/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      # internal/bridge/web.go has //go:embed web/* — the HTML assets under
+      # web/ are not *.go files, so the internal/**/*.go glob does not
+      # materialize them and the controller build fails with
+      # "pattern web/*: no matching files found" (ka-0000005393). Mirror
+      # build-trigger-engine / build-jira-conv-probe.
+      - "gardenio/controller/internal/bridge/web/**"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      # controller replace => ../clicreds local module (ka-0000003839).
+      # Without these globs the build omits gardenio/clicreds from its
+      # materialized layer and `go build` fails with "replacement directory
+      # ../clicreds does not exist" (ka-0000005437).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build gitlab-pipeline-trigger-probe from source ──────────────────
+  # Used by the `gitlab-pipeline-refpattern` shard module (ka-0000002595,
+  # coverage-backfill epic ka-0000000958) to exercise the gitlab-pipeline
+  # trigger's pipeline_ref_pattern firing gate (MR !6601): the REAL
+  # GitLabTriggerSource + TriggerEngine drive the full evaluation→fireAction→
+  # recordTriggerAudit loop against a stub multi-ref GitLab httptest server + an
+  # in-process mock daemon, so matching refs are proven to FIRE and non-matching
+  # refs to be SUPPRESSED (the runaway-guard leg) with every audit write a
+  # recorded call and no controller ever minting a pod. Like gitlab-prov-probe /
+  # trigger-probe it needs a live GitLabClient the deployed e2e stack cannot
+  # supply (the trigger-engine does not register the gitlab source and
+  # gitlab-bridge is enabled:false in the ephemeral namespace). The module falls
+  # back to an in-shell `go build` if this binary is absent, but pre-installing
+  # it via the shard `use:` list keeps the build cached + smoke-checked.
+  # Test-only: ships in no release Makefile/Dockerfile target.
+  - key: build-gitlab-pipeline-trigger-probe
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/gitlab-pipeline-trigger-probe ./cmd/gitlab-pipeline-trigger-probe/
+      sudo install /tmp/gitlab-pipeline-trigger-probe /usr/local/bin/gitlab-pipeline-trigger-probe
+      test -x /usr/local/bin/gitlab-pipeline-trigger-probe
+    filter:
+      - "gardenio/controller/cmd/gitlab-pipeline-trigger-probe/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      # internal/bridge/web.go has //go:embed web/* — see build-gitlab-prov-probe.
+      - "gardenio/controller/internal/bridge/web/**"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      # controller replace => ../clicreds local module (ka-0000003839).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build gitlab-pipeline-minduration-probe from source ──────────────
+  # Used by the `gitlab-pipeline-minduration` shard module (ka-0000001474,
+  # coverage-backfill epic ka-0000000958) to exercise the gitlab-pipeline
+  # trigger's min_duration ("slow pipeline") firing gate: the REAL
+  # GitLabTriggerSource + TriggerEngine drive the full evaluation→
+  # resolvePipelineDuration→fireAction→recordTriggerAudit loop against a stub
+  # GitLab httptest server (LIST omits duration, DETAIL carries it — prod-
+  # accurate) + an in-process mock daemon, so pipelines at/over the threshold
+  # are proven to FIRE, pipelines under it are SUPPRESSED (the runaway-guard
+  # leg), and null/unknown or detail-fetch-failed durations NEVER fire (fail
+  # closed), with every audit write a recorded call and no controller ever
+  # minting a pod. Like gitlab-pipeline-trigger-probe / gitlab-prov-probe it
+  # needs a live GitLabClient the deployed e2e stack cannot supply (the
+  # trigger-engine does not register the gitlab source and gitlab-bridge is
+  # enabled:false in the ephemeral namespace). The module falls back to an
+  # in-shell `go build` if this binary is absent, but pre-installing it via the
+  # shard `use:` list keeps the build cached + smoke-checked. Test-only: ships
+  # in no release Makefile/Dockerfile target.
+  - key: build-gitlab-pipeline-minduration-probe
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/gitlab-pipeline-minduration-probe ./cmd/gitlab-pipeline-minduration-probe/
+      sudo install /tmp/gitlab-pipeline-minduration-probe /usr/local/bin/gitlab-pipeline-minduration-probe
+      test -x /usr/local/bin/gitlab-pipeline-minduration-probe
+    filter:
+      - "gardenio/controller/cmd/gitlab-pipeline-minduration-probe/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      # internal/bridge/web.go has //go:embed web/* — see build-gitlab-prov-probe.
+      - "gardenio/controller/internal/bridge/web/**"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      # controller replace => ../clicreds local module (ka-0000003839).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build agent-feedback-probe from source ───────────────────────────
+  # Used by the `agent-feedback-writepath` shard module (ka-0000008183,
+  # coverage-backfill epic ka-0000000958) to exercise the always-on
+  # agent-feedback write path (de29900 / ka-0000002210). Unlike the mock-daemon
+  # probes above, this one wires the REAL AgentFeedbackAPI handler to a
+  # beadsapi.Client pointed at the LIVE e2e daemon, so ONE POST exercises
+  # production code on both sides: the handler's request→CreateBeadRequest
+  # mapping AND the daemon's preCreateRating (rater,rated_bead_id) upsert. A
+  # black-box HTTP test is impossible — the handler's host (slack-bridge) is
+  # `enabled: false` in the ephemeral e2e namespace. The module falls back to an
+  # in-shell `go build` if this binary is absent, but pre-installing it via the
+  # shard `use:` list keeps the build cached + smoke-checked. Test-only: ships in
+  # no release Makefile/Dockerfile target.
+  - key: build-agent-feedback-probe
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/agent-feedback-probe ./cmd/agent-feedback-probe/
+      sudo install /tmp/agent-feedback-probe /usr/local/bin/agent-feedback-probe
+      test -x /usr/local/bin/agent-feedback-probe
+    filter:
+      - "gardenio/controller/cmd/agent-feedback-probe/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      # internal/bridge/web.go has //go:embed web/* — the HTML assets under
+      # web/ are not *.go files, so the internal/**/*.go glob does not
+      # materialize them and the controller build fails with
+      # "pattern web/*: no matching files found" (ka-0000005393). Mirror
+      # build-gitlab-prov-probe / build-jira-conv-probe.
+      - "gardenio/controller/internal/bridge/web/**"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      # controller replace => ../clicreds local module (ka-0000003839).
+      # Without these globs the build omits gardenio/clicreds from its
+      # materialized layer and `go build` fails with "replacement directory
+      # ../clicreds does not exist" (ka-0000005437).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build mr-reopen-probe from source ────────────────────────────────
+  # Used by the `mr-reopen-drift` shard module (ka-0000006088, coverage-backfill
+  # epic ka-0000000958) to exercise the gitlab-bridge MR-reopen drift sweep —
+  # the REAL MRReopenDriftReconciler over the REAL beadsapi client against the
+  # LIVE shard daemon, with a STUB GitLab. Covers the reopen leg (a bead closed
+  # while its MR is still open gets re-opened) plus the merged /
+  # mr_close_override / type=merge-request / re-verify-race negatives.
+  - key: build-mr-reopen-probe
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/mr-reopen-probe ./cmd/mr-reopen-probe/
+      sudo install /tmp/mr-reopen-probe /usr/local/bin/mr-reopen-probe
+      test -x /usr/local/bin/mr-reopen-probe
+    filter:
+      - "gardenio/controller/cmd/mr-reopen-probe/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      # internal/bridge/web.go has //go:embed web/* — see build-gitlab-prov-probe.
+      - "gardenio/controller/internal/bridge/web/**"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      # controller replace => ../clicreds local module (ka-0000003839).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Build grafana-bridge-probe from source ───────────────────────────
+  # Used by the `grafana-bridge` shard module (ka-0000002319, coverage-backfill
+  # epic ka-0000000958) to exercise the grafana-bridge dashboard-sync +
+  # conflict-policy stack — the beads→Grafana ConfigMap write path, the
+  # one-time backfill, the SSE-driven sync, and the Grafana→beads read-back's
+  # three ConflictPolicy branches (beads-wins / grafana-wins / manual) —
+  # end-to-end WITHOUT a live grafana-bridge, a live Grafana, a live k8s API, or
+  # real agent pods (the read-back poll is OFF on the fleet — grafana.url is
+  # empty, so the bridge runs write-only in-cluster and the conflict branches
+  # never fire there). Like gitlab-prov-probe / jira-conv-probe it wires the REAL
+  # bridge components (GrafanaConfigMapWriter against a fake k8s clientset,
+  # GrafanaSync through the REAL SSE stream, GrafanaReadback against a STUB
+  # Grafana httptest server) + an in-process mock daemon, so every bead write is
+  # a recorded call and no controller ever mints a pod. The module falls back to
+  # an in-shell `go build` if this binary is absent, but pre-installing it via
+  # the shard `use:` list keeps the build cached + smoke-checked. Test-only:
+  # ships in no release Makefile/Dockerfile target.
+  - key: build-grafana-bridge-probe
+    use: go-deps
+    run: |
+      cd gardenio/controller
+      CGO_ENABLED=0 go build -o /tmp/grafana-bridge-probe ./cmd/grafana-bridge-probe/
+      sudo install /tmp/grafana-bridge-probe /usr/local/bin/grafana-bridge-probe
+      test -x /usr/local/bin/grafana-bridge-probe
+    filter:
+      - "gardenio/controller/cmd/grafana-bridge-probe/**/*.go"
+      - "gardenio/controller/internal/**/*.go"
+      # internal/bridge/web.go has //go:embed web/* — the HTML assets under
+      # web/ are not *.go files, so the internal/**/*.go glob does not
+      # materialize them and the controller build fails with
+      # "pattern web/*: no matching files found" (ka-0000005393). Mirror
+      # build-gitlab-prov-probe / build-jira-conv-probe.
+      - "gardenio/controller/internal/bridge/web/**"
+      - "gardenio/controller/go.mod"
+      - "gardenio/controller/go.sum"
+      # controller replace => ../clicreds local module (ka-0000003839).
+      # Without these globs the build omits gardenio/clicreds from its
+      # materialized layer and `go build` fails with "replacement directory
+      # ../clicreds does not exist" (ka-0000005437).
+      - "gardenio/clicreds/**/*.go"
+      - "gardenio/clicreds/go.mod"
+      - "gardenio/clicreds/go.sum"
+
+  # ── Install coop + claudeless for the local-mode e2e module ────────
+  # test-local-mode.sh (the `local-mode` shard module) exercises
+  # `gb agent start --local`, which spawns coop wrapping a claudeless
+  # scenario. Without these on PATH the script exits 0 with SKIP.
+  #
+  # Source choices:
+  #   coop       — extracted from the registry image gardenio/coop. The tag
+  #                is derived to match the rest of the release pipeline:
+  #                  - explicit --param version=<calver>     -> <calver>-rc
+  #                  - else bare or refs/tags/<calver> (20*) -> <calver>-rc
+  #                  - else (main-push, schedule, CLI run)   -> main-<sha7>
+  #                This mirrors the derivation in .rwx/deploy-rwx.yml's
+  #                verify-images task. On tag pipelines this fixes the race
+  #                where the per-tag docker.yml has published <calver>-rc
+  #                but the main-push docker.yml has not yet published
+  #                main-<sha7>, leaving install-coop-claudeless with no
+  #                image to pull (ka-0000000436). Caching by `:latest` is
+  #                still avoided so coop fixes are not masked
+  #                (ka-0000006549).
+  #   claudeless — pinned upstream release, mirrors coop/.rwx/ci.yml's
+  #                install-claudeless task to keep behavior consistent.
+  #
+  # cache: false — coop binary must reflect the dispatch commit, so we
+  # always re-extract. The task is small (≈15s) so the savings from
+  # caching are minimal.
+  - key: install-coop-claudeless
+    cache: false
+    run: |
+      set -ex
+      # crane pulls the coop binary out of the registry image without
+      # needing a docker daemon.
+      curl -fsSL \
+        "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+        | tar xz -C /tmp crane
+      sudo mv /tmp/crane /usr/local/bin/crane
+
+      REGISTRY_HOST="${IMAGE_REGISTRY%%/*}"
+      set +x  # never xtrace the token into the log (ka-0000002171)
+      echo "$REGISTRY_TOKEN" \
+        | crane auth login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin
+      set -x
+
+      # Derive coop image tag — same logic as deploy-rwx.yml verify-images.
+      BARE_REF="${REF_NAME#refs/tags/}"
+      BARE_REF="${BARE_REF#refs/heads/}"
+      if [ -n "$VERSION" ]; then
+        COOP_TAG="${VERSION}-rc"
+      elif [[ "$BARE_REF" == 20* ]]; then
+        COOP_TAG="${BARE_REF}-rc"
+      else
+        COOP_TAG="main-${COMMIT_SHA:0:7}"
+      fi
+      echo "Resolved coop tag: $COOP_TAG (version=${VERSION:-} ref-name=${REF_NAME:-} sha=${COMMIT_SHA:0:7})"
+
+      # Poll the registry — the tag pipeline depends on docker.yml having
+      # already published the chosen tag. deploy-rwx.yml/verify-images
+      # already gates on the controller image; coop is built in the same
+      # docker.yml run, so it should be present by the time e2e runs. The
+      # short poll absorbs any per-image push skew (ka-0000000436).
+      WAIT_TIMEOUT_SEC="${WAIT_TIMEOUT_SEC:-300}"   # 5 min cap
+      WAIT_INTERVAL_SEC="${WAIT_INTERVAL_SEC:-15}"
+      DEADLINE=$(( $(date +%s) + WAIT_TIMEOUT_SEC ))
+      ATTEMPT=0
+      while true; do
+        ATTEMPT=$((ATTEMPT + 1))
+        if crane manifest "${IMAGE_REGISTRY}/coop:${COOP_TAG}" >/dev/null 2>&1; then
+          echo "OK: ${IMAGE_REGISTRY}/coop:${COOP_TAG} exists (attempt ${ATTEMPT})"
+          break
+        fi
+        NOW=$(date +%s)
+        if [ "$NOW" -ge "$DEADLINE" ]; then
+          echo "FATAL: ${IMAGE_REGISTRY}/coop:${COOP_TAG} not in registry after ${WAIT_TIMEOUT_SEC}s (${ATTEMPT} attempts)."
+          echo "       Verify .rwx/docker.yml for commit ${COMMIT_SHA:0:7} succeeded — see https://cloud.rwx.com/mint/acme (filter on docker.yml)."
+          exit 1
+        fi
+        REMAINING=$((DEADLINE - NOW))
+        echo "Image ${IMAGE_REGISTRY}/coop:${COOP_TAG} not yet pushed; retry in ${WAIT_INTERVAL_SEC}s (attempt ${ATTEMPT}, ${REMAINING}s remaining)..."
+        sleep "$WAIT_INTERVAL_SEC"
+      done
+
+      mkdir -p /tmp/coop-extract
+      crane export "${IMAGE_REGISTRY}/coop:${COOP_TAG}" - \
+        | tar -xC /tmp/coop-extract usr/local/bin/coop
+      sudo install /tmp/coop-extract/usr/local/bin/coop /usr/local/bin/coop
+      coop --version || coop --help 2>&1 | head -1
+
+      # claudeless from upstream release (matches coop/.rwx/ci.yml v0.4.0).
+      curl -fsSL -o /tmp/claudeless.tar.gz \
+        https://github.com/alfredjeanlab/claudeless/releases/download/v0.4.0/claudeless-linux-x86_64.tar.gz
+      sudo tar -xzf /tmp/claudeless.tar.gz -C /usr/local/bin
+      sudo chmod +x /usr/local/bin/claudeless
+      claudeless --version
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      VERSION: ${{ init.version }}
+      REF_NAME: ${{ init.ref-name }}
+
+  # ── Install pinned Claude Code CLI (shard 0 only) ────────────────────
+  # The claudemore-REPLAY tier (claudemore-hooks, ka-0000004452) drives the
+  # REAL `claude` binary through claudemore at $0. Without a `claude` on PATH
+  # test-claudemore-hooks.sh SKIP-cleans on its first preflight, so the module
+  # counted green-by-skip on EVERY run (0 assertions) — the exact defect
+  # decision ka-0000004333 exists to close. This installs a pinned,
+  # integrity-checked claude so the module RUNS. Only shard 0 needs it (both
+  # claudemore modules are pinned to shard 0 in run-shard.sh), so it rides
+  # ONLY e2e-shard-0's use: list, mirroring install-coop-claudeless's shape.
+  #
+  # The npm meta package (@anthropic-ai/claude-code) is a ~20KB WRAPPER whose
+  # postinstall copies the platform-native binary over a stub — a meta-only
+  # install yields a NON-WORKING claude. The real ELF is `package/claude` in
+  # the per-arch package (@anthropic-ai/claude-code-linux-x64), a self-contained
+  # glibc binary that runs with no node/npm on the ubuntu:24.04 base. We extract
+  # it directly (like install-coop-claudeless extracts the coop/claudeless
+  # binaries) rather than doing an offline `npm install -g` — keeping the sha512
+  # integrity check meaningful without pulling node onto the runner. RWX runners
+  # are x86_64, so the x64 tarball is authoritative; VERSION + digest are SOURCED
+  # from the pin files (never hard-coded here) so there is a single source of
+  # truth and no drift — same pattern as .rwx/microvm-image.yml's fetch-claude-code.
+  - key: install-claude
+    use: code
+    filter:
+      - gardenio/images/agent/install/versions.env
+      - gardenio/images/agent/install/checksums.env
+    run: |
+      set -ex
+      source gardenio/images/agent/install/versions.env
+      source gardenio/images/agent/install/checksums.env
+      curl -fsSL -o /tmp/claude-code-linux-x64.tgz \
+        "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-${CLAUDE_CODE_VERSION}.tgz"
+      printf '%s  %s\n' "${CLAUDE_CODE_X64_SHA512}" /tmp/claude-code-linux-x64.tgz | sha512sum -c -
+      # The native tarball's top-level `package/claude` is the standalone ELF.
+      tar -xzf /tmp/claude-code-linux-x64.tgz -C /tmp --strip-components=1 package/claude
+      sudo install /tmp/claude /usr/local/bin/claude
+      rm -f /tmp/claude-code-linux-x64.tgz /tmp/claude
+      claude --version
+
+  # ── Verify cluster access ────────────────────────────────────────────
+  - key: verify-cluster
+    use: kubeconfig
+    run: |
+      # E2: derive per-instance namespace. Order: explicit `namespace` param
+      # (legacy override) → gardenio-rwx-<instance-id> → fall back to
+      # gardenio-rwx-<short-sha> for back-compat with bare CLI dispatches.
+      # POC cred routing (ka-0000005509) — match the creds the inherited
+      # kubeconfig's `aws eks get-token` exec needs. See the kubeconfig task.
+      case "${INIT_HOST_DOMAIN:-}" in
+        prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+          export AWS_ACCESS_KEY_ID="$POC_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$POC_AWS_SECRET_ACCESS_KEY" ;;
+      esac
+      NAMESPACE="${NAMESPACE:-gardenio-rwx-${INIT_INSTANCE_ID:-${COMMIT_SHA:0:8}}}"
+      BEADS_SVC="${BEADS_SVC:-${NAMESPACE}-beads}"
+      echo "Verifying cluster access in namespace: $NAMESPACE (svc: $BEADS_SVC)"
+      kubectl -n "$NAMESPACE" get svc "$BEADS_SVC"
+      echo "Cluster access verified"
+    env:
+      NAMESPACE: ${{ init.namespace }}
+      INIT_INSTANCE_ID: ${{ init.instance-id }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      # Phase 2 POC creds from the non-default gardenio-main vault (ka-0000005509).
+      POC_AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      POC_AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      INIT_HOST_DOMAIN: ${{ init.host-domain }}
+
+  # ── Load beads token from K8s secret ─────────────────────────────────
+  - key: load-token
+    use: verify-cluster
+    run: |
+      # E2: derive per-instance namespace. Order: explicit `namespace` param
+      # (legacy override) → gardenio-rwx-<instance-id> → fall back to
+      # gardenio-rwx-<short-sha> for back-compat with bare CLI dispatches.
+      # POC cred routing (ka-0000005509) — match the creds the inherited
+      # kubeconfig's `aws eks get-token` exec needs. See the kubeconfig task.
+      case "${INIT_HOST_DOMAIN:-}" in
+        prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+          export AWS_ACCESS_KEY_ID="$POC_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$POC_AWS_SECRET_ACCESS_KEY" ;;
+      esac
+      NAMESPACE="${NAMESPACE:-gardenio-rwx-${INIT_INSTANCE_ID:-${COMMIT_SHA:0:8}}}"
+      TOKEN=$(kubectl -n "$NAMESPACE" get secret kd-beads-token \
+        -o jsonpath='{.data.token}' | base64 -d)
+      if [ -z "$TOKEN" ]; then
+        echo "ERROR: Could not load beads token from secret kd-beads-token"
+        exit 1
+      fi
+      echo "Token loaded from kd-beads-token secret"
+      # Write token to file for downstream tasks
+      echo "$TOKEN" > /tmp/beads-token
+    env:
+      NAMESPACE: ${{ init.namespace }}
+      INIT_INSTANCE_ID: ${{ init.instance-id }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      # Phase 2 POC creds from the non-default gardenio-main vault (ka-0000005509).
+      POC_AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      POC_AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      INIT_HOST_DOMAIN: ${{ init.host-domain }}
+
+  # ── E2E setup (one-shot fixture seeding, shared by all shards) ──────
+  # Seeds type configs + test user beads once, before any shard runs.
+  # This avoids 4 shards racing on idempotent-but-noisy PUTs/POSTs.
+  - key: e2e-setup
+    use: [build-gb, build-kd, load-token]
+    # 10m wraps the wait-for-stack-ready.sh readiness gate (STACK_READY_TIMEOUT_S
+    # default 420s, raised from 300s in ka-0000005545 to absorb POC cold-start)
+    # plus the context banner + reaper-lease refresh, with margin so the task
+    # timeout never fires BEFORE the gate's own diagnostic dump.
+    timeout: 10m
+    run: |
+      # E2: derive per-instance namespace. Order: explicit `namespace` param
+      # (legacy override) → gardenio-rwx-<instance-id> → fall back to
+      # gardenio-rwx-<short-sha> for back-compat with bare CLI dispatches.
+      # Exported so wait-for-stack-ready.sh below sees the per-instance
+      # namespace and does not fall through to its `gardenio-rwx` (singleton)
+      # default — see ka-0000002410.
+      # POC cred routing (ka-0000005509) — match the creds the inherited
+      # kubeconfig's `aws eks get-token` exec needs. See the kubeconfig task.
+      case "${INIT_HOST_DOMAIN:-}" in
+        prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+          export AWS_ACCESS_KEY_ID="$POC_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$POC_AWS_SECRET_ACCESS_KEY" ;;
+      esac
+      export NAMESPACE="${NAMESPACE:-gardenio-rwx-${INIT_INSTANCE_ID:-${COMMIT_SHA:0:8}}}"
+      BEADS_SVC="${BEADS_SVC:-${NAMESPACE}-beads}"
+
+      # Gate: the main-push pipeline runs deploy-rwx and this e2e pipeline
+      # as two uncoordinated RWX runs. Block here until the stack has
+      # settled so shards don't see services flicker mid-test. ka-0000005539.
+      ./gardenio/tests/e2e/scripts/wait-for-stack-ready.sh
+
+      # Per-instance ephemeral namespaces (gardenio-rwx-<instance-id>) mean
+      # concurrent deploy + e2e dispatches cannot collide on shared state —
+      # there is no cross-run lock to acquire. ka-0000003189.
+
+      # ── E2E test context banner ──────────────────────────────────────
+      # This dispatch tests DEPLOYED app code with CURRENT test scripts.
+      # To test new app code: cut a release (-rc) or let main-push CI run
+      # deploy-rwx. See advice kd-<see-rollout-memory>.
+      #
+      # Banner is informational only — wrap in a subshell with relaxed
+      # shell strictness so any failure here can NEVER kill the e2e task.
+      ( set +e; set +o pipefail
+      echo ""
+      echo "════════════════════════════════════════════════════════════════════"
+      echo "  E2E TEST CONTEXT"
+      echo "════════════════════════════════════════════════════════════════════"
+      DEPLOYED_IMAGE=$(kubectl -n "$NAMESPACE" get deploy "${NAMESPACE}-beads" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+      DEPLOYED_TAG="${DEPLOYED_IMAGE##*:}"
+      # .git is not present in this task (we `use: build-gb build-kd load-token`,
+      # not `code`), so fall back to the init-injected commit-sha env var.
+      CURRENT_SHA="${INIT_COMMIT_SHA:-$(git rev-parse HEAD 2>/dev/null || echo "unknown")}"
+      TAG_ON_SHA=$(git tag --points-at "$CURRENT_SHA" 2>/dev/null | awk '/^20[0-9]{2}\./ { print; exit }')
+      if [ -n "$TAG_ON_SHA" ]; then
+        EXPECTED_TAG="${TAG_ON_SHA}-rc"
+      else
+        EXPECTED_TAG="main-${CURRENT_SHA:0:7}"
+      fi
+
+      echo "  gardenio-rwx running:    $DEPLOYED_TAG"
+      echo "  this dispatch targets:  $EXPECTED_TAG  (commit ${CURRENT_SHA:0:7})"
+      echo ""
+      if [ "$DEPLOYED_TAG" = "$EXPECTED_TAG" ]; then
+        echo "  ✓ APP CODE MATCHES — tests exercise exactly what this commit builds."
+      else
+        echo "  ⚠ APP CODE DOES NOT MATCH THIS DISPATCH."
+        echo ""
+        echo "  Tests will run against APP CODE from: $DEPLOYED_TAG"
+        echo "  Tests use TEST SCRIPTS from:          $EXPECTED_TAG  ($CURRENT_SHA)"
+        echo ""
+
+        # Try to resolve deployed tag to a commit we can log from
+        DEPLOYED_SHA=""
+        if [[ "$DEPLOYED_TAG" == main-* ]]; then
+          DEPLOYED_SHA=$(git rev-parse "${DEPLOYED_TAG#main-}" 2>/dev/null || true)
+        elif [[ "$DEPLOYED_TAG" == 20[0-9][0-9].*-rc ]]; then
+          DEPLOYED_SHA=$(git rev-parse "${DEPLOYED_TAG%-rc}" 2>/dev/null || true)
+        fi
+
+        if [ -n "$DEPLOYED_SHA" ]; then
+          AHEAD=$(git rev-list --count "$DEPLOYED_SHA..$CURRENT_SHA" 2>/dev/null || echo "?")
+          if [ "$AHEAD" != "?" ] && [ "$AHEAD" != "0" ]; then
+            echo "  UNTESTED CHANGES IN THIS RUN ($AHEAD commits since $DEPLOYED_TAG):"
+            git log --oneline "$DEPLOYED_SHA..$CURRENT_SHA" 2>/dev/null | head -20 | sed 's/^/    /'
+            TOTAL=$(git log --oneline "$DEPLOYED_SHA..$CURRENT_SHA" 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$TOTAL" -gt 20 ]; then
+              echo "    ... ($(($TOTAL - 20)) more commits, truncated)"
+            fi
+            echo ""
+          fi
+        else
+          echo "  (could not resolve $DEPLOYED_TAG to a commit for diff — shallow clone or unknown tag)"
+          echo ""
+        fi
+
+        echo "  To actually test new app code in gardenio-rwx:"
+        echo "    - Cut a release tag:  ./scripts/release.sh     (triggers deploy-rwx + e2e-rwx)"
+        echo "    - Or merge to main:   the main-push pipeline runs deploy-rwx automatically"
+        echo "  Ad-hoc rwx dispatch .rwx/e2e.yml does NOT redeploy. It is still useful for:"
+        echo "    - Retrying flaky test modules against the current deploy"
+        echo "    - Running new/updated test scripts against the existing app code"
+      fi
+      echo "════════════════════════════════════════════════════════════════════"
+      echo ""
+      true ) || true
+
+      kubectl -n "$NAMESPACE" port-forward "svc/${BEADS_SVC}" 19090:8080 &
+      PF_PID=$!
+      sleep 3
+      export BEADS_TOKEN="$(cat /tmp/beads-token 2>/dev/null || echo "")"
+      export BEADS_HTTP_URL="http://localhost:19090"
+      ./gardenio/tests/e2e/scripts/seed-types-and-users.sh
+      kill "$PF_PID" 2>/dev/null || true
+    env:
+      NAMESPACE: ${{ init.namespace }}
+      INIT_INSTANCE_ID: ${{ init.instance-id }}
+      INIT_COMMIT_SHA: ${{ init.commit-sha }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      # Phase 2 POC creds from the non-default gardenio-main vault (ka-0000005509).
+      POC_AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      POC_AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      INIT_HOST_DOMAIN: ${{ init.host-domain }}
+    outputs:
+      filesystem: false
+
+  # ── E2E shards (4-way parallel) ──────────────────────────────────────
+  # Each shard runs a subset of modules determined by shard_for() in
+  # run-shard.sh. Pinned heavy modules + cksum(name)%4 hash for the rest.
+  # Balanced by MEASURED RUNTIME, not module count (ka-0000001993): the pins
+  # bin-pack per-module wall-clock (max across five 2026-08-04 release RCs) so
+  # each shard's base p95 sits at ~8.9–9.5m and worst-case + a full heaviest-
+  # module retry stays ≤15m — comfortably under the 25m task budget below.
+  # Module COUNTS are now uneven (39/26/30/41) BY DESIGN: shards 0/3 carry more
+  # sub-5s hash-tail modules to offset shards 1/2 each owning one 280–360s heavy
+  # (cred-rotation-resume / pool-assign-attribution). The prior count-balance
+  # (36/35/37/28) hid a 5× runtime spread (836s vs 166s) that timed shard 1 out
+  # on a single retry. Constraints preserved: config-*→shard3, slack-*→shard2,
+  # from-source Go probes→shard0 (their build-*-probe use: lists, below).
+  - key: e2e-shard-0
+    use: [build-gb, build-kd, build-beads-viewer, build-trigger-engine, build-trigger-probe, build-jira-conv-probe, build-jira-syncback-probe, build-gitlab-prov-probe, build-gitlab-pipeline-trigger-probe, build-gitlab-pipeline-minduration-probe, build-grafana-bridge-probe, build-mr-reopen-probe, build-agent-feedback-probe, load-token, install-coop-claudeless, install-claude, install-captain, e2e-setup]
+    # 25m task budget (all four shards share it). History: 15m→20m after the
+    # ka-0000006868 count-rebalance; 20m→25m (ka-0000008024) for cold-POC-EBS
+    # first-touch I/O. The ka-0000001993 runtime-weight rebalance drops shard-0
+    # base to ~8.9m (from ~12.8m), but the 25m budget is RETAINED as headroom
+    # for cold-cache RCs + the 1-retry tax. run-shard.sh's SHARD_BUDGET_SECONDS
+    # default is bumped to 1500 in lockstep — keep the two in sync.
+    timeout: 25m
+    run: |
+      # Captain wraps run-shard.sh so retries, quarantine, and the failure
+      # summary go through .captain/config.yml. JUnit lands at
+      # junit-results-${E2E_SHARD}/e2e-summary.xml; we override --test-results
+      # so per-shard captain invocations see the right file. ka-0000004315.
+      #
+      # --language Python --framework unittest activates Captain's targeted
+      # retry templating (ka-0000000510). Python+unittest is the cleanest
+      # match for our generic-JUnit XML: PythonUnitTestParser accepts our
+      # <testsuites><testsuite><testcase classname=... name=.../> shape
+      # unchanged, and PythonUnitTestSubstitution templates {{ tests }} as
+      # a single space-delimited list of `'<classname>.<name>'` tokens —
+      # captain-retry.sh strips the dotted classname prefix to recover the
+      # bare module name for ONLY=. These flags are NOT yaml-bindable in
+      # captain v2 — they must be on the CLI.
+      #
+      # --intermediate-artifacts-path preserves per-attempt e2e-summary.xml
+      # (run-shard.sh overwrites the same path on each retry, so without
+      # this the original-attempt XML would be clobbered).
+      # E2: derive per-instance namespace if not explicitly set.
+      # POC cred routing (ka-0000005509) — match the creds the inherited
+      # kubeconfig's `aws eks get-token` exec needs. See the kubeconfig task.
+      case "${INIT_HOST_DOMAIN:-}" in
+        prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+          export AWS_ACCESS_KEY_ID="$POC_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$POC_AWS_SECRET_ACCESS_KEY" ;;
+      esac
+      export NAMESPACE="${NAMESPACE:-gardenio-rwx-${INIT_INSTANCE_ID:-${COMMIT_SHA:0:8}}}"
+      export E2E_SHARD=0 TOTAL_SHARDS=4
+      captain run --suite-id=gardenio-e2e \
+        --language Python --framework unittest \
+        --test-results="junit-results-${E2E_SHARD}/e2e-summary.xml" \
+        --intermediate-artifacts-path="junit-results-${E2E_SHARD}/captain-intermediate" \
+        -- ./gardenio/tests/e2e/scripts/run-shard.sh
+    env:
+      NAMESPACE: ${{ init.namespace }}
+      INIT_INSTANCE_ID: ${{ init.instance-id }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      KEEP_NAMESPACE: ${{ init.keep }}
+      ONLY: ${{ init.only }}
+      SKIP: ${{ init.skip }}
+      # Fail-loud outbox rig knob (ka-0000007489): dormant (empty) by default, so
+      # the live outbox matrix skip-PASSES an absent rig exactly as before. When a
+      # scheduled readiness dispatch sets require-outbox-rig=true (AFTER the sandbox
+      # creds are provisioned into this namespace), outbox_rig_guard turns an absent
+      # rig/seat into a hard NO-GO FAIL in the shard that owns jira-outbox-*.
+      REQUIRE_OUTBOX_RIG: ${{ init.require-outbox-rig }}
+      CAPTAIN_POISON_MODULE: ${{ init.captain-poison-module }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      # Phase 2 POC creds from the non-default gardenio-main vault (ka-0000005509).
+      POC_AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      POC_AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      INIT_HOST_DOMAIN: ${{ init.host-domain }}
+    outputs:
+      artifacts:
+        - key: junit-results-0
+          path: junit-results-0
+
+  - key: e2e-shard-1
+    # install-victoria-logs arms the idp-audit-fieldcontract gate (ka-0000004993):
+    # the module is pinned to shard 1 in run-shard.sh's shard_for(), so ONLY this
+    # shard's use: list carries the chart-pinned victoria-logs-prod binary that
+    # turns its LOUD-SKIP into a HARD gate.
+    use: [build-gb, build-kd, build-trigger-engine, build-trigger-probe, install-victoria-logs, load-token, install-coop-claudeless, install-captain, e2e-setup]
+    # 25m task budget (see shard 0). Under ka-0000001993 shard 1 owns the two
+    # heaviest cred modules (cred-rotation-resume 283s + credential-rotation
+    # 225s) on just 26 modules; base ~9.5m, worst-case + retry ~14.2m. The old
+    # count-balance made shard 1 the heaviest at 836s (13.9m) and one retry away
+    # from the timeout — the 134.2/134.3 class of failures (ka-0000007944).
+    timeout: 25m
+    run: |
+      # E2: derive per-instance namespace if not explicitly set.
+      # POC cred routing (ka-0000005509) — match the creds the inherited
+      # kubeconfig's `aws eks get-token` exec needs. See the kubeconfig task.
+      case "${INIT_HOST_DOMAIN:-}" in
+        prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+          export AWS_ACCESS_KEY_ID="$POC_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$POC_AWS_SECRET_ACCESS_KEY" ;;
+      esac
+      export NAMESPACE="${NAMESPACE:-gardenio-rwx-${INIT_INSTANCE_ID:-${COMMIT_SHA:0:8}}}"
+      export E2E_SHARD=1 TOTAL_SHARDS=4
+      captain run --suite-id=gardenio-e2e \
+        --language Python --framework unittest \
+        --test-results="junit-results-${E2E_SHARD}/e2e-summary.xml" \
+        --intermediate-artifacts-path="junit-results-${E2E_SHARD}/captain-intermediate" \
+        -- ./gardenio/tests/e2e/scripts/run-shard.sh
+    env:
+      NAMESPACE: ${{ init.namespace }}
+      INIT_INSTANCE_ID: ${{ init.instance-id }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      KEEP_NAMESPACE: ${{ init.keep }}
+      ONLY: ${{ init.only }}
+      SKIP: ${{ init.skip }}
+      # Fail-loud outbox rig knob (ka-0000007489): dormant (empty) by default, so
+      # the live outbox matrix skip-PASSES an absent rig exactly as before. When a
+      # scheduled readiness dispatch sets require-outbox-rig=true (AFTER the sandbox
+      # creds are provisioned into this namespace), outbox_rig_guard turns an absent
+      # rig/seat into a hard NO-GO FAIL in the shard that owns jira-outbox-*.
+      REQUIRE_OUTBOX_RIG: ${{ init.require-outbox-rig }}
+      CAPTAIN_POISON_MODULE: ${{ init.captain-poison-module }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      # Phase 2 POC creds from the non-default gardenio-main vault (ka-0000005509).
+      POC_AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      POC_AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      INIT_HOST_DOMAIN: ${{ init.host-domain }}
+    outputs:
+      artifacts:
+        - key: junit-results-1
+          path: junit-results-1
+
+  - key: e2e-shard-2
+    use: [build-gb, build-kd, build-trigger-engine, build-trigger-probe, load-token, install-coop-claudeless, install-captain, e2e-setup]
+    # Bumped 15m → 20m for parity with sibling shards (ka-0000007944).
+    # Bumped 20m → 25m (ka-0000008024) for cold-POC-EBS I/O margin; see shard 0.
+    timeout: 25m
+    run: |
+      # E2: derive per-instance namespace if not explicitly set.
+      # POC cred routing (ka-0000005509) — match the creds the inherited
+      # kubeconfig's `aws eks get-token` exec needs. See the kubeconfig task.
+      case "${INIT_HOST_DOMAIN:-}" in
+        prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+          export AWS_ACCESS_KEY_ID="$POC_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$POC_AWS_SECRET_ACCESS_KEY" ;;
+      esac
+      export NAMESPACE="${NAMESPACE:-gardenio-rwx-${INIT_INSTANCE_ID:-${COMMIT_SHA:0:8}}}"
+      export E2E_SHARD=2 TOTAL_SHARDS=4
+      captain run --suite-id=gardenio-e2e \
+        --language Python --framework unittest \
+        --test-results="junit-results-${E2E_SHARD}/e2e-summary.xml" \
+        --intermediate-artifacts-path="junit-results-${E2E_SHARD}/captain-intermediate" \
+        -- ./gardenio/tests/e2e/scripts/run-shard.sh
+    env:
+      NAMESPACE: ${{ init.namespace }}
+      INIT_INSTANCE_ID: ${{ init.instance-id }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      KEEP_NAMESPACE: ${{ init.keep }}
+      ONLY: ${{ init.only }}
+      SKIP: ${{ init.skip }}
+      # Fail-loud outbox rig knob (ka-0000007489): dormant (empty) by default, so
+      # the live outbox matrix skip-PASSES an absent rig exactly as before. When a
+      # scheduled readiness dispatch sets require-outbox-rig=true (AFTER the sandbox
+      # creds are provisioned into this namespace), outbox_rig_guard turns an absent
+      # rig/seat into a hard NO-GO FAIL in the shard that owns jira-outbox-*.
+      REQUIRE_OUTBOX_RIG: ${{ init.require-outbox-rig }}
+      # Fail-loud slack-ui knob (ka-0000006398): dormant (empty) by default, so
+      # the real-user Slack module SKIP-passes an absent rig. Threaded onto shard
+      # 2 only — slack-ui pins there with the rest of the slack cluster (see
+      # shard_for in run-shard.sh). When a scheduled readiness dispatch sets
+      # require-slack-ui=true (AFTER the test-Slack secrets are provisioned into
+      # this namespace), test-slack-ui.sh turns an absent storageState secret /
+      # scaffold / bridge into a hard FAIL instead of a silent skip.
+      SLACK_UI_REQUIRE: ${{ init.require-slack-ui }}
+      CAPTAIN_POISON_MODULE: ${{ init.captain-poison-module }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      # Phase 2 POC creds from the non-default gardenio-main vault (ka-0000005509).
+      POC_AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      POC_AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      INIT_HOST_DOMAIN: ${{ init.host-domain }}
+    outputs:
+      artifacts:
+        - key: junit-results-2
+          path: junit-results-2
+
+  - key: e2e-shard-3
+    use: [build-gb, build-kd, build-trigger-engine, build-trigger-probe, load-token, install-coop-claudeless, install-captain, e2e-setup]
+    # Shard 3 carries the serialized config-*/credential/escalation cluster
+    # (24 pinned modules + ~7 hash-fallback). 15m was insufficient after the
+    # 5785f46c config-* pin grew the cluster — ka-0000006868 observed SIGKILL
+    # at 15m. Bumped to 20m to give captain-retry headroom.
+    # Bumped 20m → 25m (ka-0000008024) for cold-POC-EBS I/O margin; see shard 0.
+    timeout: 25m
+    run: |
+      # E2: derive per-instance namespace if not explicitly set.
+      # POC cred routing (ka-0000005509) — match the creds the inherited
+      # kubeconfig's `aws eks get-token` exec needs. See the kubeconfig task.
+      case "${INIT_HOST_DOMAIN:-}" in
+        prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+          export AWS_ACCESS_KEY_ID="$POC_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$POC_AWS_SECRET_ACCESS_KEY" ;;
+      esac
+      export NAMESPACE="${NAMESPACE:-gardenio-rwx-${INIT_INSTANCE_ID:-${COMMIT_SHA:0:8}}}"
+      export E2E_SHARD=3 TOTAL_SHARDS=4
+      captain run --suite-id=gardenio-e2e \
+        --language Python --framework unittest \
+        --test-results="junit-results-${E2E_SHARD}/e2e-summary.xml" \
+        --intermediate-artifacts-path="junit-results-${E2E_SHARD}/captain-intermediate" \
+        -- ./gardenio/tests/e2e/scripts/run-shard.sh
+    env:
+      NAMESPACE: ${{ init.namespace }}
+      INIT_INSTANCE_ID: ${{ init.instance-id }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      KEEP_NAMESPACE: ${{ init.keep }}
+      ONLY: ${{ init.only }}
+      SKIP: ${{ init.skip }}
+      # Fail-loud outbox rig knob (ka-0000007489): dormant (empty) by default, so
+      # the live outbox matrix skip-PASSES an absent rig exactly as before. When a
+      # scheduled readiness dispatch sets require-outbox-rig=true (AFTER the sandbox
+      # creds are provisioned into this namespace), outbox_rig_guard turns an absent
+      # rig/seat into a hard NO-GO FAIL in the shard that owns jira-outbox-*.
+      REQUIRE_OUTBOX_RIG: ${{ init.require-outbox-rig }}
+      CAPTAIN_POISON_MODULE: ${{ init.captain-poison-module }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      # Phase 2 POC creds from the non-default gardenio-main vault (ka-0000005509).
+      POC_AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      POC_AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      INIT_HOST_DOMAIN: ${{ init.host-domain }}
+    outputs:
+      artifacts:
+        - key: junit-results-3
+          path: junit-results-3
+
+  # ── Aggregate per-shard JSONL results into a single junit-results/ ───
+  # HARDENED against aborted/timed-out shards (ka-0000001389). History of
+  # the two dead-ends this task walked, so nobody re-treads them:
+  #
+  #   1. `${{ tasks.<shard>.artifacts.junit-results-N }}` ENV REFS
+  #      (pre-ka-0000007944): a timed-out shard's task context has NO
+  #      `artifacts` key (only .succeeded/.failed/.aborted/.timed-out/.id/…),
+  #      so RWX rejected the whole config with "Invalid reference to a task"
+  #      — masking the real timeout as a config error (2026.134.2/.3).
+  #   2. `use: [e2e-shard-0..3]` (ka-0000007944): inheriting the shard
+  #      filesystems dodged the artifacts ref, BUT a `use:` dep that
+  #      times out is treated as failed, so RWX SKIPS this task entirely
+  #      (verified: a timed-out `use:` dep → downstream `no_result`/skipped).
+  #      The graceful partial-merge below then never ran, and downstream saw
+  #      a missing junit-results artifact instead of a partial one.
+  #
+  # FIX (candidate #2 from the bead): resolve each shard's artifact at
+  # RUNTIME via `rwx artifacts download <task-id>`, gated on an
+  # `after:` that fires whether the shard SUCCEEDED or FAILED. Each shard's
+  # `.id` IS present in its task context even when timed out (unlike
+  # `.artifacts`), so the config always resolves; a missing artifact (the
+  # timed-out shard never published one) is a clean, catchable
+  # "Artifact … not found" (exit 1), not a config error. This is the same
+  # runtime-download pattern used by fetch-e2e-tarball (.rwx/coverage.yml)
+  # and release-gate (.rwx/release.yml). The candidate #1 short-circuit
+  # (`succeeded && artifacts.X`) is IMPOSSIBLE: RWX `&&` requires two
+  # booleans and rejects a string operand ("does not compare two booleans").
+  - key: e2e-aggregate
+    use: code
+    after: ${{ (e2e-shard-0.succeeded || e2e-shard-0.failed) && (e2e-shard-1.succeeded || e2e-shard-1.failed) && (e2e-shard-2.succeeded || e2e-shard-2.failed) && (e2e-shard-3.succeeded || e2e-shard-3.failed) }}
+    cache: false
+    timeout: 10m
+    env:
+      RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+      # Per-shard task IDs — present in the task context even when a shard
+      # times out (only `.artifacts` is absent), so this config always
+      # resolves. RWX_RUN_ID is auto-injected but download-by-task-id needs
+      # no run id.
+      SHARD_0_ID: ${{ tasks.e2e-shard-0.id }}
+      SHARD_1_ID: ${{ tasks.e2e-shard-1.id }}
+      SHARD_2_ID: ${{ tasks.e2e-shard-2.id }}
+      SHARD_3_ID: ${{ tasks.e2e-shard-3.id }}
+    run: |
+      set -uo pipefail
+      # Bootstrap the rwx CLI if the base image doesn't ship it. Pin v3.13.2
+      # to match .gitlab-ci.yml / .rwx/release.yml (ka-0000006447).
+      if ! command -v rwx >/dev/null 2>&1; then
+        # Verify exact bytes before install (ka-0000001204 / F3). Digest source
+        # + update procedure: docs/ci-toolchain-checksums.md.
+        RWX_SHA256=ef4afcad5ed9a6e7d24190050753f35cf1a6d609f07b949a1caa83074c16507e
+        curl -fsSL --retry 3 --retry-delay 3 \
+          https://github.com/rwx-cloud/rwx/releases/download/v3.13.2/rwx-linux-x86_64-static \
+          -o /tmp/rwx
+        echo "${RWX_SHA256}  /tmp/rwx" | sha256sum -c -
+        sudo install -m 0755 /tmp/rwx /usr/local/bin/rwx && rm -f /tmp/rwx
+      fi
+      rwx --version || true
+
+      # Download each shard's junit-results-N directory artifact by task-id.
+      # A shard that timed out / was aborted never published its artifact —
+      # `download` then exits 1 with "Artifact … not found", which we absorb
+      # so the partial aggregation still runs (graceful degradation).
+      for i in 0 1 2 3; do
+        eval "TID=\${SHARD_${i}_ID:-}"
+        if [ -z "$TID" ]; then
+          echo "WARN: shard ${i} task-id unset — skipping download"
+          continue
+        fi
+        if rwx artifacts download "$TID" "junit-results-${i}" \
+              --auto-extract --output-dir "junit-results-${i}" 2>/tmp/rwx-art-${i}.err; then
+          echo "Downloaded shard ${i} artifact (junit-results-${i})"
+        else
+          echo "WARN: shard ${i} artifact junit-results-${i} unavailable (shard aborted/timed-out?):"
+          sed 's/^/    /' /tmp/rwx-art-${i}.err || true
+        fi
+      done
+
+      # Merge whatever landed. Absent per-shard dirs are expected when a
+      # shard aborted — the merge degrades to the shards that did produce
+      # results rather than failing the aggregate.
+      mkdir -p junit-results
+      : > junit-results/e2e-results.jsonl
+      for i in 0 1 2 3; do
+        SRC="junit-results-${i}/e2e-results.jsonl"
+        if [ -f "$SRC" ]; then
+          cat "$SRC" >> junit-results/e2e-results.jsonl
+          echo "Merged shard ${i} ($(wc -l < "$SRC") rows)"
+        else
+          echo "WARN: shard ${i} results missing ($SRC)"
+        fi
+      done
+      # Combine per-shard junit XMLs as well (best-effort)
+      for i in 0 1 2 3; do
+        if [ -d "junit-results-${i}" ]; then
+          find "junit-results-${i}" -name '*.xml' -exec cp -v {} junit-results/ \; 2>/dev/null || true
+        fi
+      done
+      echo "Aggregated results: $(wc -l < junit-results/e2e-results.jsonl) rows"
+    outputs:
+      artifacts:
+        - key: junit-results
+          path: junit-results
+
+  # ── Drain runtime coverage profiles from instrumented pods ──────────
+  # W2 coverage collection (ka-0000005395). Runs only when the deploy was
+  # opted into coverage instrumentation — controlled by the `coverage`
+  # init param surfaced by .rwx/deploy-rwx.yml. Steps:
+  #   1. Rollout-restart instrumented deployments. SIGTERM triggers the
+  #      deferred covflush.Flush() in each Go binary, writing GOCOVERDIR
+  #      counters into the shared coverage PVC.
+  #   2. Wait for rollouts to complete so the old pods have actually exited
+  #      and flushed (rollout status only returns when the new ReplicaSet
+  #      is fully ready, which means the old one has terminated).
+  #   3. Spawn an ephemeral helper pod that mounts the coverage PVC
+  #      read-only, tars the contents, and streams to stdout.
+  #   4. Capture the tar as an RWX artifact.
+  # Runs even when shards fail so we collect coverage from the shard run
+  # we just did. Best-effort: failures here MUST NOT mark the suite
+  # failed (`true) || true`).
+  - key: e2e-coverage
+    use: [code, kubeconfig]
+    after: ${{ (e2e-shard-0.succeeded || e2e-shard-0.failed) && (e2e-shard-1.succeeded || e2e-shard-1.failed) && (e2e-shard-2.succeeded || e2e-shard-2.failed) && (e2e-shard-3.succeeded || e2e-shard-3.failed) }}
+    cache: false
+    timeout: 10m
+    run: |
+      set +e
+      # POC cred routing (ka-0000005509) — match the creds the inherited
+      # kubeconfig's `aws eks get-token` exec needs. See the kubeconfig task.
+      case "${INIT_HOST_DOMAIN:-}" in
+        prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+          export AWS_ACCESS_KEY_ID="$POC_AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$POC_AWS_SECRET_ACCESS_KEY" ;;
+      esac
+      # E2: derive per-instance namespace. Order: explicit `namespace` param
+      # (legacy override) → gardenio-rwx-<instance-id> → fall back to
+      # gardenio-rwx-<short-sha> for back-compat with bare CLI dispatches.
+      NAMESPACE="${NAMESPACE:-gardenio-rwx-${INIT_INSTANCE_ID:-${COMMIT_SHA:0:8}}}"
+      mkdir -p coverage-artifacts
+
+      # Skip cleanly if coverage PVC isn't present (deploy did not opt in).
+      PVC_NAME="${NAMESPACE}-agents-coverage"
+      if ! kubectl -n "$NAMESPACE" get pvc "$PVC_NAME" >/dev/null 2>&1; then
+        echo "Coverage PVC $PVC_NAME not found in $NAMESPACE — coverage opt-in is off, skipping."
+        echo "skipped" > coverage-artifacts/SKIPPED
+        exit 0
+      fi
+
+      echo "=== Triggering pre-shutdown coverage flush via rollout restart ==="
+      # All long-running daemons that wire covflush.Flush() — see W2.
+      INSTRUMENTED_DEPLOYS=(
+        controller
+        beads-viewer
+        slack-bridge
+        jira-bridge
+        gitlab-bridge
+        push-bridge
+        wl-bridge
+        grafana-bridge
+        alertmanager-bridge
+        trigger-engine
+        roles-server
+      )
+      for name in "${INSTRUMENTED_DEPLOYS[@]}"; do
+        DEPLOY="${NAMESPACE}-${name}"
+        if kubectl -n "$NAMESPACE" get deploy "$DEPLOY" >/dev/null 2>&1; then
+          echo "  rollout restart $DEPLOY"
+          kubectl -n "$NAMESPACE" rollout restart deploy "$DEPLOY"
+        fi
+      done
+
+      echo "=== Waiting for restarts to complete (covflush runs in defer on SIGTERM) ==="
+      for name in "${INSTRUMENTED_DEPLOYS[@]}"; do
+        DEPLOY="${NAMESPACE}-${name}"
+        if kubectl -n "$NAMESPACE" get deploy "$DEPLOY" >/dev/null 2>&1; then
+          kubectl -n "$NAMESPACE" rollout status deploy "$DEPLOY" --timeout=4m || true
+        fi
+      done
+
+      echo "=== Draining coverage PVC via helper pod ==="
+      HELPER=coverage-drain-${RWX_RUN_ID:-$$}
+      kubectl -n "$NAMESPACE" delete pod "$HELPER" --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || true
+
+      cat <<EOF | kubectl -n "$NAMESPACE" apply -f -
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: ${HELPER}
+        labels:
+          app.kubernetes.io/component: coverage-drain
+          app.kubernetes.io/managed-by: rwx-e2e
+      spec:
+        restartPolicy: Never
+        automountServiceAccountToken: false
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65534
+          fsGroup: 65534
+          seccompProfile:
+            type: RuntimeDefault
+        containers:
+          - name: drain
+            image: alpine:3.20
+            command: ["sh", "-c", "sleep 600"]
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: [ALL]
+            volumeMounts:
+              - name: coverage
+                mountPath: /coverage
+                readOnly: true
+              - name: tmp
+                mountPath: /tmp
+        volumes:
+          - name: coverage
+            persistentVolumeClaim:
+              claimName: ${PVC_NAME}
+              readOnly: true
+          - name: tmp
+            emptyDir: {}
+      EOF
+
+      kubectl -n "$NAMESPACE" wait --for=condition=Ready "pod/${HELPER}" --timeout=2m || true
+
+      echo "=== Coverage PVC contents ==="
+      kubectl -n "$NAMESPACE" exec "$HELPER" -- sh -c 'ls -laR /coverage 2>/dev/null | head -200' || true
+
+      echo "=== Tarring /coverage from PVC ==="
+      kubectl -n "$NAMESPACE" exec "$HELPER" -- sh -c 'tar -C /coverage -czf /tmp/coverage.tar.gz . 2>/dev/null && ls -la /tmp/coverage.tar.gz' || true
+      kubectl -n "$NAMESPACE" cp "${HELPER}:/tmp/coverage.tar.gz" coverage-artifacts/coverage.tar.gz || true
+
+      if [ -s coverage-artifacts/coverage.tar.gz ]; then
+        echo "Coverage tarball captured: $(stat -c%s coverage-artifacts/coverage.tar.gz) bytes"
+        tar -tzf coverage-artifacts/coverage.tar.gz | head -50 > coverage-artifacts/MANIFEST.txt || true
+      else
+        echo "WARN: no coverage data captured (coverage.tar.gz missing or empty)"
+      fi
+
+      echo "=== Cleaning up helper pod ==="
+      kubectl -n "$NAMESPACE" delete pod "$HELPER" --ignore-not-found --grace-period=10 || true
+
+      true
+    env:
+      NAMESPACE: ${{ init.namespace }}
+      INIT_INSTANCE_ID: ${{ init.instance-id }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      # Phase 2 POC creds from the non-default gardenio-main vault (ka-0000005509).
+      POC_AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      POC_AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      INIT_HOST_DOMAIN: ${{ init.host-domain }}
+    outputs:
+      artifacts:
+        - key: coverage-artifacts
+          path: coverage-artifacts
+
+  # ── gVisor PRODUCTION-READINESS substrate gate (ka-0000002867) ───────
+  # The FIRST gate of the gardenio-gvisor-readiness dispatch: stands up / asserts
+  # the gvisor-poc substrate so the lifecycle modules below run against a real
+  # node instead of self-skipping into a meaningless green. Provokes Karpenter
+  # (schedules a privileged probe to force a gvisor=poc node), then runs the
+  # shared warm-node gate (runsc present + /var/tmp writable + state root
+  # reachable). Under REQUIRE_SUBSTRATE=1 (the go/no-go) an absent/cold substrate
+  # is a NO-GO HARD FAIL; otherwise it self-skips clean. It is a fast no-op on the
+  # normal gardenio-e2e / per-feature dispatches (require-substrate=false), so it
+  # adds no cost there.
+  - key: gvisor-substrate-ready
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 10m
+    run: |
+      # GVISOR_E2E=1 selects the gate; REQUIRE_SUBSTRATE (from init) decides
+      # whether an absent substrate is a NO-GO hard-fail or a clean skip.
+      export GVISOR_E2E=1
+      ./gardenio/tests/e2e/scripts/test-gvisor-substrate-ready.sh
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor runsc freeze/thaw state-fidelity (opt-in) ─────────────────
+  # ka-0000001895 / Phase 2 epic ka-0000002167. Proves runsc
+  # checkpoint/restore preserves agent state (file + in-RAM token) and the
+  # agent RESUMES on thaw, plus the failure path (thaw under a non-runsc
+  # runtime => clear error, not silent corruption). Self-contained: it only
+  # needs kubectl against the live cluster — no beads/coop/token. The module
+  # schedules its own privileged probe onto the gvisor-poc node pool and
+  # drives runsc directly (reusing the ka-0000000300 PoC mechanism, MR !3464).
+  #
+  # Only runs under the dedicated `gardenio-gvisor-freeze-thaw` dispatch — it
+  # is NOT wired into the gardenio-e2e shard fan-out because the standard
+  # gardenio-rwx cluster has no gVisor node pool. GVISOR_E2E=1 flips the
+  # module from self-SKIP to assert; the test still SKIPs cleanly if the
+  # runsc RuntimeClass / gvisor-poc create-pods perms are absent.
+  - key: gvisor-freeze-thaw
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 12m
+    # NON-BLOCKING — ka-0000000847 (operator: Matt Baker, slack:U0OPERATOR1),
+    # generalizing the ka-0000003662 mandate that already de-gated the sibling
+    # resume-latency / userresponse-latency tasks below. This module targets the
+    # ephemeral gvisor-poc node pool, which is often ABSENT at e2e time (Karpenter
+    # has not scaled a gvisor=poc node, so the privileged probe pod is NotFound /
+    # cannot schedule in 180s) or has a not-yet-warm runsc runtime (checkpoint
+    # rc=128 "FetchSpec failed: file does not exist"). Those are PoC-substrate /
+    # scheduling flakes, NOT gardenio app regressions, yet this task runs inside
+    # the gardenio-e2e fan-out and HARD-GATED promote -> deploy-prod, reddening
+    # blocking release-tag pipelines that no MR author owns (ka-0000000847).
+    # We absorb a non-zero exit (loud advisory) so a PoC-substrate flake can never
+    # red the release suite. A real C/R or substrate regression is still caught by
+    # the dedicated `gardenio-gvisor-freeze-thaw` dispatch (rwx-gvisor-e2e job,
+    # which is itself allow_failure for the same PoC-maturity reason). Earlier
+    # history: ka-0000007698 re-gated this for a one-shot `runsc --version` probe
+    # flake (since hardened with bounded retry + stderr capture in the script);
+    # the broader gate-placement issue this addresses is structural, not that
+    # probe.
+    run: |
+      export GVISOR_E2E=1
+      # GOLDEN-GATE ABSORB (ka-0000007234, ka-0000007326). Under the
+      # golden-gating gardenio-e2e dispatch (GOLDEN_GATE=true) this gVisor PoC
+      # substrate task is a rotating environmental flake (node-asset-ship,
+      # thaw-state-FS, restore-into-B, FREEZE-checkpoint, Pod-B-netns-resolve)
+      # — NOT a gardenio product regression — yet it hard-gated golden promotion
+      # for ~5 days while all 101 product modules stayed green. Absorb a
+      # non-zero exit (loud advisory) like the operator-blessed resume-latency /
+      # userresponse-latency gates (ka-0000003662). The dedicated
+      # gardenio-gvisor-freeze-thaw dispatch (GOLDEN_GATE=false) still HARD-FAILS,
+      # so real C/R regressions are caught there.
+      if ./gardenio/tests/e2e/scripts/test-gvisor-freeze-thaw.sh; then
+        echo "gvisor-freeze-thaw passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-freeze-thaw exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under the golden-gating gardenio-e2e dispatch"
+          echo "(ka-0000007234). This gVisor PoC substrate gate must never red"
+          echo "the release suite or block golden/prod. A real regression is"
+          echo "caught by the dedicated gardenio-gvisor-freeze-thaw dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-freeze-thaw FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor N-container sidecar freeze/thaw BARRIER (opt-in) ──────────
+  # ka-0000004828 / coverage-gap epic ka-0000000958. freeze-thaw (above) covers a
+  # SINGLE-container sandbox; this covers the controller's real MULTI-container
+  # path — the COUNT-GATED barrier restore (freezethaw.go:1957 roster capture +
+  # count cross-check, freezethaw_node.go:2943 barrier restore) that was UNIT-only.
+  # Builds a harness-owned multi-container runsc sandbox (sandbox + agent + dind
+  # subs, ONE shared sentry — the sidecar-agent pod shape), checkpoints the whole
+  # pod, then proves on the live substrate: container_count==len(subs)+1 baked into
+  # the statefile, the barrier HOLDS the guest frozen with N-1 subs restored +
+  # RELEASES only when the Nth satisfies the count, both subs' RAM+FILE state survive
+  # name-keyed, and an off-roster sub is refused. Self-contained: kubectl only, no
+  # beads/coop/token; schedules its own privileged probe on the gvisor-poc pool.
+  #
+  # Only meaningful under the dedicated `gardenio-gvisor-sidecar-barrier` dispatch —
+  # it is NOT wired into the gardenio-e2e shard fan-out (no gVisor on gardenio-rwx).
+  # GVISOR_E2E=1 flips the module from self-SKIP to assert; it SKIPs cleanly if the
+  # runsc RuntimeClass / gvisor-poc create-pods perms are absent.
+  - key: gvisor-sidecar-barrier
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 12m
+    # NON-BLOCKING under golden-gating gardenio-e2e — ka-0000000847 / ka-0000003662
+    # (operator: Matt Baker). Same ephemeral gvisor-poc substrate as the sibling
+    # gvisor-freeze-thaw task: the privileged probe can be NotFound when no
+    # gvisor=poc node is scheduled, or runsc can be not-yet-warm. Those are
+    # PoC-substrate / scheduling flakes, not gardenio app regressions, so they must
+    # never red the release suite. A real N-container barrier regression is still
+    # caught by the dedicated `gardenio-gvisor-sidecar-barrier` dispatch below.
+    run: |
+      export GVISOR_E2E=1
+      # GOLDEN-GATE ABSORB (ka-0000007234, ka-0000007326). See gvisor-freeze-thaw
+      # above. Non-blocking under golden-gating gardenio-e2e; hard-fails under the
+      # dedicated gardenio-gvisor-sidecar-barrier dispatch (golden-gate=false).
+      if ./gardenio/tests/e2e/scripts/test-gvisor-sidecar-barrier.sh; then
+        echo "gvisor-sidecar-barrier passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-sidecar-barrier exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real regressions caught by the dedicated"
+          echo "gardenio-gvisor-sidecar-barrier dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-sidecar-barrier FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor boot-wedge armed-watcher guard / freeze fail-safe (opt-in) ─
+  # ka-0000000584. Asserts the END-TO-END fail-safe path the P0 boot-wedge fix
+  # (ka-0000006667, controller watchersArmed + freezethaw_armed_guard_test.go)
+  # guarantees on a real runsc sandbox: a live, un-armed sandbox the guard
+  # refuses to freeze is LEFT RUNNING (the boot-wedge — an un-thawable snapshot
+  # with no live watcher inside — is never minted), and the both-armed positive
+  # control proceeds to a real checkpoint that persists a snapshot. The guard's
+  # decision reproduces the controller's exact sentinel-filename + probe-shape
+  # contract (thawepoch.ArmedName, watchersArmed) on the node, the same blessed
+  # reimplement-the-shared-protocol-in-bash pattern gvisor-rehydration uses.
+  # Only runs under the dedicated `gardenio-gvisor-armed-guard` dispatch — NOT in
+  # the gardenio-e2e shard fan-out (no gVisor on gardenio-rwx). GVISOR_E2E=1 flips
+  # the module from self-SKIP to assert; it still SKIPs cleanly if the runsc
+  # RuntimeClass / gvisor-poc create-pods perms are absent.
+  - key: gvisor-armed-guard
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 12m
+    # NON-BLOCKING — ka-0000000847 / ka-0000003662 (operator: Matt Baker). Same
+    # ephemeral gvisor-poc substrate as gvisor-freeze-thaw above: the privileged
+    # probe pod can be NotFound when no gvisor=poc node is scheduled, or runsc can
+    # be not-yet-warm. Those are PoC-substrate / scheduling flakes, not gardenio
+    # app regressions, yet this task hard-gated promote -> deploy-prod inside the
+    # gardenio-e2e fan-out and reddened blocking release pipelines no MR author
+    # owns. Absorb non-zero exit (loud advisory); a real boot-wedge fail-safe
+    # regression is caught by the dedicated `gardenio-gvisor-armed-guard` dispatch.
+    run: |
+      export GVISOR_E2E=1
+      # GOLDEN-GATE ABSORB (ka-0000007234, ka-0000007326). See gvisor-freeze-thaw
+      # above. Non-blocking under golden-gating gardenio-e2e; hard-fails under the
+      # dedicated gardenio-gvisor-armed-guard dispatch.
+      if ./gardenio/tests/e2e/scripts/test-gvisor-armed-guard.sh; then
+        echo "gvisor-armed-guard passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-armed-guard exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real regressions caught by the dedicated gardenio-gvisor-armed-guard"
+          echo "dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-armed-guard FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor multi-cycle freeze→thaw→re-freeze story (opt-in) ──────────
+  # ka-0000001878 / production-readiness epic ka-0000004667. Proves on the live
+  # gvisor-poc substrate that a THAWED runsc process is itself re-checkpointable
+  # (substrate supports multi-cycle — so option (a) is possible in principle and
+  # the substrate is not the blocker), that a node-local re-freeze to the
+  # controller's deterministic per-agent path DESTROYS the prior snapshot (the
+  # single-shot hazard the Snapshot.Consumed guard prevents — runsc refuses to
+  # checkpoint into a non-empty path, so the controller's clear-then-checkpoint
+  # has no second slot), and that state fidelity holds across both cycles (the
+  # in-RAM counter resumes past each freeze). The controller GUARD semantics
+  # (Consumed marker → ErrFreezeAlreadyThawed refusal + predicate skipping →
+  # clean cold-start degradation) are asserted by the Go unit tests
+  # freezethaw_refreeze_guard_test.go; this is their live-substrate companion.
+  # Only runs under the dedicated `gardenio-gvisor-multicycle-refreeze` dispatch —
+  # NOT in the gardenio-e2e shard fan-out (no gVisor on gardenio-rwx). GVISOR_E2E=1
+  # flips the module from self-SKIP to assert; it still SKIPs cleanly if the
+  # runsc RuntimeClass / gvisor-poc create-pods perms are absent.
+  - key: gvisor-multicycle-refreeze
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 12m
+    # NON-BLOCKING — ka-0000000847 / ka-0000003662 (operator: Matt Baker). Same
+    # ephemeral gvisor-poc substrate as gvisor-freeze-thaw above: the privileged
+    # probe pod can be NotFound when no gvisor=poc node is scheduled, or runsc can
+    # be not-yet-warm. Those are PoC-substrate / scheduling flakes, not gardenio
+    # app regressions, yet this task would hard-gate promote -> deploy-prod inside
+    # the gardenio-e2e fan-out and redden blocking release pipelines no MR author
+    # owns. Absorb non-zero exit (loud advisory); a real multi-cycle / guard
+    # regression is caught by the dedicated `gardenio-gvisor-multicycle-refreeze`
+    # dispatch.
+    run: |
+      export GVISOR_E2E=1
+      # GOLDEN-GATE ABSORB (ka-0000007234, ka-0000007326). See gvisor-freeze-thaw
+      # above. Non-blocking under golden-gating gardenio-e2e; hard-fails under the
+      # dedicated gardenio-gvisor-multicycle-refreeze dispatch.
+      if ./gardenio/tests/e2e/scripts/test-gvisor-multicycle-refreeze.sh; then
+        echo "gvisor-multicycle-refreeze passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-multicycle-refreeze exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real regressions caught by the dedicated"
+          echo "gardenio-gvisor-multicycle-refreeze dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-multicycle-refreeze FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor rehydration C1–C5 correctness contract (opt-in) ───────────
+  # ka-0000005803 / Phase 3 epic ka-0000006959; §6 of the rehydration design
+  # (ka-0000001515). Asserts the warm-boot contract a thawed agent must uphold:
+  # C1/C2 cred re-mint (the freshness gate rejects Pod-A identity, accepts
+  # Pod-B), C2 fail-close, C4 presence re-announce + C5 deadline via the
+  # thaw-epoch marker/ack release condition, and §6.5 idempotency. The
+  # contract-shape assertions need only bash + a base64 codec; GVISOR_E2E=1 also
+  # runs the runsc-lifecycle + CloudTrail assertions against the gvisor-poc
+  # substrate. The connection half of the contract (C3 NATS reconnect, C4
+  # re-announce, idempotency, deadline against a LIVE broker) is asserted by the
+  # coop Rust suite coop/tests/specs/tests/rehydration.rs (in the coop CI run).
+  - key: gvisor-rehydration
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 12m
+    # NON-BLOCKING — ka-0000000847 / ka-0000003662 (operator: Matt Baker). Same
+    # ephemeral gvisor-poc substrate and de-gating rationale as gvisor-freeze-thaw
+    # above: an absent gvisor=poc node (probe NotFound) or not-yet-warm runsc is a
+    # PoC-substrate / scheduling flake, not a gardenio app regression, and must not
+    # red the blocking release-tag e2e gate or block prod deploy. Absorb non-zero
+    # exit (loud advisory); a real rehydration C1–C5 regression is caught by the
+    # dedicated `gardenio-gvisor-rehydration` dispatch (rwx-gvisor-e2e). Earlier
+    # history: ka-0000007698 re-gated for a one-shot `runsc --version` probe flake,
+    # since hardened in the script — superseded here by the structural fix.
+    run: |
+      export GVISOR_E2E=1
+      # GOLDEN-GATE ABSORB (ka-0000007234, ka-0000007326). See gvisor-freeze-thaw
+      # above. Non-blocking under golden-gating gardenio-e2e; hard-fails under the
+      # dedicated gardenio-gvisor-rehydration dispatch.
+      if ./gardenio/tests/e2e/scripts/test-gvisor-rehydration.sh; then
+        echo "gvisor-rehydration passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-rehydration exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real regressions caught by the dedicated gardenio-gvisor-rehydration"
+          echo "dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-rehydration FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── <1s resume-latency STANDING TIMED gate (opt-in) ──────────────────
+  # ka-0000006324 / C7, Phase 5 epic ka-0000002590. Operator mandate (Matt
+  # Baker, thread 1780804147.560279): the <1s gVisor agent resume result must be
+  # guarded FOREVER by a permanent timed e2e test in the suite — not only proven
+  # once by the overnight convergence benchmark (ka-0000003577). This module
+  # graduates the R4 thaw-onto-warm-B path into a standing gate: it stands up a
+  # warm-B placeholder pool + a checkpointed single-container agent on the runsc
+  # gvisor-poc substrate, times N≥5 warm-B resumes, and FAILS the suite if
+  # p50(R4 warm-B) regresses past the SLO (default 1000ms) OR is not strictly
+  # faster than the fresh-B (R3) control. It reuses the proven node scripts
+  # (single-container-resume-node.sh + single-container-thaw-into-b-node.sh) the
+  # benchmark already proved, prints resume_latency_ms per resume to the task log,
+  # and writes a gardenio_resume_latency_seconds histogram textfile (same name +
+  # buckets + labels as controller/internal/metrics/resume_latency.go) for the
+  # dashboard. Only runs under the dedicated `gardenio-resume-latency` dispatch —
+  # NOT in the gardenio-e2e shard fan-out (no gVisor on gardenio-rwx). GVISOR_E2E=1
+  # flips the module from self-SKIP to assert; per the C7 mandate it SKIPs LOUD
+  # (never silently passes) if the opt-in flag is set but the substrate is absent.
+  - key: resume-latency
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 15m
+    # NON-BLOCKING — ka-0000003662 (operator: Matt Baker, 2026-06-11). This is a
+    # gVisor PoC standing gate that runs against the single gvisor-poc node pool.
+    # Its environmental failure modes (checkpoint-build substrate flake on a
+    # freshly Karpenter-provisioned node — see the SUBSTRATE-NOT-READY path in
+    # test-resume-latency.sh, and the hard `build checkpoint image` fail at
+    # 2026.162.7 which had NO substrate marker) are NOT gardenio app regressions,
+    # yet this task runs inside the gardenio-e2e fan-out and HARD-GATED
+    # promote -> deploy-prod, blocking unrelated prod releases. We absorb a
+    # non-zero exit (loud advisory) so a PoC-substrate flake can never red the
+    # release suite. The result is still printed to the task log and the
+    # histogram textfile is still written for the ka-0000003577 dashboard; a real
+    # <1s-resume regression is caught by the dedicated `gardenio-resume-latency`
+    # dispatch + the overnight convergence benchmark, not by gating prod.
+    run: |
+      export GVISOR_E2E=1
+      # Write the histogram textfile into the coverage artifacts dir so the
+      # ka-0000003577 dashboard / timing report can ingest the standing samples.
+      export PROM_TEXTFILE_DIR="${PWD}"
+      if ./gardenio/tests/e2e/scripts/test-resume-latency.sh; then
+        echo "resume-latency gate passed."
+      else
+        rc=$?
+        echo "════════════════════════════════════════════════════════════"
+        echo "resume-latency exited non-zero (rc=$rc) — ABSORBED as NON-BLOCKING."
+        echo "This gVisor PoC gate must never red the release suite or block"
+        echo "prod deploy (ka-0000003662). A real <1s-resume regression is caught"
+        echo "by the dedicated gardenio-resume-latency dispatch + overnight bench."
+        echo "════════════════════════════════════════════════════════════"
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── <20s user-response STANDING TIMED gate (opt-in) ──────────────────
+  # ka-0000000107 / C4, epic ka-0000008235 ("Fast + interruptible freeze").
+  # Operator: Matt Baker (slack:U0OPERATOR1). The user-visible companion to the
+  # resume-latency gate: it asserts the end-to-end <20s SLO for the FIRST-RESPONSE
+  # path across all three lifecycle states — COLD (no pod -> spawn/thaw),
+  # RESUMING (snapshot present -> warm thaw, the proven sub-second path), and
+  # MID-FREEZE (freeze in flight -> message -> C2 interrupt -> the still-live Pod A
+  # serves with NO thaw). It reuses the proven node scripts (single-container-
+  # resume-node.sh + single-container-thaw-into-b-node.sh) the resume gate already
+  # proves, prints userresponse_latency_ms per sample, and writes a
+  # gardenio_userresponse_latency_seconds histogram textfile (sibling to
+  # gardenio_resume_latency_seconds). The MID-FREEZE leg exercises the C2 interrupt
+  # invariant (ka-0000005834): `runsc checkpoint --leave-running` must leave the
+  # sandbox running (freezethaw.go L540). Only runs under the dedicated
+  # `gardenio-userresponse-latency` dispatch — NOT in the gardenio-e2e shard fan-out
+  # (no gVisor on gardenio-rwx). GVISOR_E2E=1 flips the module from self-SKIP to
+  # assert; it SKIPs LOUD (never silently passes) if the opt-in flag is set but
+  # the substrate is absent.
+  - key: userresponse-latency
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 20m
+    run: |
+      export GVISOR_E2E=1
+      # Write the histogram textfile into the coverage artifacts dir so a
+      # dashboard / timing report can ingest the standing samples.
+      export PROM_TEXTFILE_DIR="${PWD}"
+      # NON-BLOCKING — ka-0000003662 (operator: Matt Baker, 2026-06-11). Sibling
+      # to the resume-latency gate above: same gVisor PoC substrate. A fresh
+      # gvisor-poc node can hit the hard `build checkpoint image` fail
+      # (checkpoint artifacts absent) WITHOUT emitting the SUBSTRATE-NOT-READY
+      # marker, which would red the release suite + skip promote/deploy-prod.
+      # That is an environmental/substrate flake, not a gardenio app regression.
+      # Absorb non-zero exit as a loud advisory; never block prod. A real <20s
+      # user-response regression is still caught by the dedicated
+      # gardenio-userresponse-latency dispatch.
+      if ./gardenio/tests/e2e/scripts/test-userresponse-latency.sh; then
+        echo "userresponse-latency gate passed."
+      else
+        rc=$?
+        echo "════════════════════════════════════════════════════════════"
+        echo "userresponse-latency exited non-zero (rc=$rc) — ABSORBED as NON-BLOCKING."
+        echo "This gVisor PoC gate must never red the release suite or block"
+        echo "prod deploy (ka-0000003662). A real <20s user-response regression"
+        echo "is caught by the dedicated gardenio-userresponse-latency dispatch."
+        echo "════════════════════════════════════════════════════════════"
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor thaw rehydrate-ack RELEASE on the real substrate (opt-in) ──
+  # ka-0000006321 — blocks ka-0000007916 (related ka-0000001492 / ka-0000002058 /
+  # ka-0000004330). Closes the gap the 4 open P1 rehydrate-ack bugs share: NO e2e
+  # drove a REAL frozen→thawed agent on the gvisor-poc substrate and asserted the
+  # REAL controller gate (internal/thawepoch.WaitForAcks) RELEASES the agent —
+  # both required consumers (coop ConsumerCoop + gb ConsumerGB) ack the current
+  # thaw epoch — WITHIN deadline, with Pod B ALIVE (the ka-0000007916 symptom on
+  # prod 2026.160.7 was a fail-close while Pod B survived the full 60s window).
+  # Unlike the bash-re-implemented gate in test-gvisor-rehydration.sh, this module
+  # builds + runs cmd/thawepoch-probe — the GENUINE thawepoch.Watcher (the agent
+  # coop+gb arm→handle→ack loop) feeding the GENUINE WaitForAcks (the controller
+  # deadline gate) — against a marker/ack round-trip on the actual node thaw-state
+  # FS while a real runsc-restored agent is alive in Pod B's netns. A regression
+  # in either fails this e2e, not just the next prod canary. `use: go-deps` brings
+  # the Go toolchain + module cache to build the probe; `kubeconfig` for the live
+  # cluster. Only runs under the dedicated `gardenio-gvisor-rehydrate-ack` dispatch
+  # — NOT in the gardenio-e2e shard fan-out (no gVisor on gardenio-rwx). GVISOR_E2E=1
+  # flips the module from self-SKIP to assert; it SKIPs LOUD (never silently
+  # passes) if the opt-in flag is set but the gvisor-poc substrate is absent.
+  - key: gvisor-rehydrate-ack
+    use: [go-deps, kubeconfig]
+    cache: false
+    timeout: 15m
+    # NON-BLOCKING — ka-0000000847 / ka-0000003662 (operator: Matt Baker). Same
+    # ephemeral gvisor-poc substrate and de-gating rationale as the other gVisor
+    # PoC tasks above. The watchdog finding (ka-0000000847) recorded this exact
+    # task failing the BLOCKING release-tag e2e gate at 2026.163.10 / .12 with
+    # runsc checkpoint rc=128 "FetchSpec failed: loading container: file does not
+    # exist" — a PoC-substrate flake on a freshly Karpenter-provisioned node, not
+    # a controller WaitForAcks regression. Absorb non-zero exit (loud advisory) so
+    # it can never red the release suite or block prod deploy. A real thaw-epoch
+    # ack-release regression is caught by the dedicated `gardenio-gvisor-rehydrate-
+    # ack` dispatch + the next prod canary, not by gating prod.
+    run: |
+      export GVISOR_E2E=1
+      # GOLDEN-GATE ABSORB (ka-0000007234, ka-0000007326). This is the SOLE
+      # golden blocker called out by ka-0000007326. See gvisor-freeze-thaw above.
+      # Non-blocking under golden-gating gardenio-e2e; hard-fails under the
+      # dedicated gardenio-gvisor-rehydrate-ack dispatch (where the genuine
+      # thawepoch-probe WaitForAcks regression gate is asserted).
+      if ./gardenio/tests/e2e/scripts/test-gvisor-rehydrate-ack.sh; then
+        echo "gvisor-rehydrate-ack passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-rehydrate-ack exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real regressions caught by the dedicated"
+          echo "gardenio-gvisor-rehydrate-ack dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-rehydrate-ack FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor freeze → resume-INTO-POOL ACCEPTANCE GATE (opt-in) ──────────
+  # ka-0000003295 — the acceptance gate for epic ka-0000007532 (gVisor freeze→thaw
+  # RESUME into a prewarmed pool). The one end-to-end proof the epic converges on:
+  # freeze an ACTIVE agent, resume its snapshot INTO a CLAIMED prewarmed pool member
+  # (the warm-placeholder shape, kubelet-admitted OFF the hot path — NOT a fresh
+  # on-demand Pod B), and assert on the real gvisor-poc substrate that /work SURVIVED
+  # (the state.bin file token is byte-identical), RAM SURVIVED (the in-RAM counter
+  # climbs PAST the freeze value — the same live process, loaded working set
+  # included), and the REAL controller gate (internal/thawepoch.WaitForAcks, driven
+  # by cmd/thawepoch-probe over the genuine coop+gb Watchers) RELEASES within
+  # THAW_REHYDRATE_DEADLINE — plus a fail-close negative control and a pool-consumed
+  # assertion. Runs BOTH a claudeless variant (WORKING_SET=0) and an active-Claude
+  # variant (a multi-MB loaded heap standing in for a Claude working set) — the
+  # task's explicit deliverable. Sits ABOVE its three building-block siblings
+  # (gvisor-freeze-thaw state fidelity, resume-latency warm-B restore, gvisor-
+  # rehydrate-ack RELEASE), covering the converged path none of them assert.
+  # `use: go-deps` brings the Go toolchain to build the probe; `kubeconfig` for the
+  # live cluster. Only meaningful under the dedicated `gardenio-gvisor-resume-into-
+  # pool` dispatch (no gVisor on gardenio-rwx). GVISOR_E2E=1 flips the module from
+  # self-SKIP to assert; it SKIPs LOUD (never silently passes) if the opt-in flag is
+  # set but the gvisor-poc substrate is absent.
+  - key: gvisor-resume-into-pool
+    use: [go-deps, kubeconfig]
+    cache: false
+    timeout: 20m
+    # NON-BLOCKING under golden-gating gardenio-e2e (ka-0000000847 / ka-0000007234),
+    # same ephemeral gvisor-poc substrate + de-gating rationale as the sibling
+    # gvisor tasks above: an absent/cold gvisor-poc node pool is a PoC-substrate
+    # flake, NOT a gardenio product regression, so it must never red the release
+    # suite. Hard-fails under the dedicated gardenio-gvisor-resume-into-pool dispatch
+    # (GOLDEN_GATE=false), where the genuine acceptance-gate regression is asserted.
+    run: |
+      export GVISOR_E2E=1
+      if ./gardenio/tests/e2e/scripts/test-gvisor-resume-into-pool.sh; then
+        echo "gvisor-resume-into-pool passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-resume-into-pool exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real regressions caught by the dedicated"
+          echo "gardenio-gvisor-resume-into-pool dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-resume-into-pool FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor re-nudge mid-THAW coordination on the real substrate (opt-in) ─
+  # ka-0000001841 (epic ka-0000004667; impl ka-0000005830 / design ka-0000005125,
+  # MR !4719). Closes the gap that NO e2e drove the REAL re-nudge mid-THAW
+  # coordination on the gvisor-poc substrate: a user message arriving WHILE a thaw
+  # of the target agent is in flight (Pod B restoring) must NOT race a half-
+  # restored agent or mint a 2nd Pod B. This module builds + runs
+  # cmd/renudge-thaw-probe — the GENUINE internal/podmanager.FreezeThawManager.Thaw
+  # single-flight + FreezeThawManager.IsThawing (the primitives MR !4719 added and
+  # the bridge waitForThawAndNudge buffer keys on) — beside a REAL runsc-restored
+  # agent alive in Pod B's netns. It asserts: a 2nd concurrent thaw JOINS the in-
+  # flight one (exactly 1 restore, no duplicate Pod B — the ka-0000005680 admit-
+  # fail class), IsThawing is true in-flight (buffer holds the nudge) and clears on
+  # release (buffer delivers exactly-once), and a sequential wake runs a FRESH
+  # restore (negative control). A regression in the single-flight or IsThawing
+  # fails THIS e2e, not just the next prod canary. `use: go-deps` brings the Go
+  # toolchain + module cache to build the probe; `kubeconfig` for the live cluster.
+  # Only runs under the dedicated `gardenio-gvisor-renudge-thaw` dispatch — NOT in
+  # the gardenio-e2e shard fan-out (no gVisor on gardenio-rwx). GVISOR_E2E=1 flips
+  # the module from self-SKIP to assert; it SKIPs LOUD (never silently passes) if
+  # the opt-in flag is set but the gvisor-poc substrate is absent.
+  - key: gvisor-renudge-thaw
+    use: [go-deps, kubeconfig]
+    cache: false
+    timeout: 15m
+    # NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234 / ka-0000000847):
+    # same ephemeral gvisor-poc substrate + de-gating rationale as the other gVisor
+    # PoC tasks. Absorb non-zero exit (loud advisory) under golden so a rotating
+    # PoC-substrate flake can never red the release suite or block prod deploy. A
+    # real single-flight / IsThawing regression hard-fails under the dedicated
+    # `gardenio-gvisor-renudge-thaw` dispatch (golden-gate=false) + the next canary.
+    run: |
+      export GVISOR_E2E=1
+      if ./gardenio/tests/e2e/scripts/test-gvisor-renudge-thaw.sh; then
+        echo "gvisor-renudge-thaw passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-renudge-thaw exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real regressions caught by the dedicated"
+          echo "gardenio-gvisor-renudge-thaw dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-renudge-thaw FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor controller-restart mid-freeze/mid-thaw E2E (opt-in) ────────
+  # ka-0000002295 (epic ka-0000004667 "gVisor production readiness"). The
+  # CONTROLLER-PROCESS durability concern, distinct from the node-runsc siblings.
+  # This module builds + runs cmd/ftrestart-probe — the GENUINE
+  # internal/podmanager.ConfigMapSnapshotStore (ka-0000001694) and the GENUINE
+  # FreezeThawManager.Thaw + InflightThawCount + DrainThaws + the WithoutCancel-
+  # detached post-commit dctx (main.go:909, ka-0000001355 harden-thaw +
+  # ka-0000004088 detached teardown). Case (a): proc1 persists a complete snapshot
+  # into the LIVE API server via the real store, then EXITS (the mid-freeze restart
+  # boundary); a FRESH proc2 (zero heap carry-over — the post-restart controller)
+  # asserts the complete record SURVIVED + is trusted (HasSnapshot true → thaw, not
+  # silent cold-start) and a HALF-snapshot is NOT trusted. Case (b): a real Thaw is
+  # parked mid-restore when the inbound (leader-election) ctx is cancelled (the
+  # controller-roll moment); asserts InflightThawCount survives the cancel, the
+  # detached dctx is NOT cancelled (WithoutCancel), and DrainThaws drains to 0 within
+  # budget (Pod B not orphaned). A regression in the store's durability or the
+  # drain/detach contract fails THIS e2e, not just the next prod canary. `use:
+  # go-deps` brings the Go toolchain + module cache to build the probe; `kubeconfig`
+  # for the live cluster. NO privileged node pod — durability is a controller↔API-
+  # server property, so case (a) drives the real process boundary in the task
+  # container itself (the probe authenticates exactly as kubectl does here). Only
+  # runs under the dedicated `gardenio-gvisor-controller-restart` dispatch — NOT in
+  # the gardenio-e2e shard fan-out (no gVisor on gardenio-rwx). GVISOR_E2E=1 flips the
+  # module from self-SKIP to assert; it SKIPs LOUD (never silently passes) if the
+  # opt-in flag is set but the gvisor-poc substrate/RBAC is absent.
+  - key: gvisor-controller-restart
+    use: [go-deps, kubeconfig]
+    cache: false
+    timeout: 15m
+    # NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234 / ka-0000000847):
+    # same ephemeral gvisor-poc substrate + de-gating rationale as the other gVisor
+    # PoC tasks. Absorb non-zero exit (loud advisory) under golden so a rotating
+    # PoC-substrate flake can never red the release suite or block prod deploy. A
+    # real durability/drain regression hard-fails under the dedicated
+    # `gardenio-gvisor-controller-restart` dispatch (golden-gate=false) + next canary.
+    run: |
+      export GVISOR_E2E=1
+      if ./gardenio/tests/e2e/scripts/test-gvisor-controller-restart.sh; then
+        echo "gvisor-controller-restart passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-controller-restart exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real regressions caught by the dedicated"
+          echo "gardenio-gvisor-controller-restart dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-controller-restart FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor C2 interruptible-freeze (re-nudge mid-FREEZE) E2E (opt-in) ─
+  # ka-0000004367 (parent gVisor production-readiness epic ka-0000004667;
+  # ingress task ka-0000005834). The C2 interruptible-freeze path is unit-tested
+  # only; this module drives a REAL freeze on real runsc and fires a REAL
+  # POST /api/v1/freeze/interrupt through the genuine FreezeInterruptHandler
+  # mid-checkpoint, asserting the five C2 invariants on the live substrate.
+  # Only runs under the dedicated `gardenio-gvisor-freeze-interrupt` dispatch
+  # — NOT in the gardenio-e2e shard fan-out (no gVisor on gardenio-rwx).
+  # GVISOR_E2E=1 flips the module from self-SKIP to assert; it SKIPs LOUD
+  # (never silently passes) if the opt-in flag is set but the gvisor-poc
+  # substrate is absent.
+  - key: gvisor-freeze-interrupt
+    use: [go-deps, kubeconfig]
+    cache: false
+    timeout: 15m
+    # NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234 rationale, same
+    # ephemeral gvisor-poc substrate caveat as the sibling gvisor tasks above).
+    # HARD-FAILS under the dedicated `gardenio-gvisor-freeze-interrupt` dispatch
+    # where the genuine C2 regression gate is asserted.
+    run: |
+      export GVISOR_E2E=1
+      if ./gardenio/tests/e2e/scripts/test-gvisor-freeze-interrupt.sh; then
+        echo "gvisor-freeze-interrupt passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-freeze-interrupt exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real regressions caught by the dedicated"
+          echo "gardenio-gvisor-freeze-interrupt dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-freeze-interrupt FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gb stop → SUSPEND (freeze) on a freeze-eligible runsc agent (opt-in) ─
+  # ka-0000000910 (fast-hot-resume epic ka-0000003080; follow-up from decision
+  # ka-0000003208 on the merged gb-stop-suspend change ka-0000005754 / MR !4327).
+  # UNLIKE the direct-runsc siblings above, this module drives the REAL chain MR
+  # !4327 introduced: plain `gb stop` inside a freeze-eligible runsc agent →
+  # agent_state=stopping (the sole AgentStop trigger, NOT CloseBead-to-done, NOT
+  # stop_requested) → controller `runsc checkpoint --leave-running` → persisted
+  # snapshot + a gardenio_freeze_latency_seconds sample. It seeds a real agent bead
+  # (runtime_class=runsc + mock_scenario, claudeless = zero model spend), lets the
+  # CONTROLLER spawn Pod A, runs `gb stop` via kubectl exec, then asserts the bead
+  # state (beads HTTP API) + the controller /metrics freeze_latency count delta.
+  # Negative control: `gb stop --done` on a sibling freeze-eligible agent takes
+  # the unchanged terminal done path (closes to done, no stopping, no snapshot).
+  # Only runs under the dedicated `gardenio-gb-stop-suspend` dispatch — NOT in the
+  # gardenio-e2e shard fan-out (no gVisor + no freeze/thaw controller on the
+  # standard gardenio-rwx). GVISOR_E2E=1 flips the module from self-SKIP to assert;
+  # it SKIPs LOUD (still exit 0, never silently passes) when the runsc
+  # RuntimeClass / gvisor-poc perms / controller-metrics are absent.
+  - key: gb-stop-suspend
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 15m
+    # GOLDEN-GATE ABSORB (ka-0000007234, ka-0000007326; supersedes the prior
+    # unconditional absorb from ka-0000000847 / ka-0000003662). Non-blocking under
+    # the golden-gating gardenio-e2e dispatch — an absent gvisor=poc node, a
+    # not-yet-warm runsc, or a standard gardenio-rwx without a freeze/thaw-enabled
+    # controller is a PoC-substrate / environmental condition, not a gardenio app
+    # regression, and must never red the release suite or block prod deploy.
+    # HARD-FAILS under the dedicated gardenio-gb-stop-suspend dispatch so a real
+    # suspend-path regression is caught against the gvisor-poc canary.
+    run: |
+      export GVISOR_E2E=1
+      if ./gardenio/tests/e2e/scripts/test-gb-stop-suspend.sh; then
+        echo "gb-stop-suspend passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gb-stop-suspend exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real suspend-path regressions caught by the dedicated"
+          echo "gardenio-gb-stop-suspend dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gb-stop-suspend FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── Project-level runtime_class inheritance on live substrate (opt-in) ─
+  # ka-0000001145 (coverage-backfill; parent E2E-gap sprint ka-0000000958).
+  # Coverage backfill for the merged capability (commit e0de71cb, task
+  # ka-0000006969, epic ka-0000007417): a type=project bead's `runtime_class`
+  # field pins EVERY agent in that project to that RuntimeClass, with precedence
+  # global<project<role<agent — parsed by beadsapi.ListProjectBeads, loaded into
+  # the controller's ProjectCache by refreshProjectCache, applied to the pod by
+  # applyProjectDefaults. The merged change shipped with UNIT coverage only
+  # (podspec_gvisor_ns_test.go over a hand-built cache map); NO e2e drove the real
+  # project-bead → parse → cache → pod chain, and the three sibling gvisor e2e
+  # modules all set runtime_class on AGENT beads / raw pod YAML — none on a
+  # PROJECT bead. This module closes that gap: it seeds an ephemeral type=project
+  # bead with runtime_class=runsc (NO per-agent/role tag), lets the CONTROLLER
+  # load it + spawn a plain agent, then asserts the pod's .spec.runtimeClassName
+  # == runsc AND it landed in the gVisor ns — purely from project inheritance.
+  # Negative control on the same substrate: a sibling agent carrying its own
+  # runtime_class metadata overrides the project default (agent wins). Only runs
+  # under the dedicated `gardenio-project-runtime-class` dispatch — NOT in the
+  # gardenio-e2e shard fan-out (no gVisor on the standard gardenio-rwx). GVISOR_E2E=1
+  # flips the module from self-SKIP to assert; it SKIPs LOUD (still exit 0, never
+  # silently passes) when the runsc RuntimeClass / gvisor-poc perms / controller
+  # are absent. The CONTRACT leg (precedence + routing decision table over bash
+  # predicates) still runs substrate-free in every gardenio-e2e shard.
+  - key: project-runtime-class
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 15m
+    # GOLDEN-GATE ABSORB (ka-0000007234): non-blocking under the golden-gating
+    # gardenio-e2e dispatch — an absent gvisor=poc node / RuntimeClass / a standard
+    # gardenio-rwx without the gVisor namespace is a PoC-substrate / environmental
+    # condition, not a gardenio app regression, and must never red the release
+    # suite. HARD-FAILS under the dedicated gardenio-project-runtime-class dispatch
+    # so a real project-inheritance regression is caught against the gvisor-poc
+    # canary.
+    run: |
+      export GVISOR_E2E=1
+      if ./gardenio/tests/e2e/scripts/test-project-runtime-class.sh; then
+        echo "project-runtime-class passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "project-runtime-class exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real project-inheritance regressions caught by the dedicated"
+          echo "gardenio-project-runtime-class dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "project-runtime-class FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── /plans wake-over-a-husk (adopt-or-replace) on live substrate (opt-in) ─
+  # ka-0000003650 (bug ka-0000006228, MR !5439). Scenario 4 of
+  # test-plans-wake-button.sh: the live-cluster guard for CreateAgentPod no
+  # longer SWALLOWING a K8s AlreadyExists on the deterministic pod name. It parks
+  # a plan-captain assistant, plants a stale pod squatting the canonical name,
+  # POSTs the wake, and asserts a FRESH Running coop pod comes up under that name
+  # (new UID, no DeletionTimestamp) with session_resume intact. Because
+  # plan-captain pins runtime_class=runsc the woken pod routes to the gVisor ns,
+  # so this needs the runsc RuntimeClass + gVisor ns AND a live controller +
+  # beads-viewer — the prod-shaped singleton, NOT the ephemeral gardenio-rwx.
+  # PLANS_WAKE_POD_E2E=1 flips the module from the graph-only scenarios 1-3 (which
+  # the standard shard fan-out already runs) to the live scenario 4; it SKIPs LOUD
+  # (still exit 0) when the substrate / controller / viewer is absent.
+  #
+  # Only meaningful under the dedicated `gardenio-plans-wake-pod` dispatch — the
+  # standard gardenio-rwx has no gVisor pool + no beads-viewer, so on the
+  # golden-gating gardenio-e2e dispatch this task self-SKIPs. As with the sibling
+  # gvisor tasks, a non-zero exit is ABSORBED under GOLDEN_GATE=true (a PoC-
+  # substrate/environmental condition must never red the release suite) and
+  # HARD-FAILS under the dedicated dispatch so a real regression is caught.
+  - key: plans-wake-pod
+    # build-kd: scenario 4 drives the plan graph via `kd create/update/show`
+    # (unlike the pure curl-to-beads gb-stop-suspend sibling). kubeconfig: the
+    # module port-forwards the viewer + beads and mints a Keycloak token, all
+    # over kubectl against the live cluster.
+    use: [code, build-kd, kubeconfig]
+    cache: false
+    timeout: 15m
+    run: |
+      export PLANS_WAKE_POD_E2E=1
+      if ./gardenio/tests/e2e/scripts/test-plans-wake-button.sh; then
+        echo "plans-wake-pod passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "plans-wake-pod exited non-zero (rc=$rc) — ABSORBED as"
+          echo "NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real adopt-or-replace regressions caught by the dedicated"
+          echo "gardenio-plans-wake-pod dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "plans-wake-pod FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      # Namespace hosting the viewer + live controller (singleton/prod). Empty →
+      # the module's gardenio-rwx default, which self-SKIPs (no viewer there). The
+      # module derives RELEASE / BEADS_SVC / VIEWER_SVC from NAMESPACE at source
+      # time, so setting NAMESPACE is sufficient.
+      NAMESPACE: ${{ init.namespace }}
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor abort-races-completion (TOCTOU) on live substrate (opt-in) ─
+  # ka-0000000996 (epic ka-0000004667). The SEVERE companion to gb-stop-suspend +
+  # the mid-FREEZE interrupt e2e (ka-0000004367): it proves the ONE race those
+  # don't — an abort landing AFTER the snapshot is durably persisted. The
+  # invariant: a snapshot persisted microseconds before an abort is DISCARDED
+  # (Delete + on-node image reap) and the agent is LEFT LIVE — never a dead agent
+  # without a thaw target, never a live agent advertising a thaw target we already
+  # abandoned. Unit-tested with a fake executor (freezethaw_interrupt_test.go
+  # TestFreeze_AbortRacesCompletion); THIS proves it on the real controller +
+  # ConfigMap store + on-node image. The post-Put window is microseconds wide on
+  # real infra, so the module relies on the deterministic test seam
+  # FREEZE_POST_PUT_DELAY (default 0 = prod behaviour) to hold the freeze
+  # just-persisted long enough to observe the snapshot ConfigMap appear, fire
+  # POST /api/v1/freeze/interrupt INSIDE the window, and assert the discard — the
+  # SAME defer / discardAbortedFreeze / ErrFreezeAborted the prod path runs.
+  # Needs a controller with FREEZE_THAW_ENABLED=true, FREEZE_INTERRUPT_ENABLED=true,
+  # FREEZE_POST_PUT_DELAY>0 watching the seeded beads.
+  # Only runs under the dedicated `gardenio-gvisor-abort-races` dispatch — NOT in
+  # the gardenio-e2e shard fan-out (no gVisor + no freeze/thaw controller on the
+  # standard gardenio-rwx). GVISOR_E2E=1 flips the module from self-SKIP to assert;
+  # it SKIPs LOUD (still exit 0, never silently passes) when the substrate /
+  # interrupt-enabled controller is absent.
+  - key: gvisor-abort-races-completion
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 15m
+    # GOLDEN-GATE ABSORB (ka-0000007234, ka-0000007326). Non-blocking under the
+    # golden-gating gardenio-e2e dispatch — an absent gvisor=poc node, a
+    # not-yet-warm runsc, or a standard gardenio-rwx without an interrupt-enabled
+    # freeze/thaw controller is a PoC-substrate / environmental condition, not a
+    # gardenio app regression, and must never red the release suite or block prod
+    # deploy. HARD-FAILS under the dedicated gardenio-gvisor-abort-races dispatch so
+    # a real TOCTOU discard-path regression is caught against the gvisor-poc canary.
+    run: |
+      export GVISOR_E2E=1
+      if ./gardenio/tests/e2e/scripts/test-gvisor-abort-races-completion.sh; then
+        echo "gvisor-abort-races-completion passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-abort-races-completion exited non-zero (rc=$rc) — ABSORBED"
+          echo "as NON-BLOCKING under golden-gating gardenio-e2e (ka-0000007234)."
+          echo "Real TOCTOU discard-path regressions caught by the dedicated"
+          echo "gardenio-gvisor-abort-races dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-abort-races-completion FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+
+  # ── gVisor duplicate / concurrent-spawn DEDUP acceptance (opt-in) ─────
+  # ka-0000007641, parent epic ka-0000004667. E2E acceptance for the re-nudge
+  # mid-THAW design's DEDUP decision (gardenio/docs/renudge-mid-thaw-coordination.md
+  # §DEDUP, decision child ka-0000005125; single-flight impl child ka-0000005830):
+  # a 2nd wake racing an in-flight thaw must produce exactly ONE Pod B / ONE runsc
+  # restore — the ka-0000007549 double-Pod-B class. The module's CONTRACT leg (the
+  # full DEDUP guard-chain decision table over bash predicates) runs substrate-
+  # free in every gardenio-e2e shard; THIS task flips GVISOR_E2E=1 to also drive
+  # REAL concurrent Pod-B creates on the gvisor-poc node. Same de-gating rationale
+  # as the sibling gvisor tasks: absorb non-zero exits under the golden-gating
+  # gardenio-e2e dispatch (PoC-substrate flakes must never red the release suite,
+  # ka-0000007234 / ka-0000000847); HARD-FAIL under the dedicated
+  # gardenio-gvisor-duplicate-concurrent-spawn dispatch (golden-gate=false). The
+  # script honors REQUIRE_SUBSTRATE (ka-0000002867): the readiness go/no-go gate
+  # can export it to turn an absent substrate into a NO-GO; here it SKIPs LOUD.
+  - key: gvisor-duplicate-concurrent-spawn
+    use: [code, kubeconfig]
+    cache: false
+    timeout: 12m
+    run: |
+      export GVISOR_E2E=1
+      if ./gardenio/tests/e2e/scripts/test-gvisor-duplicate-concurrent-spawn.sh; then
+        echo "gvisor-duplicate-concurrent-spawn passed."
+      else
+        rc=$?
+        if [ "${GOLDEN_GATE}" = "true" ]; then
+          echo "════════════════════════════════════════════════════════════"
+          echo "gvisor-duplicate-concurrent-spawn exited non-zero (rc=$rc) —"
+          echo "ABSORBED as NON-BLOCKING under golden-gating gardenio-e2e"
+          echo "(ka-0000007234). Real DEDUP regressions caught by the dedicated"
+          echo "gardenio-gvisor-duplicate-concurrent-spawn dispatch."
+          echo "════════════════════════════════════════════════════════════"
+        else
+          echo "gvisor-duplicate-concurrent-spawn FAILED (rc=$rc) — hard-gating (dedicated dispatch)."
+          exit $rc
+        fi
+      fi
+    env:
+      # REQUIRE_SUBSTRATE flows from the dispatch init: the readiness go/no-go
+      # gate (gardenio-gvisor-readiness, ka-0000002867) sets it true → an absent
+      # substrate is a NO-GO hard fail; every other dispatch sets it false → SKIP
+      # LOUD. The script honors it in its substrate preflight.
+      REQUIRE_SUBSTRATE: ${{ init.require-substrate }}
+      GOLDEN_GATE: ${{ init.golden-gate }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1

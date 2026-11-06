@@ -1,0 +1,228 @@
+{{define "project_config"}}
+{{- /* Admin-gated project config-edit form for /p/{project} (task
+       ka-0000007456, design doc §6). Revealed by the admin-only "Edit config"
+       lever on the hub; persists to POST /p/{project}/config (admin-gated).
+       Flagship: the structured add-secret form so admins never hand-edit the
+       secrets JSON. type:project writes require gardenio-admin (lvl 3); the
+       daemon re-validates regardless of UI. */ -}}
+{{with .Config}}
+<form id="project-config-form" class="project-config-form"
+      hx-post="{{$.BasePath}}/p/{{.Project}}/config"
+      hx-target="#project-config-host" hx-swap="innerHTML"
+      hx-disabled-elt="find button[type=submit]">
+  <div class="project-config-head">
+    <h2 class="project-config-heading">Edit project config</h2>
+    <button type="button" class="pc-ctl pc-ctl-close"
+            onclick="document.getElementById('project-config-host').innerHTML=''"
+            aria-label="Close editor">Close</button>
+  </div>
+
+  {{if .Saved}}
+  <p class="project-config-saved" role="status">Saved. The controller reads the new config on its next refresh.</p>
+  {{end}}
+  {{if .Error}}
+  <p class="project-config-error" role="alert">{{.Error}}</p>
+  {{end}}
+
+  <p class="project-config-sub">
+    Editing <a href="{{$.BasePath}}/{{.ConfigBeadID}}"><code>{{.ConfigBeadID}}</code></a>
+    — admin-only. The daemon enforces <code>min_role: gardenio-admin</code> on the write.
+  </p>
+
+  {{/* ── Scalar knobs ── */}}
+  <fieldset class="project-config-section">
+    <legend>Repository &amp; image</legend>
+    <label class="project-config-field">
+      <span>Git URL</span>
+      <input type="text" name="git_url" value="{{.GitURL}}" autocomplete="off" spellcheck="false">
+    </label>
+    <div class="project-config-row">
+      <label class="project-config-field">
+        <span>Default branch</span>
+        <input type="text" name="default_branch" value="{{.DefaultBranch}}" autocomplete="off" placeholder="main">
+      </label>
+      <label class="project-config-field">
+        <span>Image override</span>
+        <input type="text" name="image" value="{{.Image}}" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset class="project-config-section">
+    <legend>Routing</legend>
+    <div class="project-config-row">
+      <label class="project-config-field">
+        <span>Account</span>
+        <input type="text" name="account" value="{{.Account}}" autocomplete="off">
+        {{with index .FieldErrors "account"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+      </label>
+      <label class="project-config-field">
+        <span>Model override</span>
+        <input type="text" name="model" value="{{.Model}}" autocomplete="off">
+      </label>
+    </div>
+    <label class="project-config-field">
+      <span>Slack card theme</span>
+      <select name="card_theme">
+        <option value="garden"{{if ne .CardTheme "business"}} selected{{end}}>Garden (default)</option>
+        <option value="business"{{if eq .CardTheme "business"}} selected{{end}}>Business</option>
+      </select>
+      {{with index .FieldErrors "card_theme"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+    </label>
+  </fieldset>
+
+  <fieldset class="project-config-section">
+    <legend>Budget</legend>
+    <p class="pc-hint">US dollars this project may spend per period. Shown to project members as &ldquo;$ remaining&rdquo;; nothing is paused when it runs out. Leave blank for no budget.</p>
+    <div class="project-config-row">
+      <label class="project-config-field">
+        <span>Budget (USD)</span>
+        <input type="text" name="budget_usd" value="{{.BudgetUSD}}" autocomplete="off" inputmode="decimal" placeholder="blank = no budget">
+        {{with index .FieldErrors "budget_usd"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+      </label>
+      <label class="project-config-field">
+        <span>Budget period</span>
+        <select name="budget_period">
+          <option value="month"{{if ne .BudgetPeriod "7d"}} selected{{end}}>Calendar month (default)</option>
+          <option value="7d"{{if eq .BudgetPeriod "7d"}} selected{{end}}>Rolling 7 days</option>
+        </select>
+        {{with index .FieldErrors "budget_period"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset class="project-config-section">
+    <legend>Pod resources</legend>
+    <div class="project-config-row">
+      <label class="project-config-field">
+        <span>CPU request</span>
+        <input type="text" name="cpu_request" value="{{.CPURequest}}" autocomplete="off" placeholder="e.g. 500m">
+        {{with index .FieldErrors "cpu_request"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+      </label>
+      <label class="project-config-field">
+        <span>CPU limit</span>
+        <input type="text" name="cpu_limit" value="{{.CPULimit}}" autocomplete="off" placeholder="e.g. 2000m">
+        {{with index .FieldErrors "cpu_limit"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+      </label>
+    </div>
+    <div class="project-config-row">
+      <label class="project-config-field">
+        <span>Memory request</span>
+        <input type="text" name="memory_request" value="{{.MemoryRequest}}" autocomplete="off" placeholder="e.g. 512Mi">
+        {{with index .FieldErrors "memory_request"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+      </label>
+      <label class="project-config-field">
+        <span>Memory limit</span>
+        <input type="text" name="memory_limit" value="{{.MemoryLimit}}" autocomplete="off" placeholder="e.g. 2Gi">
+        {{with index .FieldErrors "memory_limit"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+      </label>
+    </div>
+    <label class="project-config-field">
+      <span>Storage class</span>
+      <input type="text" name="storage_class" value="{{.StorageClass}}" autocomplete="off">
+    </label>
+  </fieldset>
+
+  <fieldset class="project-config-section">
+    <legend>Flags</legend>
+    <div class="project-config-checks">
+      <label class="project-config-check">
+        <input type="checkbox" name="docker" value="1"{{if .DockerEnabled}} checked{{end}}>
+        <span>Docker-in-Docker</span>
+      </label>
+      <label class="project-config-check">
+        <input type="checkbox" name="postgres" value="1"{{if .PostgresEnabled}} checked{{end}}>
+        <span>Postgres sidecar</span>
+      </label>
+      <label class="project-config-check">
+        <input type="checkbox" name="needs_k8s_api" value="1"{{if .NeedsK8sAPI}} checked{{end}}>
+        <span>Mount K8s API token</span>
+      </label>
+      <label class="project-config-check">
+        <input type="checkbox" name="schedules_enabled" value="1"{{if .SchedulesEnabled}} checked{{end}}>
+        <span>Schedules enabled</span>
+      </label>
+      <label class="project-config-check">
+        <input type="checkbox" name="triggers_enabled" value="1"{{if .TriggersEnabled}} checked{{end}}>
+        <span>Triggers enabled</span>
+      </label>
+    </div>
+  </fieldset>
+
+  {{/* ── Secrets: current list (by reference only) + flagship add-secret form ── */}}
+  <fieldset class="project-config-section project-config-secrets">
+    <legend>Secrets</legend>
+    {{if index .FieldErrors "secrets"}}
+    <p class="pc-field-error" role="alert">{{index .FieldErrors "secrets"}}</p>
+    {{else}}
+    {{if .Secrets}}
+    <ul class="pc-secret-list">
+      {{/* SECURITY: render env var name + Secret/key REFERENCE only — never a
+           value. The admin UI has no access to secret values. */}}
+      {{range .Secrets}}
+      <li class="pc-secret"><code>{{.Env}}</code> <span class="pc-hint">← {{.Secret}}/{{.Key}}</span></li>
+      {{end}}
+    </ul>
+    {{else}}
+    <p class="pc-hint">No secrets yet.</p>
+    {{end}}
+
+    <div class="pc-add-secret">
+      <h3 class="pc-add-secret-heading">Add a secret</h3>
+      <p class="pc-hint">Maps a key inside a K8s Secret to an env var injected into this project's pods.</p>
+      <div class="project-config-row">
+        <label class="project-config-field">
+          <span>Env var</span>
+          <input type="text" name="add_secret_env" value="{{.AddSecretEnv}}" autocomplete="off" spellcheck="false" placeholder="MY_API_KEY">
+          {{with index .FieldErrors "add_secret_env"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+        </label>
+        <label class="project-config-field">
+          <span>K8s Secret</span>
+          <input type="text" name="add_secret_secret" value="{{.AddSecretSecret}}" autocomplete="off" spellcheck="false" placeholder="my-secret">
+          {{with index .FieldErrors "add_secret_secret"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+        </label>
+        <label class="project-config-field">
+          <span>Key</span>
+          <input type="text" name="add_secret_key" value="{{.AddSecretKey}}" autocomplete="off" spellcheck="false" placeholder="api-key">
+          {{with index .FieldErrors "add_secret_key"}}<span class="pc-field-error" role="alert">{{.}}</span>{{end}}
+        </label>
+      </div>
+      <p class="pc-hint">Leave all three blank to save other edits without adding a secret.</p>
+    </div>
+    {{end}}
+  </fieldset>
+
+  <div class="project-config-actions">
+    <button type="submit" class="pc-ctl pc-ctl-save">Save config</button>
+  </div>
+</form>
+
+<style>
+.project-config-form { border: 1px solid var(--border, #ddd); border-radius: 8px; padding: 1rem; margin: .5rem 0; }
+.project-config-head { display: flex; align-items: center; justify-content: space-between; }
+.project-config-heading { margin: 0; font-size: 1.05rem; }
+.project-config-sub { font-size: .82rem; color: var(--muted, #5f6368); margin: .25rem 0 .75rem; }
+.project-config-saved { background: #e6f4ea; color: #137333; padding: .4rem .6rem; border-radius: 6px; font-size: .85rem; }
+.project-config-error { background: #fce8e6; color: #c5221f; padding: .4rem .6rem; border-radius: 6px; font-size: .85rem; }
+.project-config-section { border: 1px solid var(--border, #eee); border-radius: 6px; margin: 0 0 .75rem; padding: .6rem .8rem; }
+.project-config-section legend { font-weight: 600; font-size: .85rem; padding: 0 .35rem; color: var(--muted, #5f6368); }
+.project-config-field { display: flex; flex-direction: column; gap: .2rem; margin: 0 0 .5rem; flex: 1; }
+.project-config-field span { font-size: .8rem; font-weight: 500; }
+.project-config-field input[type=text], .project-config-field select { padding: .35rem .5rem; border: 1px solid var(--border, #ccc); border-radius: 4px; font: inherit; }
+.project-config-row { display: flex; gap: .75rem; flex-wrap: wrap; }
+.project-config-checks { display: flex; gap: 1rem; flex-wrap: wrap; }
+.project-config-check { display: flex; align-items: center; gap: .35rem; font-size: .85rem; }
+.pc-field-error { color: #c5221f; font-size: .78rem; }
+.pc-secret-list { list-style: none; padding: 0; margin: .25rem 0 .75rem; }
+.pc-secret { font-size: .85rem; padding: .1rem 0; }
+.pc-secret code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.pc-hint { color: var(--muted, #9aa0a6); font-size: .8rem; margin: .15rem 0; }
+.pc-add-secret { border-top: 1px dashed var(--border, #ddd); margin-top: .5rem; padding-top: .5rem; }
+.pc-add-secret-heading { font-size: .9rem; margin: .2rem 0; }
+.project-config-actions { margin-top: .5rem; }
+.pc-ctl { padding: .4rem .9rem; border-radius: 6px; border: 1px solid var(--border, #ccc); background: var(--bg, #fff); cursor: pointer; font: inherit; }
+.pc-ctl-save { background: var(--accent, #1a73e8); color: #fff; border-color: var(--accent, #1a73e8); font-weight: 600; }
+.pc-ctl-close { font-size: .8rem; }
+</style>
+{{end}}
+{{end}}

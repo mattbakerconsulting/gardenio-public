@@ -1,0 +1,1123 @@
+set -uo pipefail
+ROOT=/run/containerd/runsc/k8s.io
+T=/run/containerd/io.containerd.runtime.v2.task/k8s.io
+SBNAME='{{.PodName}}'
+IMG='{{.ImagePath}}'
+BUNDLE='{{.BundlePath}}'
+RUNSC_TIMEOUT={{.RunscTimeout}}
+RUNSC() { nsenter -t 1 -m -p -n -- timeout "${RUNSC_TIMEOUT}" runsc --root=$ROOT "$@"; }
+HMNT() { nsenter -t 1 -m -- "$@"; }
+# HMNTT: a KILL-signal-BOUNDED host-ns helper (bug ka-0000004931). It mirrors
+# HMNT (same nsenter -t 1 -m host mount-ns) but wraps the op in the SAME
+# ${RUNSC_TIMEOUT} discipline RUNSC() already applies to runsc, so a host-ns FS op
+# that WEDGES on the ~3.0G checkpoint image / rootfs cannot hang the freeze exec
+# until the caller (or the canary harness) kills it and TRUNCATES the sentinel
+# stream. A wedged, unbounded probe was the freeze-side snapshot_persisted
+# failure: FT_IMAGE_PRESENT never emitted (empty, not "=no") / FT_CHECKPOINT_RC
+# absent, so the truncated stream looked like image-absent when it was really a
+# hang. timeout -s KILL sends SIGKILL (not the default SIGTERM) because a D-state
+# FS syscall on a wedged mount ignores catchable signals; -k adds a hard backstop
+# if the KILL itself is briefly deferred. On timeout, timeout(1) exits 137
+# (128+SIGKILL) so the probe FAILS FAST into the EXISTING fail-closed markers
+# (FT_IMAGE_PRESENT=no / FT_IMAGE_OK=no) and the script RUNS TO COMPLETION,
+# emitting a COMPLETE, classifiable stream instead of truncating. Zero blast
+# radius on healthy nodes: a probe that finishes in <${RUNSC_TIMEOUT}s behaves
+# byte-identically to HMNT. CRITICAL SCOPE: HMNTT is applied ONLY to the
+# READ-ONLY checkpoint-image probes below (test -f/-s, du, stat, strings). The
+# MUTATING relocation cp/rm ops stay on plain HMNT — bounding a mutating copy
+# risks a partial-copy un-thawable snapshot, which is worse than fail-closed.
+HMNTT() { nsenter -t 1 -m -- timeout -s KILL -k 5s "${RUNSC_TIMEOUT}" "$@"; }
+log() { echo "    $*" >&2; }
+# NOW_MS: wall-clock milliseconds for in-script step attribution (task
+# ka-0000005147). The Go side parses the FT_*_MS sentinels emitted below to split
+# the one node exec into runsc-checkpoint vs. Step-3 relocation copy — the two are
+# fused into a single Exec() call, so only a node-side stopwatch can attribute them
+# independently (the ~3.0G image write is the suspect, but the relocation copy MUST
+# be measured separately per fast-interruptible-freeze.md §C1). date +%s%3N is the
+# same millisecond clock bench-thaw-node.sh uses for THAW_MS.
+NOW_MS() { date +%s%3N; }
+
+# ftClassifyCopyRC: DE-NOISE the /work + /tmp warm-copy rc (ka-0000006933).
+# cp -aL --reflink=auto SRC DST DEREFERENCES symlinks, so a real /work repo
+# checkout (stale node_modules/.bin, a deleted-target link) routinely carries a
+# BENIGN dangling symlink that makes cp exit non-zero while copying every other
+# byte completely. The pre-fix Go side flagged payloadComplete=false + WARN on
+# ANY non-zero cp rc, so that benign noise fired on a large fraction of
+# byte-complete freezes fleet-wide and drowned the real ENOSPC/EIO signal. This
+# function is invoked ONLY on a non-zero cp rc (rc==0 short-circuits to "clean",
+# so a healthy freeze pays ZERO pause-window cost) and classifies the rc into:
+#   clean    — (never returned by this fn; rc==0 is handled by the caller)
+#   symlink  — the copy is COMPLETE: every source entry cp -aL would have
+#              materialized is present in DST at the right size, and the ONLY
+#              thing that tripped the rc was >=1 benign DANGLING symlink cp
+#              skipped. Payload is usable; this is the noise we are de-noising.
+#   copyfail — a GENUINE truncating failure (ENOSPC/EIO/…): a source entry cp
+#              -aL should have materialized is MISSING from DST, or present but
+#              SHORT (torn write), OR the probe itself could not positively
+#              prove completeness. The affected mount cold-starts at thaw.
+# The "symlink" (=complete) verdict is emitted ONLY with POSITIVE evidence
+# (every non-dangling entry present at matching size AND >=1 dangling symlink
+# observed). Everything uncertain — a missing/short entry, a walk error, a
+# timeout, an over-budget tree, empty probe output — defaults to "copyfail".
+# So this can only ever REDUCE false alarms, NEVER introduce a false-clean.
+#
+# The probe is a metadata-only Python walk of the SOURCE tree (os.lstat/os.stat
+# + st_size compare — NO content reads, so invariant I2 "bytes copied unchanged"
+# and the read-only-probe discipline hold). It is HMNTT-bounded AND carries its
+# own 'timeout -s KILL 15s' so a wedged/degenerate source fails fast to copyfail
+# rather than eating the FreezeHardDeadline (ka-0000004931 discipline). Prints
+# exactly one token (clean|symlink|copyfail) on stdout; the caller whitelists it.
+#
+# WHY dst-relpath dedup + size compare (design review wf_45801032-25b, M1/M2):
+#   - cp -aL dereferences a dir-symlink into an INDEPENDENT dst subtree while
+#     ALSO copying the real target dir, so a source-inode (st_dev,st_ino) visited
+#     set would collapse link+target to one key and SKIP a whole dst subtree —
+#     a false-clean on exactly the projected-SA-token "..data" chain this freeze
+#     path preserves. Keying the visited set on the DST-relative path instead
+#     visits every materialized copy. A hard node budget bounds cycles/degenerate
+#     trees (cp -aL itself aborts on a symlink loop, so a bounded walk suffices).
+#   - os.path.exists(dst) is True for a torn/0-byte ENOSPC write (the dominant
+#     failure shape), so a bare presence check would read a truncated file as
+#     "present". Compare st_size for regular files to catch the short write.
+ftClassifyCopyRC() {
+  # $1=src $2=dst. metadata-only; own SIGKILL timeout on top of HMNTT.
+  local reason
+  reason=$(HMNTT timeout -s KILL 15s python3 - "$1" "$2" <<'PYCLASSIFY'
+import os,stat as _stat,sys
+src,dst=sys.argv[1],sys.argv[2]
+BUDGET=500000  # hard node cap: over-budget => copyfail (cycle/degenerate guard)
+saw_dangling=False
+bad=False
+n=0
+# Walk the SOURCE tree; for each entry decide what cp -aL would have produced in
+# DST and verify it. Iterative explicit stack of (src_path, rel) where rel is the
+# path RELATIVE to the copy root — the dst location and the dedup key (M1).
+stack=[(src,"")]
+seen=set()
+try:
+    while stack:
+        s,rel=stack.pop()
+        if rel in seen:            # dst-relpath dedup (M1): visit every copy once
+            continue
+        seen.add(rel)
+        n+=1
+        if n>BUDGET:               # bounded walk => conservative copyfail (M7)
+            bad=True; break
+        d=os.path.join(dst,rel) if rel else dst
+        is_link=os.path.islink(s)
+        if is_link and not os.path.exists(s):
+            # DANGLING symlink: cp -aL skips it (this is what trips the benign
+            # rc). Its absence from dst is expected. Record and move on.
+            saw_dangling=True
+            continue
+        # Non-dangling: cp -aL materializes real content here (a resolvable
+        # symlink is dereferenced into a file/dir). It MUST exist in dst.
+        try:
+            st=os.stat(s)          # follow_symlinks=True, mirroring cp -aL
+        except OSError:
+            # src entry vanished mid-probe (host gofer churn under pause): can't
+            # prove completeness => conservative copyfail.
+            bad=True; break
+        if not os.path.exists(d):  # missing materialized entry => truncation (M2)
+            bad=True; break
+        if _stat.S_ISREG(st.st_mode):
+            try:
+                if os.stat(d).st_size!=st.st_size:  # torn/short write (M2)
+                    bad=True; break
+            except OSError:
+                bad=True; break
+        if _stat.S_ISDIR(st.st_mode):
+            try:
+                for e in os.listdir(s):
+                    stack.append((os.path.join(s,e), os.path.join(rel,e) if rel else e))
+            except OSError:
+                bad=True; break
+    if bad:
+        print("copyfail")
+    elif saw_dangling:
+        print("symlink")           # POSITIVE evidence: complete + a benign skip
+    else:
+        # rc!=0 but everything present at size and NO dangling link found — we
+        # cannot attribute the rc to benign noise, so stay conservative.
+        print("copyfail")
+except Exception:
+    print("copyfail")
+PYCLASSIFY
+)
+  # Whitelist (M6): a SIGKILL(137) truncation can leave stdout empty or a partial
+  # token — anything not exactly symlink|copyfail collapses to copyfail so a lost
+  # freeze is never downgraded to complete. echo the sole classification. (The
+  # classifier itself only ever prints symlink|copyfail; "clean" is assigned by the
+  # rc==0 caller and never routed here, so it is intentionally NOT in this list.)
+  case "$reason" in
+    symlink|copyfail) echo "$reason" ;;
+    *) echo "copyfail" ;;
+  esac
+}
+
+# [1/8] resolve the sandbox + EVERY running sub-container of the pod.
+#
+# A bare agent pod is sandbox(pause) + agent; a Docker/Postgres agent ALSO runs
+# always-on native sidecars (dind/postgres), each a runsc sub-container of the
+# same sandbox and all baked into the one checkpoint image (container_count=N).
+# We must capture every sub-container here so the thaw barrier restore can fire
+# one runsc-restore per container (N-container barrier, ka-0000003561). Resolve
+# the AGENT first (by CRI container-name=agent), derive the sandbox from it, then
+# enumerate the rest. ann_field reads one annotation from a state JSON on stdin.
+ann_field() { python3 -c 'import sys,json;print(json.load(sys.stdin).get("annotations",{}).get(sys.argv[1],""))' "$1" 2>/dev/null; }
+ALLC=$(ctr -n k8s.io containers ls 2>/dev/null | awk 'NR>1{print $1}')
+AG=""
+for c in $ALLC; do
+  s=$(RUNSC state "$c" 2>/dev/null) || continue
+  sn=$(printf '%s' "$s" | ann_field io.kubernetes.cri.sandbox-name)
+  ct=$(printf '%s' "$s" | ann_field io.kubernetes.cri.container-type)
+  cn=$(printf '%s' "$s" | ann_field io.kubernetes.cri.container-name)
+  [ "$sn" = "$SBNAME" ] && [ "$ct" = "container" ] && [ "$cn" = "agent" ] && { AG="$c"; break; }
+done
+if [ -z "$AG" ]; then
+  # legacy fallback: the first sub-container of $SBNAME (older agent images whose
+  # CRI container-name is not the canonical "agent"); still pause+agent shape.
+  for c in $ALLC; do
+    s=$(RUNSC state "$c" 2>/dev/null) || continue
+    sn=$(printf '%s' "$s" | ann_field io.kubernetes.cri.sandbox-name)
+    ct=$(printf '%s' "$s" | ann_field io.kubernetes.cri.container-type)
+    [ "$sn" = "$SBNAME" ] && [ "$ct" = "container" ] && { AG="$c"; break; }
+  done
+fi
+[ -z "$AG" ] && { log "FATAL: no agent sub-container for pod $SBNAME"; echo "{{printf "%s" "FT_CHECKPOINT_RC"}}=127"; exit 1; }
+AGS=$(RUNSC state "$AG")
+SB=$(printf '%s' "$AGS" | ann_field io.kubernetes.cri.sandbox-id)
+PODUID=$(printf '%s' "$AGS" | ann_field io.kubernetes.cri.sandbox-uid)
+echo "FT_AGENT_CID=$AG"
+echo "FT_SANDBOX_CID=$SB"
+echo "FT_POD_UID=$PODUID"
+
+# OVERLAY-MEDIUM PROBE (ka-0000007239, overlay-dir-medium). Read the rootfs-overlay
+# medium runsc is ACTUALLY running with off the live sandbox boot process args
+# (--overlay2=root:dir=/var/lib/gardenio/overlay on the dir-medium pool; absent ⇒
+# the default root:self). The medium is a NODE property set by the containerd runsc
+# runtimeArg (shim [runsc_config] overlay2), NOT a controller knob — so the snapshot
+# SELF-DESCRIBES it (plan Step 4-A) and thaw replays the SAME medium to runsc restore.
+# A checkpoint taken under root:dir can only be restored under root:dir, and the upper
+# rides INSIDE checkpoint.img (the dir filestore is created-then-unlinked, so there is
+# nothing to copy — substrate revalidation ka-0000007329). Empty ⇒ self/default ⇒ thaw
+# adds no --overlay2 flag, leaving non-dir nodes byte-identical to today (zero blast
+# radius). HOST-ns (nsenter -t 1 -m -p) so we see the real sandbox boot args. Resolve
+# the boot pid from the sandbox cid; best-effort, diagnostic — a miss just means the
+# default medium, never a freeze gate.
+OVERLAY_MEDIUM=$(nsenter -t 1 -m -p -- sh -c '
+  sb="$1"
+  for p in $(pgrep -f "runsc-sandbox" 2>/dev/null); do
+    args=$(tr "\0" " " < /proc/$p/cmdline 2>/dev/null)
+    # scope to THIS pod: the sandbox boot args end with our sandbox cid, and other
+    # agents on the node have their own. Match both the cid and the overlay2 flag.
+    case "$args" in
+      *"$sb"*"--overlay2="*|*"--overlay2="*"$sb"*)
+        echo "$args" | tr " " "\n" | sed -n "s/^--overlay2=//p" | head -1
+        exit 0;;
+    esac
+  done
+' probe-overlay "$SB" 2>/dev/null)
+echo "FT_OVERLAY_MEDIUM=$OVERLAY_MEDIUM"
+
+# OVERLAY_FLAG (ka-0000000357, plural_fix). Derive a single dir-medium gate from the
+# probed medium so the freeze-side [3a] skeleton + lowerdir-stacking blocks below run
+# ONLY under the dir medium (--overlay2=root:dir, where the relocated lower is an
+# intentionally-sparse upper-delta missing the read-only image base dirs). Empty under
+# self/root:self ⇒ those blocks are skipped entirely ⇒ the relocation cp + .overlay-opts
+# write stay byte-identical to the pre-fix script (zero blast radius on self nodes). This
+# mirrors thaw's OVERLAY_FLAG gate (the [2] cwd-materialize + [6b] liveness guards) so
+# both sides key off the SAME medium the snapshot self-describes. We gate on the probed
+# medium directly (not the rendered "--overlay2=" string) since freeze does not carry
+# RestoreOverlayFlag; root:self / self collapse to the default ⇒ empty gate.
+case "$OVERLAY_MEDIUM" in
+  ''|root:self|self) OVERLAY_FLAG='' ;;
+  *)                 OVERLAY_FLAG="$OVERLAY_MEDIUM" ;;
+esac
+
+# enumerate ALL sub-containers of $SB (agent first, then sidecars), recording
+# "<container-name>|<cid>" per line. The agent's bundle subdir is always "agent"
+# (the canonical CRI container-name), so emit it as such regardless of the legacy
+# fallback above. Emit FT_SUBC per entry so the controller persists the restore
+# roster; len(FT_SUBC) + sandbox = FT_CONTAINER_COUNT.
+SUBC_LIST="agent|$AG"
+for c in $ALLC; do
+  [ "$c" = "$AG" ] && continue
+  s=$(RUNSC state "$c" 2>/dev/null) || continue
+  sbid=$(printf '%s' "$s" | ann_field io.kubernetes.cri.sandbox-id)
+  ct=$(printf '%s' "$s" | ann_field io.kubernetes.cri.container-type)
+  cn=$(printf '%s' "$s" | ann_field io.kubernetes.cri.container-name)
+  [ "$sbid" = "$SB" ] && [ "$ct" = "container" ] && [ -n "$cn" ] || continue
+  SUBC_LIST="$SUBC_LIST
+$cn|$c"
+done
+printf '%s\n' "$SUBC_LIST" | while IFS= read -r e; do [ -n "$e" ] && echo "FT_SUBC=$e"; done
+# DSTN_LIST is the bundle subdir per container: sandbox + each sub-container name.
+DSTN_LIST=$(printf 'sandbox\n%s\n' "$SUBC_LIST" | sed 's/|.*//')
+
+# [2/8] CONSISTENT-SNAPSHOT WINDOW (ka-0000004656, decision ka-0000003069:
+# fix_tmp_consistency / fix dir A): pause the sentry, take the 9p-gofer warm copies
+# WHILE the guest is quiesced, checkpoint the SAME paused VFS, then resume.
+#
+# THE TOCTOU THIS CLOSES. The prior code took the /tmp + /work + .gofer warm copies
+# AFTER a bare 'runsc checkpoint --leave-running' had already RESUMED the sentry, so
+# a live Claude session kept mutating the host-side 9p gofer trees (creating then
+# unlinking /tmp/claude-1000/<sess>/tasks/<id>.output once per tool call) in the gap
+# between the checkpoint's VFS capture and the cp. The checkpoint then referenced a
+# transient dentry the later cp no longer saw -> thaw vfs.CompleteRestore() 9p walk
+# ENOENTs on it -> agent sub rc=128. A QUIESCENT canary masked the defect (no churn
+# => copy==dump => false-positive rc=0); an ACTIVE-Claude canary reproduced it.
+#
+# THE FIX. Bracket BOTH the gofer copies AND the checkpoint save inside ONE external
+# 'runsc pause'..'runsc resume' window. gVisor Kernel.Pause/Unpause are
+# reference-counted (BeginExternalStop/EndExternalStop, source-verified against the
+# deployed release-20260525.0): our external pause NESTS with the save path's own
+# balanced k.Pause()/defer k.Unpause(), and --leave-running's post-save
+# BeforeResume does NOT clear our external stop — so the guest executes ZERO
+# instructions from our pause through our resume. The warm copy and the checkpoint
+# dentry set are therefore byte-identical. Container.Checkpoint explicitly accepts a
+# Paused input (requireStatus(Created,Running,Paused)), and runsc Kernel.Pause
+# drains in-flight 9p ops (runningGoroutines/aioGoroutines Wait) before returning,
+# so the host-side gofer tree is fully quiescent before we copy. Only the cheap
+# gofer trees ride inside the window; the 3.0G rootfs relocation stays AFTER resume
+# (step [3/8]) — it is an overlay source, not a churning 9p gofer mount, and keeping
+# it out of the window avoids extending agent downtime (decision: "...before
+# relocation"). bundle_dir() is defined here (was step [3/8]) because the warm-copy
+# resolvers below need the agent OCI spec before the pause.
+bundle_dir() { RUNSC state "$1" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("bundle",""))' 2>/dev/null; }
+# Init the bundle root ONCE here (host ns, ka-0000002536). Step [3/8] no longer
+# wipes $BUNDLE — the gofer warm copies below land in it BEFORE the relocation, so a
+# second rm -rf there would delete them.
+HMNT rm -rf "$BUNDLE" && HMNT mkdir -p "$BUNDLE"
+# Capture the AGENT OCI config early (before the pause): the /work, /tmp, and
+# data-driven .gofer warm-copy resolvers all parse "$BUNDLE/agent/config.json" for
+# their host mount sources, and they must run inside the quiescent window. Resolve
+# the OCI bundle dir from runsc state, fall back to the v2 task dir; HOST-ns (HMNT)
+# so it lands where thaw reads. Step [3/8] re-copies it idempotently per-container.
+HMNT mkdir -p "$BUNDLE/agent"
+AGCFG=""
+for cand in "$(bundle_dir "$AG")" "$T/$AG"; do
+  [ -n "$cand" ] || continue
+  if HMNT test -f "$cand/config.json"; then AGCFG="$cand/config.json"; break; fi
+done
+if [ -n "$AGCFG" ]; then HMNT cp -a "$AGCFG" "$BUNDLE/agent/config.json" || log "WARN early agent config.json capture failed (cid=$AG)"; else log "WARN no agent config.json found early (cid=$AG); gofer warm copies may no-op"; fi
+
+# Enter the quiescent window. A trap resumes the sentry on ANY exit path (checkpoint
+# failure, error, or a SIGTERM from an aborted exec) — a sandbox left
+# externally-paused would hang the pod. SIGKILL cannot be trapped, but that path is
+# covered: with no thaw target persisted the lifecycle cold-starts and deletes Pod A
+# (destroying the sandbox), so an unresumed pause is reaped, never eternal.
+PAUSED=0
+resume_sb() { if [ "$PAUSED" = 1 ]; then RUNSC resume "$SB" 2>/dev/null; PAUSED=0; fi; }
+trap 'resume_sb' EXIT INT TERM
+RUNSC pause "$SB"; PRC=$?
+echo "FT_PAUSE_RC=$PRC"
+if [ "$PRC" = 0 ]; then
+  PAUSED=1
+else
+  # Pause failed: the sentry is still running normally (pause is all-or-nothing).
+  # Degrade to the pre-fix non-atomic copy rather than abort — the snapshot is no
+  # worse than before this fix (a churny agent keeps its old rc=128 risk; a
+  # quiescent one still thaws clean), and a lost freeze is strictly worse.
+  log "WARN runsc pause rc=$PRC; proceeding UNPAUSED (non-atomic gofer copy, pre-fix behavior)"
+fi
+
+# --- 9p-gofer warm copies (CONSISTENCY-CRITICAL; taken inside the pause window) ---
+# preserve the GC'able warm /work + projected SA token so thaw can repoint the
+# agent bundle at node-local copies (the GC-of-kubelet-bindings problem itself is
+# defeated by the placeholder Pod B; here we keep A's warm data alive node-locally).
+#
+# COW WORKSPACE PAYLOAD (ka-0000005425). These warm copies (/work below, /tmp next,
+# and the data-driven .gofer sweep further down) run INSIDE the pause window and so
+# are billed against the whole-freeze FreezeHardDeadline (bare-agent default 240s =
+# runscTimeout 120s + a 2-container relocation copy budget; the computed cap now
+# SCALES up per always-on sidecar so multi-sidecar agents are not starved of copy
+# headroom — ka-0000007927). /work is a repo checkout — the SAME codebase measured a
+# single clone at ~170s (71% of the bare-agent cap), so a repo-heavy freeze can hit
+# the fail-closed deadline and cold-start despite being thawable. The rootfs
+# relocation already reflinks (ka-0000002239); the workspace payload did not. Add
+# --reflink=auto so on a CoW node fs (overlayfs upperdir on XFS/Btrfs/bcachefs) the
+# clone becomes an O(metadata) extent share instead of a full byte copy — speeding
+# healthy freezes AND widening headroom under the cap. Like the relocation copy this
+# is STRICTLY no-worse: --reflink=auto degrades transparently to a full byte copy on
+# any fs that cannot reflink (ext4/9p/tmpfs), and a reflink is an INDEPENDENT inode
+# that survives source deletion, so the GC-safety invariant is preserved. -aL already
+# preserves attrs + dereferences the top-level source symlink; --reflink=auto only
+# changes HOW the data blocks land.
+# Read the (host-ns) agent config.json and copy /work in the host ns too.
+WORKSRC=$(HMNT python3 -c 'import json;print([m["source"] for m in json.load(open("'"$BUNDLE"'/agent/config.json"))["mounts"] if m["destination"]=="/work"][0])' 2>/dev/null || true)
+# FT_WORK_FSTYPE (ka-0000006167): the .work COPY DESTINATION's fs type, mirroring the
+# relocation's FT_RELOC_FSTYPE_<dstn>. xfs(reflink=1)/btrfs/bcachefs support CoW clones
+# so --reflink=auto shares extents; ext4/9p/tmpfs cannot and it fell back to a full byte
+# copy. A reflink also requires src+dst on the SAME fs, so the destination type is the
+# load-bearing signal. Best-effort/diagnostic — never gates the freeze; emitted whenever
+# a /work copy was attempted so the C3 re-baseline has a per-mount CoW-capability read.
+#
+# FT_WORK_CP_RC (PAYLOAD-COMPLETENESS SENTINEL, ka-0000000276). The /work cp ran with
+# a 2>/dev/null redirect and NO exit-status check: a mid-copy ENOSPC/EIO silently
+# published an INCOMPLETE .work payload marked usable. It fails closed at THAW (the fresh
+# emptyDir lacks the warm data -> cold-start), so it is an integrity/wasted-freeze issue,
+# not an availability one — but pre-fleet-default-on it emitted ZERO signal. Capture the
+# cp rc (the $? of the cp itself, isolated from the rm and the stat that follow) and emit
+# it so the Go side can WARN into canary + fleet telemetry (see freezethaw.go workCP
+# handling). This is a WARN, not a freeze-gate, DELIBERATELY: cp -aL DEREFERENCES symlinks,
+# and a real /work repo checkout routinely carries dangling links (a stale node_modules/.bin
+# entry, a deleted-target link) that make cp exit non-zero with NO data-integrity loss — a
+# hard gate would spuriously cold-start thawable agents fleet-wide, the opposite of
+# hardening. Same fail-closed-at-thaw safety and not-gating rationale the sibling
+# FT_PAUSE_RC fix (ka-0000006783) landed. rc=0 clean; non-zero surfaces the incomplete copy.
+if [ -n "$WORKSRC" ]; then
+  HMNT rm -rf "$BUNDLE/.work"
+  HMNT cp -aL --reflink=auto "$WORKSRC" "$BUNDLE/.work" 2>/dev/null; WORK_CP_RC=$?
+  echo "FT_WORK_CP_RC=$WORK_CP_RC"
+  # FT_WORK_CP_REASON (payload-completeness DE-NOISE, ka-0000006933). A non-zero
+  # cp -aL rc is dominated by BENIGN dangling symlinks in a real /work repo
+  # checkout; classify the rc so the Go side WARNs/alerts only on a GENUINE
+  # truncating failure (copyfail), not on symlink noise. rc==0 short-circuits to
+  # "clean" (no probe cost on healthy freezes). Own line so a truncated stream
+  # never bleeds this into another sentinel; the Go side parses it exact-match
+  # and any absent/partial value on an rc!=0 leg stays "incomplete" (never a
+  # false-clean). Older-node back-compat: absent => Go falls back to the rc rule.
+  if [ "$WORK_CP_RC" -eq 0 ]; then WORK_CP_REASON=clean; else WORK_CP_REASON=$(ftClassifyCopyRC "$WORKSRC" "$BUNDLE/.work"); fi
+  echo "FT_WORK_CP_REASON=$WORK_CP_REASON"
+  [ "$WORK_CP_REASON" = copyfail ] && log "WARN /work payload copy rc=$WORK_CP_RC reason=$WORK_CP_REASON (src=$WORKSRC) — .work may be INCOMPLETE; thaw will cold-start on the missing warm data"
+  wfs=$(HMNT stat -f -c %T "$BUNDLE/.work" 2>/dev/null); echo "FT_WORK_FSTYPE=${wfs:-unknown}"
+fi
+
+# PRESERVE the agent /tmp gofer tree (ka-0000001085, decision ka-0000002555:
+# fix_tmp_preserve). /tmp is an EmptyDir bind-mounted into the agent as a 9p gofer
+# mount (NOT sandbox-internal tmpfs — confirmed live: rfdno=… directfs), so its
+# dir tree NEVER rides the checkpoint image's VFS state. Files created under /tmp
+# at RUNTIME — notably /tmp/claude-1000, the Claude Code per-uid session tempdir
+# created after pod start — live only in Pod A's live gofer host-side tree. At
+# thaw the kubelet re-provisions a FRESH empty /tmp EmptyDir for Pod B, so the
+# restored sentry's vfs.CompleteRestore() 9p walk for "claude-1000" in mount
+# "agent:/tmp" ENOENTs -> agent sub rc=128 (root restores clean / ROOT_RC=0
+# because the pause sandbox has no live 9p /tmp tree — exactly the observed
+# asymmetry). This mirrors the /work warm-copy above (and the ka-0000000655
+# rootfs-lowerdir preserve): copy A's freeze-time /tmp tree into the GC-safe
+# bundle ($BUNDLE/.tmp) so thaw can repoint Pod B's /tmp gofer source at it,
+# carrying claude-1000 (and any other runtime /tmp state) across C/R. cp -aL
+# --reflink=auto in the HOST ns (ka-0000002536 invariant) so it lands on the
+# filesystem thaw reads; the --reflink=auto CoW-or-full-copy rationale is the shared
+# ka-0000005425 note on the /work copy above (no-worse fallback, GC-safe, headroom).
+# Taken WHILE PAUSED (ka-0000004656): a live Claude churns this exact subtree, so a
+# post-resume copy would race the checkpoint dentry set (the rc=128 root cause).
+TMPSRC=$(HMNT python3 -c 'import json;print([m["source"] for m in json.load(open("'"$BUNDLE"'/agent/config.json"))["mounts"] if m["destination"]=="/tmp"][0])' 2>/dev/null || true)
+# FT_TMP_FSTYPE (ka-0000006167): the .tmp copy destination's fs type — same reflink-
+# capability signal as FT_WORK_FSTYPE above (shared ka-0000002239 rationale). Diagnostic
+# only; emitted whenever a /tmp copy was attempted.
+#
+# FT_TMP_CP_RC (PAYLOAD-COMPLETENESS SENTINEL, ka-0000000276): same fix as FT_WORK_CP_RC
+# above for the /tmp warm copy — capture the cp rc so an incomplete .tmp payload (mid-copy
+# ENOSPC/EIO) is visible in telemetry instead of silently publishing a snapshot that will
+# cold-start at thaw. WARN, not a gate (the FT_WORK_CP_RC dangling-symlink rationale
+# applies here too — /tmp/claude-1000 can carry runtime links). rc=0 clean; non-zero
+# surfaces the incomplete copy.
+if [ -n "$TMPSRC" ]; then
+  HMNT rm -rf "$BUNDLE/.tmp"
+  HMNT cp -aL --reflink=auto "$TMPSRC" "$BUNDLE/.tmp" 2>/dev/null; TMP_CP_RC=$?
+  echo "FT_TMP_CP_RC=$TMP_CP_RC"
+  # FT_TMP_CP_REASON: same de-noise as FT_WORK_CP_REASON above (ka-0000006933) for
+  # the /tmp warm copy — /tmp/claude-1000 can carry runtime symlinks so the same
+  # benign-dangling-vs-genuine-failure classification applies. rc==0 => clean.
+  if [ "$TMP_CP_RC" -eq 0 ]; then TMP_CP_REASON=clean; else TMP_CP_REASON=$(ftClassifyCopyRC "$TMPSRC" "$BUNDLE/.tmp"); fi
+  echo "FT_TMP_CP_REASON=$TMP_CP_REASON"
+  [ "$TMP_CP_REASON" = copyfail ] && log "WARN /tmp payload copy rc=$TMP_CP_RC reason=$TMP_CP_REASON (src=$TMPSRC) — .tmp may be INCOMPLETE; thaw will cold-start on the missing warm data"
+  tfs=$(HMNT stat -f -c %T "$BUNDLE/.tmp" 2>/dev/null); echo "FT_TMP_FSTYPE=${tfs:-unknown}"
+fi
+
+# PRESERVE every OTHER runtime-populated 9p gofer EmptyDir/subPath mount, data-
+# driven (ka-0000006427, decision ka-0000004662: fix_race_too = fix direction B).
+# /work and /tmp above are dedicated cases of ONE defect class: an agent mount
+# whose host source is a kubelet-reprovisioned EmptyDir (or volume subPath) dir,
+# which runsc serves as an independent 9p gofer mount. Any RUNTIME-created subtree
+# under such a mount (e.g. /home/agent/.claude/projects, the Claude Code per-
+# project state dir created after pod start) lives ONLY in Pod A's live gofer
+# host-side tree and never rides the checkpoint image's VFS state. At thaw the
+# kubelet gives Pod B a FRESH EMPTY dir, so the restored sentry's
+# vfs.CompleteRestore() 9p walk for that subtree ENOENTs -> agent sub rc=128
+# (root restores clean / ROOT_RC=0 — the pause sandbox has no live 9p tree). The
+# prod 2026.158.17 re-drive proved the /tmp fix and surfaced EXACTLY this on the
+# next mount: failed to walk "projects" in mount "agent:/home/agent/.claude".
+# Rather than chase one mount at a time, sweep ALL of them here: select agent
+# mounts whose host source is a directory under the kubelet pod dir
+# (/var/lib/kubelet/pods/<uid>/{volumes,volume-subpaths}/...) — precisely the
+# EmptyDir/subPath family the kubelet re-provisions empty for Pod B — EXCLUDING
+# /work and /tmp (already preserved above) and any non-dir or pseudo source. Copy
+# each into $BUNDLE/.gofer/<n> and record dest->n in $BUNDLE/.gofer/manifest.json
+# so thaw can repoint Pod B's source at the warm copy. cp in the HOST ns
+# (ka-0000002536 invariant) so it lands on the filesystem thaw reads. Best-effort:
+# a copy failure for one mount must NOT fail the freeze (cold-start fallback stays
+# safe); the manifest only lists copies that succeeded. Taken WHILE PAUSED
+# (ka-0000004656) for the same checkpoint-consistency reason as /tmp above.
+HMNT rm -rf "$BUNDLE/.gofer" && HMNT mkdir -p "$BUNDLE/.gofer"
+HMNT python3 - "$BUNDLE/agent/config.json" "$BUNDLE" <<'PYGOFER'
+import fcntl,json,os,re,shutil,sys
+cfg,bundle=sys.argv[1],sys.argv[2]
+try:
+    mounts=json.load(open(cfg)).get("mounts",[])
+except Exception:
+    sys.exit(0)
+# COW WARM COPY (ka-0000005425). Like the /work + /tmp cp --reflink=auto above and
+# the rootfs relocation (ka-0000002239), the .gofer sweep runs inside the pause
+# window and is billed against the FreezeHardDeadline cap, so a reflink shrinks the
+# copy AND widens headroom. But this sweep MUST stay a shutil.copytree call: it
+# carries the atomic-writer projected-SA-token symlink chain (token -> ..data/token,
+# ka-0000008074) whose faithful reproduction is the symlinks=_atomic +
+# ignore_dangling_symlinks logic below — a naive cp would drop it and fail the thaw
+# cred gate closed. So instead of replacing copytree, we hand it a CoW-aware
+# copy_function: for each REGULAR FILE, clone the data blocks via the FICLONE ioctl
+# (an O(metadata) extent share on XFS/Btrfs/bcachefs), then copystat to match copy2's
+# metadata exactly. FICLONE=0x40049409 is the arch-independent _IOW(0x94,9,int)
+# encoding on the x86_64/arm64 gVisor nodes. On ANY failure — a non-CoW fs
+# (ext4/9p/tmpfs -> EOPNOTSUPP), a cross-device dst (EXDEV), a symlink/special file,
+# or an unexpected ioctl error — we fall back to a full shutil.copy2, so the copy is
+# STRICTLY no-worse than the prior plain copytree and NEVER corrupts. copytree drives
+# symlinks itself (via symlinks=), so copy_function only ever sees the paths copy2
+# would have handled; we mirror copy2's follow_symlinks default and, like copy2 (and
+# unlike a chown), preserve mode/mtime WITHOUT touching ownership — the group-drop the
+# thaw cred-overlay depends on (ka-0000000189 token-ownership guards) is unchanged.
+FICLONE=0x40049409
+# REFLINK-ENGAGEMENT COUNTERS (ka-0000006167 observability). The rootfs relocation
+# emits FT_RELOC_FSTYPE_<dstn> so a live run can tell whether --reflink=auto took the
+# CoW path; the workspace-payload copytree sweep emitted nothing, so the C3 re-baseline
+# had no signal for whether .gofer regular files were CoW-cloned or fell back. Tally
+# per-file: a hit is a completed FICLONE ioctl + copystat; a fallback is any path that
+# went through the full copy2 (non-CoW fs -> EOPNOTSUPP, cross-device -> EXDEV, a
+# symlink/special file, or an unexpected ioctl error). Purely diagnostic — the counters
+# never change WHAT is copied, only report HOW, and are printed as FT_GOFER_REFLINK_*
+# sentinels after the sweep.
+_RL={"hits":0,"fallbacks":0}
+# PAYLOAD-COMPLETENESS FAILURE TALLY (ka-0000000276). The per-mount copytree below is
+# wrapped in an "except Exception: continue" — a genuine copy failure (mid-copytree
+# ENOSPC/EIO) drops that mount from the manifest and keeps freezing. That is the CORRECT
+# fail-closed-at-thaw shape (the un-preserved mount repoints to Pod B's fresh empty dir
+# and cold-starts, never restores half a tree), but pre-fix it emitted ZERO signal, so an
+# incomplete-payload snapshot published as usable and silently wasted a full freeze. Tally
+# the failed destinations here and emit FT_GOFER_FAILED after the sweep so the Go side can
+# WARN into canary + fleet telemetry. Distinct from _RL fallbacks (which count CoW->full-
+# copy2 degrades that STILL copied the bytes); a _FAILED entry means the mount's warm copy
+# did NOT complete at all. dangling-symlink skips are handled inside copytree by
+# ignore_dangling_symlinks and never reach this tally.
+_FAILED=[]
+def _reflink_copy2(src,dst,follow_symlinks=True):
+    try:
+        if os.path.islink(src) or not os.path.isfile(src):
+            raise OSError  # only regular files reflink; let copy2 handle the rest
+        with open(src,"rb") as fsrc, open(dst,"wb") as fdst:
+            fcntl.ioctl(fdst.fileno(),FICLONE,fsrc.fileno())
+        shutil.copystat(src,dst)
+        _RL["hits"]+=1        # FICLONE extent-share engaged (node fs is CoW-capable)
+        return dst
+    except Exception:
+        _RL["fallbacks"]+=1   # non-CoW fs / symlink / special / ioctl error -> full copy2
+        return shutil.copy2(src,dst,follow_symlinks=follow_symlinks)  # no-worse full copy
+# kubelet re-provisions these source families empty for Pod B; runsc serves them
+# as independent 9p gofer mounts, so any runtime subtree under them must ride a
+# warm copy across C/R. Match both EmptyDir volumes and volume-subPaths.
+KUBELET_RE=re.compile(r"^/var/lib/kubelet/pods/[^/]+/(volumes|volume-subpaths)/")
+manifest={}
+n=0
+for m in mounts:
+    d=m.get("destination","")
+    s=m.get("source","")
+    if d in ("/work","/tmp"):      # dedicated warm copies above
+        continue
+    if not s.startswith("/") or not KUBELET_RE.match(s):
+        continue
+    if not os.path.isdir(s):       # only directory gofer trees (not single-file binds)
+        continue
+    name=str(n)
+    dst=os.path.join(bundle,".gofer",name)
+    # ATOMIC-WRITER AWARENESS (ka-0000008074). The kubelet materializes a projected
+    # serviceAccountToken volume (the EKS IRSA token + the kube-api-access SA token)
+    # with the atomic-writer layout: token -> ..data/token (relative symlink),
+    # ..data -> ..<timestamp>/ (relative symlink), real bytes in ..<timestamp>/token.
+    # With symlinks=False, CPython's copytree drops those two symlinks: for each it
+    # reads linkto=os.readlink(name) and, when not os.path.exists(linkto) and
+    # ignore_dangling_symlinks is set, skips it -- and os.path.exists resolves the RAW
+    # RELATIVE target ("..data/token", "..<ts>") against the PROCESS CWD, not the
+    # link's own dir, so both read as false-positive "dangling" and are skipped.
+    # The warm copy then has only ..<ts>/token and NO top-level token, so at thaw
+    # coop re-reads <mount>/token -> ENOENT -> "malformed JWT: ... No such file or
+    # directory" -> credential gate fails closed (the prod 2026.180.23 canary).
+    # Detect the signature (a "..data" symlink) and copy THOSE dirs with symlinks=True
+    # so the token->..data/token chain is preserved verbatim and resolves on read;
+    # this also keeps the entry's symlink TYPE, matching the checkpoint-cached dentry.
+    # Plain runtime trees (~/.claude etc.) keep symlinks=False — they have no ..data
+    # link and a faithful symlink copy could carry a dangling relative link, so the
+    # narrow probe avoids any ka-0000006427 regression. The ka-0000004956 thaw overlay
+    # then writes Pod B's live bytes THROUGH the preserved token symlink.
+    _atomic=os.path.islink(os.path.join(s,"..data"))
+    try:
+        if os.path.exists(dst): shutil.rmtree(dst)
+        # copy_function=_reflink_copy2: CoW-clone regular-file data blocks where the
+        # node fs supports it (ka-0000005425), else a no-worse full copy2. symlinks=
+        # / ignore_dangling_symlinks stay exactly as before so the atomic-writer token
+        # chain (ka-0000008074) round-trips unchanged.
+        shutil.copytree(s,dst,symlinks=_atomic,ignore_dangling_symlinks=True,copy_function=_reflink_copy2)
+    except Exception:
+        # best-effort; skip this mount, keep freezing — but TALLY the incomplete copy
+        # (ka-0000000276) so it is not silently swallowed. The mount is absent from the
+        # manifest, so thaw repoints it to Pod B's fresh empty dir and cold-starts on the
+        # missing subtree (fail-closed), never restoring a half-written tree.
+        _FAILED.append(d)
+        continue
+    manifest[d]=name
+    n+=1
+json.dump(manifest,open(os.path.join(bundle,".gofer","manifest.json"),"w"))
+print("FT_GOFER_PRESERVED=%d" % len(manifest))
+# FT_GOFER_FAILED (ka-0000000276): count of gofer mounts whose warm copy did NOT complete
+# (a genuine copytree ENOSPC/EIO, not a dangling-symlink skip or a CoW->copy2 fallback).
+# >0 means the published snapshot has an INCOMPLETE payload for those mounts — usable but
+# it will cold-start at thaw on the missing subtree. The Go side WARNs on a non-zero value
+# so the wasted-freeze is visible in canary + fleet telemetry (never gated: the affected
+# mount already fails closed at thaw, and gating would trade a wasted freeze for a lost
+# one). Diagnostic FT_ key=value like FT_GOFER_PRESERVED.
+print("FT_GOFER_FAILED=%d" % len(_FAILED))
+# Reflink-engagement signal for the .gofer sweep (ka-0000006167): how many regular
+# files the copy_function CoW-cloned via FICLONE vs fell back to a full copy2. A run
+# with hits>0 proves --reflink=auto's ioctl path actually engaged on this node's fs;
+# all-fallbacks (with a non-empty sweep) says the node fs is not CoW-capable and the
+# lever bought nothing here. Diagnostic-only, parsed as FT_ key=value like the others.
+print("FT_GOFER_REFLINK_HITS=%d" % _RL["hits"])
+print("FT_GOFER_REFLINK_FALLBACKS=%d" % _RL["fallbacks"])
+PYGOFER
+
+# --- checkpoint the SAME quiesced VFS (still inside the pause window) ------------
+# IMAGE-RELOCATION (ka-0000003702): $IMG is the CONTROLLER-OWNED safe path
+# /var/lib/gardenio/ckpt/<agent> (CheckpointHostBase), outside the containerd /
+# pod-lifecycle GC zone /var/tmp that Pod A's post-freeze teardown reaped — that
+# reap (identical lifecycle signature to the original bundle deletion vector) was
+# the remaining thaw rc=128: checkpoint.img ENOENT even though freeze saw it at
+# 3.0G. runsc writes the image via nsenter -t 1 (the host mount ns), so EVERY
+# $IMG filesystem op below is HOST-NAMESPACED (HMNT) too — same mount-ns invariant
+# the bundle ops follow (ka-0000002536). A plain probe-ns mkdir/test/du could
+# address a different filesystem than the one runsc writes and thaw reads.
+HMNT rm -rf "$IMG" && HMNT mkdir -p "$IMG"
+# TIMING (ka-0000005147): bracket the runsc page-dump + 3.0G image write so the
+# Go side attributes it to the runsc-checkpoint step independently of the
+# Step-3 relocation copy below. CKPT_T0 is taken AFTER the rm/mkdir prep (which
+# is ms-scale control-plane) so FT_CHECKPOINT_MS isolates the page-dump itself.
+CKPT_T0=$(NOW_MS)
+RUNSC checkpoint --leave-running --image-path="$IMG" "$SB"; CRC=$?
+echo "FT_CHECKPOINT_MS=$(( $(NOW_MS) - CKPT_T0 ))"
+echo "FT_CHECKPOINT_RC=$CRC"
+[ "$CRC" -ne 0 ] && { log "checkpoint failed rc=$CRC"; exit 0; }   # trap resumes the sentry
+# READ-ONLY image probes are HMNTT-bounded (bug ka-0000004931): a wedged host-ns
+# stat/test on the just-written ~3.0G image fails fast into FT_IMAGE_PRESENT=no
+# rather than hanging the exec until the harness kills it and truncates the
+# stream. HMNTT "test -f" non-zero on timeout takes the else branch, so the
+# fail-closed marker is DEFINITE (=no), never empty-via-truncation.
+if HMNTT test -f "$IMG/checkpoint.img"; then echo "FT_IMAGE_PRESENT=yes"; else echo "FT_IMAGE_PRESENT=no"; fi
+echo "FT_IMAGE_SIZE=$(HMNTT du -sh "$IMG" 2>/dev/null | cut -f1)"
+# FT_PAGES_BYTES (ka-0000000088): the runsc pages.img is the ~3.0G RAM image the
+# restore mmaps EAGERLY on thaw — the byte count a memory-capacity gate needs to
+# compare against MemAvailable so a subject can't be scheduled onto a node that
+# structurally cannot fit it. FT_IMAGE_SIZE is human-readable ("3.0G", du -sh)
+# and DISCARDED after the log line. This is the exact byte count, stashed into
+# Snapshot at freeze so both (a) the pre-thaw memory gate (freezethaw.go thawOnce)
+# and (b) the warm-B placeholder memory reservation (warm_topology.go
+# shapePlaceholderSpec) have the number they need without another node probe.
+# HMNT so stat sees the same file bytes runsc just wrote (ka-0000002536). Empty
+# on stat failure (best-effort): the pre-thaw gate falls back to node-side stat
+# in the thaw script, and the placeholder request falls back to the 256Mi floor.
+# HMNTT-bounded (bug ka-0000004931): a wedged stat on the multi-GB pages.img
+# fails fast to empty rather than hanging+truncating; the pre-thaw gate already
+# falls back to a node-side stat on an empty value, so bounding it is loss-free.
+echo "FT_PAGES_BYTES=$(HMNTT stat -c %s "$IMG/pages.img" 2>/dev/null)"
+# barrier target baked into the statefile metadata (ContainerCountKey) — read the
+# image in the HOST ns so strings sees the same bytes runsc just wrote. HMNTT-
+# bounded (bug ka-0000004931): strings(1) over the ~3.0G checkpoint.img is the
+# single most expensive read-only probe and the likeliest to wedge; a timeout
+# yields an empty CCOUNT, which falls through to the count=2 default below —
+# fail-open to the normal agent-pod shape, never a hang+truncate.
+CCOUNT=$(HMNTT bash -c 'strings "$1/checkpoint.img" 2>/dev/null | grep -oiE "container_count[\"= ]+[0-9]+" | grep -oE "[0-9]+" | head -1' ccount "$IMG")
+[ -z "$CCOUNT" ] && CCOUNT=2   # normal agent pod: pause + agent
+echo "FT_CONTAINER_COUNT=$CCOUNT"
+
+# Leave the quiescent window: resume the sentry, clear the trap, then read state.
+# --leave-running's internal resume only undoes the save's OWN nested pause; our
+# external stop is released here, so the guest runs again exactly once.
+resume_sb
+trap - EXIT INT TERM
+# --leave-running + our explicit resume must keep Pod A alive.
+SBST=$(RUNSC state "$SB" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status",""))' 2>/dev/null)
+echo "FT_SANDBOX_STATE=$SBST"
+
+# [3/8] preserve BOTH OCI bundles + capture each container's LIVE overlay opts
+# from host-init's /proc/mounts BEFORE the originals can go away (the cp-a in the
+# probe ns sees only the empty mountpoint; we re-mount the real overlay at thaw).
+#
+# MOUNT-NAMESPACE INVARIANT (ka-0000002536): this script body runs in the probe
+# pod's mount ns (NodeExecutor execs it as 'chroot /host bash -c'), but the
+# checkpoint IMAGE is written — and at thaw the OCI bundle is READ — by runsc
+# through nsenter -t 1 -m (PID 1's host mount ns). A plain cp/mkdir/test writes to
+# $BUNDLE in the PROBE ns, a different filesystem the exec pod tears down on exit;
+# thaw's runsc then FetchSpec-ENOENTs (rc=128) on the host $BUNDLE that was never
+# populated. So EVERY $BUNDLE filesystem op below is wrapped in HMNT (nsenter -t 1
+# -m) — the bundle lands on the SAME host controller-owned base $BUNDLE
+# (BundleHostBase=/var/lib/gardenio/bundle, relocated off /var/tmp by ka-0000003702)
+# the image ($IMG under /var/lib/gardenio/ckpt) uses and thaw reads.
+#
+# config.json is the keystone: thaw reads "$BUNDLE/$dstn/config.json" directly and
+# runsc restore FetchSpec-ENOENTs (rc=128) on a missing spec. The spec may NOT
+# live at "$T/$cid/config.json" after --leave-running, so resolve the OCI bundle
+# dir from "runsc state <cid>" (the OCI bundle field) and fall back to the v2
+# task dir; copy config.json EXPLICITLY and do NOT swallow cp stderr (an
+# incomplete bundle must be loud, and the [3b/8] guard fails the freeze on it).
+#
+# NOTE: $BUNDLE was created and bundle_dir() defined in step [2/8] (the warm-copy
+# resolvers needed the agent OCI spec before the pause), and the gofer warm copies
+# (.work/.tmp/.gofer) already live under $BUNDLE — so we DO NOT re-wipe it here. The
+# per-container config.json copy below re-copies agent/config.json idempotently over
+# the early capture; sandbox + sidecar specs are captured here for the first time.
+# Iterate the sandbox + EVERY sub-container (agent + sidecars). PRES_LIST pairs
+# each bundle subdir name to its live cid as "<dstn> <cid>", one per line: the
+# sandbox uses $SB, each sub-container its own cid (SUBC_LIST is "<name>|<cid>",
+# converted to "<name> <cid>"). The per-container body below is unchanged from the
+# proven 2-container path — only the driver enumerates N.
+PRES_LIST=$(printf 'sandbox %s\n' "$SB"; printf '%s\n' "$SUBC_LIST" | sed 's/|/ /')
+# TIMING (ka-0000005147): bracket the Step-3 relocation copy — the per-container
+# cp -a of each merged rootfs into the controller-owned safe lowerdir plus the
+# bundle/config payload copy. This is the OTHER multi-second suspect (a 3.0G move
+# if cross-device) and MUST be attributed independently of the checkpoint above.
+RELOC_T0=$(NOW_MS)
+printf '%s\n' "$PRES_LIST" | while read -r dstn cid; do
+  [ -z "$dstn" ] && continue
+  HMNT mkdir -p "$BUNDLE/$dstn/rootfs"
+  # capture the LIVE overlay opts (host ns) for diagnostics + the copy fallback.
+  ovl=$(HMNT awk -v p="$T/$cid/rootfs" '$2==p && $3=="overlay"{print $4}' /proc/mounts | head -1)
+
+  # PRESERVE the rootfs overlay SOURCE past Pod A teardown (ka-0000000655, fix B).
+  # The captured opts above name containerd snapshot dirs — the image lowerdirs
+  # AND the container's writable upperdir — under the pod-lifecycle GC zone. Pod
+  # A's post-freeze teardown reaps the agent container's snapshot, so at thaw
+  # mount -t overlay ENOENTs ("special device overlay does not exist") on those
+  # vanished sources -> rootfs left unmounted -> runsc restore reads an empty
+  # mounts file -> the opaque "unmarshaling mounts: unexpected end of JSON input"
+  # sub rc=128. (The pause/sandbox image layers stay incidentally pinned by Pod
+  # B, so the sandbox overlay survived -> ROOT_RC=0; the agent overlay did not.)
+  #
+  # FIX (same shape as the image relocation ka-0000003702 + spec carry
+  # ka-0000000301): collapse the LIVE merged rootfs (still mounted under
+  # --leave-running) into a single self-contained RO lowerdir under the
+  # CONTROLLER-OWNED safe path $BUNDLE (BundleHostBase=/var/lib/gardenio/bundle),
+  # which is OUTSIDE any pod GC scope, then rewrite .overlay-opts to name THAT.
+  # Copying the merged view (vs each original lowerdir source) is strictly more
+  # robust — it dedups to the freeze-time tree and survives EVERY deletion/GC
+  # vector, not just the teardown reap. Strip any leftover .gvisor.filestore.* so
+  # the preserved lower passes runsc's overlay guard. All ops HOST-NAMESPACED
+  # (HMNT) per the ka-0000002536 mount-ns invariant. Cost: one rootfs copy at
+  # freeze (the slow path); thaw (the hot path) then just mounts a present dir.
+  #
+  # C3 FREEZE-SPEED (ka-0000002239): the C1 baseline (ka-0000005147) attributed
+  # ~88% of freeze latency (p50 662ms of 751ms total) to THIS relocation copy --
+  # it scales with rootfs SIZE, not resident page count, so it is the dominant
+  # lever, not the runsc page-dump (80ms). The byte-for-byte cp -a is the cost.
+  # We switch to cp -a --reflink=auto: when the backing filesystem supports
+  # copy-on-write reflinks (overlayfs upperdir on XFS/Btrfs/bcachefs -- the common
+  # node fs), the merged-rootfs clone becomes an O(metadata) CoW operation
+  # instead of a full data copy, collapsing the dominant freeze cost while
+  # PRESERVING the GC-safety invariant: a reflink shares extents but is an
+  # INDEPENDENT inode that survives source deletion, exactly like a full copy.
+  # --reflink=auto degrades transparently to a plain byte copy on any fs that
+  # cannot reflink, so this is STRICTLY no-worse than the prior behavior -- zero
+  # regression risk on non-CoW nodes. The realized speedup shows up directly in
+  # FT_RELOCATION_MS (a CoW clone collapses that timer) which already feeds the
+  # gardenio_freeze_latency_seconds relocation sub-histogram; we additionally emit
+  # FT_RELOC_FSTYPE_<dstn> (the LOWER target's filesystem type) so a substrate run
+  # can tell at a glance whether the node fs is even reflink-capable (xfs/btrfs)
+  # vs one where --reflink=auto necessarily fell back to a full copy (ext4/9p).
+  LOWER="$BUNDLE/$dstn/lower"
+  # ── Step-3 rootfs RELOCATION (ka-0000007174 reflink fix) ──────────────────────
+  # RELOCATION-REFLINK ROOT CAUSE (ka-0000007174, canary #13, HIGH-confidence RCA).
+  # The relocation SOURCE "$T/$cid/rootfs" is the overlayfs MERGED mountpoint (the
+  # step [3] loop above grepped /proc/mounts confirming $3=="overlay" on exactly this
+  # path). FICLONE / clone_file_range CANNOT clone an overlay inode into a bare-xfs
+  # destination (EOPNOTSUPP/EXDEV), so a cp -a --reflink=auto "$T/$cid/rootfs/." ...
+  # SILENTLY degrades to a FULL byte copy of the entire rootfs — and under the dir
+  # medium the [3a-stack] block below then copied every base layer a SECOND time,
+  # ~doubling the bytes. A multi-GB rootfs (node+claude+playwright+chromium) copied
+  # twice at a contended NON-reflink rate overran the 240s FreezeHardDeadline BEFORE
+  # snapshot-persist -> the freeze fail-closed to a cold start (snapshot NOT promoted).
+  #
+  # THE FIX: under the dir medium, DO NOT read through the overlay merged mount at all.
+  # The [3a-stack] block already parses the live overlay opts ($ovl) into the REAL
+  # constituent bare-xfs layer dirs (the container upperdir + the containerd image
+  # lowerdirs) and copies EACH directly into a GC-safe img.$i lower — an xfs-inode ->
+  # xfs-inode copy that DOES reflink (same device, CoW-capable fs). Those stacked
+  # layers ARE the merged view by construction (merged = overlay(upper,lowers...)), so
+  # $LOWER becomes a THIN skeleton-only TOP layer (the [3a-skel] dentry floor + the
+  # top-level usrmerge symlinks) and the reflinked stack supplies all content. The
+  # expensive merged-mount cp survives ONLY as (a) the self/default-medium path
+  # (UNCHANGED, byte-identical — that medium's latent non-reflink is a documented
+  # follow-up; it was NOT the canary #13 failure) and (b) the dir-medium STACK-EMPTY
+  # fallback (an $ovl we could not parse / layer dirs GC'd), so the fix is STRICTLY
+  # no-worse than the pre-fix relocation on every path.
+  #
+  # WHITEOUT SAFETY (why the layer copies STAY cp -a, not a per-file python walker):
+  # the container upperdir + the containerd image layers carry overlayfs deletions as
+  # char-device 0:0 whiteout nodes + trusted.overlay.* xattrs. cp -a (run as root via
+  # nsenter -t 1, so CAP_SYS_ADMIN for the trusted xattr namespace) faithfully recreates
+  # both (mknod + --preserve=all); a shutil.copy2/copytree would open a 0:0 whiteout as a
+  # regular file and materialize an EMPTY regular file, silently DESTROYING the deletion
+  # marker (a file deleted at runtime would REAPPEAR at thaw). The Linux overlay driver
+  # interprets whiteouts + opaque xattrs in ANY lowerdir position, not just the top, so
+  # the stacked raw layers mask deleted files exactly as the live overlay did. Because we
+  # keep cp -a, the reflink-engagement counter below is a whiteout-SAFE STRUCTURAL probe
+  # (same-device + dest-fs CoW capability), not a per-file ioctl tally.
+  HMNT rm -rf "$LOWER" && HMNT mkdir -p "$LOWER"
+  echo "$(NOW_MS) reloc $dstn start (overlay_flag='${OVERLAY_FLAG:-}')" | HMNT tee -a "$BUNDLE/ft-progress.log" >/dev/null 2>&1 || true
+  if [ -n "$OVERLAY_FLAG" ]; then
+    # === DIR MEDIUM: reconstruct the lower from the real REFLINKABLE layers (the fix). ==
+    # FT_RELOC_FSTYPE (dest fs) is emitted EARLY here (both media report it per
+    # container); $LOWER exists after the mkdir above so stat -f resolves pre-stack.
+    rfs=$(HMNT stat -f -c %T "$LOWER" 2>/dev/null)
+    echo "FT_RELOC_FSTYPE_$dstn=${rfs:-unknown}"
+    # dest-fs CoW-capability probe (whiteout-safe: one clone of a throwaway file that
+    # lives ON the $LOWER fs). xfs(reflink=1)/btrfs/bcachefs succeed; ext4/9p/tmpfs
+    # EOPNOTSUPP. Combined with the per-segment same-device check below it decides
+    # whether each layer's cp -a --reflink=auto actually engaged FICLONE (HIT) or fell
+    # back to a full byte copy (FALLBACK) — the smoking-gun signal FT_RELOC_FSTYPE (dest
+    # only) could never give, since the dest is always the bare node fs (xfs) even when
+    # the copy no-oped through an overlay source (the canary #13 false reassurance).
+    DSTCOW=0
+    if HMNT bash -c 'p="$1/.ft-rlprobe"; printf ftrl > "$p.src" 2>/dev/null && cp --reflink=always "$p.src" "$p.dst" 2>/dev/null; rc=$?; rm -f "$p.src" "$p.dst" 2>/dev/null; exit $rc' rlprobe "$LOWER"; then DSTCOW=1; fi
+    DSTDEV=$(HMNT stat -c %d "$LOWER" 2>/dev/null)
+    # [3a-stack] CONTENT fix. The captured live opts ($ovl) name the containerd image
+    # read-only lowerdir(s) + the container upperdir — the real base-image layers
+    # (/usr/bin/bash etc.) and the runtime delta. On-disk those individual layer dirs are
+    # ALWAYS complete regardless of the merged-mount state (verified live: snap base layer
+    # carries bin/usr/lib/etc...). PRESERVE each GC-safely (reflink, xfs->xfs — an
+    # independent inode that survives Pod-A teardown, the ka-0000000655 invariant; we do
+    # NOT repoint .overlay-opts back to the GC-fragile containerd snapshot paths) and
+    # STACK them BENEATH the skeleton $LOWER as lowerdir= segments. overlay precedence:
+    # the skeleton $LOWER (dentry floor, non-masking) wins on top; the raw upper (img.0,
+    # authoritative delta + whiteouts) next; the image lowerdirs backfill the base. Order
+    # upper-first then lowerdirs in declared order, replicating the merged-view precedence.
+    # Best-effort: a segment that cannot be preserved is skipped (the rest still stack);
+    # if NONE preserve, the STACK-empty fallback below does the pre-fix merged cp.
+    IMG_T0=$(NOW_MS)
+    segs=$(HMNT python3 -c 'import sys
+opts=sys.argv[1]; upper=""; lowers=[]
+for tok in opts.split(","):
+    if tok.startswith("upperdir="): upper=tok[len("upperdir="):]
+    elif tok.startswith("lowerdir="): lowers=tok[len("lowerdir="):].split(":")
+for s in ([upper] if upper else []) + [l for l in lowers if l]:
+    if s: print(s)' "$ovl" 2>/dev/null)
+    STACK=""; i=0; RHITS=0; RFALL=0
+    while IFS= read -r seg; do
+      [ -n "$seg" ] || continue
+      IMGDST="$BUNDLE/$dstn/img.$i"
+      if HMNT test -d "$seg" \
+         && HMNT rm -rf "$IMGDST" \
+         && HMNT mkdir -p "$IMGDST" \
+         && HMNT bash -c 'cp -a --reflink=auto "$1/." "$2/" 2>/dev/null && rm -f "$2"/.gvisor.filestore.* 2>/dev/null; true' cp-img "$seg" "$IMGDST" \
+         && HMNT test -n "$(HMNT ls -A "$IMGDST" 2>/dev/null)"; then
+        # reflink-engagement tally (whiteout-safe, per-SEGMENT — see the WHITEOUT SAFETY
+        # note above for why this is not a per-file ioctl count). The cp -a --reflink=auto
+        # above reflinks its regular-file data IFF src and dst are on the SAME device AND
+        # that device's fs is CoW-capable. HIT when both hold; else the copy fell back to a
+        # full byte copy (cross-device EXDEV, or a non-CoW fs).
+        SEGDEV=$(HMNT stat -c %d "$seg" 2>/dev/null)
+        if [ "$DSTCOW" = 1 ] && [ -n "$SEGDEV" ] && [ "$SEGDEV" = "$DSTDEV" ]; then RHITS=$((RHITS+1)); else RFALL=$((RFALL+1)); fi
+        STACK="$STACK:$IMGDST"; i=$((i+1))
+        echo "$(NOW_MS) reloc $dstn img.$((i-1)) reflink-stacked seg=$seg hits=$RHITS falls=$RFALL" | HMNT tee -a "$BUNDLE/ft-progress.log" >/dev/null 2>&1 || true
+      else
+        log "WARN could not preserve image lower segment '$seg' for $dstn (stacking the rest best-effort)"
+      fi
+    done <<STACKEOF
+$segs
+STACKEOF
+    echo "FT_STACKED_LOWERS_$dstn=$i"
+    echo "FT_RELOC_IMG_MS_$dstn=$(( $(NOW_MS) - IMG_T0 ))"
+    # Relocation reflink-engagement counters (ka-0000007174), mirroring the .gofer sweep's
+    # FT_GOFER_REFLINK_HITS/FALLBACKS (~L733). Diagnostic-only, NEVER gates the freeze:
+    # all-fallbacks on a cross-device / non-CoW node is expected, not an error. But
+    # hits=0 with a NON-empty stack is the exact "the relocation did NOT reflink"
+    # smoking gun (the canary #13 signature) that FT_RELOC_FSTYPE (dest-only) hid.
+    #
+    # HONESTY CAVEAT (WP4/WP8, ka-0000001867). A HIT here is a STRUCTURAL INFERENCE, not
+    # an observed FICLONE result: RHITS increments when DSTCOW==1 (the dest fs cloned a
+    # throwaway probe file) AND SEGDEV==DSTDEV (same device), NOT because we read back the
+    # cp's per-file ioctl outcome. The layer copy is coreutils cp -a --reflink=auto wrapped
+    # in a 2>/dev/null; true guard, so it SWALLOWS any per-file clone error and always
+    # returns success -- we cannot see whether FICLONE actually shared extents for a given
+    # file. The counter is deliberately per-SEGMENT (not per-file) because a python per-file
+    # walker would corrupt the overlay whiteout char-devices + trusted.overlay.* xattrs the
+    # raw layers carry (WHITEOUT SAFETY note above). CONSEQUENCE: HITS>0 means "conditions for
+    # reflink held on every counted segment", which is NECESSARY but NOT SUFFICIENT proof the
+    # bytes were shared. The load-bearing acceptance signal is HITS>0 AND a small
+    # FT_RELOCATION_MS together (a genuine reflink is O(metadata) fast; a silent full-copy
+    # fallback is slow) -- canary #14 judged on exactly that pair. Do not read HITS>0 alone as
+    # "the fix engaged."
+    echo "FT_RELOC_REFLINK_HITS_$dstn=$RHITS"
+    echo "FT_RELOC_REFLINK_FALLBACKS_$dstn=$RFALL"
+    if [ -n "$STACK" ]; then
+      # PRIMARY PATH: skeleton-only $LOWER ON TOP of the reflinked stack (NO merged cp —
+      # this is the copy the fix eliminates). Copy the top-level usrmerge symlinks
+      # (bin->usr/bin, lib64->usr/lib64, sbin->usr/sbin, ...) from the merged mount into
+      # $LOWER — metadata-only, whiteout-irrelevant — so the reconstructed TOP layer
+      # carries them (a non-usrmerge base image may not, and thaw's remount + the restore
+      # 9p-walk expect them on the top layer; ka-0000007174 KS-2).
+      HMNT bash -c 'for e in "$1"/*; do [ -h "$e" ] && cp -a "$e" "$2/" 2>/dev/null; done; true' cp-tlsym "$T/$cid/rootfs" "$LOWER"
+      printf 'lowerdir=%s%s\n' "$LOWER" "$STACK" | HMNT tee "$BUNDLE/$dstn/.overlay-opts" >/dev/null
+      log "stacked $i GC-safe REFLINKED image lowerdir(s) beneath a skeleton-only $LOWER for $dstn (reflink hits=$RHITS fallbacks=$RFALL, dstfs=${rfs:-unknown}; .overlay-opts now lowerdir=$LOWER$STACK) — the non-reflinkable merged-mount cp is SKIPPED so the relocation reflinks off the real bare-xfs layers instead of full-copying the overlay merged view (ka-0000007174; was: $ovl)"
+    else
+      # STACK-EMPTY FALLBACK ($ovl unparseable / all layer dirs GC'd): fall back to the
+      # pre-fix merged-mount cp so the lower is NOT hollow (ka-0000007174 KS-1 — a
+      # skeleton-only $LOWER with no stack is the cycle-14 rc=128 failure mode). This
+      # SOURCE is the overlay merged mount so it will NOT reflink, but a working full copy
+      # beats an un-thawable hollow lower. NOTE (ka-0000001867): the reflink counters echoed
+      # above are already 0/0 on this path — RHITS/RFALL are incremented ONLY inside the
+      # stack loop's success branch (the same branch that appends to STACK), so STACK-empty
+      # implies both are 0. This fallback cp is DELIBERATELY NOT tallied into
+      # FT_RELOC_REFLINK_FALLBACKS: keeping it 0/0 (not fallbacks>0) is what makes the WP7
+      # non-reflink WARN correctly stay SILENT here (a legitimate empty-stack fallback is not
+      # the canary #13 "non-empty stack that reflinked nothing" signature). Whiteout-safe
+      # cp -a; degrades to $ovl (loud) on cp failure, exactly like the pre-fix path.
+      if HMNT bash -c 'cp -a --reflink=auto "$1/." "$2/" 2>/dev/null && rm -f "$2"/.gvisor.filestore.* 2>/dev/null; true' cp-lower "$T/$cid/rootfs" "$LOWER" \
+         && HMNT test -n "$(HMNT ls -A "$LOWER" 2>/dev/null)"; then
+        printf 'lowerdir=%s\n' "$LOWER" | HMNT tee "$BUNDLE/$dstn/.overlay-opts" >/dev/null
+        log "note: no image lower segments to stack for $dstn (ovl='$ovl'); fell back to the merged-mount cp into $LOWER so the reconstructed lower is not hollow (ka-0000007174 STACK-empty fallback)"
+      else
+        printf '%s\n' "$ovl" | HMNT tee "$BUNDLE/$dstn/.overlay-opts" >/dev/null
+        log "WARN could not preserve $dstn rootfs lowerdir (STACK empty AND merged cp failed); fell back to live opts ($ovl)"
+      fi
+    fi
+    # ── [3a] dir-medium plural_fix (ka-0000000357): make the relocated lower
+    # NON-HOLLOW + walkable — runs for BOTH dir sub-paths (skeleton primary + merged-cp
+    # fallback). Under the dir medium the reconstructed $LOWER (skeleton, or a possibly-
+    # sparse merged cp) needs a dentry FLOOR: at thaw runsc vfs.CompleteRestore re-walks
+    # EVERY cached dentry against the LIVE lower top-down, and a missing DIRECTORY dentry
+    # ("usr", the cwd, a mount ancestor) ENOENTs (rc=128, the cycle-14 walk). BOTH a
+    # dentry floor AND real base content are required (source-grounded, bundle
+    # ka-0000000259); the reflinked stack supplies the content, this supplies the floor.
+    # [3a-skel] DENTRY floor. The base mount destinations + the container cwd are
+    # the dentries runsc re-walks top-down at restore; some (an image WORKDIR like
+    # /home/agent/workspace, an emptyDir mountpoint) exist in NEITHER the stacked
+    # image layers NOR the (possibly sparse) merged cp — their CONTENT rides in
+    # checkpoint.img (the gVisor upper) but the DIRECTORY must exist on the lower
+    # for the 9p-walk to resolve. Data-driven mkdir into $LOWER, PLUS the hardcoded
+    # symlink-target set (usr, usr/bin, usr/lib, usr/lib64, usr/sbin) so the dangling
+    # bin/lib64/sbin symlinks resolve even if [3a-stack] could not run.
+    #
+    # LEAF DISCIPLINE (critical): for a MOUNT destination we seed only its ANCESTOR
+    # chain (the parent dirs), NOT the leaf. The leaf is the MOUNTPOINT — runsc's
+    # mount machinery creates it with the correct type at restore, and a file bind
+    # (e.g. /etc/resolv.conf, /etc/hosts, /dev/termination-log) onto a leaf we had
+    # pre-created as a DIRECTORY is a type mismatch that kills the gofer in
+    # ResolveMounts ("reading mounts file: unexpected end of JSON input"). On a
+    # COMPLETE cp this never bit because the real file already existed (mkdir -p is a
+    # no-op); on a SPARSE cp — the actual failure mode — seeding the leaf as a dir
+    # would BREAK the mount. So: mount destinations -> ancestors only. process.cwd and
+    # the symlink targets ARE real directories the walk needs, so those get the FULL
+    # path (leaf included). Idempotent (a lower already carrying the dir is untouched),
+    # best-effort, NEVER fail-closes the freeze (the relocation already succeeded; the
+    # restore rc + the thaw [2] cwd-materialize + the [6b] liveness guard are the
+    # backstops). A plain mkdir carries no opaque xattr / whiteout, so it cannot mask
+    # the stacked image content beneath (overlay merges empty skeleton dirs).
+    #
+    # /var/run NORMALIZATION (ka-0000005421): the skeleton reads the EARLY-captured
+    # spec, whose mount destinations are still the raw /var/run/* form (the thaw [3]
+    # per-container config.json /var/run->/run destination rewrite has not run yet at
+    # freeze time — it runs at restore, in the [3] PYAGENT mount-destination
+    # normalization below). But
+    # the RESTORED mounts re-land at the NORMALIZED /run/* destination — so seeding the
+    # raw var/run/* ancestors as real dirs (a) materializes the wrong ancestor chain
+    # (the tokens land at /run/secrets/..., not /var/run/secrets/...) and, worse, (b)
+    # makes var/run a REAL directory that SHADOWS the base-image /var/run->/run usrmerge
+    # symlink. coop's hardcoded /var/run/secrets/.../token read (rehydrate.rs:53 SA +
+    # :415 EKS-webhook IRSA env) then hits the empty shadow dir -> ENOENT -> the canary
+    # #10 rehydrate fail-close. So we NORMALIZE /var/run/* -> /run/* before chaining
+    # (mirroring thaw [3] + the ka-0000003421 thaw-state /run-canonicalization), seeding
+    # the REAL /run/secrets ancestors where the normalized token mounts actually bind,
+    # and recreate var/run itself as a symlink -> /run below so the cold-start FS
+    # topology (where /var/run/secrets and /run/secrets are the same inode) is restored.
+    skel=$(HMNT python3 -c 'import json,sys
+paths=set()
+def chain(p,include_leaf):
+    p=(p or "").strip().strip("/")
+    if not p: return
+    parts=p.split("/")
+    last=len(parts) if include_leaf else len(parts)-1
+    for k in range(last): paths.add("/".join(parts[:k+1]))
+def norm(d):
+    # /var/run/* -> /run/* (the restore mount-destination normalization, node.go:1663).
+    return "/run/"+d[len("/var/run/"):] if d.startswith("/var/run/") else d
+try:
+    d=json.load(open(sys.argv[1]))
+    # mount destinations: ANCESTORS ONLY (leaf is the mountpoint, created by the mount).
+    # NORMALIZE first so the seeded chain matches where the restored mount re-lands
+    # (a /var/run/secrets/... mount binds at /run/secrets/... post-restore).
+    for m in d.get("mounts",[]): chain(norm(m.get("destination","")), False)
+    # cwd: a real working directory the restore walks -> full path.
+    chain(d.get("process",{}).get("cwd",""), True)
+except Exception: pass
+# symlink targets: real dirs the dangling rootfs symlinks resolve to -> full path.
+for s in ("usr","usr/bin","usr/lib","usr/lib64","usr/sbin"): paths.add(s)
+# never seed var/run (or any var/run/* ancestor) as a real dir -- it is recreated as a
+# symlink->/run after this loop. A real var/run dir would shadow the usrmerge symlink.
+for p in sorted(paths):
+    if p and p!="var/run" and not p.startswith("var/run/"): print(p)' "$BUNDLE/$dstn/config.json" 2>/dev/null)
+    n=$(printf '%s\n' "$skel" | grep -c . 2>/dev/null || echo 0)
+    printf '%s\n' "$skel" | while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      HMNT mkdir -p "$LOWER/$rel" 2>/dev/null || log "WARN skeleton mkdir '$LOWER/$rel' failed for $dstn (best-effort; restore rc + thaw guards backstop)"
+    done
+    echo "FT_SKELETON_DIRS_$dstn=$n"
+    log "seeded $n skeleton dentries into $LOWER for $dstn (mount destinations normalized /var/run->/run + cwd ancestor chains + symlink targets usr,usr/bin,usr/lib,usr/lib64,usr/sbin) so vfs.CompleteRestore re-walks them without ENOENT (ka-0000000357)"
+    # [3a-varrun] /var/run->/run USRMERGE SYMLINK (ka-0000005421). Recreate var/run in
+    # the relocated lower as a SYMLINK -> /run, exactly as the base image ships it (the
+    # usrmerge layout). On a cold-start pod /var/run is this symlink, so coop's
+    # /var/run/secrets/.../token reads resolve through it to the /run/secrets mount; in
+    # the reconstructed lower the symlink had been lost (the sparse cp dropped /var, and
+    # the skeleton previously mkdir-p'd var/run as a REAL dir). We seed the real /run
+    # ancestors above (where the normalized token mounts bind) and point /var/run at
+    # them via this link. mkdir the var parent, remove any stale real var/run the cp or
+    # an earlier step left, then ln -s /run. Best-effort like the rest of [3a]; a plain
+    # symlink carries no opaque xattr/whiteout so it cannot mask stacked content.
+    if HMNT mkdir -p "$LOWER/var" 2>/dev/null \
+       && HMNT rm -rf "$LOWER/var/run" 2>/dev/null \
+       && HMNT ln -s /run "$LOWER/var/run" 2>/dev/null; then
+      echo "FT_VARRUN_SYMLINK_$dstn=1"
+      log "recreated $LOWER/var/run as a symlink -> /run for $dstn (usrmerge topology) so coop's /var/run/secrets/.../token reads resolve to the normalized /run/secrets mounts (ka-0000005421)"
+    else
+      echo "FT_VARRUN_SYMLINK_$dstn=0"
+      log "WARN could not recreate $LOWER/var/run as a symlink -> /run for $dstn (best-effort; restore rc + thaw guards backstop) (ka-0000005421)"
+    fi
+  else
+    # === SELF/DEFAULT MEDIUM: byte-identical to the pre-ka-0000007174 relocation. ===
+    # The merged-mount source is still an overlay inode, so --reflink=auto still degrades
+    # to a full byte copy here; that latent non-reflink is a documented follow-up (this
+    # medium was NOT the canary #13 dir-medium failure). Left untouched for ZERO blast
+    # radius on the self-medium fleet: the [3a] stacking/skeleton/varrun + the reflink
+    # counter are dir-medium-only, so a self-medium freeze's .overlay-opts + $LOWER bytes
+    # + emitted sentinels are identical to the pre-fix script.
+    if HMNT bash -c 'cp -a --reflink=auto "$1/." "$2/" 2>/dev/null && rm -f "$2"/.gvisor.filestore.* 2>/dev/null; true' cp-lower "$T/$cid/rootfs" "$LOWER" \
+       && HMNT test -n "$(HMNT ls -A "$LOWER" 2>/dev/null)"; then
+      printf 'lowerdir=%s\n' "$LOWER" | HMNT tee "$BUNDLE/$dstn/.overlay-opts" >/dev/null
+      # Reflink-capability signal (ka-0000002239): the LOWER target's fs type. xfs
+      # (with reflink=1) / btrfs / bcachefs support CoW clones; ext4 / 9p / tmpfs do
+      # not and --reflink=auto fell back to a full copy. Best-effort, diagnostic-only
+      # -- never gates the freeze; the timing truth is FT_RELOCATION_MS.
+      rfs=$(HMNT stat -f -c %T "$LOWER" 2>/dev/null)
+      echo "FT_RELOC_FSTYPE_$dstn=${rfs:-unknown}"
+      log "preserved $dstn rootfs lowerdir at $LOWER (GC-safe, reflink=auto fstype=${rfs:-unknown}; was: $ovl)"
+    else
+      # degrade to the captured live opts (pre-fix behavior) rather than writing
+      # empty opts — a copy failure must not silently produce an un-thawable bundle
+      # here; thaw's fix-C lowerdir assertion then fails LOUD on the GC'd source.
+      printf '%s\n' "$ovl" | HMNT tee "$BUNDLE/$dstn/.overlay-opts" >/dev/null
+      log "WARN could not preserve $dstn rootfs lowerdir; fell back to live opts ($ovl)"
+    fi
+  fi
+  # resolve the OCI bundle dir (runsc state "bundle" field, then the v2 task dir)
+  # and pick whichever actually holds config.json — probe each candidate in the
+  # HOST ns (HMNT test) so the source-existence check sees what runsc sees.
+  BDIR=$(bundle_dir "$cid")
+  cfgsrc=""
+  for cand in "$BDIR" "$T/$cid"; do
+    [ -n "$cand" ] || continue
+    if HMNT test -f "$cand/config.json"; then cfgsrc="$cand/config.json"; break; fi
+  done
+  if [ -n "$cfgsrc" ]; then
+    HMNT cp -a "$cfgsrc" "$BUNDLE/$dstn/config.json" || log "WARN cp config.json($dstn) from $cfgsrc failed rc=$?"
+  else
+    log "WARN no config.json found for $dstn (cid=$cid bundle='$BDIR' task=$T/$cid)"
+  fi
+  # preserve the remaining bundle payload (everything except rootfs + the
+  # explicitly-handled config.json) — enumerate AND copy in the HOST ns (single
+  # HMNT bash -c) so both the source glob and the $BUNDLE dest agree on the
+  # filesystem runsc reads; surface cp errors rather than swallow them.
+  HMNT bash -c '
+    src=$1; dst=$2
+    for f in "$src"/*; do
+      [ -e "$f" ] || continue
+      bn=$(basename "$f"); case "$bn" in rootfs|config.json) continue;; esac
+      cp -a "$f" "$dst/" || echo "    WARN cp $bn failed rc=$?" >&2
+    done
+  ' hmnt-copy "$T/$cid" "$BUNDLE/$dstn"
+done
+FT_RELOCATION_MS_VAL=$(( $(NOW_MS) - RELOC_T0 ))
+echo "FT_RELOCATION_MS=$FT_RELOCATION_MS_VAL"
+# FREEZE-TIMEOUT FORENSICS (ka-0000007174): also tee the terminal relocation timer to
+# the node-local progress log. On a freeze hard-deadline ctx-kill, freezethaw_exec.go's
+# StreamWithContext returns the transport error and DISCARDS all buffered stdout, so
+# parseSentinels never runs and every FT_*_MS/FT_RELOC_* sentinel is lost — the timeout
+# path is otherwise forensically blind. $BUNDLE/ft-progress.log lives on the GC-safe
+# controller-owned dir, so a follow-up node-exec/reaper can read the per-container
+# heartbeats + this total to classify a wedge (progressing copy vs true hang). Best-
+# effort, never gates.
+echo "$(NOW_MS) reloc all-containers done FT_RELOCATION_MS=$FT_RELOCATION_MS_VAL" | HMNT tee -a "$BUNDLE/ft-progress.log" >/dev/null 2>&1 || true
+
+# [3b/8] FAIL-CLOSED bundle-completeness guard. A snapshot whose bundle lacks a
+# spec is structurally un-thawable (the prod rc=128 FetchSpec defect). Assert both
+# config.json files AND both .overlay-opts are present + non-empty — IN THE HOST NS
+# (HMNT test) so the guard inspects the same controller-owned $BUNDLE
+# (BundleHostBase=/var/lib/gardenio/bundle) that thaw reads, not the throwaway
+# probe-ns copy. Emit FT_BUNDLE_OK so the Go post-state check
+# refuses to persist an un-thawable snapshot (and the controller cold-starts
+# cleanly instead).
+BUNDLE_OK=yes
+for dstn in $DSTN_LIST; do
+  HMNT test -s "$BUNDLE/$dstn/config.json"   || { BUNDLE_OK=no; log "BUNDLE INCOMPLETE: $BUNDLE/$dstn/config.json missing or empty"; }
+  HMNT test -s "$BUNDLE/$dstn/.overlay-opts" || { BUNDLE_OK=no; log "BUNDLE INCOMPLETE: $BUNDLE/$dstn/.overlay-opts missing or empty"; }
+done
+echo "FT_BUNDLE_OK=$BUNDLE_OK"
+
+# [3d/8] FAIL-CLOSED checkpoint-IMAGE guard (ka-0000003702), parallel to [3b/8].
+# The 3.0G checkpoint image is the OTHER deletion vector: it is NOT snapshot-
+# carried (too large for the fix-B base64 shape), so thaw reads it from $IMG on
+# the node. Assert it is present + non-empty AT the controller-owned safe path,
+# IN THE HOST NS (HMNT test -s) so the guard inspects the same /var/lib/gardenio/
+# ckpt that runsc wrote and thaw reads — not a probe-ns view. Emit FT_IMAGE_OK so
+# the Go post-state check refuses to persist a snapshot whose image is absent /
+# empty / un-relocated. Because the snapshot is what the lifecycle's Pod-A
+# DeleteAgentPod waits on, FT_IMAGE_OK=no means Pod A is NOT torn down behind an
+# image thaw could never restore from.
+# HMNTT-bounded (bug ka-0000004931): this is the LAST read-only image probe and
+# the one that gates snapshot persistence (FT_IMAGE_OK). A wedged host-ns test -s
+# here previously hung the whole freeze exec AFTER the checkpoint succeeded,
+# truncating the stream so the Go side saw neither FT_IMAGE_OK nor a clean exit —
+# the snapshot_persisted rung then misclassified a hang as image-absent. Bounding
+# it makes a wedge fail-fast into IMAGE_OK=no, which the Go post-state check
+# already fail-closes on (refuse to persist an un-thawable snapshot; Pod A stays
+# live; cold-start next spawn) — the correct, classifiable outcome.
+if HMNTT test -s "$IMG/checkpoint.img"; then IMAGE_OK=yes; else IMAGE_OK=no; log "IMAGE MISSING: $IMG/checkpoint.img absent or empty at controller-owned safe path"; fi
+echo "FT_IMAGE_OK=$IMAGE_OK"
+
+# [3c/8] CAPTURE the spec files into the snapshot (fix B, ka-0000000301). The host
+# OCI bundle dir ($BUNDLE = BundleHostBase/<agent> = /var/lib/gardenio/bundle/<agent>;
+# formerly /var/tmp/gb-bundle/<agent> pre-ka-0000003702) could be reaped before thaw
+# — the original vector was Pod A's post-freeze teardown GC'ing the then-/var/tmp
+# bundle dir (containerd 'runsc delete' reaps the per-container bundle dir) while the
+# standalone checkpoint image survives — so thaw FetchSpec-ENOENTs (rc=128) on
+# config.json even though FT_BUNDLE_OK=yes proved it existed AT FREEZE. Emit the
+# small spec files (config.json + .overlay-opts for sandbox AND every
+# sub-container) as repeated single-line FT_SPEC sentinels carrying
+# "<bundle-rel-path>|<base64>" so the controller persists them in the snapshot
+# and re-materializes the bundle at thaw start, making thaw independent of the
+# host bundle dir surviving. Read in the HOST ns (HMNT) so we capture what thaw
+# reads. rootfs (the large overlay) is NOT captured — thaw rebuilds it from
+# .overlay-opts. The count of FT_SPEC lines scales with the container count.
+emit_spec() { # $1=bundle-relative path
+  local b64
+  b64=$(HMNT base64 -w0 "$BUNDLE/$1" 2>/dev/null) || { log "WARN capture $1 failed"; return; }
+  echo "FT_SPEC=$1|$b64"
+}
+for dstn in $DSTN_LIST; do
+  emit_spec "$dstn/config.json"
+  emit_spec "$dstn/.overlay-opts"
+done
+
+# NOTE: the 9p-gofer warm copies (.work / .tmp / .gofer) are NO LONGER taken here.
+# They moved UP into step [2/8]'s pause window (ka-0000004656, decision
+# ka-0000003069: fix_tmp_consistency) so they snapshot the SAME quiesced VFS the
+# checkpoint captured — eliminating the live-Claude TOCTOU that ENOENT'd the thaw
+# 9p walk (rc=128). Taking them post-resume here (the old location) is exactly the
+# race that was fixed. Everything below this point operates on already-captured
+# bundle artifacts and is unaffected by the move.
+log "freeze complete: sandbox=$SB agent=$AG count=$CCOUNT image=$IMG"

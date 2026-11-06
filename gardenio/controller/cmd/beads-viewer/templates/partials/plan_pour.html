@@ -1,0 +1,145 @@
+{{/* plan_pour — the plan-cockpit "⚗ Pour a formula" disclosure (epic
+     ka-0000000759, Phase 3). It joins ＋ Add step and ＋ New phase in the
+     operator footer of the step timeline: an operator picks a formula scoped to
+     THIS plan's project, fills its vars, and — via the Preview centerpiece
+     (ka-0000001848) — sees the exact steps the pour would materialize BEFORE any
+     bead is written. "Pour" then emplaces the molecule as a first-class phase.
+
+     Lazy, quick_spawn idiom: the disclosure shell renders in the plan_steps
+     footer (which re-renders on every add/reorder AND every live-progress SSE
+     frame), so it must stay CHEAP — no daemon call. The project-scoped formula
+     list is fetched ONLY when the operator first opens the disclosure, via
+     GET /plans/{id}/pours/new (hx-trigger toggle once). Choosing a formula then
+     lazy-loads its var inputs + Preview/Pour actions. This keeps the SSE
+     re-render path free of formula-list queries.
+
+     The shell is called with the plan_steps bag (PlanID, IsOperator, BasePath). */}}
+{{define "plan_pour"}}
+{{if .IsOperator}}
+<details class="plan-pour" id="plan-pour">
+  <summary class="bead-action plan-pour-toggle" title="Pour a reusable formula into this plan as a phase">⚗ Pour a formula</summary>
+  {{/* Lazy-load the picker the first time the disclosure opens (native <details>
+       toggle event, once). Keeps the formula-list query off the hot re-render
+       path — nothing is fetched until an operator actually wants to pour. */}}
+  <div id="plan-pour-panel" class="plan-pour-panel"
+       hx-get="{{.BasePath}}/plans/{{.PlanID}}/pours/new"
+       hx-trigger="toggle once from:closest details"
+       hx-target="#plan-pour-panel"
+       hx-swap="innerHTML">
+    <p class="empty plan-pour-empty">Loading formulas…</p>
+  </div>
+</details>
+{{end}}
+{{end}}
+
+{{/* plan_pour_picker — the panel body served by GET /plans/{id}/pours/new (no
+     formula chosen): the project-scoped formula <select> above an empty body.
+     Choosing a formula GETs its var inputs into #plan-pour-body. */}}
+{{define "plan_pour_picker"}}
+{{if .Formulas}}
+<div class="plan-pour-picker">
+  <label for="plan-pour-formula">Formula{{if .Project}} <span class="meta">· project {{.Project}}</span>{{end}}</label>
+  <select id="plan-pour-formula" name="formula"
+          hx-get="{{.BasePath}}/plans/{{.PlanID}}/pours/new"
+          hx-target="#plan-pour-body"
+          hx-swap="innerHTML"
+          hx-trigger="change">
+    <option value="">Pick a formula to pour…</option>
+    {{range .Formulas}}
+    <option value="{{.ID}}">{{.Title}}{{if .StepCount}} ({{.StepCount}} step{{if ne .StepCount 1}}s{{end}}){{end}}</option>
+    {{end}}
+  </select>
+</div>
+<div id="plan-pour-body" class="plan-pour-body">
+  {{template "plan_pour_body_empty" .}}
+</div>
+{{else}}
+<p class="empty plan-pour-empty">No formulas are available{{if .Project}} in project <code>{{.Project}}</code>{{end}}. Author a <a href="{{.BasePath}}/formulas">formula</a> first.</p>
+{{end}}
+{{end}}
+
+{{/* plan_pour_body_empty — the #plan-pour-body prompt shown before a formula is
+     chosen (initial picker render, and after re-selecting the blank option). */}}
+{{define "plan_pour_body_empty"}}
+<p class="empty plan-pour-empty">Pick a formula above to preview and pour its steps into this plan.</p>
+{{end}}
+
+{{/* plan_pour_body — the #plan-pour-body fragment: swapped in when a formula is
+     chosen (GET /plans/{id}/pours/new?formula=<id>) and re-rendered after a
+     Preview (POST .../pours with preview=1, HTMX form). It carries the var
+     inputs, the ephemeral/force toggles, the Preview + Pour actions, and — after
+     a preview — the dry-run step plan. Both actions submit this same form and
+     hx-target #plan-pour-body, so the disclosure stays open across a preview.
+
+     Bag: PlanID, Formula (pourFormulaChoice: ID + Vars), Ephemeral, Force, Plan
+     ([]beadsapi.PourPlanStep), PlanTotal, Warning, Error, BasePath. */}}
+{{define "plan_pour_body"}}
+{{if .Error}}<p class="bead-actions-error" role="alert">{{.Error}}</p>{{end}}
+{{if .Warning}}<p class="plan-pour-warning" role="status">{{.Warning}}</p>{{end}}
+
+{{if .Plan}}
+{{/* Preview centerpiece (ka-0000001848): the exact step tree the pour WOULD
+     create — shown before anything is written. Nothing has been created yet. */}}
+<div class="plan-pour-preview" role="status">
+  <h4>Preview — would create 1 molecule + {{.PlanTotal}} step{{if ne .PlanTotal 1}}s{{end}} (nothing written yet)</h4>
+  {{template "plan_pour_steps" .Plan}}
+</div>
+{{end}}
+
+<form class="plan-pour-form"
+      hx-post="{{.BasePath}}/plans/{{.PlanID}}/pours"
+      hx-target="#plan-pour-body"
+      hx-swap="innerHTML"
+      hx-disabled-elt="find button, find input, find select">
+  <input type="hidden" name="formula" value="{{.Formula.ID}}">
+  {{range .Formula.Vars}}
+  <div class="plan-pour-var">
+    <label for="plan-pour-var_{{.Name}}">{{.Name}}{{if .Required}}<span class="pv-req" title="Required"> *</span>{{end}}</label>
+    {{if .Description}}<span class="pv-desc">{{.Description}}</span>{{end}}
+    {{if .Enum}}
+    <select id="plan-pour-var_{{.Name}}" name="var_{{.Name}}">
+      {{$v := .Value}}{{if not .Required}}<option value=""></option>{{end}}
+      {{range .Enum}}<option value="{{.}}"{{if eq . $v}} selected{{end}}>{{.}}</option>{{end}}
+    </select>
+    {{else}}
+    <input type="text" id="plan-pour-var_{{.Name}}" name="var_{{.Name}}" value="{{.Value}}"{{if .Required}} required{{end}}>
+    {{end}}
+  </div>
+  {{end}}
+
+  <div class="plan-pour-toggles">
+    <label title="Create an ephemeral wisp (vapor phase, GC-eligible) instead of a persistent molecule">
+      <input type="checkbox" name="ephemeral" value="1"{{if .Ephemeral}} checked{{end}}>
+      Ephemeral (wisp)
+    </label>
+    <label title="Override the duplicate-molecule guard">
+      <input type="checkbox" name="force" value="1"{{if .Force}} checked{{end}}>
+      Force
+    </label>
+  </div>
+
+  <div class="plan-pour-actions">
+    {{/* Preview runs the dry_run (nothing written) and re-renders this body with
+         the step plan; Pour emplaces the molecule as a phase and reloads the
+         cockpit. Preview-first, then Pour, is the intended flow. */}}
+    <button type="submit" name="preview" value="1" class="bead-action plan-pour-preview-btn">Preview</button>
+    <button type="submit" class="bead-action plan-pour-pour-btn"
+            hx-confirm="Pour this formula into the plan as a new phase? This creates the molecule + its steps.">Pour as phase</button>
+  </div>
+</form>
+{{end}}
+
+{{/* plan_pour_steps — the recursive dry-run step tree (mirrors the freestanding
+     form's pour-plan-list). Preview only: no bead ids, no links — these steps do
+     not exist yet. */}}
+{{define "plan_pour_steps"}}
+<ol class="plan-pour-steplist">
+  {{range .}}
+  <li>
+    {{.Title}} <span class="pp-type">[{{.Type}}]</span>
+    {{if .DependsOn}}<span class="pp-deps">after: {{range $i, $d := .DependsOn}}{{if $i}}, {{end}}{{$d}}{{end}}</span>{{end}}
+    {{if .Children}}{{template "plan_pour_steps" .Children}}{{end}}
+  </li>
+  {{end}}
+</ol>
+{{end}}

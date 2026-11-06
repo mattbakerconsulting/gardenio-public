@@ -1,0 +1,128 @@
+{{- if include "gardenio.keycloakRuntime.tlsEnabled" . }}
+{{- $name := include "gardenio.keycloakRuntime.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $truststore := and (include "gardenio.keycloakRuntime.clientsTLS" .) .Values.keycloak.runtime.firstAdmin.enabled -}}
+# ── keycloak-runtime in-cluster TLS (gd-XRsosVFAau) ──────────────────────────
+# Keycloak serves https on service.httpsPort with a leaf cert for its Service
+# names, so the Lands provisioner's client_credentials secret no longer crosses
+# the pod network in clear (owner decision gd-F060vJkxoM asked for this as the
+# follow-up to the in-cluster http exception, now removed).
+#
+# The chain is namespaced because the release deployer's write scope is (its
+# Role is namespaced; its ClusterRole grants no ClusterIssuer):
+# a SelfSigned Issuer mints a long-lived CA once, a CA Issuer signs the leaf
+# from it. cert-manager writes ca.crt into the leaf Secret, and the controller
+# mounts that one key, never tls.key nor the CA's own Secret.
+#
+# Keycloak re-reads its cert files hourly (https-certificates-reload-period,
+# default 1h), so a renewed leaf is served without a restart.
+#
+# CRDs: cert-manager's Issuer/Certificate must be installed first, as for the
+# chart's other Certificates (templates/tls.yaml).
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ printf "%s-selfsigned" $name | quote }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-runtime-tls
+spec:
+  selfSigned: {}
+---
+# The CA: 10y, key never rotated, because a new CA key would invalidate the
+# ca.crt the controller already holds until its Secret volume refreshes.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ printf "%s-ca" $name | quote }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-runtime-tls
+spec:
+  isCA: true
+  commonName: {{ printf "%s in-cluster CA (%s)" $name $ns | quote }}
+  secretName: {{ printf "%s-ca" $name | quote }}
+  duration: 87600h    # 10y
+  renewBefore: 8760h  # 1y
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  issuerRef:
+    name: {{ printf "%s-selfsigned" $name | quote }}
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ printf "%s-ca" $name | quote }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-runtime-tls
+spec:
+  ca:
+    secretName: {{ printf "%s-ca" $name | quote }}
+---
+# The leaf: every name the Service answers to in-cluster. The provisioner's
+# default URL (gardenio.keycloak.adminBaseURL) uses the .svc.cluster.local one.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "gardenio.keycloakRuntime.tlsSecretName" . | quote }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-runtime-tls
+spec:
+  secretName: {{ include "gardenio.keycloakRuntime.tlsSecretName" . | quote }}
+  duration: 2160h    # 90d
+  renewBefore: 720h  # 30d
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  dnsNames:
+    - {{ $name | quote }}
+    - {{ printf "%s.%s" $name $ns | quote }}
+    - {{ printf "%s.%s.svc" $name $ns | quote }}
+    - {{ printf "%s.%s.svc.cluster.local" $name $ns | quote }}
+  issuerRef:
+    name: {{ printf "%s-ca" $name | quote }}
+    kind: Issuer
+  {{- if $truststore }}
+  # The first-admin Job's kcadm (Java) reads only JKS/PKCS#12 truststores,
+  # not PEM (gd-lYPZlslOM7). cert-manager also writes truststore.p12 here:
+  # ca.crt alone, with the Java trusted-cert attribute. The Job mounts that
+  # one key (never keystore.p12, which carries tls.key).
+  keystores:
+    pkcs12:
+      create: true
+      passwordSecretRef:
+        name: {{ printf "%s-truststore-password" $name | quote }}
+        key: password
+  {{- end }}
+{{- if $truststore }}
+---
+# The truststore.p12 password. Not a secret: the truststore holds only the
+# public CA certificate, and PKCS#12 just needs some password. Fixed so the
+# render is deterministic.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ printf "%s-truststore-password" $name | quote }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-runtime-tls
+type: Opaque
+stringData:
+  password: "keycloak-runtime-ca"
+{{- end }}
+{{- end }}

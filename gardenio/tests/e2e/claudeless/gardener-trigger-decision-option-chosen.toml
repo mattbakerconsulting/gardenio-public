@@ -1,0 +1,149 @@
+# gardener-trigger-decision-option-chosen.toml
+#
+# Live-flow scenario for ka-0000002765 §6: decision_resolved Match on the
+# specific option chosen → gardener fires only when the matching option is
+# selected.
+#
+# Engine code covered:
+#   - gardenio/controller/internal/scheduler/nats_decision.go:130-145
+#     (natsDecisionPayload.ChosenLabel routed into payload[chosen_label]).
+#   - gardenio/controller/internal/scheduler/triggers.go:566-590
+#     (entry.Match evaluation, payload-leaf field path).
+#
+# Two assertions:
+#   NEG: resolve with chosen_label=no  → gardener does NOT fire.
+#   POS: re-resolve with chosen_label=yes (via a fresh decision) → gardener fires.
+#
+# Decisions can't be re-responded, so we run NEG and POS against separate
+# decision objects; the same schedule observes both.
+
+[claude]
+session_id = "e2e00000-000c-4000-a000-000000000006"
+username = "e2e-gardener-decision-option"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 300000
+
+[[responses]]
+on = "*"
+say = "Running gardener-trigger-decision-option-chosen: chosen_label==yes fires, others don't."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+if ! command -v kd >/dev/null 2>&1 || ! command -v gb >/dev/null 2>&1; then
+  echo "SKIP: kd or gb not present"; exit 0
+fi
+if [ -z "${BEADS_HTTP_URL:-}" ] || [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL/BEADS_TOKEN unset"; exit 0
+fi
+
+TAG="e2e-cdoc-$$-$(date +%s)"
+EPIC_ID=$(kd create "gardener-decision-option-epic-$TAG" --type=epic -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+
+# chosen_label is the human-readable label from gb decision's --option spec.
+# We match the "Continue" label exactly.
+TARGET_LABEL="Continue"
+
+TRIGGERS=$(cat <<JSON
+[
+  {"kind":"cron","cron":"0 0 1 1 *","timezone":"UTC"},
+  {"kind":"decision_resolved",
+   "match":{"all":[{"field":"chosen_label","op":"==","value":"$TARGET_LABEL"}]}}
+]
+JSON
+)
+STOP='{"loop_end":{"any":[{"kind":"max_runs"}]},"run_end":{"any":[{"kind":"no_actionable_state"}]},"hard_stop":{"any":[{"kind":"manual_force","field":"force_close","value":"true"}]}}'
+
+SCHED_ID=$(kd create "gardener-sched-$TAG" --type=schedule \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "role:gardener" -l "project:gardenio" \
+  -f "enabled=true" -f "role=gardener" -f "assign_bead=$EPIC_ID" -f "project=gardenio" \
+  -f "prompt=gardener test prompt" -f "max_runs=2" \
+  -f "cron=0 0 1 1 *" -f "timezone=UTC" \
+  -f "triggers=$TRIGGERS" -f "stop=$STOP" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$SCHED_ID" ]; then fail "create schedule"; exit 1; fi
+echo "schedule: $SCHED_ID  target-label: $TARGET_LABEL"
+
+DEC_NEG=""; DEC_POS=""
+cleanup() {
+  kd update "$SCHED_ID" -f "enabled=false" -f "force_close=true" >/dev/null 2>&1 || true
+  AGENT=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.last_agent_id // empty')
+  [ -n "$AGENT" ] && kd close "$AGENT" >/dev/null 2>&1 || true
+  for id in "$SCHED_ID" "$DEC_NEG" "$DEC_POS" "$EPIC_ID"; do
+    [ -n "$id" ] && kd close "$id" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+sleep 5
+
+# ── NEG: resolve with non-matching label ───────────────────────────
+DEC_NEG=$(gb decision create --no-wait --http-url "$BEADS_HTTP_URL" \
+  --prompt "neg-$TAG" \
+  --option "yes:Continue:report" \
+  --option "no:Skip:report" \
+  --json 2>&1 | jq -r '.id // empty')
+if [ -z "$DEC_NEG" ]; then fail "create neg decision"; exit 1; fi
+gb decision respond "$DEC_NEG" --http-url "$BEADS_HTTP_URL" --select no >/dev/null 2>&1 \
+  || { fail "respond neg"; exit 1; }
+echo "resolved DEC_NEG=$DEC_NEG with label=Skip; waiting 90s to confirm no fire..."
+sleep 90
+RS=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.runs_spawned // "0"')
+if [ "${RS:-0}" = "0" ]; then
+  pass "chosen_label=Skip did NOT fire gardener (runs_spawned=0)"
+else
+  fail "gardener fired despite chosen_label mismatch" "runs_spawned=$RS"; exit 1
+fi
+
+# ── POS: resolve with matching label ───────────────────────────────
+DEC_POS=$(gb decision create --no-wait --http-url "$BEADS_HTTP_URL" \
+  --prompt "pos-$TAG" \
+  --option "yes:Continue:report" \
+  --option "no:Skip:report" \
+  --json 2>&1 | jq -r '.id // empty')
+if [ -z "$DEC_POS" ]; then fail "create pos decision"; exit 1; fi
+gb decision respond "$DEC_POS" --http-url "$BEADS_HTTP_URL" --select yes >/dev/null 2>&1 \
+  || { fail "respond pos"; exit 1; }
+echo "resolved DEC_POS=$DEC_POS with label=Continue; waiting for fire..."
+
+DEADLINE=$(( $(date +%s) + 150 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  RS=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.runs_spawned // "0"')
+  if [ "${RS:-0}" -ge 1 ] 2>/dev/null; then
+    FIRED=1
+    pass "chosen_label=Continue fired gardener (runs_spawned=$RS)"
+    break
+  fi
+  sleep 5
+done
+
+if [ "$FIRED" = "0" ]; then
+  fail "gardener did not fire on matching chosen_label within 150s"
+  kd show "$SCHED_ID" 2>/dev/null | head -40 || true
+  exit 1
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "gardener-trigger-decision-option-chosen OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-trigger-decision-option-chosen scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

@@ -1,0 +1,86 @@
+{
+  "title": "Embedding Search P0: Foundation",
+  "description": "Implement Phase 0 of embedding-based semantic search for beads.\n\nDesign doc: kbeads/docs/design-embedding-search.md (branch sketch/embedding-search)\n\nScope: pgvector migration, Embedder interface, Ollama backend, store methods, HTTP search endpoint, CLI integration (kd search --semantic, kd embed sync).\n\nAll work happens in the gardenio repo on a feature branch off main.",
+  "labels": ["project:monorepo"],
+  "phase": "liquid",
+  "variables": {},
+  "steps": [
+    {
+      "id": "migration",
+      "title": "Add pgvector migration (005_bead_embeddings)",
+      "type": "task",
+      "description": "Create migration files `005_bead_embeddings.up.sql` and `005_bead_embeddings.down.sql` in `kbeads/internal/store/postgres/migrations/`.\n\nUp migration:\n- CREATE EXTENSION IF NOT EXISTS vector\n- CREATE TABLE bead_embeddings (bead_id TEXT PK FK→beads, embedding vector(1024), model TEXT NOT NULL, text_hash TEXT NOT NULL, fleet TEXT NOT NULL DEFAULT 'default', created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)\n- CREATE INDEX idx_bead_embeddings_ivfflat ON bead_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)\n- CREATE INDEX idx_bead_embeddings_fleet ON bead_embeddings(fleet)\n\nDown migration:\n- DROP TABLE IF EXISTS bead_embeddings (do NOT drop the vector extension)\n\nSee design doc section 1 for exact SQL.",
+      "needs": []
+    },
+    {
+      "id": "embedder-interface",
+      "title": "Create Embedder interface and text helpers",
+      "type": "task",
+      "description": "Create package `kbeads/internal/embedding/` with:\n\n1. `embedder.go` — Embedder interface: Embed(ctx, text) ([]float32, error), EmbedBatch(ctx, []string) ([][]float32, error), ModelName() string, Dimensions() int\n\n2. `text.go` — BeadText(bead) string (concatenates Title, Type, Description, Notes, Labels with field prefixes), TextHash(text) string (SHA-256 hex)\n\n3. `noop.go` — NoopEmbedder that returns errors (for disabled mode)\n\nSee design doc sections 3 and 4 for exact signatures and text construction format.",
+      "needs": []
+    },
+    {
+      "id": "ollama-backend",
+      "title": "Implement Ollama embedding backend",
+      "type": "task",
+      "description": "Create `kbeads/internal/embedding/ollama.go`:\n\n- OllamaEmbedder struct with baseURL, model, dims, http.Client\n- NewOllamaEmbedder(baseURL, model string) constructor (default dims=1024 for nomic-embed-text)\n- Embed() calls POST {baseURL}/api/embed with {model, input: text}\n- EmbedBatch() calls same endpoint with {model, input: []texts} (Ollama supports batch natively)\n- ModelName() returns model string, Dimensions() returns dims\n\nSee design doc section 3 for the full implementation sketch.\n\nWrite unit tests that mock the HTTP calls.",
+      "needs": ["embedder-interface"]
+    },
+    {
+      "id": "store-methods",
+      "title": "Add embedding store methods to Store interface and Postgres implementation",
+      "type": "task",
+      "description": "Extend `kbeads/internal/store/store.go` with 4 new methods:\n- UpsertEmbedding(ctx, beadID string, embedding []float32, model string, textHash string) error\n- SemanticSearch(ctx, queryVec []float32, filter BeadFilter, limit int) ([]*SemanticResult, error)\n- DeleteEmbedding(ctx, beadID string) error\n- GetEmbeddingStats(ctx) (*EmbeddingStats, error)\n\nAdd model types in `kbeads/internal/model/embedding.go`:\n- SemanticResult{Bead, Score float64, Distance float64}\n- EmbeddingStats{TotalBeads, EmbeddedBeads int, Model string, StaleCount int}\n\nImplement in `kbeads/internal/store/postgres/queries_embedding.go`:\n- UpsertEmbedding: INSERT ON CONFLICT UPDATE\n- SemanticSearch: SELECT b.*, 1-(e.embedding <=> $1::vector) AS score FROM bead_embeddings e JOIN beads b ON b.id=e.bead_id WHERE [filters] ORDER BY e.embedding <=> $1::vector LIMIT $N\n- DeleteEmbedding: DELETE FROM bead_embeddings WHERE bead_id=$1\n- GetEmbeddingStats: COUNT queries comparing beads vs bead_embeddings\n\nSee design doc sections 5 and 6 for exact SQL and types.\n\nUpdate sqlmock tests.",
+      "needs": ["migration", "embedder-interface"]
+    },
+    {
+      "id": "http-endpoint",
+      "title": "Add POST /v1/search/semantic HTTP endpoint",
+      "type": "task",
+      "description": "Create `kbeads/internal/server/http_search.go` with handleSemanticSearch handler.\n\nRequest body: {query string, status []string, type []string, kind []string, labels []string, assignee string, fleet string, limit int, min_score float64}\n\nHandler flow:\n1. Decode JSON body, validate query is non-empty, default limit=20\n2. Embed query text via s.embedder.Embed(ctx, query)\n3. Build BeadFilter from request fields + fleet from context\n4. Call s.store.SemanticSearch(ctx, queryVec, filter, limit)\n5. Filter by min_score if set\n6. writeJSON response\n\nRegister route in http.go: mux.HandleFunc(\"POST /v1/search/semantic\", requireRole(RoleViewer, s.handleSemanticSearch))\n\nAdd embedder field to BeadsServer struct. Wire it up in server initialization (read BEADS_EMBED_BACKEND env var to pick provider).\n\nSee design doc section 8 for handler sketch.",
+      "needs": ["store-methods", "ollama-backend"]
+    },
+    {
+      "id": "grpc-rpc",
+      "title": "Add SemanticSearch gRPC RPC",
+      "type": "task",
+      "description": "Extend proto definitions:\n- Add SemanticSearchRequest, SemanticSearchResult, SemanticSearchResponse messages to beads.proto\n- Add SemanticSearch RPC to BeadsService in service.proto\n- Run make proto to regenerate\n- Implement the gRPC handler in internal/server/grpc.go mirroring the HTTP handler logic\n\nSee design doc section 7 for proto definitions.",
+      "needs": ["store-methods", "ollama-backend"]
+    },
+    {
+      "id": "cli-search-semantic",
+      "title": "Add --semantic flag to kd search",
+      "type": "task",
+      "description": "Modify `kbeads/cmd/kd/search.go` to add a --semantic boolean flag.\n\nWhen --semantic is set:\n- Call POST /v1/search/semantic instead of GET /v1/beads\n- Pass query text + any filters (--status, --type, --where, etc.)\n- Display results with similarity scores\n\nAdd the HTTP client method in internal/client/http.go: SemanticSearch(ctx, query, filters, limit) ([]*SemanticResult, error)",
+      "needs": ["http-endpoint"]
+    },
+    {
+      "id": "cli-embed-sync",
+      "title": "Add kd embed sync command for backfill",
+      "type": "task",
+      "description": "Create `kbeads/cmd/kd/embed.go` with an embed command group:\n\n`kd embed sync [--fleet default] [--batch-size 50] [--force]`\n\nFlow:\n1. Paginate through all beads via GET /v1/beads (batch-size per page)\n2. For each bead, compute BeadText() and TextHash()\n3. Skip if not --force and hash matches existing embedding\n4. Call embedder.EmbedBatch() on the batch texts\n5. Upsert embeddings via a new POST /v1/embeddings/sync endpoint (or direct store call if running server-side)\n\nThis needs a server-side endpoint: POST /v1/embeddings/upsert (admin-only) that accepts {bead_id, embedding, model, text_hash}.\n\nProgress output: print batch progress (e.g., 'Embedded 50/1700 beads...').",
+      "needs": ["http-endpoint"]
+    },
+    {
+      "id": "config-wiring",
+      "title": "Add embedding configuration env vars and server wiring",
+      "type": "task",
+      "description": "Extend `kbeads/internal/config/config.go` with new fields:\n- EmbedBackend string (env: BEADS_EMBED_BACKEND, default: 'noop')\n- EmbedURL string (env: BEADS_EMBED_URL, default: 'http://localhost:11434')\n- EmbedAPIKey string (env: BEADS_EMBED_API_KEY)\n- EmbedModel string (env: BEADS_EMBED_MODEL)\n\nAdd a factory function NewEmbedder(cfg) Embedder that returns the right backend based on EmbedBackend.\n\nWire into server.go: create embedder during server init, pass to BeadsServer.",
+      "needs": ["embedder-interface", "ollama-backend"]
+    },
+    {
+      "id": "tests",
+      "title": "Add tests for embedding pipeline",
+      "type": "task",
+      "description": "Write tests covering:\n1. embedding/text_test.go — BeadText() produces correct concatenation, TextHash() is stable\n2. embedding/ollama_test.go — OllamaEmbedder with httptest mock server\n3. store/postgres tests — SemanticSearch query building (sqlmock)\n4. server/http_search_test.go — handleSemanticSearch handler (httptest + mock store + mock embedder)\n\nTests must exercise the actual code paths. Do NOT write superficial mocks.",
+      "needs": ["http-endpoint", "store-methods"]
+    },
+    {
+      "id": "branch-and-mr",
+      "title": "Push branch and open MR",
+      "type": "task",
+      "description": "Push all work to a feature branch (feat/embedding-search-p0) and open a merge request targeting main.\n\nMR description should reference:\n- Design doc: kbeads/docs/design-embedding-search.md\n- Bead: ka-0000003874\n- Phase: P0 foundation\n- What's included and what's deferred to P1+\n\nRun `make build` and `go test ./...` before pushing. Fix any issues.",
+      "needs": ["cli-search-semantic", "cli-embed-sync", "config-wiring", "grpc-rpc", "tests"]
+    }
+  ]
+}

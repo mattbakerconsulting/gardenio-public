@@ -1,0 +1,75 @@
+# local-task-preassignment.toml
+#
+# Claudeless scenario: Local-mode --task pre-assignment
+#
+# Exercises the `gb agent start --local --task <id>` pre-assignment path.
+# The runner passes a task ID via --task; the CLI plumbs it into the session
+# as BOAT_TASK_ID (mirroring the K8s path, where podmanager sets the same
+# env var from Spec.TaskID). The initial nudge prompt that `gb nudge-prompt`
+# emits then steers the agent at the pre-assigned task.
+#
+# Assertions here check the env plumbing side only — verifying that the
+# task flag reaches the scenario's execution environment. Runner-level
+# assertions (bead status transitions, kd claim attribution) live in the
+# `test-local-mode.sh` runner that wraps this scenario.
+#
+# Run via:
+#   gb agent start --local \
+#       --test-scenario=local-task-preassignment \
+#       --task=<gd-id>
+#
+# Local-mode startup prompt for `gb agent start --local` lives in the
+# sidecar local-task-preassignment.startup-prompt.txt next to this file
+# (claudeless rejects unknown TOML keys, so [test_scenario] cannot ship
+# inside the scenario itself). Follow-up nudges that drive the remaining
+# phases (show, stop) live in local-task-preassignment.nudges.txt — see
+# decision ka-0000006129 (multi-nudge).
+
+[claude]
+session_id = "e2e00000-0004-4000-a000-000000000007"
+username = "e2e-local-task-preassignment"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+# ── Phase 1: Startup — print pre-assigned task ID ───────────────────
+[[responses]]
+on = { contains = "task" }
+say = "Verifying pre-assigned task env."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = "printf 'BOAT_TASK_ID=%s\\n' \"${BOAT_TASK_ID:-<unset>}\""
+
+# ── Phase 2: Show the pre-assigned task ─────────────────────────────
+[[responses]]
+on = { contains = "show" }
+say = "Inspecting the pre-assigned task bead."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = "if [ -n \"$BOAT_TASK_ID\" ]; then kd show \"$BOAT_TASK_ID\" 2>&1 || true; else echo 'no BOAT_TASK_ID set'; fi"
+
+# ── Phase 3: Stop ───────────────────────────────────────────────────
+# Signals pass to gb-agent (ka-0000006600) before despawning.
+[[responses]]
+on = { contains = "stop" }
+say = "Signaling despawn."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = "if [ -n \"${GB_SCENARIO_RESULT_FILE:-}\" ]; then echo pass > \"$GB_SCENARIO_RESULT_FILE\"; fi; gb stop 2>&1 || true"
+
+# ── Fallback ────────────────────────────────────────────────────────
+[default]
+say = "Local task-preassignment scenario idle. Ready for the next step."
+
+# ── Tool config ─────────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

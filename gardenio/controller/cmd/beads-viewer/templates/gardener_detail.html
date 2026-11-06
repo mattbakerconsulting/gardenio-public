@@ -1,0 +1,166 @@
+{{template "layout" .}}
+{{define "title"}}{{with .Gardener}}{{if .Name}}{{.Name}}{{else}}{{.Title}}{{end}}{{end}} · Gardener · Beads Viewer{{end}}
+{{define "content"}}
+{{with .GardenHref}}{{template "garden_banner" .}}{{end}}
+{{- $cap := .Gardener -}}
+<span class="wide-page" hidden></span>
+
+<nav class="crumbs" aria-label="Breadcrumb">
+  <a href="{{.BasePath}}/triggers">Triggers</a> &rsaquo; <span>Gardener</span>
+</nav>
+
+<h1 class="gardener-title">
+  {{if $cap.Name}}{{$cap.Name}}{{else}}{{$cap.Title}}{{end}}
+  {{if $cap.IsClosed}}<span class="chip chip-type gardener-badge-closed">closed</span>
+  {{else if eq $cap.GardenerGoalState "achieved"}}{{- /* Goal reached but the trigger bead is still open (the engine has not
+         flipped it to closed yet, or it never will on this kind). The loud
+         "🏁 GOAL ACHIEVED" badge below is the authoritative lifecycle signal —
+         the live loop is effectively done — so an "enabled" chip here is a
+         misleading contradiction (ka-0000008246). Suppress it. A genuinely
+         disabled gardener still surfaces "disabled" (accurate, not misleading). */ -}}
+  {{if not $cap.Enabled}}<span class="chip chip-type gardener-badge-disabled">disabled</span>{{end}}
+  {{else if $cap.Enabled}}<span class="chip chip-type gardener-badge-enabled">enabled</span>
+  {{else}}<span class="chip chip-type gardener-badge-disabled">disabled</span>{{end}}
+  {{if eq $cap.GardenerGoalState "achieved"}}<span class="gardener-goal-badge" title="This gardener reached its terminal goal — {{$cap.TerminationReason}}">🏁 GOAL ACHIEVED</span>
+  {{else if eq $cap.GardenerGoalState "unachieved"}}<span class="gardener-goal-badge gardener-goal-badge-unachieved" title="Closed without reaching its terminal goal — {{$cap.TerminationReason}}">goal not reached</span>{{end}}
+  {{if $cap.StuckEscalated}}<span class="gardener-goal-badge gardener-goal-badge-unachieved" title="Resume budget exhausted with terminal_goal unmet — escalated for the resumer watchdog / operator (bead ka-0000005353)">⚠ STUCK — ESCALATED</span>{{end}}
+  {{- /* Overdue / silent-gardener liveness (bug ka-0000006095 / A1): the
+         next-fire strip below is computed from the cron regardless of whether
+         the gardener is actually firing, so surface a loud counter-signal when
+         it should have fired again and did not (overdue) or is still spawning
+         but making no progress (silent). */ -}}
+  {{if $cap.Liveness.Overdue}}<span class="gardener-goal-badge gardener-goal-badge-unachieved" title="This enabled gardener looks overdue — {{$cap.Liveness.OverdueDetail}}. Its next-fire below is projected from the cron and does NOT confirm it is firing.">⚠ OVERDUE — {{$cap.Liveness.OverdueDetail}}</span>
+  {{else if $cap.Liveness.Silent}}<span class="gardener-goal-badge gardener-goal-badge-unachieved" title="This gardener is still spawning runs but making no progress — {{$cap.Liveness.SilentDetail}}.">⚠ SILENT — {{$cap.Liveness.SilentDetail}}</span>{{end}}
+  {{- with $cap.Trajectory}}{{if .HasData}}
+  <span class="gardener-verdict gardener-verdict-{{.VerdictKind}}" title="health: {{.Verdict}} ({{.VerdictDetail}})">{{.Verdict}}{{if .VerdictDetail}} <span class="gardener-verdict-detail">· {{.VerdictDetail}}</span>{{end}}</span>
+  {{- end}}{{end}}
+  {{- /* Per-gardener spend roll-up chip (ka-0000003220): total agent spend across
+         this gardener's runs PLUS the crew they spawned, maintained by the
+         controller. Only rendered once the roll-up has run at least once. */ -}}
+  {{if $cap.HasSpend}}<span class="chip gardener-spend-chip{{if $cap.SpendLevel}} gardener-spend-chip-{{$cap.SpendLevel}}{{end}}{{if $cap.SpendStale}} gardener-spend-chip-stale{{end}}" title="Total agent spend rolled up across this gardener's runs and the crew they spawned{{if eq $cap.SpendLevel "over"}} — RUNAWAY: over the spend threshold{{else if eq $cap.SpendLevel "warn"}} — expensive: past the warn threshold{{end}}{{if $cap.SpendExcludesLiveRun}} (approximate — EXCLUDES the in-flight run, whose cost lands only at session close){{end}}{{if $cap.SpendStale}} (roll-up is stale — controller may be behind){{end}}.">💸 {{if or $cap.SpendStale $cap.SpendExcludesLiveRun}}~{{end}}{{$cap.SpendLabel}}</span>{{end}}
+</h1>
+{{- /* Reconcile a displayed-name vs bead-title divergence (bug ka-0000008054):
+       when GardenerSpec.Name differs from the bead title, surface the bead title
+       so the header is never silently mislabelled. */ -}}
+{{if $cap.NameDivergesFromTitle}}<div class="gardener-bead-title" title="bead title (differs from the gardener's configured name)">bead title: {{$cap.Title}}</div>{{end}}
+
+{{- /* Operator-gated lifecycle + config surface (task ka-0000003713). Closes
+       the read→write→config loop: an operator can enable/disable, run-now,
+       cancel a run, retire, and edit the goal/budget/stop-spec from this page.
+       .IsOperator is viewerCanOperateAuthed — the operator role AND an
+       authenticated identity, matching the mutation POST contract exactly so
+       the page never renders a lever the matching POST would 401 (bug
+       ka-0000005377: render-gate ≠ route-gate). Read-scoped / unauthenticated
+       viewers (.OperatorNote) see a muted "operator-only" note instead of
+       live-looking buttons — never dead levers. The config form lazy-loads
+       into #gardener-config-host when "Edit config" is clicked. */ -}}
+{{if .IsOperator}}
+{{template "gardener_controls" (dict "Controls" .Controls "BasePath" .BasePath)}}
+<div id="gardener-config-host" class="gardener-config-host"></div>
+{{else if .OperatorNote}}
+<p class="gardener-operator-note" role="status" title="The lifecycle controls (enable/disable, run-now, retire) and config editor are operator-only.">Operate controls are operator-only &mdash; sign in as an operator to enable/disable, run a gardener now, or edit its config.</p>
+{{end}}
+
+{{- /* Two-column life-thread layout (ka-0000002341). On a wide desktop the
+       summary (header meta, goal, stats, config, trajectory) lives in a sticky
+       right-hand rail while the thread + connected beads fill the main column,
+       so the page uses the horizontal width of the viewport instead of leaving
+       blank acres on the right (near_white_ratio was 0.90). The grid collapses
+       to a single stacked column below 960px, where the rail simply flows above
+       the thread. */ -}}
+<div class="gardener-detail-grid">
+<aside class="gardener-rail" aria-label="Gardener summary">
+{{template "gardener_summary" (dict "Gardener" $cap "BasePath" .BasePath)}}
+</aside>
+
+<div class="gardener-main">
+
+<h2 class="gardener-thread-heading">Life-thread <span class="meta">({{$cap.IterationCount}} iteration{{if ne $cap.IterationCount 1}}s{{end}})</span></h2>
+
+{{- /* Per-key cap-saturation guard (task ka-0000002835). A single per-key
+       iteration query is capped at HistoryLimit rows; when one came back full,
+       the daemon holds MORE iterations for that key than this page materialized
+       and the OLDEST runs were sliced off. Surface the ceiling so an operator
+       sees it BEFORE a gardener silently crosses it, instead of reading a
+       quietly-truncated thread as complete. Distinct from the "older runs
+       pruned" engine-count note: pruned runs no longer exist as beads, whereas
+       truncated runs still exist in the daemon and are reachable by paginating
+       the older-runs tail below. */ -}}
+{{if $cap.HistoryTruncated}}
+<p class="gardener-history-truncated" role="status">
+  History truncated — this gardener has at least {{$cap.HistoryLimit}} iterations for a single
+  spawn key, the per-page ceiling. The oldest runs are not shown here; paginate the older-runs
+  tail below to reach them.
+</p>
+{{end}}
+
+{{- /* Live updates (design doc v2 §5): subscribe to the agents SSE stream
+       scoped to this gardener (== the gardener trigger bead ID). The handler
+       matches iterations carrying that id under EITHER trigger_id (modern
+       bridge path) OR schedule_id (legacy scheduler path), so trigger-path
+       gardeners get live rows too. For a gardener-scoped stream the handler
+       emits <li> life-thread cards (in-progress badge, no uptime/MR-final on
+       live rows); the shared agents_stream.js client swaps each card in place
+       by data-bead-id and prepends a brand-new iteration to the top of the
+       thread. Manual agents carry neither key and correctly never stream
+       here. The ?schedule_id= param name is kept for back-compat. */ -}}
+<span class="gardener-thread-stream" data-agents-stream="{{.BasePath}}/agents/events?schedule_id={{$cap.ID}}" hidden></span>
+
+{{if .IterationsError}}
+<p class="empty">{{.IterationsError}}</p>
+{{else if .Iterations}}
+<ul class="bead-list gardener-thread">
+  {{range .Iterations}}{{template "gardener_iteration_card" (dict "Iter" . "BasePath" $.BasePath)}}{{end}}
+</ul>
+{{if .HasMoreRuns}}
+<div class="gardener-runs-lazy"
+     hx-get="{{.RunsLazyURL}}"
+     hx-trigger="intersect once"
+     hx-swap="outerHTML">
+  <p class="empty">Loading older runs&hellip;</p>
+</div>
+{{end}}
+{{else}}
+<p class="empty empty-yet">No runs yet &mdash; this gardener has not spawned any iterations.</p>
+{{end}}
+
+{{- /* Shared fleet-wide SSE client — gated on the [data-agents-stream] anchor
+       above, scoped to this gardener's schedule_id. Same script the /agents
+       index uses; findExisting() already matches li[data-bead-id] iteration
+       cards, so live row swaps work without bespoke gardener JS. */ -}}
+<script src="{{.BasePath}}/assets/static/agents_stream.js" defer></script>
+
+{{- /* Connected beads (thread request 2026-06-02, task ka-0000007414): the
+       transitive dependency graph reachable from this gardener's invocations,
+       out to N degrees. Lazy-loaded on intersect so the eager page stays fast;
+       the degree pills inside re-request the fragment in place.
+
+       Placed BELOW the life-thread (bug ka-0000007518): the gardener-health
+       content (goal, counters, run history) is the page's purpose, so it must
+       lead. The exploratory connected-beads graph — and especially its long
+       by-type list — is reference material and belongs after the runs, not
+       stacked above them where it pushed the actual thread down a 33k-39k px
+       page (CDQR Density 6/10, three iterations). The partial itself keeps the
+       grouped LIST collapsed behind a disclosure by default (constellation +
+       "N beads within 2 hops" summary stay visible), so signal-per-pixel is
+       restored regardless of where the panel sits.
+
+       Trigger is `intersect once`, NOT `revealed once` (ka-0000003717): htmx's
+       `revealed` is scroll-event driven and never fires for a shell that is
+       already in the viewport and never scrolled past — leaving a perpetual
+       "Loading connected beads…" spinner. `intersect` uses IntersectionObserver
+       and fires as soon as the shell is visible (including at first paint), so
+       the pane always resolves to the real graph or the partial's explicit
+       "No connected beads found" empty state. */ -}}
+<h2 class="gardener-connected-heading">Connected beads</h2>
+<div id="cap-beads-host" class="cap-beads-host"
+     hx-get="{{.BasePath}}/gardener/{{$cap.ID}}/beads"
+     hx-trigger="intersect once"
+     hx-swap="innerHTML">
+  <p class="empty">Loading connected beads&hellip;</p>
+</div>
+
+</div>{{/* .gardener-main */}}
+</div>{{/* .gardener-detail-grid */}}
+
+{{end}}

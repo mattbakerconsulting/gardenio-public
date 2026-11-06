@@ -1,0 +1,519 @@
+syntax = "proto3";
+package beads.v1;
+option go_package = "gardenio/kbeads/gen/beads/v1;beadsv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+import "beads/v1/types.proto";
+
+// CreateBeadRequest contains the fields needed to create a new bead.
+message CreateBeadRequest {
+  string title = 1;
+  string kind = 2;
+  string type = 3;
+  string description = 4;
+  string notes = 5;
+  int32 priority = 6;
+  string assignee = 7;
+  string owner = 8;
+  optional google.protobuf.Timestamp due_at = 9;
+  optional google.protobuf.Timestamp defer_until = 10;
+  bytes fields = 11;
+  repeated string labels = 12;
+  string created_by = 13;
+  // parent_bead_id, when set, makes the server wire a parent-child dep
+  // from the new bead to this bead inside the create transaction and skip
+  // the post-create static-actor auto-parent step (D5, ka-0000007622).
+  // Used by `kd formula apply` to link step beads to the molecule in a
+  // single round-trip without accumulating a second auto-parent edge to
+  // the agent's claimed task.
+  string parent_bead_id = 14;
+  // idempotency_key, when set, makes the create lookup-or-return: if a
+  // non-deleted bead in the same project already carries this key, the
+  // server returns that existing bead instead of inserting a duplicate
+  // (and does NOT emit a second BeadCreated event). Lets a resumed pod
+  // safely re-issue a create that may have already committed before a
+  // crash. Uniqueness scope is per-project (resolved from the bead's
+  // project:<name> label); a per-fleet partial unique index backstops
+  // concurrent-insert races. See ka-0000002856.
+  string idempotency_key = 15;
+  // short_title is the optional <=40-rune human name (model.ShortTitleMax).
+  // The server trims and collapses whitespace; over the limit or multi-line
+  // is InvalidArgument.
+  string short_title = 16;
+  // heraldry is the optional arms, three to five emoji in a row ("🔥🧭📦");
+  // the server stores the run. A refused value is InvalidArgument; arms
+  // already borne in the project are AlreadyExists.
+  string heraldry = 17;
+}
+
+// CreateBeadResponse returns the newly created bead.
+message CreateBeadResponse {
+  Bead bead = 1;
+}
+
+// GetBeadRequest identifies a bead to retrieve.
+message GetBeadRequest {
+  string id = 1;
+}
+
+// GetBeadResponse returns a single bead.
+message GetBeadResponse {
+  Bead bead = 1;
+}
+
+// ListBeadsRequest contains filter criteria for listing beads.
+message ListBeadsRequest {
+  repeated string status = 1;
+  repeated string type = 2;
+  repeated string kind = 3;
+  google.protobuf.Int32Value priority = 4;
+  string assignee = 5;
+  repeated string labels = 6;
+  string search = 7;
+  int32 limit = 8;
+  int32 offset = 9;
+  string sort = 10;
+  map<string, string> field_filters = 11;
+
+  // Phase 3b: server-side filter predicates for the My Work operator tab
+  // (ka-0000002249). Plan-of-record: beads3d/docs/my-work-operator-tab.md §Phase 3.
+  // The "_in" variants are merged with their singular counterparts server-side
+  // and accept multiple values. Older daemons silently drop unknown fields,
+  // so callers should keep a client-side fallback path.
+  repeated string status_in = 12;
+  repeated string type_in = 13;
+  repeated string assignee_in = 14;
+  repeated string owner_in = 15;
+  repeated string created_by_in = 16;
+  // last_active_before filters to beads whose updated_at is strictly before
+  // the given timestamp (treated as a UTC instant).
+  optional google.protobuf.Timestamp last_active_before = 17;
+  // decision_pending is a shortcut for "type=decision AND status in
+  // (open, in_progress)". It's mutually exclusive with explicit non-decision
+  // type filters; the server returns InvalidArgument when they conflict.
+  bool decision_pending = 18;
+  // stale_for_minutes filters to rows where updated_at is older than N
+  // minutes (server-evaluated relative to its current clock). Values <= 0
+  // are ignored. Combines with any other predicate via AND.
+  int32 stale_for_minutes = 19;
+  // exclude_scheduled hides beads carrying a `schedule_id` field
+  // (auto-spawned by the cron scheduler each tick). Default false to
+  // preserve backward compatibility; ready/active views opt in. See
+  // ka-0000006652.
+  bool exclude_scheduled = 20;
+  // operated_by_in filters to beads whose operated_by matches any of these
+  // values. Empty means "no operated_by filter" (NOT "operated_by IS NULL");
+  // use operated_by_is_null for that. See R6 §2.2 (docs/research/human-attribution-api.md).
+  repeated string operated_by_in = 21;
+  // operated_by_is_null restricts to autonomous/scheduled beads
+  // (operated_by is empty). Mutually exclusive with operated_by_in.
+  bool operated_by_is_null = 22;
+  // mentions filters to beads whose text references the given target bead id
+  // (joins through bead_references). Composes with other filters via AND.
+  // See kbeads/docs/design-bead-references.md § 5c.
+  optional string mentions = 23;
+  // mentions_type narrows the mentions filter by bead_references.relationship_type
+  // (typed-mention verb such as "parent", "blocks", "related"). Only meaningful
+  // when mentions is also set. Three-state semantics (ka-0000001544):
+  //   - field absent     → no filter (all rows)
+  //   - "" (empty value) → untyped only (relationship_type IS NULL)
+  //   - "<verb>"         → exact match
+  // Mirrors the HTTP ?mentions_type= shape.
+  optional string mentions_type = 24;
+  // has_report filters to beads whose has_report projection matches this
+  // bool. has_report is true when the bead has a direct (depth-1)
+  // parent-child child whose type ∈ {report, rich-report, bundle} and
+  // whose deleted_at IS NULL. Field absent = no filter. See R1
+  // (gardenio/docs/research/sequencer-report-decision-visibility.md).
+  optional bool has_report = 25;
+  // labels_any is the OR / any-of label filter: a bead matches when it
+  // carries AT LEAST ONE of these labels. Contrast `labels` (field 6),
+  // which ANDs — a bead must carry ALL of them. Multiple labels_any values
+  // OR together, and the whole any-of group ANDs with `labels`, status,
+  // type, etc. Empty = no filter. Surfaced as `kd list --label-any`.
+  //
+  // NOTE: this is the USER-facing any-of filter and maps to
+  // model.BeadFilter.LabelsAnyUser — deliberately distinct from the
+  // internal LabelsAny field the server uses for OIDC project scoping, so a
+  // user-supplied any-of can never widen a request's project isolation
+  // (ka-0000003307).
+  repeated string labels_any = 26;
+  // short_title_missing restricts results to beads with no short_title
+  // (NULL or empty) — the groomer's backfill queue. Mirrors the HTTP
+  // ?short_title_missing=true filter.
+  bool short_title_missing = 27;
+  // heraldry restricts results to beads bearing these arms, the run of
+  // emoji. Mirrors the HTTP ?heraldry= filter; an unreadable value is
+  // InvalidArgument.
+  string heraldry = 28;
+}
+
+// ListBeadsResponse returns a page of beads and the total count.
+message ListBeadsResponse {
+  repeated Bead beads = 1;
+  int32 total = 2;
+}
+
+// UpdateBeadRequest updates fields on an existing bead.
+// Optional scalar fields use the optional keyword so the server can
+// distinguish between "not provided" and "set to zero/empty".
+message UpdateBeadRequest {
+  string id = 1;
+  optional string title = 2;
+  optional string description = 3;
+  optional string notes = 4;
+  optional string status = 5;
+  optional int32 priority = 6;
+  optional string assignee = 7;
+  optional string owner = 8;
+  optional google.protobuf.Timestamp due_at = 9;
+  optional google.protobuf.Timestamp defer_until = 10;
+  optional bytes fields = 11;
+  repeated string labels = 12;
+  // short_title replaces the bead's short_title; "" clears it.
+  optional string short_title = 13;
+  // only_if_short_title_empty makes short_title a fill, not a replace: it
+  // applies only when the bead has no short_title yet, so a backfill never
+  // overwrites one a human or the creating agent wrote.
+  optional bool only_if_short_title_empty = 14;
+  // heraldry replaces the bead's arms, three to five emoji in a row; "" or
+  // "none" removes them. Errors as CreateBeadRequest.heraldry.
+  optional string heraldry = 15;
+}
+
+// UpdateBeadResponse returns the updated bead.
+message UpdateBeadResponse {
+  Bead bead = 1;
+}
+
+// CloseBeadRequest marks a bead as closed.
+message CloseBeadRequest {
+  string id = 1;
+  string closed_by = 2;
+}
+
+// CloseBeadResponse returns the closed bead.
+message CloseBeadResponse {
+  Bead bead = 1;
+}
+
+// DeleteBeadRequest identifies a bead to delete.
+message DeleteBeadRequest {
+  string id = 1;
+}
+
+// DeleteBeadResponse is empty on success.
+message DeleteBeadResponse {}
+
+// AddDependencyRequest creates a dependency between two beads.
+message AddDependencyRequest {
+  string bead_id = 1;
+  string depends_on_id = 2;
+  string type = 3;
+  string created_by = 4;
+}
+
+// AddDependencyResponse returns the created dependency.
+message AddDependencyResponse {
+  Dependency dependency = 1;
+}
+
+// RemoveDependencyRequest removes a dependency between two beads.
+message RemoveDependencyRequest {
+  string bead_id = 1;
+  string depends_on_id = 2;
+  string type = 3;
+}
+
+// RemoveDependencyResponse reports whether an edge actually matched.
+message RemoveDependencyResponse {
+  // removed is false when the (bead_id, depends_on_id, type) triple matched no
+  // row — the delete was a no-op. It is NOT an error: idempotent callers
+  // (`kd reparent`, `kd admin backfill-mr-edges`) rely on removing an
+  // already-absent edge succeeding. Interactive `kd dep remove` uses it to
+  // report a 0-match instead of a false "Removed dependency" (ka-0000001966).
+  //
+  // `optional` is load-bearing: it gives explicit field presence, so a NEW
+  // client can tell "daemon said no-match" (present, false) from "daemon
+  // predates this field" (absent). Absent MUST be read as removed=true — the
+  // legacy assume-success behavior — or a new kd against an old daemon would
+  // report "no such dependency" for a removal that in fact happened.
+  optional bool removed = 1;
+}
+
+// GetDependenciesRequest retrieves dependencies for a bead.
+message GetDependenciesRequest {
+  string bead_id = 1;
+}
+
+// GetDependenciesResponse returns the list of dependencies.
+message GetDependenciesResponse {
+  repeated Dependency dependencies = 1;
+}
+
+// GetChildrenStatusHistogramRequest asks for, per parent_id, a histogram of
+// the parent's parent-child children grouped by status. Used by the
+// project-view sequencer (gardenio/plans/project-view-epic-sequencer.md AC-2)
+// to color epic pills in O(1) round trips per page render.
+message GetChildrenStatusHistogramRequest {
+  repeated string parent_ids = 1;
+}
+
+// ChildStatusHistogram carries the status -> count map for a single parent.
+message ChildStatusHistogram {
+  // status_counts is keyed by bead status string ("open", "in_progress",
+  // "closed", ...). Statuses with zero children are omitted from the map.
+  map<string, int32> status_counts = 1;
+}
+
+// GetChildrenStatusHistogramResponse returns one histogram per requested
+// parent ID. Parents that had no parent-child children appear with an empty
+// status_counts map so the client can rely on a stable shape.
+message GetChildrenStatusHistogramResponse {
+  map<string, ChildStatusHistogram> histograms = 1;
+}
+
+// AddLabelRequest adds a label to a bead.
+message AddLabelRequest {
+  string bead_id = 1;
+  string label = 2;
+}
+
+// AddLabelResponse returns the updated bead.
+message AddLabelResponse {
+  Bead bead = 1;
+}
+
+// RemoveLabelRequest removes a label from a bead.
+message RemoveLabelRequest {
+  string bead_id = 1;
+  string label = 2;
+}
+
+// RemoveLabelResponse reports whether a label was actually present.
+message RemoveLabelResponse {
+  // removed is false when the (bead_id, label) pair matched no row — the delete
+  // was a no-op. It is NOT an error: idempotent callers (`kd update
+  // --remove-label`, the controller's label reconcilers) rely on removing an
+  // already-absent label succeeding. Interactive `kd label remove` uses it to
+  // report a 0-match instead of a false "Removed label(s)" (ka-0000000424).
+  //
+  // `optional` is load-bearing: it gives explicit field presence, so a NEW
+  // client can tell "daemon said no-match" (present, false) from "daemon
+  // predates this field" (absent). Absent MUST be read as removed=true — the
+  // legacy assume-success behavior — or a new kd against an old daemon would
+  // report "no such label" for a removal that in fact happened.
+  optional bool removed = 1;
+}
+
+// GetLabelsRequest retrieves labels for a bead.
+message GetLabelsRequest {
+  string bead_id = 1;
+}
+
+// GetLabelsResponse returns the list of labels.
+message GetLabelsResponse {
+  repeated string labels = 1;
+}
+
+// AddCommentRequest adds a comment to a bead.
+message AddCommentRequest {
+  string bead_id = 1;
+  string author = 2;
+  string text = 3;
+}
+
+// AddCommentResponse returns the created comment.
+message AddCommentResponse {
+  Comment comment = 1;
+}
+
+// GetCommentsRequest retrieves comments for a bead.
+message GetCommentsRequest {
+  string bead_id = 1;
+}
+
+// GetCommentsResponse returns the list of comments.
+message GetCommentsResponse {
+  repeated Comment comments = 1;
+}
+
+// DeleteCommentRequest removes a single comment by id. Idempotent: deleting a
+// comment that does not exist (or that lives on a different bead) returns OK
+// with deleted=false rather than NotFound. Every successful delete writes an
+// audit event row whose operated_by_id is required (see migration 022).
+message DeleteCommentRequest {
+  string bead_id = 1;
+  int64  comment_id = 2;
+}
+
+// DeleteCommentResponse signals whether a row was actually removed.
+message DeleteCommentResponse {
+  bool deleted = 1;
+}
+
+// TrimCommentsRequest keeps only the most recent keep_last comments on
+// bead_id, optionally restricted to comments authored by author. An empty
+// author filter trims across all authors; non-empty filters by exact author
+// match so callers (e.g. the scheduler) can prune their own history without
+// disturbing human / agent commentary. Each removed comment writes its own
+// audit event row.
+message TrimCommentsRequest {
+  string bead_id = 1;
+  int32  keep_last = 2;
+  string author = 3;
+}
+
+// TrimCommentsResponse returns the ids of comments deleted, in ascending
+// creation order.
+message TrimCommentsResponse {
+  repeated int64 deleted_ids = 1;
+}
+
+// GetEventsRequest retrieves events for a bead.
+message GetEventsRequest {
+  string bead_id = 1;
+}
+
+// GetEventsResponse returns the list of events.
+message GetEventsResponse {
+  repeated Event events = 1;
+}
+
+// SemanticSearchRequest contains the query and filters for a semantic
+// (embedding-based) search. Mirrors the JSON body of POST /v1/search/semantic.
+message SemanticSearchRequest {
+  string query = 1;
+  repeated string status = 2;
+  repeated string type = 3;
+  repeated string kind = 4;
+  repeated string labels = 5;
+  string assignee = 6;
+  string fleet = 7;
+  int32 limit = 8;
+  float min_score = 9;
+}
+
+// SemanticSearchResult is a single bead returned from a semantic search,
+// paired with its similarity score.
+message SemanticSearchResult {
+  Bead bead = 1;
+  float score = 2;
+}
+
+// SemanticSearchResponse returns ranked results for a semantic search.
+message SemanticSearchResponse {
+  repeated SemanticSearchResult results = 1;
+  string model = 2;
+}
+
+// MyWorkSummaryRequest aggregates the operator-centric "My Work" queues
+// in a single fan-out so the viewer doesn't have to issue 4-5 List calls
+// per refresh. Plan-of-record: beads3d/docs/my-work-operator-tab.md §Phase 3.
+message MyWorkSummaryRequest {
+  // Operator id used as the "me" predicate (slack handle / agent name).
+  string operator_id = 1;
+  // Idle threshold (minutes) for flagging stale crew agents. Zero or
+  // negative means "use server default" (30 minutes).
+  int32 stale_minutes = 2;
+  // Cap on rows returned per queue. Zero means "use server default".
+  int32 limit = 3;
+}
+
+// WhoamiRequest is empty — the server derives identity from the auth context.
+message WhoamiRequest {}
+
+// WhoamiResponse describes the authenticated caller. Used by the viewer to
+// derive operator identity from the auth claim instead of a URL param /
+// localStorage. Plan-of-record: beads3d/docs/my-work-operator-tab.md §Phase 3.
+message WhoamiResponse {
+  // The authenticated identity (email for OIDC, fleet name for fleet
+  // tokens, or "static" for the primary bearer). Empty when unauthenticated.
+  string operator_id = 1;
+  // How the identity was derived: "auth" (OIDC claim), "token" (static or
+  // fleet bearer), or "anonymous" (no auth context).
+  string source = 2;
+}
+
+// MyWorkSummaryResponse returns the operator's queues plus per-queue counts.
+// Each array is already pre-sorted (most-recent first) and trimmed to
+// `limit` rows; the counts reflect the *unbounded* queue size so the UI
+// can render "(N)" badges accurately even when limit truncates.
+message MyWorkSummaryResponse {
+  // Pending decisions (status=open|in_progress, type=decision).
+  repeated Bead decisions_pending = 1;
+  int32 decisions_pending_count = 2;
+  // Mail addressed to the operator (type=message, assignee=<op>, not closed).
+  repeated Bead mail_unread = 3;
+  int32 mail_unread_count = 4;
+  // Beads assigned to / owned by / created by the operator that are still open.
+  repeated Bead assigned_open = 5;
+  int32 assigned_open_count = 6;
+  // Crew agents the operator spawned that look stale (idle past threshold).
+  repeated Bead stale_agents = 7;
+  int32 stale_agents_count = 8;
+  // Recently-closed beads in the operator's lane (last 24h).
+  repeated Bead recent_closed = 9;
+  int32 recent_closed_count = 10;
+  // Echo of the operator id used by the server (for audit / sanity).
+  string operator_id = 11;
+  // Effective stale threshold (in minutes) applied by the server.
+  int32 stale_minutes = 12;
+}
+
+// BeadReferenceSummary is the per-row payload for the reverse-lookup APIs.
+// Maps to model.BeadReferenceSummary; see kbeads/docs/design-bead-references.md § 5a.
+//
+// For ListMentions (forward direction) the target bead may be missing from
+// the beads table (dangling reference), in which case title/type/status are
+// empty strings — bead_references.target_bead_id is intentionally NOT a
+// foreign key.
+message BeadReferenceSummary {
+  string id = 1;
+  string title = 2;
+  string type = 3;
+  string status = 4;
+  string source_field = 5;
+}
+
+// ListMentionedByRequest paginates the beads whose text references bead_id.
+message ListMentionedByRequest {
+  string bead_id = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+  // relationship_type filters by bead_references.relationship_type
+  // (typed-mention verb). Three-state semantics (ka-0000001544):
+  //   - field absent     → no filter (all rows)
+  //   - "" (empty value) → untyped only (relationship_type IS NULL)
+  //   - "<verb>"         → exact match (e.g. "parent", "blocks", "related")
+  // Mirrors the HTTP ?type= shape; the alias "mentions" → untyped is
+  // applied client-side before the request is sent (see HTTP path).
+  optional string relationship_type = 4;
+}
+
+// ListMentionedByResponse returns one row per (source bead, source field).
+message ListMentionedByResponse {
+  repeated BeadReferenceSummary references = 1;
+  int32 total = 2;
+  int32 limit = 3;
+  int32 offset = 4;
+}
+
+// ListMentionsRequest paginates the ka-IDs that bead_id mentions.
+message ListMentionsRequest {
+  string bead_id = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+  // relationship_type filters by bead_references.relationship_type
+  // (typed-mention verb). See ListMentionedByRequest for semantics.
+  optional string relationship_type = 4;
+}
+
+// ListMentionsResponse returns one row per outgoing reference.
+message ListMentionsResponse {
+  repeated BeadReferenceSummary references = 1;
+  int32 total = 2;
+  int32 limit = 3;
+  int32 offset = 4;
+}

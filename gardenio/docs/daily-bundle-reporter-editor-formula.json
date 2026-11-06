@@ -1,0 +1,106 @@
+{
+  "formula_type": "workflow",
+  "phase": "liquid",
+  "default_roles": ["thread"],
+  "vars": [
+    {
+      "name": "EDITION",
+      "required": true,
+      "description": "Edition slug for this run (e.g. 2026-06-17-AM). Used as the run-directory name and to namespace the draft bundle so concurrent pours don't collide."
+    },
+    {
+      "name": "PARENT_BUNDLE",
+      "default": "ka-0000006422",
+      "description": "Plan-of-record bundle the loop reports under. Every step bead is parented here so the operator browses one tree."
+    },
+    {
+      "name": "PASS_SCORE",
+      "default": "90",
+      "description": "Weighted rubric total (out of 100) at or above which the editor returns verdict=accept. Operator-set to 90 (Matt Baker, thread ka-0000001255)."
+    },
+    {
+      "name": "ACCURACY_FLOOR",
+      "default": "4",
+      "description": "Hard floor for the Accuracy & Verifiability criterion (0-5). Below this the editor returns verdict=hold (never publish), regardless of weighted total. Journalism's one inviolable rule."
+    },
+    {
+      "name": "SLACK_CHANNEL",
+      "default": "C0BB5HTMFAP",
+      "description": "Slack channel ID for #the-daily-bundle, where the accepted edition is posted."
+    },
+    {
+      "name": "PUBLISH_BELOW_BAR",
+      "default": "hold",
+      "description": "What the editor-in-chief does if rounds exhaust above the accuracy floor but below PASS_SCORE: 'hold' (file a gb decision, do not post) or 'note' (publish best draft with an Editor's Note). Default hold on the gardenio volume."
+    }
+  ],
+  "steps": [
+    {
+      "id": "setup",
+      "type": "task",
+      "title": "Daily Bundle {{EDITION}}: editor-in-chief boot — coverage window + rubric + run dir",
+      "labels": ["project:daily-bundle", "kind:reporter-editor-loop", "role:editor-in-chief"],
+      "description": "## Step 0 — Editor-in-Chief: boot the loop\n\nYou own this edition's refinement loop. You do NOT write prose and you do NOT grade it — the reporter and editor pods do that. Your job: establish the shared ground-truth that every round reads, then (at the end) decide publish-or-hold.\n\n### Do\n\n1. Clone/refresh `example-org/daily-bundle` and read `README.md`, `STYLEBOOK.md`, `PLAYBOOK.md`, `ARCHIVE.md`, and `RUBRIC.md` (if `RUBRIC.md` is absent, create it from the rubric table in the `editor-r1` step below and open an MR — both reporter and editor must read the SAME source of truth).\n2. Determine the **coverage window**: from the timestamp of the previous edition in `ARCHIVE.md` to now. Record the window bounds.\n3. Determine the **next issue index** in the current volume (read `ARCHIVE.md`).\n4. Create the run directory `runs/{{EDITION}}/` in the daily-bundle repo (or a scratch dir) holding: `WINDOW.json` (window bounds + issue index), and an empty `rounds/` dir for per-round `draft-bundle-id` and `verdict.json` artifacts.\n\n### Deliverables (comment on this bead, then close)\n- Coverage window (from -> to) and next issue index.\n- Confirmation `RUBRIC.md` exists and PASS_SCORE in it reads {{PASS_SCORE}}, accuracy floor {{ACCURACY_FLOOR}}.\n- Path to `runs/{{EDITION}}/WINDOW.json`.\n\nIf the previous edition can't be located, BLOCK (comment 'BLOCKED: no prior edition anchor') rather than guess a window.\n\nparent({{PARENT_BUNDLE}})"
+    },
+
+    {
+      "id": "reporter-r1",
+      "type": "task",
+      "title": "Daily Bundle {{EDITION}}: REPORTER round 1 — research + draft",
+      "labels": ["project:daily-bundle", "kind:reporter-editor-loop", "role:reporter"],
+      "depends_on": ["setup"],
+      "description": "## Round 1 — Reporter: research the window and draft the edition\n\nYou are a FRESH reporter pod. Produce the first full draft. (You are independent from the editor — write your best paper; the editor scores it.)\n\n### Research the coverage window (from `runs/{{EDITION}}/WINDOW.json`) across ALL sources\n- **Fleet kbeads activity** — beads opened/closed, bugs, epics, releases/tags, incidents, retirements (obituaries). Use the kbeads HTTP API `GET /v1/beads?kind=issue` with sort/offset windowing.\n- **GitLab MRs** in BOTH `example-org/site-deployment` AND `example-org/monorepo` (monorepo project id 79511414; resolve site-deployment's id with `glab api \"projects?search=site-deployment\"`): merged + notable open MRs, release tags, pipeline/deploy outcomes.\n- **Jira** PE + DEVOPS tickets — read as `source:jira` beads (`GET /v1/beads?labels=source:jira&labels=project:monorepo`, carrying jira_key/jira_url/jira_status). Use as stories AND to cross-check engineering MRs.\n\n### Draft to STYLEBOOK\n1. Find the THEME and the LEAD (highest-impact thread of the window: P0/P1 incident, shipped epic, notable investigation, high-impact MR/release).\n2. Draft the four sections: Page One (html), Infrastructure & Markets (html), Inside This Issue (md) + Obituaries, The Wire (csv). Match the house CSS/format of prior editions.\n3. Every monorepo/site-deployment story carries an MR id / Jira key / pipeline ref and is labeled project:monorepo. Filter cron/session noise from obituaries.\n\n### Assemble a DRAFT bundle (do NOT post to Slack — this is a draft)\n- `gb bundle create` a draft bundle; `gb bundle add` each section in TOC order.\n- Record the draft bundle id at `runs/{{EDITION}}/rounds/r1-draft-bundle.txt` and comment it on this bead.\n\n### Deliverables\n- Draft bundle id (round 1).\n- Comment: theme, chosen lead (with its kd-/MR/Jira ref), and a one-line source-count per section.\n\nparent({{PARENT_BUNDLE}})"
+    },
+    {
+      "id": "editor-r1",
+      "type": "task",
+      "title": "Daily Bundle {{EDITION}}: EDITOR round 1 — score draft against rubric",
+      "labels": ["project:daily-bundle", "kind:reporter-editor-loop", "role:editor"],
+      "depends_on": ["reporter-r1"],
+      "description": "## Round 1 — Editor (critic): score the draft\n\nYou are a FRESH editor pod. Read ONLY the **draft bundle** (`runs/{{EDITION}}/rounds/r1-draft-bundle.txt`) and **RUBRIC.md**. Do NOT read the reporter's reasoning/comments — independence is the whole point (no grading-your-own-homework).\n\n### The rubric (each criterion 0-5; weighted total out of 100)\n| # | Criterion | Weight | Hard floor | What '5' looks like |\n|---|-----------|:--:|:--:|---|\n| 1 | Accuracy & verifiability | 25 | {{ACCURACY_FLOOR}} | Every kd-/MR/Jira cited is real and says what the story claims; ledger counts reconcile with kbeads; zero fabricated events/quotes. |\n| 2 | Lead strength | 15 | 3 | Front-page lead is the genuinely highest-impact thread; headline+deck+lede land in ~10s. |\n| 3 | Coverage & proportion | 15 | - | Every significant thread represented; column space proportional to impact. |\n| 4 | Narrative & synthesis | 15 | - | Stories connect dots across beads; the 'so what' is explicit. |\n| 5 | House style & voice | 10 | - | Masthead, desks-as-bylines, tag pills, motto, the Daily Bundle voice (per STYLEBOOK). |\n| 6 | Structure & rendering | 10 | - | Four sections well-formed; HTML renders in the iframe; below-the-fold <details> works; ledger computes. |\n| 7 | Link integrity | 10 | - | Every kd- is a live relative link; wire CSV machine-valid; no dead anchors. |\n\n### Verify accuracy for real (this is the gate)\nSpot-check EVERY kd-/MR/Jira citation in the draft against its source (`kd show`, `glab api`, kbeads HTTP). A citation that doesn't exist or doesn't say what the story claims drives the accuracy score below {{ACCURACY_FLOOR}}.\n\n### Decision rule\n- weighted_total >= {{PASS_SCORE}} AND accuracy >= {{ACCURACY_FLOOR}} AND no other criterion below its floor -> `verdict: accept`\n- accuracy < {{ACCURACY_FLOOR}} -> `verdict: hold` (never publish; reporter cannot fix-by-fabricating)\n- otherwise -> `verdict: revise`\n\n### Output — write `runs/{{EDITION}}/rounds/r1-verdict.json` AND paste it in a comment\n```json\n{\"round\":1,\"scores\":{\"accuracy\":0,\"lead\":0,\"coverage\":0,\"narrative\":0,\"style\":0,\"structure\":0,\"links\":0},\n \"weighted_total\":0,\"verdict\":\"accept|revise|hold\",\n \"edits\":[{\"priority\":1,\"criterion\":\"lead\",\"where\":\"page-one lead\",\"problem\":\"...\",\"fix\":\"...\"}]}\n```\nEdits MUST be specific and actionable (what to promote/demote/tie-together/cut), prioritized.\n\nparent({{PARENT_BUNDLE}})"
+    },
+
+    {
+      "id": "reporter-r2",
+      "type": "task",
+      "title": "Daily Bundle {{EDITION}}: REPORTER round 2 — revise per verdict (or carry forward)",
+      "labels": ["project:daily-bundle", "kind:reporter-editor-loop", "role:reporter"],
+      "depends_on": ["editor-r1"],
+      "description": "## Round 2 — Reporter: revise\n\nYou are a FRESH reporter pod. First read `runs/{{EDITION}}/rounds/r1-verdict.json`.\n\n### Carry-forward short-circuit (terminate early)\n- If round-1 verdict is `accept` OR `hold`: the loop is DONE. Copy `r1-draft-bundle.txt` -> `r2-draft-bundle.txt` and `r1-verdict.json` -> `r2-verdict.json` unchanged, comment 'CARRY-FORWARD (round 1 was {accept|hold}) — no revision', and close. Do NOT re-draft.\n\n### Otherwise (verdict was `revise`)\n- Take the round-1 DRAFT bundle and address the prioritized `edits` list in order. Make a NEW draft bundle (don't mutate the round-1 one — we keep each round for the monotonic-improvement check).\n- Re-research ONLY what an edit requires (e.g. a missing source, a miscounted ledger). Don't churn sections the editor didn't flag.\n- Record the new draft bundle id at `runs/{{EDITION}}/rounds/r2-draft-bundle.txt`.\n\n### Deliverables\n- Round-2 draft bundle id, and a one-line note per round-1 edit: addressed / can't-address-because.\n\nparent({{PARENT_BUNDLE}})"
+    },
+    {
+      "id": "editor-r2",
+      "type": "task",
+      "title": "Daily Bundle {{EDITION}}: EDITOR round 2 — re-score",
+      "labels": ["project:daily-bundle", "kind:reporter-editor-loop", "role:editor"],
+      "depends_on": ["reporter-r2"],
+      "description": "## Round 2 — Editor: re-score\n\nFRESH editor pod. Read ONLY `runs/{{EDITION}}/rounds/r2-draft-bundle.txt` + RUBRIC.md (not the reporter's reasoning).\n\n### Carry-forward short-circuit\n- If `r2-verdict.json` already exists (reporter carried forward an accept/hold), copy it to nothing-to-do: comment 'CARRY-FORWARD verdict stands' and close.\n\n### Otherwise score exactly as in round 1 (same rubric, same decision rule: PASS_SCORE={{PASS_SCORE}}, accuracy floor={{ACCURACY_FLOOR}}).\nAdditionally compute the **monotonic-improvement** signal vs round 1:\n- Read `r1-verdict.json`. If `weighted_total(r2) <= weighted_total(r1)` AND verdict is still `revise`, set `\"converging\": false` (we are NOT improving — the editor-in-chief will stop revising and decide publish-or-hold from the best draft so far).\n- Else `\"converging\": true`.\n\n### Output — `runs/{{EDITION}}/rounds/r2-verdict.json` (same shape as r1 plus `\"converging\": bool`) + paste in a comment.\n\nparent({{PARENT_BUNDLE}})"
+    },
+
+    {
+      "id": "reporter-r3",
+      "type": "task",
+      "title": "Daily Bundle {{EDITION}}: REPORTER round 3 — final revision (or carry forward)",
+      "labels": ["project:daily-bundle", "kind:reporter-editor-loop", "role:reporter"],
+      "depends_on": ["editor-r2"],
+      "description": "## Round 3 — Reporter: final revision (round cap = 3)\n\nFRESH reporter pod. Read `runs/{{EDITION}}/rounds/r2-verdict.json`.\n\n### Carry-forward short-circuit (terminate early)\n- If round-2 verdict is `accept` OR `hold`, OR `converging` is false: the loop is DONE. Copy `r2-draft-bundle.txt` -> `r3-draft-bundle.txt` and `r2-verdict.json` -> `r3-verdict.json` unchanged, comment the carry-forward reason, and close. Do NOT re-draft.\n\n### Otherwise (verdict `revise` and still converging)\n- This is the LAST revision (round cap 3). Address the round-2 `edits` list, make a NEW draft bundle, record id at `runs/{{EDITION}}/rounds/r3-draft-bundle.txt`.\n\n### Deliverables\n- Round-3 draft bundle id + per-edit addressed/can't note.\n\nparent({{PARENT_BUNDLE}})"
+    },
+    {
+      "id": "editor-r3",
+      "type": "task",
+      "title": "Daily Bundle {{EDITION}}: EDITOR round 3 — final score",
+      "labels": ["project:daily-bundle", "kind:reporter-editor-loop", "role:editor"],
+      "depends_on": ["reporter-r3"],
+      "description": "## Round 3 — Editor: final score\n\nFRESH editor pod. Read ONLY `runs/{{EDITION}}/rounds/r3-draft-bundle.txt` + RUBRIC.md.\n\n### Carry-forward short-circuit\n- If `r3-verdict.json` already exists (carried forward), comment 'CARRY-FORWARD verdict stands' and close.\n\n### Otherwise score exactly as before (PASS_SCORE={{PASS_SCORE}}, accuracy floor={{ACCURACY_FLOOR}}) and write `runs/{{EDITION}}/rounds/r3-verdict.json`.\nThis is the final round — there is no round 4. The editor-in-chief's publish step reads this verdict (or the carried-forward one).\n\nparent({{PARENT_BUNDLE}})"
+    },
+
+    {
+      "id": "publish-or-hold",
+      "type": "task",
+      "title": "Daily Bundle {{EDITION}}: editor-in-chief — publish accepted edition or hold for human",
+      "labels": ["project:daily-bundle", "kind:reporter-editor-loop", "role:editor-in-chief"],
+      "depends_on": ["editor-r3"],
+      "description": "## Final — Editor-in-Chief: publish or hold\n\nThe loop has terminated (accept, hold, non-converging, or round cap). Read the FINAL verdict at `runs/{{EDITION}}/rounds/r3-verdict.json` and the matching draft bundle id at `runs/{{EDITION}}/rounds/r3-draft-bundle.txt`. Pick the **best accepted** draft across rounds if multiple accepts exist (highest weighted_total).\n\n### Branch on the verdict\n- **verdict=accept** (weighted >= {{PASS_SCORE}}, accuracy >= {{ACCURACY_FLOOR}}): PUBLISH. Post `/bundle/<draft-id>` to Slack channel {{SLACK_CHANNEL}} (#the-daily-bundle), number the issue as the next volume index, and add the row to `ARCHIVE.md` via an MR.\n- **verdict=hold** (accuracy below floor at the cap): do NOT publish. File `gb decision create` describing what couldn't be verified, attach the best draft bundle, and `gb yield`. Never ship unverified prose.\n- **revise at cap, above accuracy floor but below {{PASS_SCORE}}**: honour PUBLISH_BELOW_BAR={{PUBLISH_BELOW_BAR}} — `hold` => same as hold path (gb decision + yield); `note` => publish the best draft with a one-line Editor's Note that it ran the round cap below bar.\n\n### Deliverables (comment on this bead, then close)\n- Final verdict + per-round weighted_total trajectory (e.g. r1=82, r2=88, r3=91).\n- If published: the posted `/bundle/<id>` permalink, issue index, and ARCHIVE.md MR url.\n- If held: the decision bead id.\n- Roll-up comment on {{PARENT_BUNDLE}} summarizing this edition's loop outcome.\n\nThis closes the molecule. The Editor-in-Chief schedule fires the next edition on its cadence.\n\nparent({{PARENT_BUNDLE}})"
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+package badge
+
+// Throwaway harness for the step 8 sample sheet (gd-0WVnaI8q4z); never committed.
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+type sampleBead struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Prose string `json:"prose"`
+	Arms  string `json:"arms"`
+}
+
+func TestZZSamples(t *testing.T) {
+	dir := os.Getenv("SAMPLES_DIR")
+	if dir == "" {
+		t.Skip("SAMPLES_DIR unset")
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "beads.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beads []sampleBead
+	if err := json.Unmarshal(raw, &beads); err != nil {
+		t.Fatal(err)
+	}
+	styles := []string{StyleLineArtBold, StylePoster}
+	switch os.Getenv("SAMPLES_MODE") {
+	case "prompts":
+		for _, b := range beads {
+			prose := b.Prose
+			if len(prose) > 2000 { // as authorSVG
+				prose = prose[:2000]
+			}
+			for _, s := range styles {
+				p := filepath.Join(dir, "prompts", s, b.ID+".txt")
+				os.MkdirAll(filepath.Dir(p), 0o755)
+				if err := os.WriteFile(p, []byte(buildPrompt(s, b.Title, prose, b.Arms)), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	case "render":
+		type res struct {
+			ID, Model, Style, Tier, Err string
+			Bytes                       int
+		}
+		var out []res
+		for _, m := range []string{"sonnet", "opus"} {
+			for _, s := range styles {
+				g := &Generator{style: s}
+				for _, b := range beads {
+					r := res{ID: b.ID, Model: m, Style: s}
+					svgRaw, err := os.ReadFile(filepath.Join(dir, "raw", m, s, b.ID+".svg"))
+					bdg := Tier0(b.ID, b.Title)
+					if err != nil {
+						r.Err = "no reply file"
+					} else if clean, err := sanitizeSVG(string(svgRaw), g.maxSVGBytes()); err != nil {
+						r.Err = err.Error()
+					} else {
+						bdg = Badge{SVG: clean, Tier: TierModel}
+						r.Bytes = len(clean)
+					}
+					r.Tier = bdg.Tier
+					for _, size := range []int{128, 512} {
+						rr, err := bdg.Rasterize(size)
+						if err != nil {
+							r.Err += fmt.Sprintf("; raster %d: %v", size, err)
+							continue
+						}
+						p := filepath.Join(dir, "png", m, s, fmt.Sprintf("%s-%d.png", b.ID, size))
+						os.MkdirAll(filepath.Dir(p), 0o755)
+						os.WriteFile(p, rr.PNG, 0o644)
+					}
+					out = append(out, r)
+				}
+			}
+		}
+		j, _ := json.MarshalIndent(out, "", " ")
+		os.WriteFile(filepath.Join(dir, "results.json"), j, 0o644)
+	}
+}

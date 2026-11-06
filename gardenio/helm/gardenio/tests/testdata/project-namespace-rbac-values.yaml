@@ -1,0 +1,114 @@
+# Fixture for project_namespace_rbac_test.go: a grant set that exercises
+# templates/project-namespace-rbac.yaml (a cs grant with rules and a subject,
+# plus a glm-lab grant left off). It is not deployed anywhere; the live k3s
+# grants are projectNamespaceRbac in deploy-values/gardenio-k3s.yaml. It came
+# from the retired canonical-prod day0 overlays (gd-HGe22fUCr9).
+
+projectNamespaceRbac:
+  enabled: true
+
+  grants:
+    # ── cs (crab-science) — ADOPT AS-IS ──────────────────────────────────────
+    # These are LOAD-BEARING. The rbac roles/rolebindings rule is what lets a cs
+    # agent pod `helm install` the crab-science chart, whose templates/rbac.yaml
+    # ships a per-release ServiceAccount + Role + RoleBinding. Granted and
+    # verified 2026-08-25 resolving escalation ka-0000000617 — proven not with
+    # `kubectl auth can-i` but by actually creating, getting and deleting an SA,
+    # a Role and the RoleBinding joining them as the subject SA, because
+    # can-i does not exercise RBAC escalation-prevention admission (which can
+    # reject the create even when the verb is granted).
+    #
+    # DO NOT narrow, reorder, or "tidy" these rules as part of the adoption. If
+    # a rule looks wrong, say so in a bead and change it in its own reviewed MR
+    # where the behavior delta is the whole diff.
+    crab-science-runner:
+      enabled: true
+      namespace: crab-science
+      project: cs
+      rules:
+        # Per-release science Jobs — the workload the chart installs.
+        - apiGroups: ["batch"]
+          resources: ["jobs"]
+          verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+        - apiGroups: [""]
+          resources: ["secrets"]
+          verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+        - apiGroups: [""]
+          resources: ["configmaps"]
+          verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+        # Read-only on pods/logs and events — how a run is observed. Note there
+        # is deliberately no pods/exec and no pod write verb.
+        - apiGroups: [""]
+          resources: ["pods", "pods/log"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: [""]
+          resources: ["events"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: [""]
+          resources: ["serviceaccounts"]
+          verbs: ["create", "get", "list", "delete"]
+        # The ka-0000000617 grant: the crab-science chart's own per-release RBAC.
+        # Scoped to this namespace only — the SA still cannot create roles in
+        # any other namespace, and holds nothing cluster-wide.
+        - apiGroups: ["rbac.authorization.k8s.io"]
+          resources: ["roles", "rolebindings"]
+          verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+      subjects:
+        # The fleet's default spawned-agent ServiceAccount. A cs agent pod runs
+        # as this SA in gardenio-system and reaches ACROSS into crab-science
+        # through this binding — which is why the binding, not a cluster role,
+        # is the boundary that matters here.
+        - kind: ServiceAccount
+          name: gardenio-agent
+          namespace: gardenio-system
+
+    # ── glm-lab — REVOKED, PARKED OFF ───────────────────────────────────────
+    # Operator ruling (Matt Baker, 2026-08-25): "let's revoke the glm stuff for
+    # now and leave it off behind a flag." Role glm-lab/glm-lab-agent-admin and
+    # RoleBinding glm-lab/glm-lab-agents are DELETED from the cluster. This entry
+    # exists so the grant is a reviewable one-flag decision instead of tribal
+    # memory — it is NOT a restore stanza.
+    #
+    # WHAT WAS REVOKED, and why it is not reproduced here. The deleted Role was:
+    #     rules:
+    #     - apiGroups: ["", "apps", "batch"]
+    #       resources: ["*"]
+    #       verbs: ["*"]
+    # Full admin over every core/apps/batch resource in the namespace — pods,
+    # deployments, jobs, secrets, serviceaccounts, configmaps, the lot. Hand-
+    # applied 2026-07-11, never reviewed in an MR, live 45 days. The deleted
+    # RoleBinding's subject was `kind: Group, name: glm-lab-agents` (NOT a
+    # ServiceAccount — unlike the cs grant above), populated by an EKS access
+    # entry mapping IAM role arn:aws:iam::123456789012:role/gardenio-prod-glm-lab-agent
+    # to kubernetesGroups: [glm-lab-agents]. That access entry was deliberately
+    # left in place; with no RoleBinding referencing the group it now grants
+    # nothing, and it keeps re-enablement a one-flag operation. The full
+    # restore-from-here record is in the ka-0000007869 comment "glm-lab
+    # namespace RBAC REVOKED".
+    #
+    # Revoking was safe (measured before deleting): namespace glm-lab was EMPTY
+    # (`kubectl get all -n glm-lab` returned nothing) and project glm-lab beads
+    # had been dormant since 2026-07-31. The grant itself was live, not inert —
+    # `kubectl auth can-i --as-group=glm-lab-agents` answered yes on
+    # create/delete/get/list for pods, deployments, jobs and secrets. A dormant
+    # project holding a live namespace-admin grant is exactly the combination
+    # worth revoking.
+    #
+    # TO RE-ENABLE you must do TWO things, not one:
+    #   1. Flip `enabled: true`.
+    #   2. STATE the resources and verbs glm-lab actually needs. `rules: []` and
+    #      `subjects: []` below are placeholders that FAIL the render on purpose,
+    #      so the flip alone cannot silently restore anything. Copy the SHAPE of
+    #      the cs grant above — explicit resources, explicit verbs. Wildcard-on-
+    #      wildcard does not come back. If the subject is the group again, it is
+    #      `- kind: Group, name: glm-lab-agents, apiGroup: rbac.authorization.k8s.io`.
+    # If glm-lab is instead formally decommissioned, the EKS access entry above
+    # is the next thing to remove, and this entry should be deleted outright.
+    glm-lab-agent-admin:
+      enabled: false
+      namespace: glm-lab
+      project: glm-lab
+      roleBinding:
+        name: glm-lab-agents
+      rules: []
+      subjects: []

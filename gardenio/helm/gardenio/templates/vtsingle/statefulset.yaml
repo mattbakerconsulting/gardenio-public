@@ -1,0 +1,122 @@
+{{- if .Values.vtsingle.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "gardenio.vtsingle.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vtsingle.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "gardenio.vtsingle.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.vtsingle.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.vtsingle.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: vtsingle
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.vtsingle.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.vtsingle.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            - "-retentionPeriod={{ .Values.vtsingle.retentionPeriod }}"
+            - "-storageDataPath=/victoria-traces-data"
+            - "-httpListenAddr=:10428"
+            {{- if .Values.vtsingle.otlpGRPC.enabled }}
+            - "-otlpGRPCListenAddr=:4317"
+            {{- end }}
+            {{- with .Values.vtsingle.retention.maxDiskSpaceUsageBytes }}
+            - "-retention.maxDiskSpaceUsageBytes={{ . }}"
+            {{- end }}
+            {{- range .Values.vtsingle.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 10428
+              protocol: TCP
+            {{- if .Values.vtsingle.otlpGRPC.enabled }}
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.vtsingle.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /victoria-traces-data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        {{- if not .Values.vtsingle.persistence.enabled }}
+        {{- /* Persistence disabled (throwaway ephemeral test namespaces,
+               ka-0000000711): back the traces data dir with an emptyDir
+               instead of a PVC. The volumeClaimTemplates block only renders
+               when persistence is enabled, so the `data` mount would otherwise
+               dangle. emptyDir avoids consuming an EBS attachment slot on the
+               POC node — mirrors the vmsingle statefulset. */}}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.vtsingle.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.vtsingle.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.vtsingle.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+  {{- if .Values.vtsingle.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.vtsingle.persistence.storageClass }}
+        storageClassName: {{ .Values.vtsingle.persistence.storageClass }}
+        {{- else if .Values.global.storageClass }}
+        storageClassName: {{ .Values.global.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.vtsingle.persistence.size }}
+  {{- end }}
+{{- end }}

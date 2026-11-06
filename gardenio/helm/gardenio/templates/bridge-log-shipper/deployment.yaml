@@ -1,0 +1,121 @@
+{{- if .Values.bridgeLogShipper.enabled }}
+{{- /*
+bridge-log-shipper Deployment (non-AVA webhook-audit transport, GAP-B of the
+webhook carve-out, task ka-0000000320, epic ka-0000000914).
+
+A purpose-built Go streamer (gardenio/controller/cmd/bridge-log-shipper) that
+opens FOLLOW streams of the jira-bridge and gitlab-bridge pods' stdout via the
+Kubernetes pod-log API, keeps only the webhook receive-path slog records (by
+`msg` prefix), stamps each with its logical door name, and POSTs them to the
+in-chart VictoriaLogs /insert/jsonline. This is the durable audit-log pipeline
+the non-AVA webhook carve-out needs (control 1 "good LOGS of all non-AVA bridge
+traffic"); see gardenio/docs/security/non-ava-webhook-carveout.md GAP-B.
+
+It reuses the sanctioned stream->filter->sink shape of traefik-log-shipper (the
+same pod-log follow streamer and VictoriaLogs sink); the only structural
+difference is it streams TWO in-namespace bridge pods rather than one
+cross-namespace Traefik pod. Both bridge doors run in THIS release's namespace,
+so RBAC is same-namespace (rbac.yaml) and no cross-namespace plumbing is needed.
+*/}}
+{{- $ship := .Values.bridgeLogShipper }}
+{{- if and (not .Values.jiraBridge.enabled) (not .Values.gitlabBridge.enabled) }}
+{{- fail "bridgeLogShipper.enabled=true requires at least one of jiraBridge.enabled / gitlabBridge.enabled — the shipper streams those bridge pods' webhook stdout, so with neither bridge deployed it would have no source to follow. Enable the bridge(s) whose non-AVA webhook traffic you want audited, or disable bridgeLogShipper. See ka-0000000320." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.bridgeLogShipper.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.bridgeLogShipper.labels" . | nindent 4 }}
+spec:
+  # Exactly one replica: the shipper follows each door's pod-log stream and
+  # de-dup is not attempted, so two replicas would double-ship every record. A
+  # brief gap across a restart is acceptable — streamSinceSeconds re-reads a
+  # bounded window on reconnect so the disconnect window is covered
+  # (at-least-once), matching traefik-log-shipper.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.bridgeLogShipper.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.bridgeLogShipper.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "gardenio.bridgeLogShipper.fullname" . }}
+      # The shipper authenticates to the API server as its ServiceAccount to read
+      # pods/log, so the projected SA token must be mounted.
+      automountServiceAccountToken: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: bridge-log-shipper
+          image: {{ include "gardenio.imageRef" (dict "image" $ship.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ $ship.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: BRIDGE_VICTORIALOGS_ENDPOINT
+              value: {{ include "gardenio.bridgeLogShipper.victoriaLogsEndpoint" . | quote }}
+            - name: BRIDGE_POD_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            {{- if .Values.jiraBridge.enabled }}
+            # Jira door: stream the jira-bridge pod, keep only its webhook
+            # receive-path records (msg prefix "jira-webhook:"). Selector mirrors
+            # the jira-bridge Deployment's component label.
+            - name: BRIDGE_JIRA_POD_SELECTOR
+              value: "app.kubernetes.io/component=jira-bridge"
+            - name: BRIDGE_JIRA_MSG_PREFIX
+              value: {{ $ship.jira.msgPrefix | quote }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.enabled }}
+            # GitLab door: stream the gitlab-bridge pod, keep only its webhook
+            # receive-path records (msg prefix "webhook:"). Selector mirrors the
+            # gitlab-bridge Deployment's component label.
+            - name: BRIDGE_GITLAB_POD_SELECTOR
+              value: "app.kubernetes.io/component=gitlab-bridge"
+            - name: BRIDGE_GITLAB_MSG_PREFIX
+              value: {{ $ship.gitlab.msgPrefix | quote }}
+            {{- end }}
+            - name: BRIDGE_RECONNECT_BACKOFF
+              value: {{ $ship.reconnectBackoff | quote }}
+            - name: BRIDGE_STREAM_SINCE_SECONDS
+              value: {{ $ship.streamSinceSeconds | quote }}
+            - name: BRIDGE_FLUSH_INTERVAL
+              value: {{ $ship.flushInterval | quote }}
+            - name: BRIDGE_MAX_BATCH_LINES
+              value: {{ $ship.maxBatchLines | quote }}
+          # No containerPort: the shipper dials OUT (API server + VictoriaLogs) and
+          # opens no in-cluster listener. kubelet restarts the pod on process exit.
+          resources:
+            {{- toYaml $ship.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" $ship.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with $ship.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" $ship.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2026 Matt Baker <fimbaz@gmail.com>
+#
+# Kubernetes manifests for coopmux + coop session pods.
+# Apply with: kubectl apply -f deploy/k8s-mux.yaml
+
+# -- Namespace ----------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: coop
+---
+# -- ServiceAccount for coopmux (needs pod CRUD) -----------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coopmux
+  namespace: coop
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coopmux-pod-manager
+  namespace: coop
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coopmux-pod-manager
+  namespace: coop
+subjects:
+  - kind: ServiceAccount
+    name: coopmux
+    namespace: coop
+roleRef:
+  kind: Role
+  name: coopmux-pod-manager
+  apiGroup: rbac.authorization.k8s.io
+---
+# -- ServiceAccount for session pods (minimal) --------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coop-session
+  namespace: coop
+---
+# -- Service for coopmux (ClusterIP) ------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: coopmux
+  namespace: coop
+spec:
+  type: ClusterIP
+  selector:
+    app: coopmux
+  ports:
+    - port: 9800
+      targetPort: 9800
+      protocol: TCP
+---
+# -- Deployment for coopmux ---------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coopmux
+  namespace: coop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coopmux
+  template:
+    metadata:
+      labels:
+        app: coopmux
+    spec:
+      serviceAccountName: coopmux
+      containers:
+        - name: coopmux
+          image: coop:coopmux
+          imagePullPolicy: Never
+          args:
+            - "--host=0.0.0.0"
+            - "--port=9800"
+            - "--launch=coop-launch"
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: COOP_SESSION_IMAGE
+              value: "coop:claude"
+          ports:
+            - containerPort: 9800
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 9800
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 9800
+            initialDelaySeconds: 2
+            periodSeconds: 5

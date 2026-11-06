@@ -1,0 +1,2257 @@
+{{- if .Values.vmalert.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.vmalert.rulesConfigMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmalert.labels" . | nindent 4 }}
+data:
+  # Recording rules evaluated by vmalert against vmsingle, with results
+  # remote-written back to the same vmsingle. Per the E8 charter
+  # (gardenio/plans/timeseries-platform.md §2.E8) and R1
+  # (timeseries-victoriametrics-ops.md §Q3): author ONLY the small set of
+  # rules demonstrably hot on real data. These two back the live /charts
+  # spend + beads-events panels and the cost-overview dashboard's per-agent
+  # / per-event rollups — the exact queries the operator looks at hourly.
+  #
+  # Naming follows the Prometheus level:metric:operation convention so the
+  # recorded series are unambiguous and never collide with the raw counters.
+  recording.yaml: |
+    groups:
+      - name: gardenio.recording
+        # 1m evaluation cadence: the chart range bar's tightest step is 1m
+        # (the 1h window). Evaluating faster than the underlying 30s scrape
+        # buys nothing; 1m keeps the recorded series fresh for the hot path
+        # without hammering vmsingle.
+        interval: {{ .Values.vmalert.evaluationInterval | quote }}
+        rules:
+          # Per-agent spend rate over a trailing hour. Collapses the
+          # per-turn gardenio_agent_spend_usd_total counter (E3, labels
+          # {agent,project,role,model,account}) into the operator's stated
+          # v1 metric — "spend per agent per hour" — as a single recorded
+          # series keyed on {agent,project}. increase() (not rate()) so the
+          # value reads as dollars-per-hour, matching the dashboard legend.
+          - record: gardenio:agent_cost_usd:rate1h
+            expr: |
+              sum by (agent, project) (increase(gardenio_agent_spend_usd_total[1h]))
+
+          # Beads-event rate over a trailing 5m window. Pre-aggregates the
+          # gardenio_beads_events_total counter (E4, labels
+          # {event,project,bead_type}) into a per-second rate keyed on the
+          # same bounded label set, resolving the beads-event-rate v1 metric
+          # without each dashboard repeating the rate() transform.
+          - record: gardenio:beads_events:rate5m
+            expr: |
+              sum by (event, project, bead_type) (rate(gardenio_beads_events_total[5m]))
+{{- if .Values.vmalert.landCredits.enabled }}
+  # Tenant land credit series (plan step 3.2): recording rules only, so no
+  # notifier gate. See templates/_lands-credits.tpl for the full rationale.
+  lands-credits.yaml: |
+    groups:
+      {{- include "gardenio.landsCredits.groups" . | nindent 6 }}
+{{- end }}
+{{- /*
+  gap-alerts.yaml — the "starter alert pack" (task ka-0000001461, epic
+  ka-0000000770), authored as a vmalert ConfigMap rule key because that is the
+  ONLY rule path that fires on new prod (PrometheusRule/VMRule CRDs are
+  converted but never evaluated — no VMAlert behind them). Full inventory +
+  PromQL + fireability matrix: /bundle/ka-0000004470.
+
+  Alerting rules require a notifier: vmalert crashloops if it loads alerting
+  rules with neither -notifier.url nor -notifier.blackhole set. So this whole
+  key is gated on a notifier being wired (alertmanager.enabled OR
+  vmalert.notifierURL OR vmalert.notifierBlackhole). A recording-only vmalert
+  (enabled, no notifier) renders NO gap-alert key and stays clean — preserving
+  the recording-only contract the vmalert tests assert.
+*/ -}}
+{{- $ga := .Values.vmalert.gapAlerts }}
+{{- $notifier := include "gardenio.vmalert.effectiveNotifierURL" . }}
+{{- $notifierAvailable := or $notifier .Values.vmalert.notifierBlackhole }}
+{{- if and $ga.enabled $notifierAvailable }}
+{{- /* empty incidentBead → empty beadURL (not a dead trailing-slash link) */ -}}
+{{- $beadURL := "" }}
+{{- if $ga.incidentBead }}{{ $beadURL = include "gardenio.link.beadURL" (dict "ctx" $ "id" $ga.incidentBead) }}{{ end }}
+{{- /* Grafana dashboard base for the `dashboard` annotation the Alertmanager→
+       Slack template renders as a "📊 Graph" link (ka-0000008039). Empty ⇒ every
+       `dashboard:` annotation below is omitted. Each alert appends its own
+       /d/<uid>?<vars>&from=now-1h&to=now so the graph opens pre-scoped to the
+       last hour on the panel that shows the exact signal that fired. */ -}}
+{{- $dashBase := $ga.grafanaBaseURL | trimSuffix "/" }}
+{{- $dashWindow := "from=now-1h&to=now" }}
+  # Starter alert pack (ka-0000001461). See header above for why these are
+  # ConfigMap keys and not PrometheusRule CRDs on prod.
+  gap-alerts.yaml: |
+    groups:
+      # ---- fireable today: up{}/vector(1) series already in vmsingle --------
+      - name: gardenio.gap-alerts
+        interval: {{ .Values.vmalert.evaluationInterval | quote }}
+        rules:
+{{- if $ga.platformPodRestarts.enabled }}
+          # ka-0000003606 — PLATFORM-SINGLETON restart/crashloop coverage.
+          #
+          # THE GAP THIS CLOSES (measured blind for 4+ days in prod): the
+          # in-cluster litellm proxy — the LLM data-plane for the ENTIRE fleet —
+          # sat in a sustained OOMKill crashloop (159 restarts/24h, ~14% of the
+          # day unavailable) and NOTHING could page on it:
+          #   * AgentOOMKilled reads gardenio_agent_lifecycle_events_total{event=
+          #     "oom_killed"}, an AGENT-pod lifecycle metric. A platform
+          #     singleton in the release namespace emits no such series, so that
+          #     rule is structurally incapable of firing for litellm /
+          #     beads-viewer / vmsingle / the bridges.
+          #   * AgentContainerOOMKilled is default-OFF, and its namespaceRegex
+          #     ("gardenio|gardenio-e2e.*") is a FULL-match that excludes
+          #     "gardenio-system" — where every platform singleton actually runs.
+          #   * up{}-based liveness (BeadsDaemonDown above) does not catch this
+          #     shape either: a pod that dies and comes back every ~9min is
+          #     scrape-UP most of the time, so only the RESTART COUNT reveals it.
+          # Net: the two OOM alerts cover agents, the up{} alerts cover a total
+          # outage, and a flapping platform singleton fell between them.
+          #
+          # NOT a blocked gap — kube_pod_container_status_restarts_total is
+          # already in vmsingle for this namespace via the pod-state-metrics
+          # scrape (verified live: 35 gardenio-system pods carry the series, and
+          # topk over it reproduced litellm 159/24h). So this rule is armed by
+          # default rather than parked in gap-alerts-blocked.
+          #
+          # by (namespace, pod, container) so the firing series names the exact
+          # container. Threshold is a RATE over 1h, not a cumulative count, so a
+          # one-off restart (node recycle, image pull retry, a deploy) does not
+          # page — only a genuine crashloop clears it.
+          # container!~excludeContainerRegex is what keeps this PLATFORM-scoped.
+          # The release namespace also hosts ephemeral AGENT pods (container
+          # "agent" — 9502 series/14d, by far the bulk) and short-lived Job pods
+          # (reap/stamp/adopt/migrate). Without the exclusion this rule
+          # double-reports agent churn that AgentOOMKilled/AgentContainerOOMKilled
+          # already own, and it fans out per-pod: replaying the expression over
+          # the last 14d, one 08-05 crew-e2e burst alone produced 12 simultaneous
+          # firing series for a single root cause. Excluding those leaves exactly
+          # the long-lived singletons this alert exists for.
+          - alert: PlatformPodCrashLooping
+            expr: |
+              sum by (namespace, pod, container) (increase(kube_pod_container_status_restarts_total{namespace="{{ .Release.Namespace }}",container!~"{{ $ga.platformPodRestarts.excludeContainerRegex }}"}[1h])) > {{ $ga.platformPodRestarts.threshold }}
+            for: {{ $ga.platformPodRestarts.for | quote }}
+            labels:
+              severity: {{ $ga.platformPodRestarts.severity | quote }}
+              component: gardenio
+              subsystem: platform-reliability
+            annotations:
+              summary: "platform container restarting >{{ $ga.platformPodRestarts.threshold }}x/h ({{`{{ $labels.namespace }}/{{ $labels.pod }}`}}/{{`{{ $labels.container }}`}})"
+              description: |
+                Container {{`{{ $labels.container }}`}} in platform pod
+                {{`{{ $labels.pod }}`}} restarted more than
+                {{ $ga.platformPodRestarts.threshold }} times in the last hour.
+                These are SINGLETON control-plane/data-plane components, so a
+                crashloop is user-visible the whole time it lasts — litellm is
+                the fleet's LLM data-plane (every agent call), beads-viewer is
+                the operator UI, the bridges carry Slack/GitLab/JIRA.
+                Triage:
+                  kubectl -n {{`{{ $labels.namespace }}`}} describe pod {{`{{ $labels.pod }}`}}
+                  # read lastState.terminated.reason + exitCode:
+                  #   OOMKilled/137 -> working set exceeded limits.memory. Compare
+                  #     the container's real peak against its limit before raising:
+                  #     a limit only ~5% over the normal peak is what produced
+                  #     ka-0000003606. Sustained OOM at a generous limit = leak.
+                  #   Error/non-zero -> read the logs for the crash itself.
+                  kubectl -n {{`{{ $labels.namespace }}`}} logs {{`{{ $labels.pod }}`}} --previous
+              runbook_url: "{{ $ga.runbookBaseURL }}#platformpodcrashlooping"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=20&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.beadsHealth.enabled }}
+          # GAP-4 — beads daemon health. kbeads is prometheus.io/scrape=true
+          # (:9091), so vmagent synthesizes up{component="beads"} in vmsingle.
+          # kbeads down = ALL agent orchestration halts (spawns, gates,
+          # decisions), so this is the highest-severity liveness signal.
+          - alert: BeadsDaemonDown
+            expr: |
+              up{component="beads"} == 0
+            for: {{ $ga.beadsHealth.downFor | quote }}
+            labels:
+              severity: {{ $ga.beadsHealth.severity | quote }}
+              component: beads
+              subsystem: beads-daemon
+            annotations:
+              summary: "beads daemon scrape target down (up{component=beads}==0 — /metrics unreachable OR scrape-timing-out)"
+              description: |
+                up{component="beads"} has been 0 for {{ $ga.beadsHealth.downFor }}. This is a
+                SCRAPE-LEVEL signal: it means vmagent could not successfully scrape kbeads
+                /metrics — either the daemon is crashlooping/OOMKilled/gone, OR /metrics is
+                answering too slowly to complete within scrape_timeout (10s). A healthy,
+                responsive daemon still trips this if /metrics is slow. Do NOT assume the
+                daemon is dead until you have ruled out scrape latency.
+                Triage (in order):
+                  1. Latency FIRST: time a scrape against the pod's metrics port —
+                     kubectl -n {{ .Release.Namespace }} port-forward <beads-pod> 9091:9091 &
+                     time curl -s localhost:9091/metrics >/dev/null
+                     If it exceeds scrape_timeout (10s), the daemon is UP but /metrics is
+                     slow (historically: DB-backed collectors on the scrape path under a
+                     saturated Postgres — ka-0000006261). Check
+                     gardenio_beads_fleet_metrics_staleness_seconds and
+                     gardenio_beads_embedding_stats_staleness_seconds — if those are climbing,
+                     the background refreshers are stalled on the DB, not the daemon.
+                  2. Only then liveness: kubectl -n {{ .Release.Namespace }} get pods
+                     -l app.kubernetes.io/component=beads ; check its logs + RDS reachability.
+                See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#beadsdaemondown"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=2&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+          - alert: BeadsDaemonAbsent
+            expr: |
+              absent(up{component="beads"})
+            for: {{ $ga.beadsHealth.absentFor | quote }}
+            labels:
+              severity: {{ $ga.beadsHealth.severity | quote }}
+              component: beads
+              subsystem: beads-daemon
+            annotations:
+              summary: "beads daemon scrape target ABSENT (never scraped / pod deleted)"
+              description: |
+                No up{component="beads"} series has existed for {{ $ga.beadsHealth.absentFor }} — the
+                target was never scraped or the pod was deleted (distinct from
+                down==0, which needs a live-but-failing target).
+                Triage: kubectl -n {{ .Release.Namespace }} get deploy,pods -l app.kubernetes.io/component=beads.
+              runbook_url: "{{ $ga.runbookBaseURL }}#beadsdaemondown"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=2&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.beadsDBAuth.enabled }}
+          # Beads daemon DB-auth failures (ka-0000006554). On 2026-08-08 the
+          # kbeads daemon lost Postgres authentication (pq 28P01) for ~4 minutes
+          # fleet-wide, 500'd 957 requests — 40 of them WRITES that were silently
+          # dropped — then self-healed with NO pod restart and, critically, NO
+          # alert: the daemon exposed no request-status or DB-error metric at all,
+          # so up{component="beads"}==0 (BeadsDaemonDown) never tripped (the pod
+          # stayed Running the whole time). This closes that gap directly.
+          #
+          # Source: gardenio_beads_db_auth_errors_total{handler}, incremented in the 5xx
+          # logging choke point on any response root-caused to SQLSTATE 28P01
+          # (internal/server/db_auth_metrics.go). On this deployment the daemon
+          # reads the DB password from a live-updating mounted Secret file whose
+          # value lags an RDS master-password rotation by up to one ExternalSecret
+          # refresh (category rotated-db = 5m): during that window new connections
+          # fail 28P01 while existing pooled ones stay valid — a PARTIAL, un-
+          # restarting fault. A short `for` rides out a single unlucky dial; a
+          # sustained rate is the real blackout and PAGES.
+          - alert: BeadsDBAuthErrors
+            expr: |
+              sum(increase(gardenio_beads_db_auth_errors_total[5m])) > {{ $ga.beadsDBAuth.threshold }}
+            for: {{ $ga.beadsDBAuth.for | quote }}
+            labels:
+              severity: {{ $ga.beadsDBAuth.severity | quote }}
+              component: beads
+              subsystem: beads-daemon
+            annotations:
+              summary: "beads daemon failing Postgres auth (pq 28P01) — data plane blacked out"
+              description: |
+                gardenio_beads_db_auth_errors_total has increased over the last 5m — the
+                beads daemon is returning 5xx (503) on requests it cannot
+                authenticate to RDS for (SQLSTATE 28P01). This is a fleet-wide
+                data-plane fault: reads AND writes fail, and derived-empty reads
+                (`kd list` → [], `gb news` → nothing) mislead agents into a false
+                world-model. The pod does NOT restart, so BeadsDaemonDown does not
+                fire — this metric is the only signal (ka-0000006554).
+                Most likely cause: an RDS master-password rotation the mounted
+                Secret file has not yet re-synced (ExternalSecret category
+                rotated-db, 5m). Triage: force the ExternalSecret to re-sync
+                (kubectl -n {{ .Release.Namespace }} annotate externalsecret
+                {{ include "gardenio.postgres.passwordSecretName" . }}
+                force-sync=$(date +%s) --overwrite), confirm the mounted
+                /var/run/db-secret/password authenticates, and check RDS rotation
+                events. Break down by `handler` on the graph to see the blast
+                radius. See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#beadsdbautherrors"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=2&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.costMetrics.enabled }}
+          # Cost-metric liveness (ka-0000006669). On 2026-07-26 the controller
+          # OOMKill-crashlooped and these gauges stopped being exported for
+          # ~7.75h with NO alert — it was caught only because a human noticed
+          # the Grafana panels were flat.
+          #
+          # This asserts the USER-VISIBLE fact (cost numbers exist) rather than
+          # the controller's pod health, which was already covered and still did
+          # not surface the outage as "cost metrics are dark". Any future cause
+          # — OOM, a bad query, a scrape-config change, an exporter regression —
+          # trips this.
+          - alert: CostMetricsAbsent
+            expr: |
+              absent(gardenio_account_cost_usd)
+              or absent(gardenio_agent_cost_usd)
+            for: {{ $ga.costMetrics.absentFor | quote }}
+            labels:
+              severity: {{ $ga.costMetrics.severity | quote }}
+              component: agents
+              subsystem: cost-metrics
+            annotations:
+              summary: "gardenio cost metrics ABSENT — fleet spend is unobservable"
+              description: |
+                No gardenio_account_cost_usd / gardenio_agent_cost_usd series has
+                existed for {{ $ga.costMetrics.absentFor }}. Every cost and spend panel is
+                dark and fleet spend is unobservable.
+                The controller exports these on :9092; if it is crashlooping,
+                nothing is scraped. This exact failure ran ~7.75h unnoticed on
+                2026-07-26 (ka-0000006669).
+                Triage: kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=agents
+                — check for OOMKilled / CrashLoopBackOff, then its logs.
+              runbook_url: "{{ $ga.runbookBaseURL }}#costmetricsabsent"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-cost-overview/gardenio-cost-overview?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.bridgeLiveness.enabled }}
+          # GAP-5 — bridge liveness. slack/jira/gitlab-bridge are all
+          # prometheus.io/scrape=true, so up{} exists per bridge. Alert
+          # delivery does NOT flow through slack-bridge (Alertmanager POSTs the
+          # Slack webhook directly), so a dead bridge degrades bead
+          # notifications / mention handling but does not break paging → warn.
+          - alert: BridgeDown
+            expr: |
+              up{component=~"slack-bridge|jira-bridge|gitlab-bridge"} == 0
+            for: {{ $ga.bridgeLiveness.downFor | quote }}
+            labels:
+              severity: {{ $ga.bridgeLiveness.severity | quote }}
+              subsystem: bridge
+            annotations:
+              summary: "gardenio bridge down (a scraped slack/jira/gitlab bridge target is 0)"
+              description: |
+                A bridge scrape target has been down for {{ $ga.bridgeLiveness.downFor }}
+                (the firing series' `component` label names which one). Bead
+                lifecycle → Slack, mentions, and JIRA/GitLab ingestion for that
+                bridge are stalled. Triage: kubectl -n {{ .Release.Namespace }} get pods
+                -l app.kubernetes.io/component=<component> ; check token expiry
+                (a common bridge-death cause) — see runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#bridgedown"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=3&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- /* Only the bridges this release runs. A disabled bridge has no up{}
+       series by design, so an absent() clause for it fires forever: on k3s
+       (slack-bridge only) BridgeAbsent fired for jira-bridge and gitlab-bridge
+       from the first evaluation (gd-YmPhRPJIfp). With no bridge enabled the
+       rule is not rendered. */}}
+{{- $absentBridges := list }}
+{{- if .Values.slackBridge.enabled }}{{ $absentBridges = append $absentBridges "slack-bridge" }}{{ end }}
+{{- if .Values.jiraBridge.enabled }}{{ $absentBridges = append $absentBridges "jira-bridge" }}{{ end }}
+{{- if .Values.gitlabBridge.enabled }}{{ $absentBridges = append $absentBridges "gitlab-bridge" }}{{ end }}
+{{- if $absentBridges }}
+          - alert: BridgeAbsent
+            # absent() of an equality selector carries its matched `component`
+            # label into the firing vector, so chaining `or` names which bridge
+            # vanished. Covers "target gone entirely" (up==0 cannot see it).
+            expr: |
+              {{- range $i, $b := $absentBridges }}
+              {{ if $i }}or {{ end }}absent(up{component="{{ $b }}"})
+              {{- end }}
+            for: {{ $ga.bridgeLiveness.absentFor | quote }}
+            labels:
+              severity: {{ $ga.bridgeLiveness.severity | quote }}
+              subsystem: bridge
+            annotations:
+              summary: "gardenio bridge scrape target ABSENT (slack/jira/gitlab)"
+              description: |
+                A bridge target has had no up{} series for {{ $ga.bridgeLiveness.absentFor }}
+                (the `component` label names which). The pod is gone or never
+                came up. Triage: kubectl -n {{ .Release.Namespace }} get deploy,pods
+                -l app.kubernetes.io/component=<component>.
+              runbook_url: "{{ $ga.runbookBaseURL }}#bridgedown"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=3&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- end }}
+{{- /* Gate on BOTH the alert flag ($ga.bridgeTokenRotation.enabled) AND the
+       rotator feature itself (.Values.agents.bridgeTokenRotation.enabled).
+       The deadman's absent() clause is designed to page when the rotator is
+       "meant to be running" but never exported the series (crash-before-first
+       -check / scrape-gone). That premise is FALSE while the rotator is
+       deliberately off in its staged rollout (ka-0000005123 keeps prod at
+       enabled:false pending soak): absent() then pages continuously for an
+       unshipped feature — a false page (ka-0000003055). Requiring the rotator
+       feature flag makes these rules arrive exactly when the rotator does, so
+       once it IS enabled a controller that never exports the series still
+       pages as intended. */ -}}
+{{- if and $ga.bridgeTokenRotation.enabled .Values.agents.bridgeTokenRotation.enabled }}
+          # Bridge fleet-token rotation overdue (ka-0000002353 plan item 3).
+          # The controller-side rotator (internal/bridgetokenrotator) refreshes
+          # each bridge fleet token before its TTL expires and publishes each
+          # fleet's absolute expiry as gardenio_bridge_token_expires_at_timestamp_
+          # seconds on every successful check. This alert reads that series
+          # directly — remaining TTL is `expires_at - time()` — so it fires on
+          # the USER-VISIBLE fact (a bridge token is about to expire) no matter
+          # WHY the rotator fell behind: a wedged loop, an RBAC-forbidden Secret
+          # Update, a daemon 5xx, or a dry-run left on past its observe window.
+          # This is the guard that keeps the 720h TTL from silently walking to
+          # its cliff — the exact failure this whole task exists to prevent.
+          #
+          # Keys on the ABSOLUTE expires_at (clock-skew-immune between vmalert
+          # and the controller), not the convenience remaining_seconds gauge. A
+          # legacy/seed token with no daemon expiry is published as 0 (epoch),
+          # which is always < now - overdue, so it reads as maximally overdue and
+          # pages until it is migrated onto the TTL-bearing rails — deliberate.
+          - alert: BridgeTokenRotationOverdue
+            expr: |
+              gardenio_bridge_token_expires_at_timestamp_seconds - time()
+                < {{ $ga.bridgeTokenRotation.overdueSeconds }}
+            for: {{ $ga.bridgeTokenRotation.for | quote }}
+            labels:
+              severity: {{ $ga.bridgeTokenRotation.severity | quote }}
+              subsystem: bridge-token
+            annotations:
+              summary: "bridge fleet token rotation overdue (the firing series' `fleet` label names which bridge) — token nears TTL expiry and the rotator has not refreshed it"
+              description: |
+                A bridge fleet token (slack/gitlab/jira-bridge — the `fleet`
+                label names which) is within {{ div $ga.bridgeTokenRotation.overdueSeconds 3600 }}h of
+                expiry and the controller rotator has not refreshed it. When it
+                expires the bridge's beads writes start 401ing — bead lifecycle
+                → Slack, mentions, and JIRA/GitLab ingestion for that fleet
+                stall. Triage: check the rotator logs (component=fleet-token
+                -rotator) and gardenio_bridge_token_rotations_total{result="error"}
+                for the fleet; verify the controller RBAC can Update the
+                bridge-fleet-tokens Secret + bounce the deployment. Manual
+                rotation runbook: gardenio/docs/bridge-token-runbook.md.
+              runbook_url: "{{ $ga.runbookBaseURL }}#bridgetokenrotationoverdue"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=3&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+          # Deadman for the rotator loop itself: if the rotator stops checking,
+          # the expires_at gauges above FREEZE at their last value and can no
+          # longer catch a token walking toward expiry. A stale last_check
+          # timestamp (or an absent series when the rotator never came up / is
+          # scrape-gone) reports the rotator as blind. absent() is OR-ed in so a
+          # never-scraped / crash-before-first-check controller still pages —
+          # a bare `time() - series` over a never-written series is no-data, not
+          # a large number, and would leave this un-fireable in the total-outage
+          # case it exists for.
+          - alert: BridgeTokenRotatorStale
+            expr: |
+              (time() - gardenio_bridge_token_rotator_last_check_timestamp_seconds
+                > {{ $ga.bridgeTokenRotation.staleSeconds }})
+              or absent(gardenio_bridge_token_rotator_last_check_timestamp_seconds)
+            for: {{ $ga.bridgeTokenRotation.staleFor | quote }}
+            labels:
+              severity: {{ $ga.bridgeTokenRotation.severity | quote }}
+              subsystem: bridge-token
+            annotations:
+              summary: "bridge fleet-token rotator has not completed a check recently — expiry gauges are frozen and the rotator is blind"
+              description: |
+                The controller's bridge fleet-token rotator has not completed a
+                successful check within its stale window (last_check timestamp is
+                stale, or the series is absent because the rotator never came up
+                / is scrape-gone). While it is blind the per-fleet expiry gauges
+                are frozen at their last value, so BridgeTokenRotationOverdue
+                cannot catch a token approaching expiry. Triage: kubectl -n
+                {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=controller ;
+                check rotator logs (component=fleet-token-rotator) and
+                gardenio_bridge_token_rotator_check_errors_total.
+              runbook_url: "{{ $ga.runbookBaseURL }}#bridgetokenrotationoverdue"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=3&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.vlsingleDiskUsage.enabled }}
+          # VictoriaLogs disk-usage over cap (ka-0000001302). gardenio-victoria-logs
+          # runs with -retention.maxDiskSpaceUsageBytes=8GiB alongside
+          # -retentionPeriod=30d, so effective retention is min(30d, whatever
+          # fits in the cap): under disk pressure VictoriaLogs self-trims the
+          # OLDEST partitions regardless of the time window. That shortening is
+          # LOAD-DEPENDENT and SILENT — nothing surfaces "your 30d window is now
+          # really N days" — which is the watch-item risk this alert closes.
+          #
+          # Ratio, not a hardcoded cap: VictoriaLogs exposes the cap ITSELF as
+          # vl_max_disk_space_usage_bytes, so the expr divides live on-disk bytes
+          # by the live cap. If the -retention.maxDiskSpaceUsageBytes flag ever
+          # changes, the alert tracks it automatically — no config drift between
+          # the flag and a duplicated threshold (advice ka-0000005924: the two
+          # derivations of "the cap" must agree, so read the one source).
+          #
+          # storage + indexdb are summed because both count against the cap.
+          # `sum without(type)` collapses the two vl_data_size_bytes series into
+          # total bytes on disk. The `> 0` guard on the denominator makes the
+          # rule inert (empty vector) if the cap metric is ever 0/absent rather
+          # than dividing by zero.
+          #
+          # Fires WELL BEFORE the cap (default 0.75) and holds `for` a sustained
+          # window so a transient ingest burst that VictoriaLogs immediately
+          # trims back does not page — the actionable signal is sustained
+          # pressure, i.e. the point at which time-based retention is about to
+          # start silently losing to disk-based retention. Today usage is ~0.05%
+          # of cap (ka-0000001302), so this is pure early-warning headroom.
+          - alert: VlsingleDiskUsageHigh
+            expr: |
+              (
+                sum without(type) (vl_data_size_bytes{component="vlsingle"})
+                /
+                (vl_max_disk_space_usage_bytes{component="vlsingle"} > 0)
+              ) >= {{ $ga.vlsingleDiskUsage.threshold }}
+            for: {{ $ga.vlsingleDiskUsage.for | quote }}
+            labels:
+              severity: {{ $ga.vlsingleDiskUsage.severity | quote }}
+              component: vlsingle
+              subsystem: log-retention
+            annotations:
+              summary: "VictoriaLogs disk usage at {{ "{{" }} $value | humanizePercentage {{ "}}" }} of its retention.maxDiskSpaceUsageBytes cap (≥{{ $ga.vlsingleDiskUsage.threshold }}) — 30d retention is silently shortening"
+              description: |
+                gardenio-victoria-logs on-disk bytes (storage + indexdb) have been
+                ≥{{ $ga.vlsingleDiskUsage.threshold }} of its
+                -retention.maxDiskSpaceUsageBytes cap
+                (vl_max_disk_space_usage_bytes) for {{ $ga.vlsingleDiskUsage.for }}.
+                VictoriaLogs enforces min(retentionPeriod=30d, disk cap): past the
+                cap it self-trims the OLDEST log partitions regardless of the 30d
+                window, so the effective retention silently drops below 30d and
+                the oldest EKS-audit / edge-detection logs age out early with no
+                other signal. This alert exists so that shortening is never
+                silent (watch item ka-0000001302).
+                Triage:
+                  - Confirm live usage vs cap:
+                      vl_data_size_bytes{component="vlsingle"} (sum storage+indexdb)
+                      vl_max_disk_space_usage_bytes{component="vlsingle"}
+                  - Identify the ingest that grew the store (recent transport
+                    adoption? a backfill?) — vl_rows_ingested_total by type.
+                  - If the store legitimately needs more shelf, raise
+                    vlsingle.retention.maxDiskSpaceUsageBytes AND
+                    vlsingle.persistence.size in IaC together (the PVC must stay
+                    larger than the cap), then reconcile prod.
+              runbook_url: "{{ $ga.runbookBaseURL }}#vlsinglediskusagehigh"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=21&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if and $ga.postgresS3Backup.enabled .Values.postgres.enabled .Values.postgres.s3Backup.enabled }}
+{{- $bk := $ga.postgresS3Backup }}
+{{- $bkSel := printf "namespace=%q, cronjob=%q" .Release.Namespace (printf "%s-s3-backup" (include "gardenio.postgres.fullname" .)) }}
+          # gd-Li0fBnupv2 — the postgres S3 backup CronJob
+          # (templates/postgres/s3-backup-cronjob.yaml) has not succeeded
+          # recently. Before this rule nothing paged on a failed or never-
+          # scheduled run: on 2026-10-20 no backup succeeded for 16 h unseen. A
+          # run that sits Pending (the backup pod is pinned to postgres's zone,
+          # gd-RbR8vI9K5e) dies silently at activeDeadlineSeconds.
+          #
+          # Reads kube_cronjob_status_last_successful_time from the in-chart
+          # pod-state-metrics exporter, which watches cronjobs whenever
+          # postgres.s3Backup is on (templates/monitoring/pod-state-metrics.yaml).
+          # lastSuccessfulTime is the COMPLETION time of the last good run. On
+          # the k3s 2-hourly schedule with runs of up to 110 min, two good runs
+          # complete at most ~3.5 h apart, so the 4 h default fires after ONE
+          # missed slot. `for` keeps a slow run that lands just past 4 h quiet.
+          - alert: PostgresS3BackupStale
+            expr: |
+              time() - kube_cronjob_status_last_successful_time{ {{- $bkSel -}} }
+                > {{ $bk.staleSeconds }}
+            for: {{ $bk.for | quote }}
+            labels:
+              severity: {{ $bk.severity | quote }}
+              component: postgres
+              subsystem: backup
+            annotations:
+              summary: "postgres S3 backup has not succeeded for over {{ div $bk.staleSeconds 3600 }}h"
+              description: |
+                The {{ .Release.Namespace }}/{{ include "gardenio.postgres.fullname" . }}-s3-backup
+                CronJob's last successful run finished more than
+                {{ div $bk.staleSeconds 3600 }}h ago, so the newest off-node
+                dump in s3://{{ .Values.postgres.s3Backup.bucket }}/{{ .Values.postgres.s3Backup.prefix }}/
+                is at least that old. Triage: kubectl -n {{ .Release.Namespace }}
+                get jobs,pods -l app.kubernetes.io/component=postgres-s3-backup ;
+                a Pending pod is a scheduling problem (zone affinity, node
+                capacity), a DeadlineExceeded job is a dump slower than
+                activeDeadlineSeconds ({{ .Values.postgres.s3Backup.activeDeadlineSeconds }}s).
+              runbook_url: "{{ $ga.runbookBaseURL }}#postgress3backupstale"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?from=now-24h&to=now"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+          # The rule above is no-data, not firing, when the series is missing:
+          # the backup has never succeeded since install, pod-state-metrics is
+          # off or down, or it lost its cronjobs RBAC. absent() covers all three.
+          # `for` matches the stale window: a fresh install's first success can
+          # take ~3h50m (wait for the next slot, then a run of up to 110 min).
+          - alert: PostgresS3BackupUnmonitored
+            expr: |
+              absent(kube_cronjob_status_last_successful_time{ {{- $bkSel -}} })
+            for: {{ $bk.absentFor | quote }}
+            labels:
+              severity: {{ $bk.severity | quote }}
+              component: postgres
+              subsystem: backup
+            annotations:
+              summary: "no successful postgres S3 backup is on record (or pod-state-metrics cannot see the CronJob)"
+              description: |
+                vmsingle has no kube_cronjob_status_last_successful_time for the
+                {{ .Release.Namespace }}/{{ include "gardenio.postgres.fullname" . }}-s3-backup
+                CronJob. Either the backup has never succeeded, or
+                monitoring.podStateMetrics is disabled, crashing, or forbidden
+                from listing cronjobs, which leaves PostgresS3BackupStale blind.
+                Triage: kubectl -n {{ .Release.Namespace }} get cronjob
+                {{ include "gardenio.postgres.fullname" . }}-s3-backup -o jsonpath='{.status.lastSuccessfulTime}' ;
+                then the pod-state-metrics pod's logs.
+              runbook_url: "{{ $ga.runbookBaseURL }}#postgress3backupstale"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?from=now-24h&to=now"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if and $ga.keycloakRoleDrift.enabled (include "gardenio.keycloakRuntime.roleDriftProbe.on" .) }}
+{{- $kd := $ga.keycloakRoleDrift }}
+{{- $kdJob := include "gardenio.keycloakRuntime.roleDriftProbe.name" . }}
+{{- $kdSel := printf "namespace=%q, cronjob=%q" .Release.Namespace $kdJob }}
+          # gd-L2MyfEe9lL — the Keycloak role-drift probe
+          # (templates/keycloak-runtime/role-drift-cronjob.yaml) fails when
+          # default-roles-<realm> composes a gardenio-* role or a fresh user
+          # holds one, and when it cannot look. Such a user is an unrestricted
+          # reader in kbeads and the viewer, so drift and a blind probe both
+          # need a human. The series comes from pod-state-metrics, which watches
+          # cronjobs while the probe renders.
+          - alert: KeycloakRoleDriftProbeFailing
+            expr: |
+              time() - kube_cronjob_status_last_successful_time{ {{- $kdSel -}} }
+                > {{ $kd.staleSeconds }}
+            for: {{ $kd.for | quote }}
+            labels:
+              severity: {{ $kd.severity | quote }}
+              component: keycloak
+              subsystem: role-drift
+            annotations:
+              summary: "Keycloak role-drift probe has not passed for over {{ div $kd.staleSeconds 60 }}m: a fresh user may hold a gardenio-* role"
+              description: |
+                The {{ .Release.Namespace }}/{{ $kdJob }} CronJob has not passed
+                for {{ div $kd.staleSeconds 60 }}m. Either default-roles-<realm>
+                composes a gardenio-* role, or a fresh user gets one through a
+                default group, or the probe cannot reach or sign in to Keycloak.
+                While it fires, treat every new sign-up as a global reader.
+                Triage: kubectl -n {{ .Release.Namespace }} logs job/<newest
+                {{ $kdJob }} job>; a FAIL R1/R2 line names the role. Remove it
+                with kcadm (remove-roles on default-roles-<realm>, or drop the
+                realm default group), then re-run the probe with kubectl create
+                job --from=cronjob/{{ $kdJob }}.
+              runbook_url: "{{ $ga.runbookBaseURL }}#keycloakroledriftprobefailing"
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+          # No series: the probe never passed since install, or pod-state-metrics
+          # is off, down or forbidden from listing cronjobs.
+          - alert: KeycloakRoleDriftProbeUnmonitored
+            expr: |
+              absent(kube_cronjob_status_last_successful_time{ {{- $kdSel -}} })
+            for: {{ $kd.absentFor | quote }}
+            labels:
+              severity: {{ $kd.severity | quote }}
+              component: keycloak
+              subsystem: role-drift
+            annotations:
+              summary: "no passing Keycloak role-drift probe is on record (or pod-state-metrics cannot see the CronJob)"
+              description: |
+                vmsingle has no kube_cronjob_status_last_successful_time for the
+                {{ .Release.Namespace }}/{{ $kdJob }} CronJob, which leaves
+                KeycloakRoleDriftProbeFailing blind. Either the probe has never
+                passed, or monitoring.podStateMetrics is disabled, crashing or
+                forbidden from listing cronjobs.
+              runbook_url: "{{ $ga.runbookBaseURL }}#keycloakroledriftprobefailing"
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.openPRs.enabled }}
+{{- $op := $ga.openPRs }}
+          # Open-PR health (plan gd-3F4W22h2nT step 10, gd-Pt8ztuasTE). The PR
+          # sweeper (docs/pr-sweeper.md) counts the open PRs into main once an
+          # hour and the controller republishes its last count as the
+          # gardenio_open_prs* gauges. max() drops the scrape labels; there is
+          # one controller and one sweeper. The gauges are absent until the
+          # sweeper has recorded a run, so all three rules stay quiet before.
+          - alert: OpenPROrphansHigh
+            expr: |
+              max(gardenio_open_prs{state="orphaned"}) > {{ $op.maxOrphans }}
+            for: {{ $op.for | quote }}
+            labels:
+              severity: {{ $op.severity | quote }}
+              component: pr-sweeper
+              subsystem: open-prs
+            annotations:
+              summary: "{{ "{{" }} $value {{ "}}" }} orphaned open PRs at the PR sweeper's last run (more than {{ $op.maxOrphans }})"
+              description: |
+                The PR sweeper found more than {{ $op.maxOrphans }} open PRs with no
+                merge escalation and no living owner. It escalates or closes
+                them in the same run, so the PRs are handled; what is wrong is
+                that they were orphaned at all. gb stop's PR park and the kd
+                close guard should leave the sweeper nothing to find. Read the
+                sweeper's last wrap-up for the PRs, then why their crews ended
+                without gb stop (OOM, eviction, wall-clock kill).
+              runbook_url: "{{ $ga.runbookBaseURL }}#openprorphanshigh"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=24&from=now-7d&to=now"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+          - alert: OpenPROldestOverdue
+            expr: |
+              max(gardenio_open_pr_oldest_age_hours{state="open"}) > {{ $op.maxOldestOpenHours }}
+            for: {{ $op.for | quote }}
+            labels:
+              severity: {{ $op.severity | quote }}
+              component: pr-sweeper
+              subsystem: open-prs
+            annotations:
+              summary: "the oldest open PR is {{ "{{" }} $value | humanize {{ "}}" }}h old (more than {{ $op.maxOldestOpenHours }}h)"
+              description: |
+                At the PR sweeper's last run an open PR into main (desk and
+                human PRs excluded) was more than {{ $op.maxOldestOpenHours }} hours
+                old. The merge desk merges or sends back within hours, so it is
+                stuck: a send-back nobody reworked, a red or conflicting PR the
+                desk keeps returning, or a draft. The sweeper's record names it
+                (oldest_open_pr in the pr_health field of its last run).
+              runbook_url: "{{ $ga.runbookBaseURL }}#openprorphanshigh"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=25&from=now-7d&to=now"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+          - alert: OpenPRHealthStale
+            expr: |
+              time() - max(gardenio_open_pr_health_timestamp_seconds) > {{ mul $op.staleHours 3600 }}
+            for: {{ $op.for | quote }}
+            labels:
+              severity: {{ $op.severity | quote }}
+              component: pr-sweeper
+              subsystem: open-prs
+            annotations:
+              summary: "the PR sweeper has not recorded an open-PR count for over {{ $op.staleHours }}h"
+              description: |
+                The PR sweeper records its count every hour. Nothing new for
+                {{ $op.staleHours }} hours means the trigger is disabled or unsealed, or
+                its runs die before Step 2, and OpenPROrphansHigh and
+                OpenPROldestOverdue are reading a frozen count. Check the
+                sweeper trigger's last_outcome and its last run's wrap-up.
+              runbook_url: "{{ $ga.runbookBaseURL }}#openprorphanshigh"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=24&from=now-7d&to=now"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if and $ga.deadMansSwitch.enabled $ga.deadMansSwitch.watchdog.enabled }}
+          # GAP-6a — Watchdog / dead-man's-switch. Always fires; routed to the
+          # alertmanager.watchdog receiver (away from oncall). The SIGNAL is its
+          # absence: an external heartbeat monitor alerts when the Watchdog
+          # stops arriving → vmalert, Alertmanager, or the Slack webhook died.
+          - alert: Watchdog
+            expr: |
+              vector(1)
+            labels:
+              severity: watchdog
+            annotations:
+              summary: "gardenio alert pipeline heartbeat (expected to fire continuously)"
+              description: |
+                This alert always fires. Its purpose is to be ALWAYS present in
+                the notification pipeline. An external heartbeat check (Dead
+                Man's Snitch or a cron watching the last delivery) must alert
+                when this Watchdog STOPS arriving — that absence means vmalert,
+                Alertmanager, or the Slack webhook is dead. See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#dead-mans-switch"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=5&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if and $ga.deadMansSwitch.enabled $ga.deadMansSwitch.selfLiveness.enabled }}
+          # GAP-6b — vmalert self-liveness via recording-rule freshness.
+          # vmalert continuously remote-writes gardenio:beads_events:rate5m back
+          # to vmsingle every evaluationInterval, so the series stays fresh
+          # while vmalert is alive. We use absent_over_time(series[window]) — it
+          # fires when the series has had NO sample for the whole window — NOT
+          # `time() - timestamp(series) > N`: with no -datasource.queryStep set,
+          # timestamp()'s implicit lookbehind is the 1m evaluationInterval, so a
+          # stale sample ages out of the lookback after ~1m and the staleness
+          # value can never climb past a multi-minute threshold — the alert would
+          # be SILENT exactly when vmalert dies (ka-0000001461 review finding).
+          # absent_over_time uses an explicit range and is immune to that trap.
+          # Caveat: the series also goes absent if kbeads stops being scraped
+          # (its counter disappears → rate() empty). That is itself page-worthy
+          # and independently covered by BeadsDaemonDown, so co-firing is
+          # acceptable defence-in-depth, not a false positive. A quiet fleet does
+          # NOT trip it: a flat counter still yields a fresh 0 from rate().
+          - alert: VMAlertNotEvaluating
+            expr: |
+              absent_over_time(gardenio:beads_events:rate5m[{{ $ga.deadMansSwitch.selfLiveness.stalenessWindow }}])
+            for: {{ $ga.deadMansSwitch.selfLiveness.for | quote }}
+            labels:
+              severity: {{ $ga.deadMansSwitch.selfLiveness.severity | quote }}
+              component: vmalert
+              subsystem: alerting-pipeline
+            annotations:
+              summary: "vmalert stopped evaluating rules (recorded series absent for {{ $ga.deadMansSwitch.selfLiveness.stalenessWindow }})"
+              description: |
+                The vmalert-written recording series gardenio:beads_events:rate5m
+                has had no sample for {{ $ga.deadMansSwitch.selfLiveness.stalenessWindow }} — vmalert is dead/wedged or its
+                remoteWrite to vmsingle is broken, so NO alerting rule is being
+                evaluated (silent alerting failure). May co-fire with
+                BeadsDaemonDown if kbeads itself stopped being scraped.
+                Triage: kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=vmalert ;
+                check its logs and vmsingle reachability. See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#dead-mans-switch"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=5&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if and $ga.deadMansSwitch.enabled $ga.deadMansSwitch.down.enabled .Values.vmalert.selfScrape }}
+          # GAP-6c — vmalert scrape-target down. Needs vmalert.selfScrape (pod
+          # annotated prometheus.io/scrape). Bootstrapping caveat: a fully-dead
+          # vmalert cannot fire its own down alert — this catches
+          # degraded-not-dead; the external Watchdog absence check is the true
+          # net. Gated on selfScrape so up{component="vmalert"} actually exists.
+          - alert: VMAlertDown
+            expr: |
+              up{component="vmalert"} == 0
+            for: {{ $ga.deadMansSwitch.down.for | quote }}
+            labels:
+              severity: {{ $ga.deadMansSwitch.down.severity | quote }}
+              component: vmalert
+              subsystem: alerting-pipeline
+            annotations:
+              summary: "vmalert scrape target down (alerting evaluator unreachable)"
+              description: |
+                up{component="vmalert"} has been 0 for {{ $ga.deadMansSwitch.down.for }}. vmalert
+                evaluates every alerting rule in this pack; while it is down NO
+                alert can fire. Triage: kubectl -n {{ .Release.Namespace }} get pods
+                -l app.kubernetes.io/component=vmalert. See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#dead-mans-switch"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=4&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.involuntaryDeaths.enabled }}
+          # NEW (ka-0000008039) — agents killed mid-work. Fireable today:
+          # gardenio_agent_involuntary_deaths_total is live on prod (it already
+          # backs the involuntary-deaths dashboard). increase()/1h so the value
+          # reads as deaths-per-hour; warn (a sustained churn signal, not a
+          # single-death page).
+          #
+          # family="context_cancelled_unclaimed" (C9 ka-0000001146) is excluded:
+          # that family is a deliberately COARSE completeness signal (SIGTERM'd
+          # busy-but-taskless agent — tool calls are bead-lifetime cumulative,
+          # so warm-parked thread agents killed between turns land there too).
+          # Folding it into this threshold would re-arm the rollout/recycle
+          # false-positives the ka-0000008254 precision fix (!5571) removed.
+          # It stays a dashboard/P9 surface, not an alert input.
+          # family="context_cancelled_claim_lookup_failed" (gd-TYjMaxCMZR) is
+          # NOT excluded: it is not coarse. It means a claimed task may have
+          # been orphaned and the teardown could not tell, so it should count.
+          - alert: AgentInvoluntaryDeaths
+            expr: |
+              sum(increase(gardenio_agent_involuntary_deaths_total{family!="context_cancelled_unclaimed"}[1h])) > {{ $ga.involuntaryDeaths.threshold }}
+            for: {{ $ga.involuntaryDeaths.for | quote }}
+            labels:
+              severity: {{ $ga.involuntaryDeaths.severity | quote }}
+              component: gardenio
+              subsystem: agent-reliability
+            annotations:
+              summary: "agents killed mid-work >{{ $ga.involuntaryDeaths.threshold }}/h (involuntary deaths)"
+              description: |
+                More than {{ $ga.involuntaryDeaths.threshold }} agents were killed mid-work (a claimed task
+                in flight) per hour for {{ $ga.involuntaryDeaths.for }} — OOM, context-cancel
+                (SIGTERM/node drain/Spot reclaim), or stop-gate rotation churn.
+                Break down by `family` on the graph; deep dive on the dedicated
+                involuntary-deaths dashboard. Sustained churn wastes spend and
+                loses in-flight work.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentinvoluntarydeaths"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=6&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.nodeReclaimDeaths.enabled }}
+          # WS4 (ka-0000007155, epic ka-0000004429) — the node-reclaim
+          # regression sentinel. Same live series as AgentInvoluntaryDeaths but
+          # filtered to family="context_cancelled" (a pod SIGTERM'd mid-turn by
+          # a forced node teardown), the exact class the WS1 graceful-drain
+          # (!5577) + WS2 node-churn cut (!5578) target. A LOWER threshold than
+          # the 5/h all-family aggregate so a node-churn regression that leaves
+          # the aggregate quiet still fires. Points at the dedicated
+          # involuntary-deaths board (family breakdown), not System Health. warn
+          # — work is not lost (drain nudge + S3 salvage); a sustained rate is
+          # the "node reclaims outpacing WS1/WS2" signal.
+          - alert: AgentNodeReclaimDeaths
+            expr: |
+              sum(increase(gardenio_agent_involuntary_deaths_total{family="context_cancelled"}[1h])) > {{ $ga.nodeReclaimDeaths.threshold }}
+            for: {{ $ga.nodeReclaimDeaths.for | quote }}
+            labels:
+              severity: {{ $ga.nodeReclaimDeaths.severity | quote }}
+              component: gardenio
+              subsystem: agent-reliability
+            annotations:
+              summary: "agents killed by node reclaim >{{ $ga.nodeReclaimDeaths.threshold }}/h (context_cancelled family)"
+              description: |
+                More than {{ $ga.nodeReclaimDeaths.threshold }} agents were killed mid-work by a forced
+                node teardown (family=context_cancelled — Spot reclaim / AWS
+                health / interruption-queue SIGTERM) per hour for {{ $ga.nodeReclaimDeaths.for }}.
+                This is the WS1/WS2 regression sentinel (epic ka-0000004429): the
+                graceful-drain nudge (!5577) + node-churn reduction (!5578) keep
+                this class rare. A sustained rate means node reclaims are
+                outpacing them — check karpenter disruption budgets, node
+                expireAfter / AMI-drift churn, and whether COOP_NODE_DRAIN_NUDGE
+                is on. Work should NOT be lost (drain nudge + S3 salvage); the
+                harm is cold-resumes. Deep-dive the family/role/project split on
+                the involuntary-deaths board.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentnodereclaimdeaths"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-involuntary-deaths/gardenio-killed-mid-work-agents-involuntary-deaths?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.projectFailureRate.enabled }}
+          # DEFECT 2 (ka-0000002985) — the RATE-based mass-failure sentinel. The
+          # count-based AgentInvoluntaryDeaths (>5/h fleet-wide) is BLIND to a
+          # project failing at a high RATE but a modest absolute VOLUME: the
+          # 2026-08 site-deployment loop failed ~every spawn yet ran only ~3
+          # deaths/hour and never breached the 5/h floor, so no alert ever fired
+          # while 137 agents died on 3 work items. This rule catches a project
+          # whose involuntary-death-to-spawn RATIO is high, regardless of volume,
+          # while a small-absolute floor (minDeaths) suppresses paging on a
+          # single bad spawn in an otherwise-idle project.
+          #
+          # Per-project (sum by project) so the firing series NAMES the sick
+          # project. context_cancelled_unclaimed excluded for the same reason as
+          # AgentInvoluntaryDeaths (coarse taskless-SIGTERM completeness signal).
+          #
+          # WINDOW = 24h deliberately: at ~0.4 deaths/hr a shorter window rarely
+          # accumulates the minDeaths floor, so a slow-but-total failure loop
+          # would slip through. Numerator = involuntary deaths, denominator =
+          # spawns, both over the same window and grouped by project so `and`
+          # joins them on project.
+          #
+          # REPLAY (14d prod, prod-gardenio-eks, 6h steps): this rule fires for
+          # site-deployment ONLY (34/57 sample windows over the incident) and for
+          # ZERO other project in the fleet — no healthy project ever crossed
+          # ratio {{ $ga.projectFailureRate.ratioThreshold }} with ≥{{ $ga.projectFailureRate.minDeaths }} deaths in 24h. See the MR PROOF block.
+          #
+          # warn, not page: the harm is wasted spend + a work item wedged in a
+          # reopen loop (DEFECT 3 caps that), not a live outage. Tune via
+          # vmalert.gapAlerts.projectFailureRate.
+          - alert: AgentProjectFailureRate
+            expr: |
+              (
+                sum by (project) (increase(gardenio_agent_involuntary_deaths_total{family!="context_cancelled_unclaimed"}[{{ $ga.projectFailureRate.window }}]))
+                /
+                sum by (project) (increase(gardenio_agent_lifecycle_events_total{event="spawned"}[{{ $ga.projectFailureRate.window }}]))
+              ) > {{ $ga.projectFailureRate.ratioThreshold }}
+              and
+              sum by (project) (increase(gardenio_agent_involuntary_deaths_total{family!="context_cancelled_unclaimed"}[{{ $ga.projectFailureRate.window }}])) > {{ $ga.projectFailureRate.minDeaths }}
+            for: {{ $ga.projectFailureRate.for | quote }}
+            labels:
+              severity: {{ $ga.projectFailureRate.severity | quote }}
+              component: gardenio
+              subsystem: agent-reliability
+            annotations:
+              summary: "project {{`{{ $labels.project }}`}} failing >{{ $ga.projectFailureRate.ratioThreshold }} of spawns (mass-failure rate)"
+              description: |
+                Project {{`{{ $labels.project }}`}} is losing more than
+                {{ $ga.projectFailureRate.ratioThreshold }} of its agent spawns to involuntary mid-work
+                death over {{ $ga.projectFailureRate.window }} (≥{{ $ga.projectFailureRate.minDeaths }} deaths in the window). This is
+                the RATE sentinel (ka-0000002985 DEFECT 2): a project can fail
+                nearly every spawn at a modest absolute volume and never breach
+                the count-based AgentInvoluntaryDeaths >5/h floor — the exact hole
+                the 2026-08 site-deployment loop fell through (137 deaths on 3
+                items at ~3/h). A high failure RATE means the work is
+                systematically un-runnable, not a one-off: check the failing
+                project's death `family` breakdown and its close_reason /
+                error_category on the involuntary-deaths board — a project-wide
+                credential/auth failure, a missing project record, or a wedged
+                reopen loop are the usual causes. Requeuing does not help when the
+                cause is the work itself; fix the root cause or park the item.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentprojectfailurerate"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-involuntary-deaths/gardenio-killed-mid-work-agents-involuntary-deaths?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.oomKilled.enabled }}
+          # Track D (ka-0000001509; operator ask ka-0000006448: "monitoring and
+          # alerts for oomkill … alerts that fire into slack"). The DIRECT
+          # agent-OOM Slack alert, on the fireable vmalert path. Reads the live
+          # gardenio_agent_lifecycle_events_total{event="oom_killed"} counter the
+          # controller status reporter emits on every kubelet OOMKill
+          # (reporter.go recordPodLifecycleMetrics — :9092 /metrics, scraped on
+          # prod). This is the un-joined, always-fireable sibling of the
+          # fsm-composite FSMAgentOOMWithECSRestart rule, which (a) is a
+          # PrometheusRule CRD and thus INERT on new prod and (b) only fires on
+          # OOM ∧ a coincident ECS task restart — so a plain agent OOM reaches
+          # Slack through NO alert until this one. sum by (project, role) so the
+          # firing series names who is OOMing. warn, not page: a single OOM is a
+          # cold-resume not an outage (the run is auto-salvaged to S3), but a
+          # sustained rate is the "something is under-provisioned / leaking
+          # memory" signal — tune threshold/severity via
+          # vmalert.gapAlerts.oomKilled.
+          - alert: AgentOOMKilled
+            expr: |
+              sum by (project, role) (increase(gardenio_agent_lifecycle_events_total{event="oom_killed"}[1h])) > {{ $ga.oomKilled.threshold }}
+            for: {{ $ga.oomKilled.for | quote }}
+            labels:
+              severity: {{ $ga.oomKilled.severity | quote }}
+              component: gardenio
+              subsystem: agent-reliability
+            annotations:
+              summary: "agent pods OOMKilled >{{ $ga.oomKilled.threshold }}/h ({{`{{ $labels.project }}/{{ $labels.role }}`}})"
+              description: |
+                More than {{ $ga.oomKilled.threshold }} agent pods in project
+                {{`{{ $labels.project }}`}} (role {{`{{ $labels.role }}`}}) were
+                OOMKilled per hour for {{ $ga.oomKilled.for }} — the kubelet's own
+                OOMKilled container-termination reason, surfaced as
+                gardenio_agent_lifecycle_events_total{event="oom_killed"}. The
+                killed runs are auto-salvaged to S3 (the harm is a cold-resume,
+                not lost work), but a sustained OOM rate means the agent memory
+                limit is too tight for the workload or a run is leaking. Triage:
+                check the VPA right-sizing board for this role's working-set vs
+                limit, widen the limit / VPA minAllowed if under-provisioned, and
+                deep-dive the OOM breakdown on the involuntary-deaths board.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentoomkilled"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-involuntary-deaths/gardenio-killed-mid-work-agents-involuntary-deaths?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- $co := $ga.claudeOutage }}
+{{- $coBeadURL := $beadURL }}
+{{- if $co.incidentBead }}{{ $coBeadURL = include "gardenio.link.beadURL" (dict "ctx" $ "id" $co.incidentBead) }}{{ end }}
+{{- if $co.enabled }}
+          # --- Claude-outage detector (epic ka-0000000487) --------------------
+          #
+          # Origin: on 2026-07-29 the Claude API ran a ~2h partial outage
+          # ("Elevated errors across all models", status.claude.com incident
+          # q2kg8n613kr3, impact critical) and #gardenio-alerts stayed SILENT the
+          # whole time. Agents ate upstream 5xx while the controller quietly
+          # recovered them one by one. It was the second such incident in five
+          # days (see internal/bridge/init.go:103-113 for the 2026-07-25 opus-5
+          # outage that ran ~4.5h fleet-wide with total_errors=0 everywhere).
+          #
+          # TWO LEGS, deliberately asymmetric:
+          #   leg A — gardenio_agent_upstream_error_active  (ours; PAGES)
+          #   leg B — gardenio_claude_status_*              (theirs; corroborates)
+          #
+          # The page is gated on leg A because that is the leg that means WE are
+          # being hurt. Leg B alone pages nobody: a status-page blip that never
+          # touches our traffic (claude.ai down while api.anthropic.com is fine)
+          # must not wake an oncall, and an incident stays open through the
+          # Statuspage "monitoring" window long after service is restored — a
+          # tail state observed live while building this. Leg B instead rides in
+          # the annotation so the Slack message self-diagnoses "us" vs "them".
+          # The `dashboard` annotations below deep-link to the "Claude upstream
+          # outage detector" panel group on the System Health board (ka-0000004886):
+          # leg A (viewPanel=11) and leg B (viewPanel=12) sit on the SAME row so
+          # the oncall reads them together to tell "us" from "them".
+          - alert: ClaudeUpstreamOutage
+            expr: |
+              sum(gardenio_agent_upstream_error_active{category="server_error"}) > {{ $co.threshold }}
+            for: {{ $co.for | quote }}
+            labels:
+              severity: {{ $co.severity | quote }}
+              component: gardenio
+              subsystem: agent-reliability
+            annotations:
+              summary: "{{`{{ $value }}`}} agents failing on upstream Claude errors (provider outage suspected)"
+              description: |
+                More than {{ $co.threshold }} agents have been sitting on an
+                upstream provider error (coop error_category=server_error — HTTP
+                500/502/503/529, api_error, overloaded) for {{ $co.for }}.
+                gb init's in-place recovery (dismiss → short backoff → re-inject,
+                base 5s capped at 2m) has therefore already failed to clear it,
+                so this is not a transient blip.
+                Check the Claude status page FIRST: https://status.claude.com —
+                and read gardenio_claude_status_component{component="claude_api"}
+                (0=operational 1=degraded 2=partial_outage 3=major_outage) plus
+                gardenio_claude_status_open_incidents on the graph link below. If
+                the provider corroborates, this is THEIRS: agents self-recover
+                when upstream does, so the action is to stop spawning new work
+                rather than to debug gardenio. If the status page is clean, this
+                is OURS — suspect the LiteLLM proxy, egress, or a credential
+                path, and treat the clean status page as evidence.
+              runbook_url: "{{ $ga.runbookBaseURL }}#claudeupstreamoutage"
+              {{- if $dashBase }}
+              # Leg A panel — sum by (category) (gardenio_agent_upstream_error_active),
+              # the signal this rule thresholds on; leg B (viewPanel=12) is adjacent.
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=11&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $coBeadURL }}
+              bead: {{ $coBeadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $co.statusPage.enabled }}
+          # Leg B on its own — a HEADS-UP, never a page (see the note above).
+          # Scoped to the two components our agent traffic actually depends on;
+          # claude.ai / Console / Cowork degradation is explicitly NOT alertable
+          # here because it does not touch us. `>= 2` is partial_outage or worse
+          # on the ordinal severity ladder the poller publishes. Worth having
+          # because it usually PRECEDES leg A and pre-explains the pages.
+          - alert: ClaudeStatusPageOutage
+            expr: |
+              max(gardenio_claude_status_component{component=~"claude_api|claude_code"}) >= 2
+            for: {{ $co.statusPage.for | quote }}
+            labels:
+              severity: {{ $co.statusPage.severity | quote }}
+              component: gardenio
+              subsystem: upstream-provider
+            annotations:
+              summary: "Claude status page reports partial_outage or worse on the agent path"
+              description: |
+                status.claude.com reports partial_outage or worse on the Claude
+                API and/or Claude Code component for {{ $co.statusPage.for }}.
+                No gardenio agents are confirmed failing yet — if they were,
+                ClaudeUpstreamOutage would be firing alongside this and THAT is
+                the one to act on. Treat this as advance warning: expect elevated
+                agent errors, and consider holding back new spawns. Live detail:
+                https://status.claude.com
+              runbook_url: "{{ $ga.runbookBaseURL }}#claudestatuspageoutage"
+              {{- if $dashBase }}
+              # Leg B panel — max by (component) (gardenio_claude_status_component)
+              # as the ordinal severity ladder, the signal this rule thresholds on.
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=12&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $coBeadURL }}
+              bead: {{ $coBeadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $co.deadman.enabled }}
+          # Deadmen for BOTH legs. Without these the detector rots silently: a
+          # wedged poller or an un-emitted gauge looks exactly like "everything
+          # is fine" on a dashboard, which is the failure this whole epic exists
+          # to stop repeating. absent() covers "never scraped / emitter gone";
+          # the staleness clause covers "poller alive but no longer succeeding"
+          # (it only advances last_check on a SUCCESSFUL fetch, and deliberately
+          # leaves the status gauges stale on failure rather than zeroing them —
+          # writing "all operational" on a failed fetch would let a partition
+          # suppress the outage alert).
+          - alert: ClaudeStatusPollerStale
+            expr: |
+              absent(gardenio_claude_status_indicator)
+              or (time() - gardenio_claude_status_last_check_timestamp_seconds > {{ $co.deadman.staleAfterSeconds }})
+            for: {{ $co.deadman.for | quote }}
+            labels:
+              severity: {{ $co.deadman.severity | quote }}
+              component: gardenio
+              subsystem: upstream-provider
+            annotations:
+              summary: "Claude status poller is stale or gone — leg B of the outage detector is blind"
+              description: |
+                gardenio_claude_status_indicator is absent, or the poller has not
+                completed a SUCCESSFUL fetch in
+                {{ $co.deadman.staleAfterSeconds }}s. Leg B cannot corroborate an
+                outage right now, so a firing ClaudeUpstreamOutage will not be
+                able to tell the oncall whether the fault is ours or the
+                provider's. FIRST triage which failure mode via
+                gardenio_claude_status_check_errors_by_reason_total{reason}: a
+                `tls` streak is a PROVIDER cert (or a MITM) — status.claude.com
+                has served the bare *.statuspage.io wildcard with no SAN before
+                (ka-0000007040) — NOT our pod egress, so do not chase a
+                partition; `dns`/`connect` point at our egress; `http_status`/
+                `parse`/`empty` at a wrong endpoint or a changed payload. The
+                poller falls through GARDENIO_CLAUDE_STATUS_FALLBACK_URLS (if set)
+                before failing, so a persistent stale means every configured
+                endpoint is down. Also check the "claude status poll failed" log
+                line (it carries reason=) and gardenio_claude_status_check_errors_total.
+                Note the poller is disabled outright when
+                GARDENIO_CLAUDE_STATUS_POLL_INTERVAL=0.
+              runbook_url: "{{ $ga.runbookBaseURL }}#claudestatuspollerstale"
+              {{- if $dashBase }}
+              # Deadman panel — time() - gardenio_claude_status_last_check_timestamp_seconds
+              # vs the 600s staleness line, the signal this rule thresholds on.
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=17&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $coBeadURL }}
+              bead: {{ $coBeadURL | quote }}
+              {{- end }}
+          # Leg A's deadman CANNOT be absent(gardenio_agent_upstream_error_active):
+          # that gauge is a snapshot cleared to no-data whenever no agent is
+          # erroring, so absent() is the HEALTHY steady state and such a rule
+          # would fire permanently on a well-behaved fleet (no `for` window
+          # rescues it — the condition is continuously true).
+          #
+          # Instead watch the emitter's own liveness through a series the SAME
+          # sweep always writes: gardenio_agent_pods_pending is set by
+          # SetPodsPending in the identical flush block at the end of every
+          # SyncAll pass. If the reporter is scraped and running, that vector is
+          # being maintained; if the controller target is down, up{} goes 0 and
+          # leg A is dead. This asserts the SCRAPE PATH the gauge depends on
+          # rather than the gauge's own (legitimately empty) value.
+          #
+          # NOTE the label value is `agents`, not `controller`: the controller
+          # Deployment carries app.kubernetes.io/component=agents (helpers.tpl
+          # "gardenio.agents.labels"), which vmagent relabels to component. A rule
+          # written against up{component="controller"} matches NO series and is
+          # therefore permanently silent — the exact silent-no-fire trap the
+          # runbook warns about.
+          - alert: AgentUpstreamErrorEmitterDown
+            expr: |
+              absent(up{component="agents"}) or max(up{component="agents"}) == 0
+            for: {{ $co.deadman.for | quote }}
+            labels:
+              severity: {{ $co.deadman.severity | quote }}
+              component: gardenio
+              subsystem: agent-reliability
+            annotations:
+              summary: "controller metrics target is down — leg A of the Claude-outage detector cannot fire"
+              description: |
+                The controller's /metrics target is absent or down, so the status
+                reporter is not publishing gardenio_agent_upstream_error_active and
+                ClaudeUpstreamOutage CANNOT FIRE — the fleet is un-alerted for
+                provider outages, which is exactly the 2026-07-29 blind spot this
+                epic closed.
+                Note the active gauge is deliberately EMPTY when no agent is
+                erroring, so its absence alone is not a fault — that is why this
+                rule watches the scrape path instead. Triage: confirm the
+                controller pod is Running and its :9092 /metrics responds, then
+                check vmagent is still scraping it.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentupstreamerroremitterdown"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=1&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $coBeadURL }}
+              bead: {{ $coBeadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.threadReplyDLQ.enabled }}
+          # NEW (ka-0000008039) — Slack thread-reply dead-letter backlog.
+          # gardenio_thread_reply_dlq_depth is live per bridge component. A
+          # non-zero depth = the bot SILENTLY stopped answering some threads
+          # (the "it just went quiet" failure with no other alarm). warn.
+          - alert: ThreadReplyDLQBacklog
+            expr: |
+              sum(gardenio_thread_reply_dlq_depth) > {{ $ga.threadReplyDLQ.threshold }}
+            for: {{ $ga.threadReplyDLQ.for | quote }}
+            labels:
+              severity: {{ $ga.threadReplyDLQ.severity | quote }}
+              component: slack-bridge
+              subsystem: thread-reply
+            annotations:
+              summary: "Slack thread-reply DLQ backlog >{{ $ga.threadReplyDLQ.threshold }} for {{ $ga.threadReplyDLQ.for }}"
+              description: |
+                gardenio_thread_reply_dlq_depth has been above {{ $ga.threadReplyDLQ.threshold }} for
+                {{ $ga.threadReplyDLQ.for }} — thread replies are failing and piling up in the
+                dead-letter queue, so the bot has silently stopped answering some
+                Slack threads. Triage: check slack-bridge logs for the reply
+                error, and the DLQ replay path (gardenio_thread_reply_dlq_replayed_total).
+              runbook_url: "{{ $ga.runbookBaseURL }}#threadreplydlqbacklog"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=7&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.triggerStarved.enabled }}
+          # NEW (ka-0000008039) — starved triggers/gardeners. gardenio_trigger_starved
+          # is live per trigger bead. Non-zero = scheduled automation that met
+          # its fire condition hasn't fired (cooldown wedged / starved) — the
+          # fleet quietly stops making progress with no crash to point at. warn.
+          - alert: TriggerStarved
+            expr: |
+              sum(gardenio_trigger_starved) > {{ $ga.triggerStarved.threshold }}
+            for: {{ $ga.triggerStarved.for | quote }}
+            labels:
+              severity: {{ $ga.triggerStarved.severity | quote }}
+              component: trigger-engine
+              subsystem: triggers
+            annotations:
+              summary: "trigger(s) starved >{{ $ga.triggerStarved.for }} (should have fired, didn't)"
+              description: |
+                gardenio_trigger_starved has been above {{ $ga.triggerStarved.threshold }} for {{ $ga.triggerStarved.for }} —
+                a trigger/gardener met its fire condition but has not fired
+                (cooldown wedged or starved). Scheduled automation is stalled.
+                The graph legend names the offending trigger bead id; open it
+                with `kd show <id>` and check the trigger-engine logs.
+              runbook_url: "{{ $ga.runbookBaseURL }}#triggerstarved"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=8&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.triggerEngineDark.enabled }}
+          # TriggerEngineScheduleDark (ka-0000005325) — the ENGINE-LOOP DEADMAN.
+          #
+          # THE 30h BLIND SPOT THIS CLOSES. On 2026-08-09→08-10 the trigger-engine
+          # fired ZERO scheduled triggers for ~30h (a fleet-wide schedule blackout)
+          # while its pod stayed Ready with restartCount=0. It was invisible to
+          # every existing guard: the old /healthz was STATIC (always ok, so k8s
+          # liveness never restarted the wedged pod), and every engine-side
+          # liveness sweep (TriggerStarved above, SweepDarkLaneByConcurrency,
+          # SweepGardenerLiveness, …) runs INSIDE Evaluate() — so a stalled
+          # Evaluate() runs none of them and none can detect the loop itself
+          # stalling. TriggerStarved is the WRONG twin here: it reads
+          # gardenio_trigger_starved, which is computed INSIDE the very loop that
+          # went dark, so it froze at its last value and could not fire.
+          #
+          # WHY THIS IS FIREABLE WHERE TriggerStarved WAS NOT. The engine beats
+          # gardenio_trigger_engine_evaluations_total once per COMPLETED Evaluate()
+          # cycle, unconditionally on the poll timer (default 30s) regardless of
+          # whether any trigger is enabled or matched. So increase(...[window])==0
+          # means the main loop is not evaluating AT ALL — the exact wedge — and it
+          # cannot be frozen by the wedge because the metric is beat by the loop
+          # itself, not derived from its output. absent() covers the never-scraped
+          # / crash-before-first-scrape / pod-gone case an increase() alone misses
+          # (increase over a never-written series is no-data, not 0). The verdict is
+          # a single self-contained deadman leg with NO `and`-joined term an absent
+          # series could silently suppress — the same folded discipline as the
+          # gitlab/jira webhook deadman legs. This is also defended by the LIVE
+          # /healthz (503 if no Evaluate() in N×poll_interval) so k8s restarts a
+          # wedged pod; this alert is the operator-visible page for the same fact.
+          - alert: TriggerEngineScheduleDark
+            expr: |
+              increase(gardenio_trigger_engine_evaluations_total[{{ $ga.triggerEngineDark.window }}]) == 0
+              or absent(gardenio_trigger_engine_evaluations_total)
+            for: {{ $ga.triggerEngineDark.for | quote }}
+            labels:
+              severity: {{ $ga.triggerEngineDark.severity | quote }}
+              component: trigger-engine
+              subsystem: schedule-source
+            annotations:
+              summary: "trigger-engine evaluation loop is DARK — no Evaluate() cycle completed in {{ $ga.triggerEngineDark.window }}"
+              description: |
+                gardenio_trigger_engine_evaluations_total has not increased over
+                {{ $ga.triggerEngineDark.window }} (or the series is absent) — the
+                trigger-engine main loop is not evaluating at all. EVERY scheduled
+                trigger, gardener pre-fire, and engine-side liveness sweep runs
+                inside that loop, so the whole fleet's scheduled automation has
+                gone globally dark with NO crash to point at (the pod can stay
+                Ready with restartCount=0 — the exact 30h-blackout signature of
+                ka-0000005325). This is the deadman TriggerStarved cannot provide:
+                gardenio_trigger_starved is computed inside the wedged loop and
+                freezes at its last value.
+                Triage: kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=trigger-engine ;
+                check the pod is Running and its /healthz (LIVE — 503s on a stalled
+                loop, so k8s should already be restarting it); read its logs for a
+                hung goroutine / deadlock / blocked daemon call. See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#triggerenginescheduledark"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=8&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.triggerEngineMachineAuth.enabled }}
+          # TriggerEngineMachineAuthUnavailable (gd-Hc34EENbO9) — the trigger-engine
+          # authenticates to the beads daemon as its own Keycloak machine principal
+          # (machine:gardenio-trigger-engine) and FAILS CLOSED when it has no token:
+          # the client Secret is optional on the pod (a Secret nobody created leaves
+          # the file missing), or Keycloak refuses / is unreachable. Every daemon
+          # call then errors auth_unavailable and is never sent, and there is no
+          # fallback to the static token. The engine loop is unaffected, so it keeps
+          # beating gardenio_trigger_engine_evaluations_total and
+          # TriggerEngineScheduleDark (which counts COMPLETED Evaluate() cycles,
+          # not successful writes) stays green while no trigger stamp, spawn or
+          # close lands. gardenio_machine_token_unavailable_total counts exactly
+          # those refused calls; sustained increase>0 is the page. The client label
+          # scopes it to this component, so another component's failures never
+          # page this rule. No `absent()` leg on purpose: the series exists only
+          # after the first failure, and its absence is the healthy state.
+          - alert: TriggerEngineMachineAuthUnavailable
+            expr: |
+              sum(increase(gardenio_machine_token_unavailable_total{client={{ $.Values.triggerEngine.machinePrincipal.clientId | quote }}}[{{ $ga.triggerEngineMachineAuth.window }}])) > 0
+            for: {{ $ga.triggerEngineMachineAuth.for | quote }}
+            labels:
+              severity: {{ $ga.triggerEngineMachineAuth.severity | quote }}
+              component: trigger-engine
+              subsystem: machine-principal
+            annotations:
+              summary: "trigger-engine cannot obtain its machine token — its daemon writes are failing closed (auth_unavailable)"
+              description: |
+                gardenio_machine_token_unavailable_total{client={{ $.Values.triggerEngine.machinePrincipal.clientId | quote }}}
+                increased over {{ $ga.triggerEngineMachineAuth.window }}. The trigger-engine
+                is authenticating as machine:gardenio-trigger-engine and could not get a
+                token, so its trigger stamps, agent spawns, run-task creates / closes and
+                sweeps were refused before reaching the daemon. The pod stays Ready and
+                TriggerEngineScheduleDark stays green (the loop still completes cycles),
+                so scheduled triggers silently stop firing.
+                Triage: the Secret named in triggerEngine.machinePrincipal.secretName
+                exists in the namespace with a clientSecret key and the pod has it
+                mounted (the volume is optional — a missing Secret only shows up here);
+                the Keycloak client gardenio-trigger-engine is reconciled; the pod log
+                carries the auth_unavailable cause. See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#triggerenginemachineauthunavailable"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=8&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.triggerEngineMachineForbidden.enabled }}
+          # TriggerEngineMachineForbidden (gd-cr3BJRmyTr) — the trigger-engine's
+          # machine token is valid but the daemon DENIES its writes (403). That is
+          # the first-roll race: a chart that adds a gardenio-machine-* realm role
+          # and the client using it in one release can hand the engine a token
+          # before Keycloak attaches the role, and every ownership write is then
+          # refused until the token expires (155 denials in 20 minutes on the #370
+          # roll, no alert). TriggerEngineMachineAuthUnavailable only covers a
+          # failed token FETCH, and TriggerEngineScheduleDark stays green because
+          # the cycle still completes. gardenio_machine_forbidden_total{client}
+          # counts every 403 on a request carrying this client's token, so the
+          # client label gives the per-principal view the daemon's own
+          # gardenio_authz_denials_total (no caller label) cannot. The client
+          # re-acquires its token once per minute on a 403, so a role-race clears
+          # itself within a minute; a sustained rate is a real grant gap.
+          # No absent-series leg: the series exists only after the first 403.
+          - alert: TriggerEngineMachineForbidden
+            expr: |
+              sum(increase(gardenio_machine_forbidden_total{client={{ $.Values.triggerEngine.machinePrincipal.clientId | quote }}}[{{ $ga.triggerEngineMachineForbidden.window }}])) > {{ $ga.triggerEngineMachineForbidden.threshold }}
+            for: {{ $ga.triggerEngineMachineForbidden.for | quote }}
+            labels:
+              severity: {{ $ga.triggerEngineMachineForbidden.severity | quote }}
+              component: trigger-engine
+              subsystem: machine-principal
+            annotations:
+              summary: "trigger-engine's machine principal is being denied (403) by the beads daemon — its writes are not landing"
+              description: |
+                gardenio_machine_forbidden_total{client={{ $.Values.triggerEngine.machinePrincipal.clientId | quote }}}
+                increased by more than {{ $ga.triggerEngineMachineForbidden.threshold }} over {{ $ga.triggerEngineMachineForbidden.window }}.
+                The trigger-engine authenticates fine as machine:gardenio-trigger-engine
+                but the daemon refuses its trigger stamps, spawns, run-task writes or
+                sweeps (authz:deny). The pod stays Ready and TriggerEngineScheduleDark
+                stays green.
+                Triage: the engine log's "machine token acquired" line lists realm_roles;
+                gardenio-machine-trigger-ops must be there (a missing role also logs
+                "machine token lacks expected realm role(s)"). If it is, the role grants
+                do not cover the denied write: compare the denied action with
+                kbeads/internal/server/testdata/machine_grants.golden.json and the
+                authz:deny audit beads. See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#triggerenginemachineforbidden"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=8&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.slackBridgeMachineAuth.enabled }}
+          # SlackBridgeMachineAuthUnavailable (gd-Hc34EENbO9 component 4) — the
+          # slack-bridge authenticates its BACKGROUND writes (the startup config
+          # seed and the dm delivery writes) as its own Keycloak machine principal
+          # (machine:gardenio-slack-bridge) and FAILS CLOSED when it has no token:
+          # the client Secret is optional on the pod (a Secret nobody created
+          # leaves the file missing), or Keycloak refuses / is unreachable. Each
+          # such call errors auth_unavailable and is never sent, with no fallback
+          # to the bridge's fleet token. Everything else the bridge does (and every
+          # read) stays on the fleet token, so the pod stays Ready and no other
+          # alert moves while question DMs stop being stamped, closed or recorded.
+          # gardenio_machine_token_unavailable_total counts exactly those refused
+          # calls; sustained increase>0 is the page. The client label scopes it to
+          # this component. No absence leg on purpose: the series exists only
+          # after the first failure, and its absence is the healthy state.
+          - alert: SlackBridgeMachineAuthUnavailable
+            expr: |
+              sum(increase(gardenio_machine_token_unavailable_total{client={{ $.Values.slackBridge.machinePrincipal.clientId | quote }}}[{{ $ga.slackBridgeMachineAuth.window }}])) > 0
+            for: {{ $ga.slackBridgeMachineAuth.for | quote }}
+            labels:
+              severity: {{ $ga.slackBridgeMachineAuth.severity | quote }}
+              component: slack-bridge
+              subsystem: machine-principal
+            annotations:
+              summary: "slack-bridge cannot obtain its machine token — its dm delivery writes and config seed are failing closed (auth_unavailable)"
+              description: |
+                gardenio_machine_token_unavailable_total{client={{ $.Values.slackBridge.machinePrincipal.clientId | quote }}}
+                increased over {{ $ga.slackBridgeMachineAuth.window }}. The slack-bridge is
+                authenticating its background writes as machine:gardenio-slack-bridge and
+                could not get a token, so dm delivery stamps / closes / reply captures and
+                the startup config seed were refused before reaching the daemon. The pod
+                stays Ready; DMs are still sent to Slack but the dm beads are not updated,
+                so question DMs lose their reply capture.
+                Triage: the Secret named in slackBridge.machinePrincipal.secretName
+                exists in the namespace with a clientSecret key and the pod has it
+                mounted (the volume is optional — a missing Secret only shows up here);
+                the Keycloak client gardenio-slack-bridge is reconciled; the pod log
+                carries the auth_unavailable cause. See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#slackbridgemachineauthunavailable"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=8&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.slackBridgeMachineForbidden.enabled }}
+          # SlackBridgeMachineForbidden (gd-Hc34EENbO9 component 4) — the slack-bridge's
+          # machine token is valid but the daemon DENIES its background writes (403).
+          # That is the first-roll role race: a chart that adds the
+          # gardenio-machine-slack-* realm roles and the client using them in one
+          # release can hand the bridge a token before Keycloak attaches the roles
+          # (the 2026-10-15 #370 roll, 155 denials in 20 minutes, no alert). The
+          # config seed and dm delivery writes are then refused while the pod stays
+          # Ready and DMs still reach Slack. SlackBridgeMachineAuthUnavailable only
+          # covers a failed token FETCH. gardenio_machine_forbidden_total{client}
+          # counts every 403 on a request carrying this client's token. dm traffic is
+          # light, so the threshold is low; the client re-acquires its token once a
+          # minute on a 403, so a role race clears itself and a sustained rate is a
+          # real grant gap. No absent-series leg: the series exists only after the
+          # first 403.
+          - alert: SlackBridgeMachineForbidden
+            expr: |
+              sum(increase(gardenio_machine_forbidden_total{client={{ $.Values.slackBridge.machinePrincipal.clientId | quote }}}[{{ $ga.slackBridgeMachineForbidden.window }}])) > {{ $ga.slackBridgeMachineForbidden.threshold }}
+            for: {{ $ga.slackBridgeMachineForbidden.for | quote }}
+            labels:
+              severity: {{ $ga.slackBridgeMachineForbidden.severity | quote }}
+              component: slack-bridge
+              subsystem: machine-principal
+            annotations:
+              summary: "slack-bridge's machine principal is being denied (403) by the beads daemon — its config seed / dm delivery writes are not landing"
+              description: |
+                gardenio_machine_forbidden_total{client={{ $.Values.slackBridge.machinePrincipal.clientId | quote }}}
+                increased by more than {{ $ga.slackBridgeMachineForbidden.threshold }} over {{ $ga.slackBridgeMachineForbidden.window }}.
+                The slack-bridge authenticates fine as machine:gardenio-slack-bridge but
+                the daemon refuses its config seed or dm delivery writes (authz:deny).
+                The pod stays Ready and DMs still reach Slack, but dm beads are not
+                stamped or closed and question DMs lose their reply capture.
+                Triage: the bridge log's "machine token acquired" line lists realm_roles;
+                gardenio-machine-slack-config-seed and gardenio-machine-slack-dm-delivery
+                must both be there (a missing role also logs "machine token lacks
+                expected realm role(s)"). If they are, the grants do not cover the denied
+                write: compare it with kbeads/internal/server/testdata/machine_grants.golden.json
+                and the authz:deny audit beads. See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#slackbridgemachineforbidden"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=8&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.respawnPhaseSlow.enabled }}
+          # NEW (ka-0000001457) — slack-bridge cold-respawn phase anomaly.
+          # gardenio_slackbridge_respawn_phase_slow_total{phase} is bumped by the
+          # slack-bridge whenever a cold thread/DM respawn's phase exceeded its
+          # anomaly threshold (dispatch>15s = bridge-side bead mint / daemon
+          # retries; boot>150s = pod-side schedule + image pull + coop --resume
+          # replay; total>180s = end-to-end). A multi-minute respawn (the
+          # motivating ~4-min incident) previously had NO alarm and no way to
+          # attribute the gap; this fires on increase>0 and the `phase` label
+          # localizes the slow leg to the bridge vs the pod. increase(...) over a
+          # counter (not histogram_quantile) because respawns are infrequent — a
+          # percentile is jumpy on a short window, a counter delta is not. warn.
+          - alert: SlackBridgeRespawnPhaseSlow
+            expr: |
+              sum by (phase) (increase(gardenio_slackbridge_respawn_phase_slow_total[1h])) > {{ $ga.respawnPhaseSlow.threshold }}
+            for: {{ $ga.respawnPhaseSlow.for | quote }}
+            labels:
+              severity: {{ $ga.respawnPhaseSlow.severity | quote }}
+              component: slack-bridge
+              subsystem: respawn-latency
+            annotations:
+              summary: "slack-bridge cold-respawn phase anomalously slow ({{`{{ $labels.phase }}`}})"
+              description: |
+                gardenio_slackbridge_respawn_phase_slow_total{phase="{{`{{ $labels.phase }}`}}"}
+                increased over the last 15m — a cold thread/DM agent respawn's
+                {{`{{ $labels.phase }}`}} phase exceeded its anomaly threshold
+                (dispatch>15s / boot>150s / total>180s). phase=dispatch points at
+                the bridge (bead mint / daemon retries); phase=boot points at the
+                pod (schedule + image pull + coop --resume replay). Triage: graph
+                gardenio_slackbridge_respawn_phase_seconds by phase, and check
+                slack-bridge logs around the respawn for the offending agent.
+              runbook_url: "{{ $ga.runbookBaseURL }}#slackbridgerespawnphaseslow"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=19&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.adviceBudget.enabled }}
+          # Advice context budget (ka-0000004716, context-crisis plan
+          # ka-0000003733). gb prime pushes gardenio_prime_hook_bytes at
+          # every agent session start; source="advice" over the hard budget
+          # for any (project, role) archetype means the Part-A advice cut
+          # regressed. max by (project, role) so the firing series names the
+          # offending archetype. Bytes unit: 20k tok x 4 = 81920 default.
+          # Silent-before-release caveat: the series first exists on the
+          # release carrying MR !5331; absent series -> no evaluation, which
+          # is fine because the budget cannot regress before the metric does.
+          - alert: AdviceContextOverBudget
+            expr: |
+              max by (project, role) (gardenio_prime_hook_bytes{source="advice"}) > {{ $ga.adviceBudget.maxBytes }}
+            for: {{ $ga.adviceBudget.for | quote }}
+            labels:
+              severity: {{ $ga.adviceBudget.severity | quote }}
+              component: gardenio
+              subsystem: advice-hygiene
+            annotations:
+              summary: "advice section over the per-archetype context budget ({{ $ga.adviceBudget.maxBytes }} bytes)"
+              description: |
+                gardenio_prime_hook_bytes{source="advice"} has exceeded
+                {{ $ga.adviceBudget.maxBytes }} bytes (~{{ div $ga.adviceBudget.maxBytes 4096 }}k tokens) for the firing
+                (project, role) archetype for {{ $ga.adviceBudget.for }} — the advice corpus
+                regressed past the Part-A budget (ka-0000003733). Triage:
+                `gb advice audit --project <project> --role <role>` to see the
+                matched beads; `gb advice lint` for targeting smells; then
+                RETARGET/NUKE/CONSOLIDATE/SHORTEN per the plan runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#advicecontextoverbudget"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-system-health/gardenio-system-health?viewPanel=9&{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.unattributedSpend.enabled }}
+          # Approach B residual (ka-0000003988). tagSpendSync splits the whole
+          # LiteLLM bill into gardenio_agent_attributed_cost_usd (agent:*-tagged
+          # — what per-agent settlement can book) + gardenio_unattributed_cost_usd
+          # (per-proxy /global/spend bill minus agent-tagged), so
+          # attributed + unattributed ≡ bill by construction. This alert fires
+          # when the unattributed share of the trailing-1h bill exceeds
+          # ratioThreshold — a new untagged consumer appeared or tag propagation
+          # regressed (e.g. the rotation tag-loss bug ka-0000000333). Both series
+          # come from the SAME poller tick, so no cross-poller phase skew; the
+          # same dedup + aligned-subquery shape as the tag-cost validation rules.
+          # The minSpend gate is a label-less VECTOR via `and on() (...)` — a
+          # bare scalar comparison on `and`'s RHS suppresses everything.
+          # Silent-before-release caveat: the series first exist on the release
+          # carrying ka-0000003988; absent series → no evaluation, which is fine
+          # (the residual cannot regress before it is measured).
+          - alert: UnattributedSpendHigh
+            expr: |
+              (
+                sum(increase((max by (env) (gardenio_unattributed_cost_usd))[1h:5m]))
+                /
+                clamp_min(
+                  sum(increase((max by (env) (gardenio_unattributed_cost_usd))[1h:5m]))
+                  + sum(increase((max by (env) (gardenio_agent_attributed_cost_usd))[1h:5m])),
+                  {{ $ga.unattributedSpend.minSpendUSD }}
+                )
+              ) > {{ $ga.unattributedSpend.ratioThreshold }}
+              and on()
+              (
+                sum(increase((max by (env) (gardenio_unattributed_cost_usd))[1h:5m]))
+                + sum(increase((max by (env) (gardenio_agent_attributed_cost_usd))[1h:5m]))
+                > {{ $ga.unattributedSpend.minSpendUSD }}
+              )
+            for: {{ $ga.unattributedSpend.for | quote }}
+            labels:
+              severity: {{ $ga.unattributedSpend.severity | quote }}
+              component: gardenio
+              subsystem: spend
+            annotations:
+              summary: "unattributed LiteLLM spend >{{ $ga.unattributedSpend.ratioThreshold }} of the trailing-1h bill"
+              description: |
+                gardenio_unattributed_cost_usd (the part of the LiteLLM bill
+                carrying no agent: tag) exceeded {{ $ga.unattributedSpend.ratioThreshold }} of the trailing-1h
+                bill for {{ $ga.unattributedSpend.for }}. Per-agent settlement can never book this
+                money — a new untagged consumer appeared (an internal service,
+                an operator key) or tag propagation regressed (credential
+                rotation dropping x-litellm-tags, ka-0000000333; podspec
+                x-litellm-tags wiring). Enumerate the offending rows with
+                GET /spend/logs/ui (master key): untagged = no agent: entry in
+                request_tags; key alias + requester IP identify the consumer.
+              runbook_url: "{{ $ga.runbookBaseURL }}#unattributedspendhigh"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-cost-overview/gardenio-cost-overview?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.darkSpend.enabled }}
+{{- $ds := $ga.darkSpend }}
+          # DarkSpendOverThreshold (R6-FU6c, ka-0000007149; epic ka-5FZ2 pre-
+          # autonomy guardrails ka-0000005876) — the cost guardrail for the
+          # autonomous (dark) fleet, the OBSERVE half of the R6-FU6 cost pair
+          # whose ENFORCE half is the per-agent/day token budget. Keyed to the
+          # litellm-cost-tracking metric family: gardenio_agent_spend_usd_total
+          # is the per-turn LiteLLM spend counter (labels
+          # {agent,project,role,model,account}) the controller tag_spend_sync
+          # daemon feeds from LiteLLM spend logs — the exact series the
+          # litellm-cost-tracking E2E module validates end-to-end, and the same
+          # counter the gardenio:agent_cost_usd:rate1h recording rule and the
+          # gardenio-dark-spend dashboard read.
+          #
+          # Fires when the selected fleet's TRAILING-1h spend rate (USD/hour)
+          # crosses the operator-set threshold. increase(...[1h]) (not rate())
+          # so the value reads as dollars-per-hour, matching the dashboard's
+          # "Dark spend rate vs alert threshold" panel and the threshold
+          # variable. projectRegex scopes it to the dark universe (default
+          # "monorepo-dark") — an anchored full-match, so it does not leak onto
+          # the main-fleet project. `for` debounces a single spiky turn so only
+          # a SUSTAINED over-threshold burn pages, matching the guardrail's
+          # intent (a runaway autonomous loop, not one expensive turn).
+          #
+          # Off by default: dark-fleet spend is only in this vmsingle once the
+          # dark controller's metrics are scraped/federated (cf. the parked
+          # gitlab-dark-drift board whose gitlab_dark_* exporter is not yet
+          # applied). An absent series makes increase() no-data, so even if
+          # flipped on early the rule stays silent rather than mis-fires — the
+          # operator flips darkSpend.enabled + threshold when dark spend lands.
+          - alert: DarkSpendOverThreshold
+            expr: |
+              sum(increase(gardenio_agent_spend_usd_total{project=~"{{ $ds.projectRegex }}"}[1h])) > {{ $ds.threshold }}
+            for: {{ $ds.for | quote }}
+            labels:
+              severity: {{ $ds.severity | quote }}
+              component: gardenio
+              subsystem: spend
+              universe: dark
+            annotations:
+              summary: "dark-fleet LiteLLM spend >${{ $ds.threshold }}/h (project=~{{ $ds.projectRegex }})"
+              description: |
+                The autonomous (dark) fleet's trailing-1h LiteLLM spend rate
+                crossed the operator-set guardrail of ${{ $ds.threshold }}/hour
+                for {{ $ds.for }} (projects matching "{{ $ds.projectRegex }}").
+                This is the OBSERVE guardrail from R6-FU6 (ka-0000007149) — the
+                per-agent/day token budget ENFORCES, this alert watches the
+                aggregate burn. A sustained over-threshold rate is what a
+                runaway autonomous loop looks like on the bill.
+                Triage: open the Gardenio Dark Spend board to see WHICH agent /
+                gardener is driving it (per-agent + per-gardener spend-rate
+                panels), then decide whether to raise the threshold (expected
+                growth), throttle/kill the offending gardener (kill-switch), or
+                hunt a spend regression (untagged consumer — cross-check with
+                UnattributedSpendHigh).
+              runbook_url: "{{ $ga.runbookBaseURL }}#darkspendoverthreshold"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-dark-spend/gardenio-dark-spend?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.xcheckDrift.enabled }}
+{{- $xd := $ga.xcheckDrift }}
+{{- $pairOverrides := $xd.pairThresholds | default dict }}
+{{- $overriddenPairs := keys $pairOverrides | sortAlpha }}
+          # C5 (ka-0000006644, plan ka-0000003747) — cost x-check corroboration
+          # drift. The controller x-check sweep publishes
+          # gardenio_xcheck_agreement{pair,env}: a [0,1] score per conservation
+          # pair (the same quantity derived from two INDEPENDENT sources;
+          # 1 − |A−B|/max(A,B,ε)). Sustained low agreement means two
+          # derivations of one number disagree — a real measurement bug in one
+          # of the sources, not noise. The sweep NEVER publishes a pair it
+          # could not derive both sides of (absent, not fabricated), so this
+          # cannot fire on missing data; and a pair listed in pairThresholds
+          # is excluded here and gets its own floor below (0 = opted out, so a
+          # structurally-low pair does not fire the default 0.95 rule).
+          # Silent-before-release caveat: the series first exists on the
+          # release carrying C2 (ka-0000000950).
+          - alert: CostXCheckDrift
+            expr: |
+              gardenio_xcheck_agreement{{ if $overriddenPairs }}{pair!~"{{ join "|" $overriddenPairs }}"}{{ end }} < {{ $xd.threshold }}
+            for: {{ $xd.for | quote }}
+            labels:
+              severity: {{ $xd.severity | quote }}
+              component: gardenio
+              subsystem: cost-trust
+            annotations:
+              summary: "cost x-check pair {{`{{ $labels.pair }}`}} agreement <{{ $xd.threshold }} for {{ $xd.for }} (two derivations disagree)"
+              description: |
+                gardenio_xcheck_agreement{pair="{{`{{ $labels.pair }}`}}",env="{{`{{ $labels.env }}`}}"} has stayed
+                below {{ $xd.threshold }} for {{ $xd.for }} (current score {{`{{ $value | printf "%.3f" }}`}}). The pair's
+                two INDEPENDENT derivations of the same quantity (x-check
+                sweep, cmd/controller/xcheck_sweep.go) disagree — one of the
+                sources is mismeasuring, so every cost number that pair
+                qualifies is suspect until reconciled. Open the xcheck-trust
+                board's side A/B panel for the pair to see which derivation
+                moved and when; the runbook maps each pair to its two sources.
+              runbook_url: "{{ $ga.runbookBaseURL }}#costxcheckdrift"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-xcheck-trust/gardenio-cost-x-check-trust-double-check-principle?from=now-24h&to=now"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- range $pair, $floor := $pairOverrides }}
+{{- if $floor }}
+          # Per-pair floor override (vmalert.gapAlerts.xcheckDrift.pairThresholds).
+          - alert: CostXCheckDrift
+            expr: |
+              gardenio_xcheck_agreement{pair="{{ $pair }}"} < {{ $floor }}
+            for: {{ $xd.for | quote }}
+            labels:
+              severity: {{ $xd.severity | quote }}
+              component: gardenio
+              subsystem: cost-trust
+            annotations:
+              summary: "cost x-check pair {{ $pair }} agreement <{{ $floor }} (pair-specific floor) for {{ $xd.for }}"
+              description: |
+                gardenio_xcheck_agreement{pair="{{ $pair }}",env="{{`{{ $labels.env }}`}}"} has stayed below its
+                pair-specific floor {{ $floor }} for {{ $xd.for }} (current score {{`{{ $value | printf "%.3f" }}`}}).
+                This pair's two independent derivations disagree beyond its
+                tuned baseline. Open the xcheck-trust board's side A/B panel
+                for the pair; the runbook maps each pair to its two sources.
+              runbook_url: "{{ $ga.runbookBaseURL }}#costxcheckdrift"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-xcheck-trust/gardenio-cost-x-check-trust-double-check-principle?from=now-24h&to=now"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $ga.accountThrottled.enabled }}
+          # Credential-account rate-limited (ka-0000003179). Series:
+          # gardenio_account_throttled (labels {account,env}), set to 1 by the
+          # controller when the Anthropic rate-limit probe reports
+          # throttle_status="rejected" for a credential account. FIREABLE TODAY —
+          # the series is live on prod (it already backs the account-capacity
+          # dashboard's throttle timeline), so this belongs in the fireable group,
+          # not the blocked pack. count(max by (account)(...)>0) dedups the
+          # per-pod gauge republish so a single throttled account counts once,
+          # not once per controller pod. E2E/probe throwaway accounts are excluded
+          # with the byte-identical matcher the beads-viewer rollup uses
+          # (ka-0000005167) so a harness run can never trip this. warn, not page:
+          # the credential broker fails over to un-throttled accounts, so a
+          # throttle degrades headroom rather than halting work — a sustained
+          # count is the "we are running out of un-throttled capacity" signal.
+          # Deep-links to the account-capacity board, whose throttle timeline +
+          # utilization panels answer the "why" (was the account already near its
+          # 5h ceiling?).
+          - alert: AccountThrottled
+            expr: |
+              count(max by (account) (gardenio_account_throttled{account!~"(?i:e2e-.*|probe-acct-.*)"}) > 0) > {{ $ga.accountThrottled.threshold }}
+            for: {{ $ga.accountThrottled.for | quote }}
+            labels:
+              severity: {{ $ga.accountThrottled.severity | quote }}
+              component: gardenio
+              subsystem: credential-capacity
+            annotations:
+              summary: ">{{ $ga.accountThrottled.threshold }} credential account(s) rate-limited (throttled)"
+              description: |
+                More than {{ $ga.accountThrottled.threshold }} credential account(s) have been rate-limited
+                (gardenio_account_throttled==1, provider 429) for {{ $ga.accountThrottled.for }}. The
+                broker fails over to un-throttled accounts, so this degrades
+                capacity headroom rather than halting work — but a sustained
+                count means the fleet is leaning on fewer accounts. Break down by
+                `account` on the graph; the account-capacity dashboard correlates
+                each throttle with its 5h/7d utilization so you can see whether
+                the account was already near its window ceiling.
+              runbook_url: "{{ $ga.runbookBaseURL }}#accountthrottled"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-account-capacity/gardenio-account-capacity-rate-limit-health?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if or $ga.pendingPods.enabled $ga.nodepoolMemory.enabled $ga.nodeLifecycle.enabled $ga.fleetSize.enabled $ga.idleNodes.enabled $ga.containerOOMKilled.enabled $ga.pvcObs.enabled }}
+      # ---- BLOCKED gaps — enabled per-toggle ONLY after the prereq series
+      #      exists in vmsingle; otherwise these evaluate against a missing
+      #      series and never fire (silent). See values.yaml gapAlerts.* notes.
+      - name: gardenio.gap-alerts-blocked
+        interval: {{ .Values.vmalert.evaluationInterval | quote }}
+        rules:
+{{- if $ga.containerOOMKilled.enabled }}
+          # ka-0000004184 (Matt: "detect OOMs and alert in Slack"). The
+          # CHILD-PROCESS-OOM-aware sibling of the fireable AgentOOMKilled.
+          # AgentOOMKilled reads the kubelet's per-container reason=OOMKilled,
+          # which the kubelet sets ONLY when the container PID1 is the OOM victim.
+          # Agents run coop as PID1 and claude + workflow fan-out
+          # (node/playwright/subagents) as CHILDREN, so a cgroup OOM-kill of a
+          # workflow child leaves coop alive → the container is never flagged
+          # OOMKilled → AgentOOMKilled stays silent and the death is mislabeled
+          # stop_gate_*_involuntary. This alert reads container_oom_events_total —
+          # the cadvisor counter for the cgroup's OWN oom_kill count, which
+          # increments for ANY process the OOM-killer reaps in the container cgroup
+          # (child OR PID1), and fires under gVisor since the memory limit is
+          # host-cgroup-enforced. by (namespace, pod) so the firing series names
+          # the exact agent pod that OOMed.
+          #
+          # BLOCKED gap: container_oom_events_total exists in vmsingle ONLY when
+          # the cadvisor scrape is on (vmagent.kubeletScrape.cadvisorOOM.enabled,
+          # which itself needs kubeletScrape.enabled). Arming this alert without
+          # that scrape evaluates a missing series and NEVER fires (silent) — the
+          # footgun this group's convention prevents. The prod overlay flips BOTH
+          # together. warn, not page: a single OOM is a cold-resume (run
+          # auto-salvaged to S3), a sustained rate is the under-provisioning /
+          # workflow-memory-leak signal.
+          - alert: AgentContainerOOMKilled
+            expr: |
+              sum by (namespace, pod) (increase(container_oom_events_total{namespace=~"{{ $ga.containerOOMKilled.namespaceRegex }}"}[1h])) > {{ $ga.containerOOMKilled.threshold }}
+            for: {{ $ga.containerOOMKilled.for | quote }}
+            labels:
+              severity: {{ $ga.containerOOMKilled.severity | quote }}
+              component: gardenio
+              subsystem: agent-reliability
+            annotations:
+              summary: "agent container OOM-kill (incl. workflow child procs) >{{ $ga.containerOOMKilled.threshold }}/h ({{`{{ $labels.namespace }}/{{ $labels.pod }}`}})"
+              description: |
+                More than {{ $ga.containerOOMKilled.threshold }} cgroup OOM-kills/h
+                in agent pod {{`{{ $labels.pod }}`}} (namespace
+                {{`{{ $labels.namespace }}`}}) — the cadvisor
+                container_oom_events_total counter, which unlike the kubelet
+                reason=OOMKilled signal AgentOOMKilled reads ALSO counts OOM-kills
+                of workflow CHILD processes (node/playwright/subagents) under coop
+                (PID1), the "lots of deaths on workflows" blind spot (ka-0000004184).
+                Fires under gVisor too (host-cgroup-enforced limit). A single OOM is
+                a cold-resume (run auto-salvaged to S3); a sustained rate means the
+                agent memory limit is too tight for the workflow or a run is leaking.
+                Triage: check the VPA right-sizing board for this role's working-set
+                vs limit and widen the limit / VPA minAllowed if under-provisioned.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentcontaineroomkilled"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-involuntary-deaths/gardenio-killed-mid-work-agents-involuntary-deaths?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.nodeLifecycle.enabled }}
+          # Track D (ka-0000001509; operator ask ka-0000006448: "monitoring and
+          # alerts for … node lifecycle events; alerts that fire into slack;
+          # create a metric if we do not have one"). Node-lifecycle churn on the
+          # fireable vmalert path. Reads the controller-emitted
+          # gardenio_node_lifecycle_events_total{reason=...} counter — CREATED for
+          # this ask (internal/nodelifecycle). BLOCKED gap: the series exists
+          # only when the collector is enabled (agents.nodeLifecycle.enabled,
+          # prereq {{ $ga.nodeLifecycle.prereqBead }}), so this alert defaults OFF
+          # and both flip together in the prod overlay — otherwise it evaluates a
+          # missing series and never fires (silent), the footgun this group's
+          # convention prevents. Counts reason="terminated" ONLY — the once-per-
+          # node vanish-from-listing edge (ka-0000005966). A single graceful node
+          # teardown walks ALL THREE going-away edges in sequence (disrupting ->
+          # deleting -> terminated), so summing disrupting|deleting|terminated
+          # counted ~3 events per node gone and tripped the per-node 6/h threshold
+          # on just ~2 clean consolidations/h — routine healthy scale-down, not
+          # churn. terminated fires exactly once per node that goes away regardless
+          # of path (graceful drain OR abrupt spot/AWS-health reclaim), so the
+          # threshold reads as NODES/h and matches the runbook's per-node model;
+          # it also keeps uniform sensitivity across graceful and abrupt reclaims
+          # (an abrupt spot kill emits terminated with little/no disrupting, so
+          # summing would have made the alert LEAST sensitive to the most
+          # dangerous churn). disrupting/deleting stay emitted for the dashboard
+          # reason-breakdown (triage step 1) — only the ALERT counts nodes.
+          # not_ready is likewise excluded (a Ready flap is a health blip, not a
+          # teardown). Complements AgentNodeReclaimDeaths, which fires only once
+          # churn actually KILLS an agent; this fires on the teardowns too,
+          # including the ones that miss the agents. warn: node churn is expected
+          # background (spot, TTL); a sustained rate is the "reclaims are climbing"
+          # signal. Tune via vmalert.gapAlerts.nodeLifecycle.
+          - alert: AgentNodeLifecycleEvents
+            expr: |
+              sum(increase(gardenio_node_lifecycle_events_total{reason="terminated"}[1h])) > {{ $ga.nodeLifecycle.threshold }}
+            for: {{ $ga.nodeLifecycle.for | quote }}
+            labels:
+              severity: {{ $ga.nodeLifecycle.severity | quote }}
+              component: gardenio
+              subsystem: node-lifecycle
+            annotations:
+              summary: "node teardowns >{{ $ga.nodeLifecycle.threshold }} nodes/h (agent-pool going-away churn)"
+              description: |
+                More than {{ $ga.nodeLifecycle.threshold }} agent-pool nodes went
+                away (terminated/reclaimed — Karpenter disruption drain, node
+                deletion, or instance reclaim via spot / AWS health /
+                interruption-queue / expireAfter TTL / AMI drift) per hour for
+                {{ $ga.nodeLifecycle.for }}, from
+                gardenio_node_lifecycle_events_total{reason="terminated"} (one count
+                per node gone). Break down by `reason` (disrupting/deleting/
+                terminated) on the graph to see the teardown path. Node churn is
+                expected background, but a sustained
+                rate means instances are cycling faster than usual — which
+                cold-resumes any agent on those nodes (see AgentNodeReclaimDeaths
+                for the ones that were actually killed mid-work). Check Karpenter
+                disruption budgets, the node expireAfter TTL, and any AMI-drift
+                rollout in flight.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentnodelifecycleevents"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-involuntary-deaths/gardenio-killed-mid-work-agents-involuntary-deaths?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.fleetSize.enabled }}
+          # P1b FLEET-SIZE alerting (ka-0000003023; operator ask Matt Baker,
+          # #aws-cost-management 2026-08-13: "alert when running agent-node count
+          # / total vCPU provisioned exceeds a threshold"). Reads the
+          # controller-emitted current-state gauge gardenio_agent_node_count{env}
+          # — the number of agent-pool nodes (karpenter.sh/nodepool=agent-pool)
+          # live as of the last sweep. This is the LEADING cost indicator: it
+          # rises the moment Karpenter provisions a node, hours before the
+          # On-Demand BoxUsage lands on the bill, so we catch fleet growth BEFORE
+          # the trailing spend. Routed to the cost channel via subsystem="cost".
+          #
+          # BLOCKED gap (default OFF): the gauge exists only when the
+          # node-lifecycle collector is enabled (agents.nodeLifecycle.enabled,
+          # prereq {{ $ga.fleetSize.prereqBead }}) — the SAME collector + RBAC
+          # that backs AgentNodeLifecycleEvents, since the gauge is a tally over
+          # the node LIST that collector already runs. Flip both together in the
+          # prod overlay; arming this without the collector evaluates a missing
+          # series and never fires (silent), the footgun this group prevents.
+          # warn, not page: a large fleet is a cost signal to investigate, not an
+          # availability incident. Written gauge > threshold so an absent series
+          # yields NO result (never a phantom fire). Threshold is NODES; tune to
+          # the fleet's expected steady-state ceiling per env.
+          - alert: AgentFleetSizeHigh
+            expr: |
+              gardenio_agent_node_count > {{ $ga.fleetSize.threshold }}
+            for: {{ $ga.fleetSize.for | quote }}
+            labels:
+              severity: {{ $ga.fleetSize.severity | quote }}
+              component: gardenio
+              subsystem: cost
+            annotations:
+              summary: "agent-pool fleet size >{{ $ga.fleetSize.threshold }} nodes (provisioned-cost early warning)"
+              description: |
+                The agent-pool node count (gardenio_agent_node_count) has been
+                above {{ $ga.fleetSize.threshold }} for {{ $ga.fleetSize.for }} —
+                the fleet is running more On-Demand nodes than the expected
+                steady-state ceiling. This is the LEADING cost indicator: node
+                count rises the moment Karpenter provisions, hours before the
+                BoxUsage bill lands (gardenio-account EC2 is 100% On-Demand). Check
+                the total provisioned vCPU (gardenio_agent_node_vcpus) and whether
+                the growth is real demand or under-utilized/idle nodes that the
+                P2b right-sizing should consolidate. Cross-refs the cost-control
+                epic ka-0000006909.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentfleetsizehigh"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-involuntary-deaths/gardenio-killed-mid-work-agents-involuntary-deaths?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.idleNodes.enabled }}
+          # P1b-follow-up IDLE-NODE alerting (ka-0000001398). Reads the
+          # controller-emitted current-state gauge gardenio_agent_idle_node_count
+          # {env} — agent-pool nodes (karpenter.sh/nodepool=agent-pool) hosting
+          # ZERO active agent pods as of the last sweep. This is the UNBLOCKED
+          # half of the node-utilization ask: "provisioned but nothing scheduled"
+          # idle capacity, the direct waste signal — On-Demand nodes Karpenter
+          # has not yet consolidated, paying for nothing. Routed to the cost
+          # channel via subsystem="cost".
+          #
+          # BLOCKED gap (default OFF): the gauge exists only when idle-node
+          # detection is enabled (agents.nodeLifecycle.idleNodes.enabled, prereq
+          # {{ $ga.idleNodes.prereqBead }} — itself gated on the node-lifecycle
+          # collector). Arming this without it evaluates a missing series and
+          # never fires (silent), the footgun this group prevents. warn, not page:
+          # idle capacity is a cost signal to investigate, not an availability
+          # incident. Written gauge > threshold so an absent series yields NO
+          # result (never a phantom fire). Real sustained-low CPU/mem utilization
+          # (busy-looking nodes barely using their requests) stays blocked — it
+          # needs node-exporter/cadvisor series absent from vmsingle today.
+          - alert: AgentFleetIdleNodes
+            expr: |
+              gardenio_agent_idle_node_count > {{ $ga.idleNodes.threshold }}
+            for: {{ $ga.idleNodes.for | quote }}
+            labels:
+              severity: {{ $ga.idleNodes.severity | quote }}
+              component: gardenio
+              subsystem: cost
+            annotations:
+              summary: "agent-pool has >{{ $ga.idleNodes.threshold }} idle nodes (provisioned but nothing scheduled)"
+              description: |
+                The count of agent-pool nodes hosting zero active agent pods
+                (gardenio_agent_idle_node_count) has been above
+                {{ $ga.idleNodes.threshold }} for {{ $ga.idleNodes.for }} — the
+                fleet is running On-Demand nodes Karpenter has not consolidated,
+                paying for idle capacity (gardenio-account EC2 is 100% On-Demand).
+                Check gardenio_agent_node_count / gardenio_agents_active to gauge how
+                much of the fleet is idle, then tighten Karpenter consolidation/TTL
+                or right-size over-provisioned instance types. This is the
+                "provisioned but nothing scheduled" signal; real sustained-low
+                CPU/mem utilization is a separate blocked follow-up. Cross-refs the
+                cost-control epic ka-0000006909.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentfleetidlenodes"
+              {{- if $dashBase }}
+              dashboard: "{{ $dashBase }}/d/gardenio-involuntary-deaths/gardenio-killed-mid-work-agents-involuntary-deaths?{{ $dashWindow }}"
+              {{- end }}
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.pendingPods.enabled }}
+          # GAP-1 — agent pods stuck Pending. Requires the controller gauge
+          # gardenio_agent_pods_pending (prereq {{ $ga.pendingPods.prereqBead }}).
+          - alert: AgentPodsPendingTooLong
+            expr: |
+              sum(gardenio_agent_pods_pending) > {{ $ga.pendingPods.threshold }}
+            for: {{ $ga.pendingPods.for | quote }}
+            labels:
+              severity: {{ $ga.pendingPods.severity | quote }}
+              subsystem: agent-scheduling
+            annotations:
+              summary: "agent pods stuck Pending >{{ $ga.pendingPods.for }} (spawn stall)"
+              description: |
+                Agent pods cannot schedule. Check agent-pool nodepool memory
+                headroom (GAP-2), ephemeral ns bloat (GAP-3), and
+                kubectl -n {{ .Release.Namespace }} get pods
+                -l app.kubernetes.io/component=agents --field-selector=status.phase=Pending.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentpodspendingtoolong"
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.nodepoolMemory.enabled }}
+          # GAP-2 — karpenter agent-pool provisioned memory ≥ limit. Requires
+          # karpenter_* scraped into vmagent (prereq {{ $ga.nodepoolMemory.prereqBead }}).
+          # Metric names AND label keys vary by karpenter version — verify both
+          # against the running build (curl karpenter-metrics:8080/metrics | grep
+          # nodepool) before enabling. The v1 series are
+          # karpenter_nodepools_{usage,limit}, and v1.3.3 labels the resource
+          # dimension `resource_type` (NOT `resource` — the pre-v1 key). A wrong
+          # label key selects an EMPTY vector and the alert can NEVER fire
+          # (ka-0000005173), the exact silent-no-fire this pack exists to kill.
+          # Written as usage >= threshold*limit (NOT usage/limit >= threshold) so
+          # a 0/absent limit yields NO result instead of usage/0 = +Inf, which
+          # would satisfy >= threshold and spuriously page (ka-0000001461 review).
+          - alert: AgentPoolMemoryNearLimit
+            expr: |
+              karpenter_nodepools_usage{nodepool="{{ $ga.nodepoolMemory.nodepool }}",resource_type="memory"}
+              >=
+              {{ $ga.nodepoolMemory.threshold }} * karpenter_nodepools_limit{nodepool="{{ $ga.nodepoolMemory.nodepool }}",resource_type="memory"}
+            for: {{ $ga.nodepoolMemory.for | quote }}
+            labels:
+              severity: {{ $ga.nodepoolMemory.severity | quote }}
+              subsystem: capacity
+            annotations:
+              summary: "karpenter {{ $ga.nodepoolMemory.nodepool }} provisioned memory ≥{{ $ga.nodepoolMemory.threshold }} of limit"
+              description: |
+                The {{ $ga.nodepoolMemory.nodepool }} nodepool is near its provisioned-memory
+                limit — Karpenter will soon refuse new nodes and agent pods will
+                stall Pending (the 2026-07-08 root cause, ~12h early warning).
+                Mitigation: raise the nodepool memory limit in IaC and reconcile
+                any live kubectl-patch drift; check ns bloat (GAP-3). See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#agentpoolmemorynearlimit"
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- if $ga.pvcObs.enabled }}
+          # ka-0000002737 — orphaned Pending PVCs (storage/EBS cost leak). Backed
+          # by the controller gauge gardenio_orphaned_pending_pvcs (PVCs stuck
+          # Pending past the orphan threshold with no consuming pod, re-derived
+          # every controller sweep; the in-chart vmagent has no KSM). The day-1
+          # cost-gardener survey found observability/tempo-0 (~200d) and dolt/redis-master-0
+          # (~148d) leaking silently. Threshold defaults to 0 so the alert fires
+          # on the FIRST confirmed orphan — one is already a leak worth an owner
+          # cleaning up. Prereq {{ $ga.pvcObs.prereqBead }}.
+          - alert: OrphanedPendingPVCs
+            expr: |
+              gardenio_orphaned_pending_pvcs > {{ $ga.pvcObs.threshold }}
+            for: {{ $ga.pvcObs.for | quote }}
+            labels:
+              severity: {{ $ga.pvcObs.severity | quote }}
+              component: gardenio
+              subsystem: storage-cost
+            annotations:
+              summary: "orphaned Pending PVCs >{{ $ga.pvcObs.threshold }} (storage cost leak)"
+              description: |
+                One or more PersistentVolumeClaims have been stuck Pending past
+                the orphan threshold with no consuming pod for {{ $ga.pvcObs.for }}
+                — a long-abandoned storage/EBS cost leak (the day-1 cost-gardener
+                survey found observability/tempo-0 ~200d and dolt/redis-master-0
+                ~148d). The oldest age is in
+                gardenio_orphaned_pending_pvc_max_age_seconds and the wasted
+                capacity in gardenio_orphaned_pending_pvc_requested_bytes; the
+                per-PVC gardenio_orphaned_pending_pvc_age_seconds{namespace,name,
+                storageclass} names exactly which claims to clean up.
+                Triage: confirm the consumer is truly gone/relocated, then have
+                the owning team delete the abandoned PVC. See runbook.
+              runbook_url: "{{ $ga.runbookBaseURL }}#orphanedpendingpvcs"
+              {{- if $beadURL }}
+              bead: {{ $beadURL | quote }}
+              {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /*
+  assistant-pane-alert.yaml — AssistantPaneSilent on the vmalert rule path
+  (ka-0000004766). The alert's canonical home is the PrometheusRule CRD
+  (templates/slack-bridge/assistant-pane-alert.yaml — full failure-mode +
+  tuning rationale there), but on new prod that CRD is INERT (converted to a
+  VMRule nobody evaluates — same reason the gap-alerts above are ConfigMap
+  keys). Render the SAME rule (shared define, zero drift) as a ConfigMap key
+  the vmalert -rule=/config/*.yaml glob loads, whenever the pane alert is
+  enabled and a notifier is wired (alerting rules without a notifier crashloop
+  vmalert). vmsingle has the gardenio_assistant_event_total series via the
+  slack-bridge pod's prometheus.io/scrape annotation, so the expr evaluates
+  against real history. Deliberately independent of gapAlerts.enabled — this
+  is the pane smoke check, not part of the starter pack.
+*/ -}}
+{{- if and .Values.slackBridge.metrics.prometheusRule.assistantPane.enabled $notifierAvailable }}
+  # AssistantPaneSilent on the fireable (ConfigMap) rule path — see
+  # templates/slack-bridge/assistant-pane-alert.yaml for the full rationale.
+  assistant-pane-alert.yaml: |
+    groups:
+      - name: gardenio.assistant_pane
+        interval: 1m
+        rules:
+          {{- include "gardenio.slackBridge.assistantPaneSilentRule" . | nindent 10 }}
+{{- end }}
+{{- /*
+  lands-slo.yaml — the Lands SLO recording rules and burn-rate alerts (Track B
+  §5.8, gd-rqtbyqCMZJ) on the vmalert rule path. Canonical home and rationale:
+  templates/_lands-slo.tpl, rendered also as the PrometheusRule CRD
+  templates/lands-slo-rules.yaml (inert where no VMAlert evaluates it). Same
+  define, zero drift; gated on a notifier like every alerting key here.
+*/ -}}
+{{- if and .Values.agents.metrics.prometheusRule.landsSLO.enabled $notifierAvailable }}
+  # Lands SLOs on the fireable (ConfigMap) rule path — see
+  # templates/_lands-slo.tpl for the full rationale.
+  lands-slo.yaml: |
+    groups:
+      {{- include "gardenio.landsSLO.groups" . | nindent 6 }}
+{{- end }}
+{{- /*
+  postgres-budgets.yaml — Postgres efficiency budgets on the postgres_exporter
+  series (gd-ylgk1jBhLi); rules and rationale in templates/_postgres-budgets.tpl.
+  Needs the exporter, and a notifier like every alerting key here.
+*/ -}}
+{{- if and .Values.vmalert.postgresBudgets.enabled .Values.postgres.enabled .Values.postgres.exporter.enabled $notifierAvailable }}
+  postgres-budgets.yaml: |
+    groups:
+      {{- include "gardenio.postgresBudgets.groups" . | nindent 6 }}
+{{- end }}
+{{- end }}

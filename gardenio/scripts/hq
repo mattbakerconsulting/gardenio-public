@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# hq -- operate the Gas City HQ host (terraform/modules/hq) from the laptop.
+#
+#   hq status              instance state/type/IP + on-host idle-stop inputs
+#   hq start               start a stopped instance and wait for SSM
+#   hq stop [--force]      stop it (refuses while agent sessions are active)
+#   hq resize TYPE [--force]  stop, change instance type, start (same guard)
+#   hq run 'CMD'           run a shell command on the host via SSM RunCommand
+#   hq shell               interactive SSM Session Manager shell (root)
+#   hq hold | hq unhold    set/clear /var/lib/hq/hold (idle-stop opt-out)
+#   hq log                 last idle-stop journal lines
+#   hq backup-status       /var/lib/hq/last-backup (gc-dolt-backup's one-line
+#                          status; gc doctor's bd-backup-freshness is blind)
+#
+# Discovery is by tag Name=gardenio-hq; nothing is hard-coded. Overrides:
+# AWS_PROFILE (gardenio), AWS_REGION (us-east-1), HQ_NAME (gardenio-hq).
+# After `hq resize`, set hq_instance_type in composition/gardenio (tfvars or
+# -var) so the next `terraform apply` does not resize it back.
+set -euo pipefail
+export AWS_PAGER=""
+PROFILE=${AWS_PROFILE:-gardenio}
+REGION=${AWS_REGION:-us-east-1}
+NAME=${HQ_NAME:-gardenio-hq}
+aws() { command aws --profile "${PROFILE}" --region "${REGION}" "$@"; }
+die() { echo "hq: $*" >&2; exit 1; }
+
+instance_id() {
+  local id
+  id=$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${NAME}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[].Instances[].InstanceId' --output text)
+  [ -n "${id}" ] && [ "${id}" != "None" ] || die "no instance tagged Name=${NAME} (profile ${PROFILE}, ${REGION})"
+  echo "${id}"
+}
+
+describe() {
+  aws ec2 describe-instances --instance-ids "$1" \
+    --query 'Reservations[0].Instances[0].[State.Name,InstanceType,PublicIpAddress,PrivateIpAddress,LaunchTime]' \
+    --output text
+}
+
+# ssm_run ID 'CMD' [timeout-s]: run via AWS-RunShellScript, poll, print output.
+ssm_run() {
+  local id=$1 cmd=$2 timeout=${3:-300} cid status
+  # SSM validates --comment against ^.{0,100}$ and "." does not match a
+  # newline, so ANY multi-line command fails validation with an error that
+  # reads like a length problem. Flatten whitespace before truncating.
+  local label params
+  label=$(printf '%s' "${cmd}" | tr '\n\r\t' '   ' | cut -c1-80)
+  # Build the parameters as real JSON rather than escaping quotes by hand:
+  # the hand-rolled form could not carry newlines either, which forced
+  # base64 workarounds for multi-line payloads.
+  params=$(jq -nc --arg c "${cmd}" '{commands:[$c]}')
+  cid=$(aws ssm send-command --instance-ids "${id}" --document-name AWS-RunShellScript \
+    --comment "hq: ${label}" --timeout-seconds "${timeout}" \
+    --parameters "${params}" \
+    --query Command.CommandId --output text)
+  for _ in $(seq 1 $((timeout / 2 + 5))); do
+    status=$(aws ssm get-command-invocation --command-id "${cid}" --instance-id "${id}" \
+      --query Status --output text 2>/dev/null || echo Pending)
+    case "${status}" in Pending|InProgress|Delayed) sleep 2 ;; *) break ;; esac
+  done
+  aws ssm get-command-invocation --command-id "${cid}" --instance-id "${id}" \
+    --query '[StandardOutputContent,StandardErrorContent]' --output text | sed '/^$/d'
+  [ "${status}" = Success ] || die "ssm command ${cid} ended ${status}"
+}
+
+wait_ssm() {
+  local id=$1
+  echo "waiting for SSM agent on ${id} ..."
+  for _ in $(seq 1 60); do
+    if aws ssm describe-instance-information --filters "Key=InstanceIds,Values=${id}" \
+      --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null | grep -q Online; then
+      return 0
+    fi
+    sleep 5
+  done
+  die "SSM agent did not come online"
+}
+
+# active_sessions ID: prints the idle-stop check JSON; exit 1 if active.
+guard_idle() {
+  local id=$1 force=$2 check
+  [ "${force}" = true ] && return 0
+  check=$(ssm_run "${id}" 'hq-idle-stop check' 60) || die "could not query idle state (use --force to skip)"
+  echo "${check}"
+  if [ "$(echo "${check}" | jq -r .sessions)" != "0" ] || [ "$(echo "${check}" | jq -r .sessions_unknown)" = true ]; then
+    die "agent sessions are active on the host; refusing (use --force to override)"
+  fi
+}
+
+cmd_status() {
+  local id state
+  id=$(instance_id)
+  read -r state type pub priv launched <<<"$(describe "${id}")"
+  echo "instance:  ${id}"
+  echo "state:     ${state}"
+  echo "type:      ${type}"
+  echo "public ip: ${pub}"
+  echo "private:   ${priv}"
+  echo "launched:  ${launched}"
+  if [ "${state}" = running ]; then
+    echo "idle-stop: $(ssm_run "${id}" 'hq-idle-stop check' 60 2>/dev/null || echo '(ssm not reachable yet)')"
+  else
+    echo "idle-stop: n/a (instance ${state}); \`hq start\` to boot it"
+  fi
+}
+
+cmd_start() {
+  local id state
+  id=$(instance_id)
+  state=$(describe "${id}" | cut -f1)
+  case "${state}" in
+    running) echo "${id} already running" ;;
+    stopped) aws ec2 start-instances --instance-ids "${id}" --query 'StartingInstances[0].CurrentState.Name' --output text
+             aws ec2 wait instance-running --instance-ids "${id}" ;;
+    *) die "instance is ${state}; try again shortly" ;;
+  esac
+  wait_ssm "${id}"
+  cmd_status
+}
+
+cmd_stop() {
+  local id force=false
+  [ "${1:-}" = --force ] && force=true
+  id=$(instance_id)
+  [ "$(describe "${id}" | cut -f1)" = running ] || { echo "${id} not running"; return 0; }
+  guard_idle "${id}" "${force}"
+  # Graceful: let the supervisor and tmux sessions get SIGTERM from systemd.
+  ssm_run "${id}" 'systemctl poweroff' 30 >/dev/null || true
+  aws ec2 wait instance-stopped --instance-ids "${id}"
+  echo "${id} stopped (EBS persists; compute billing ended)"
+}
+
+cmd_resize() {
+  local type=${1:-} force=false id
+  [ -n "${type}" ] || die "usage: hq resize <instance-type> [--force]"
+  [ "${2:-}" = --force ] && force=true
+  id=$(instance_id)
+  if [ "$(describe "${id}" | cut -f1)" = running ]; then
+    guard_idle "${id}" "${force}"
+    ssm_run "${id}" 'systemctl poweroff' 30 >/dev/null || true
+  fi
+  aws ec2 wait instance-stopped --instance-ids "${id}"
+  aws ec2 modify-instance-attribute --instance-id "${id}" --instance-type "{\"Value\":\"${type}\"}"
+  aws ec2 start-instances --instance-ids "${id}" >/dev/null
+  aws ec2 wait instance-running --instance-ids "${id}"
+  wait_ssm "${id}"
+  cmd_status
+  echo
+  echo "NOTE: set hq_instance_type = \"${type}\" in terraform/composition/gardenio (tfvars or -var)"
+  echo "      or the next terraform apply will change it back."
+}
+
+case "${1:-}" in
+  status) cmd_status ;;
+  start) cmd_start ;;
+  stop) shift; cmd_stop "$@" ;;
+  resize) shift; cmd_resize "$@" ;;
+  run) shift; [ $# -ge 1 ] || die "usage: hq run 'CMD'"; ssm_run "$(instance_id)" "$1" "${2:-300}" ;;
+  shell) aws ssm start-session --target "$(instance_id)" ;;
+  hold) ssm_run "$(instance_id)" 'touch /var/lib/hq/hold && echo hold set' 30 ;;
+  unhold) ssm_run "$(instance_id)" 'rm -f /var/lib/hq/hold && echo hold cleared' 30 ;;
+  log) ssm_run "$(instance_id)" 'journalctl -t hq-idle-stop --no-pager -n 20' 30 ;;
+  backup-status) ssm_run "$(instance_id)" 'cat /var/lib/hq/last-backup 2>/dev/null || echo "no backup has run yet"; journalctl -t gc-dolt-backup --no-pager -n 3 -o short-iso' 30 ;;
+  *) sed -n '2,18p' "$0"; exit 2 ;;
+esac

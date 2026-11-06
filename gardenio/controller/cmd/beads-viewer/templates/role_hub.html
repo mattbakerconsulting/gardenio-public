@@ -1,0 +1,157 @@
+{{template "layout" .}}
+{{define "title"}}{{.Role.Name}} · Role · Beads Viewer{{end}}
+{{define "content"}}
+{{- $role := .Role -}}
+{{- $base := .BasePath -}}
+<span class="wide-page" hidden></span>
+
+<nav class="crumbs" aria-label="Breadcrumb">
+  <a href="{{$base}}/agents">Agents</a> &rsaquo; <span>Role</span>
+</nav>
+
+{{/* Role hub at /role/<name> (epic ka-0000001026, design doc §8.5). The
+     role-side mirror of /p/<project>: one ROLE across every project. The header
+     reuses the advice-scope "Role: <name>" vocabulary (advice/matching.go) so
+     this page reads identically to the advice tab's role group. */}}
+<h1 class="role-hub-title">
+  {{.ScopeHeader}}
+  {{if $role.Found}}<span class="chip chip-type">type:role</span>
+  {{else}}<span class="chip chip-type role-hub-badge-unregistered" title="No type:role config bead carries this title — this is a label-only or builtin role. Agents and role-scoped config/advice still render below.">no role bead</span>{{end}}
+</h1>
+
+{{/* (b) Resolved type:role overrides — the pod-spec overrides this role layers
+       on at spawn (precedence: global < project < role < agent). Secrets are
+       carried BY NAME ONLY; the hub never renders a secret value. */}}
+<section class="role-hub-section role-hub-overrides">
+  <h2>Resolved overrides</h2>
+  {{if $role.Found}}
+    {{if $role.Overrides}}
+    <dl class="role-hub-override-list">
+      {{range $role.Overrides}}
+      <dt>{{.Label}}</dt><dd>{{.Value}}</dd>
+      {{end}}
+    </dl>
+    {{else}}
+    <p class="empty">This role declares no scalar pod overrides.</p>
+    {{end}}
+
+    {{if $role.Secrets}}
+    <h3>Secrets <span class="role-hub-note">(by name only)</span></h3>
+    <ul class="bead-list role-hub-secrets">
+      {{range $role.Secrets}}
+      <li class="bead-row">
+        <code>{{.Env}}</code>
+        <span class="meta">&larr; secret <code>{{.Secret}}</code>{{if .Key}} key <code>{{.Key}}</code>{{end}}</span>
+      </li>
+      {{end}}
+    </ul>
+    {{end}}
+
+    {{if $role.EnvVars}}
+    <h3>Env</h3>
+    <ul class="bead-list role-hub-envvars">
+      {{range $role.EnvVars}}
+      <li class="bead-row"><code>{{.Name}}</code><span class="meta">{{.Value}}</span></li>
+      {{end}}
+    </ul>
+    {{end}}
+
+    {{if $role.EnvOverrideKeys}}
+    <h3>Env overrides <span class="role-hub-note">(keys only)</span></h3>
+    <p class="role-hub-keylist">{{range $i, $k := $role.EnvOverrideKeys}}{{if $i}}, {{end}}<code>{{$k}}</code>{{end}}</p>
+    {{end}}
+
+    {{if $role.ClaudeConfigKeys}}
+    <h3>claude_config <span class="role-hub-note">(keys only)</span></h3>
+    <p class="role-hub-keylist">{{range $i, $k := $role.ClaudeConfigKeys}}{{if $i}}, {{end}}<code>{{$k}}</code>{{end}}</p>
+    {{end}}
+
+    {{if $role.AccountWhitelist}}
+    <h3>Account whitelist</h3>
+    <p class="role-hub-keylist">{{range $i, $a := $role.AccountWhitelist}}{{if $i}}, {{end}}<code>{{$a}}</code>{{end}}</p>
+    {{end}}
+
+    {{/* Per-role skill toggle (Adam feedback #1, epic ka-0000004989). Enabled
+         is an allow-list (empty = all discovered skills on); Disabled is a
+         deny-list that wins over the allow-list. Names match the LINKED skill
+         name Claude Code discovers (sibling-repo skills prefixed "{repo}-"). */}}
+    {{if $role.EnabledSkills}}
+    <h3>Skills enabled <span class="role-hub-note">(allow-list)</span></h3>
+    <p class="role-hub-keylist">{{range $i, $s := $role.EnabledSkills}}{{if $i}}, {{end}}<code>{{$s}}</code>{{end}}</p>
+    {{end}}
+
+    {{if $role.DisabledSkills}}
+    <h3>Skills disabled <span class="role-hub-note">(deny-list)</span></h3>
+    <p class="role-hub-keylist">{{range $i, $s := $role.DisabledSkills}}{{if $i}}, {{end}}<code>{{$s}}</code>{{end}}</p>
+    {{end}}
+
+    {{/* Per-role sub-agent toggle (ka-0000006908) — the agents-subdir analogue
+         of the skill toggle, same allow/deny semantics and linked-name matching. */}}
+    {{if $role.EnabledAgents}}
+    <h3>Sub-agents enabled <span class="role-hub-note">(allow-list)</span></h3>
+    <p class="role-hub-keylist">{{range $i, $s := $role.EnabledAgents}}{{if $i}}, {{end}}<code>{{$s}}</code>{{end}}</p>
+    {{end}}
+
+    {{if $role.DisabledAgents}}
+    <h3>Sub-agents disabled <span class="role-hub-note">(deny-list)</span></h3>
+    <p class="role-hub-keylist">{{range $i, $s := $role.DisabledAgents}}{{if $i}}, {{end}}<code>{{$s}}</code>{{end}}</p>
+    {{end}}
+  {{else}}
+  <p class="empty">No <code>type:role</code> bead is registered for this role, so it carries no resolved overrides. Pods spawned with this role fall back to project + global defaults.</p>
+  {{end}}
+</section>
+
+{{/* (a) Cross-project agents — lazy shell. The one expensive, fan-out section
+       (two queries across every project), so it loads as an HTMX fragment on
+       reveal (gardener-page eager-head + lazy-tail skeleton). intersect (not
+       revealed) so a shell that is already on-screen at load still fires
+       (ka-0000003717). */}}
+<div class="role-hub-section-lazy"
+     id="{{.AgentsSlug}}"
+     hx-get="{{.AgentsLazyURL}}"
+     hx-trigger="intersect once"
+     hx-swap="outerHTML">
+  <h2>Agents with this role</h2>
+  <p class="empty">Loading agents…</p>
+</div>
+
+{{/* (c) Role-scoped config + advice — the role:<name>-labelled config and
+       advice beads that delivery matches into every session for this role
+       (advice/matching.go). */}}
+<section class="role-hub-section role-hub-config">
+  <h2>Role-scoped config</h2>
+  {{if $role.Config}}
+  <ul class="bead-list role-hub-config-list">
+    {{range $role.Config}}
+    <li class="bead-row">
+      <a href="{{$base}}/{{.ID}}"><code>{{.ID}}</code></a>
+      <span class="bead-row-title">{{.Title}}</span>
+      {{if .Type}}<span class="bead-row-type">{{.Type}}</span>{{end}}
+      {{if .Status}}<span class="bead-row-status">{{.Status}}</span>{{end}}
+      <span class="meta">{{.Ago}}</span>
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p class="empty">No role-scoped config beads.</p>
+  {{end}}
+</section>
+
+<section class="role-hub-section role-hub-advice">
+  <h2>Role-scoped advice</h2>
+  {{if $role.Advice}}
+  <ul class="bead-list role-hub-advice-list">
+    {{range $role.Advice}}
+    <li class="bead-row">
+      <a href="{{$base}}/{{.ID}}"><code>{{.ID}}</code></a>
+      <span class="bead-row-title">{{.Title}}</span>
+      {{if .Status}}<span class="bead-row-status">{{.Status}}</span>{{end}}
+      <span class="meta">{{.Ago}}</span>
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p class="empty">No role-scoped advice beads.</p>
+  {{end}}
+</section>
+{{end}}

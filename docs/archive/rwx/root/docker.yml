@@ -1,0 +1,3741 @@
+# OCI image builds for gardenio monorepo — crane-based push to container registry.
+#
+# Architecture:
+#   build-* tasks     -> compile binaries as artifacts (cached by filters)
+#   agent-install-*   -> 8 parallel cached agent layer installs
+#   push-agent-base   -> cached base image from agent-install-* layers (~1.8 GB)
+#   push-*  tasks     -> crane-append layers to base images, push to $IMAGE_REGISTRY
+#   promote-images    -> promote RC tags to final calver (after E2E; :latest retired)
+#
+# Agent image optimization:
+#   The agent image is split into two layers to avoid uploading ~1.9 GB on every commit:
+#   1. agent-base — contains all 8 agent-install layers + system config (cached by filter)
+#   2. agent     — thin overlay with project binaries, hooks, config (~50-100 MB)
+#   On typical commits (no install script changes), push-agent uploads only the overlay,
+#   reducing push time from ~17 min to ~1-2 min.
+#
+# Registry target defaults to registry.gitlab.com/acme/platform/gardenio via
+# bash ${:-} defaults, with GHCR fallback for auth if REGISTRY_USER/TOKEN not set.
+# Vault secrets: IMAGE_REGISTRY, REGISTRY_USER, REGISTRY_TOKEN.
+#
+# Images produced (all under $IMAGE_REGISTRY/):
+#   push-controller     -> controller
+#   push-agent-base     -> agent-base (7 install layers, cached, ~1.8 GB)
+#   push-agent          -> agent (thin overlay on agent-base, ~50-100 MB)
+#   push-slack-bridge   -> slack-bridge
+#   push-jira-bridge    -> jira-bridge
+#   push-gitlab-bridge  -> gitlab-bridge
+#   push-roles-server   -> roles-server
+#   push-claudemore     -> claudemore (Phase1 MVP, Messages-API proxy fronting litellm)
+#   push-beads-viewer   -> beads-viewer
+#   push-repro-cockpit  -> repro-cockpit (read-only repro-run observation UI)
+#   push-trigger-engine -> trigger-engine
+#   push-edge-auth      -> edge-auth (Stage 3 CLI auth-shim)
+#   push-scif-portal    -> scif-portal (acme-scif v1.1 Phase D approval portal)
+#   push-grafana-bridge -> grafana-bridge (Phase1 W2, beads↔Grafana)
+#   push-grafana-assistant-plugin -> grafana-assistant-plugin (C4, Path C chat-box dist)
+#   push-grafana-llm-app-plugin -> grafana-llm-app-plugin (C6 prereq, pinned LLM-app dist)
+#   push-grafana-vl-datasource-plugin -> grafana-vl-datasource-plugin (Phase-2 forensics, pinned VictoriaLogs datasource dist)
+#   push-geo-table      -> geo-table (edge-IDP L1b, full CIDR->{ASN,country} geo table for the shipper enrichment)
+#   push-alertmanager-bridge -> alertmanager-bridge (Phase1 W3, beads↔alerts)
+#   push-idp-log-shipper -> idp-log-shipper (IDP Phase-2 CloudWatch->VictoriaLogs transport)
+#   push-ava-log-shipper -> ava-log-shipper (edge-IDP apex AVA-OCSF-accesslog->VictoriaLogs transport)
+#   push-traefik-log-shipper -> traefik-log-shipper (edge-IDP L0 Traefik-accesslog->VictoriaLogs transport)
+#   push-bridge-log-shipper -> bridge-log-shipper (non-AVA webhook-audit: jira/gitlab-bridge stdout->VictoriaLogs)
+#   push-core-log-shipper -> core-log-shipper (gb logs WRITE side: controller/slack-bridge/trigger-engine/grafana-bridge stdout->VictoriaLogs, redacted)
+#   push-kbeads         -> kbeads
+#   push-coop           -> coop (coopmux)
+#   push-ci-runner      -> ci-runner (deploy/E2E tools: helm, kubectl, AWS CLI, Go)
+#
+# Image tag strategy (mutable :latest retired — F7 ka-0000006416):
+#   Main push:  main-<short-sha>             (unique per commit, always pullable)
+#   Tag push:   <calver>-rc                  (release candidate, pre-validation)
+#   Promote:    <calver>-rc → <calver>       (after all pushes / E2E gate; the
+#                                             immutable digest is recorded so the
+#                                             release deploys/pins by digest)
+#   CLI build:  cli                          (feature branch agent-only)
+#   No first-party image is retagged :latest anymore — a floating :latest is a
+#   registry-write attack surface and no deploy path consumes it. The build-cache
+#   base agent-base:latest (push-agent-base) is unrelated and intentionally kept.
+#
+# Key monorepo improvement: coop and kd are built FROM SOURCE, not downloaded
+# from GitHub releases. No cross-repo dispatch needed.
+#
+# Feature branch builds (agent-only):
+#   rwx run .rwx/docker.yml --init build-target=agent
+#   Builds and pushes only the agent image, tagged "cli".
+
+on:
+  # Event triggers in this file are scoped to image builds + ungated PR/MR
+  # fanout. The GitLab-CI dispatch chain in .gitlab-ci.yml (epic
+  # ka-0000000408) is the single source of truth for *gated* stages on
+  # main/tag refs (build → dispatch deploy-rwx → dispatch smoke/e2e,
+  # each a native GitLab job with native commit status). docker.yml only
+  # produces image artifacts for those refs — no status-checks, no
+  # smoke-rwx, no promote-images gating from the trigger here.
+  #
+  # `status-checks: false` on push + tag-push is load-bearing: RWX posts a
+  # DEFAULT status check ("RWX: docker.yml (push/tag-push)") unless you
+  # explicitly disable it. Without this, a transient image-push flake (e.g.
+  # a registry BLOB_UPLOAD_UNKNOWN on one of ~50 push-* tasks) reddens the
+  # whole GitLab pipeline for main/tag even though the gated dispatch chain
+  # is fine — a false release-blocker (ka-0000006462, pipeline 2720727317).
+  #
+  # Path A from ka-0000000395 / decision ka-0000004455 (ka-0000000927):
+  # restore on.gitlab.push + on.gitlab.tag-push for image builds, drop
+  # on.github.push entirely so the (12-days-stale) groblegark/gardenio
+  # mirror is no longer load-bearing for releases. GitHub PR fanout
+  # remains because PRs originate on the GitHub side of the mirror.
+  gitlab:
+    push:
+      if: ${{ event.git.branch == 'main' }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: ${{ event.git.ref }}
+        build-target: all
+        cover: ""
+        force-deploy: ""
+        # mr-iid keys the per-MR cancel-running concurrency pool below.
+        # "" on non-MR triggers → they never join a pool (ka-0000002755).
+        mr-iid: ""
+      # Image builds only — the .gitlab-ci.yml dispatch chain gates main.
+      status-checks: false
+    tag-push:
+      if: ${{ starts-with(event.git.tag, '20') }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: ${{ event.git.ref }}
+        build-target: all
+        cover: ""
+        force-deploy: ""
+        mr-iid: ""
+      # Image builds only — the .gitlab-ci.yml dispatch chain gates tags.
+      status-checks: false
+    merge-request:
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: pr
+        build-target: all
+        cover: ""
+        force-deploy: ""
+        # Populated only here → GitLab MR re-pushes supersede (ka-0000002755).
+        mr-iid: ${{ event.gitlab.merge-request.object_attributes.iid }}
+      status-checks:
+        - tasks: [build-go-binaries, build-coop, build-kd, validate-agent, build-grafana-assistant-plugin, build-grafana-llm-app-plugin, build-grafana-vl-datasource-plugin]
+          name: Docker
+  github:
+    pull_request:
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: pr
+        build-target: all
+        cover: ""
+        force-deploy: ""
+        # GitHub PRs stay OUT of the pool (mr-iid="") — a GitLab MR iid and an
+        # unrelated GitHub PR number could collide on the same small integer
+        # and cross-cancel. The agent-throughput burn is GitLab MRs; scope the
+        # supersede there only (ka-0000002755).
+        mr-iid: ""
+      status-checks:
+        - tasks: [build-go-binaries, build-coop, build-kd, validate-agent, build-grafana-assistant-plugin, build-grafana-llm-app-plugin, build-grafana-vl-datasource-plugin]
+          name: Docker
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      ref-name: cli
+      build-target: all
+      cover: ""
+      force-deploy: ""
+      mr-iid: ""
+
+  # Coverage build: rwx run .rwx/docker.yml --init cover=1
+  # Produces coverage-instrumented binaries that write profiling data at runtime.
+  # Go binaries: set GOCOVERDIR=/path/to/dir before running.
+  # Rust binaries: set LLVM_PROFILE_FILE=/path/to/%p-%m.profraw before running.
+
+# ── Cancel superseded MR image builds (ka-0000002755) ─────────────────
+# Same CI-burn lever as ci.yml's per-MR pool: the 7 image-build tasks
+# (build-go-binaries, build-coop, build-kd, validate-agent, 3× grafana
+# plugins) are the heaviest per-push cost, and an agent re-pushing to an
+# open MR left the prior commit's whole fanout building to completion for
+# a commit that can never merge. Key on the GitLab MR iid so re-pushes to
+# the SAME MR share one pool; capacity:1 + cancel-running cancels the older
+# in-flight build when a newer push starts (RWX feature-branch pattern,
+# https://www.rwx.com/docs/rwx/concurrency-pools).
+#
+# Scoped to GitLab MR events ONLY (`init.mr-iid != ""`): main push, tag-push,
+# GitHub PR, and cli all pass mr-iid="" and are EXCLUDED — main/tag image
+# builds must always run to completion (the release/deploy chain pulls those
+# tags), and GitHub PR numbers are kept out to avoid a small-integer collision
+# with a GitLab MR iid.
+concurrency-pools:
+  - id: Acme/Platform/gardenio:docker-mr-${{ init.mr-iid }}
+    if: ${{ init.mr-iid != "" }}
+    capacity: 1
+    on-overflow: cancel-running
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+# Incremental build cache for tasks that opt in via `tool-cache: <task-key>`.
+# Vault is unlocked on protected branches (main, tags) so they populate the
+# cache; feature branches read from it but don't write back. See:
+# https://www.rwx.com/docs/tool-caches
+tool-cache:
+  vault: gardenio-main
+
+tasks:
+  # ═══════════════════════════════════════════════════════════════════════
+  # Build tasks — compile all binaries in parallel, output artifacts
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── Clone gardenio monorepo (retry-wrapped) ─────────────────────────
+  # Hand-rolled shallow clone with a bounded retry loop instead of
+  # `call: git/clone`. The stock package (through 2.0.8) has NO retry and
+  # RWX has no task-level auto-retry, so a single transient gitlab.com blip
+  # during fetch-pack (`Connection to gitlab.com closed by remote host`,
+  # exit 128) fails the whole run and cascades into verify-images →
+  # promotion blocks (ka-0000003035 / ka-0000007550).
+  #
+  # The fetch also carries http.lowSpeedLimit/lowSpeedTime (ka-0000007824):
+  # the retry loop only fires on a fetch that FAILS, so a connection that
+  # STALLS mid-fetch (no bytes, no EOF) would otherwise hang until the RWX
+  # task timeout with no retry. lowSpeedLimit=1000 bytes/s over
+  # lowSpeedTime=20s aborts a stalled fetch with a non-zero exit, converting
+  # the stall variant of the transient-EOF class into a retriable failure.
+  #
+  # Parity with `git/clone` DEFAULTS (which is all this task used):
+  #   * shallow `--depth=1` fetch of the exact SHA (init.commit-sha is a
+  #     40-hex commit, so no ls-remote ref resolution is needed)
+  #   * detached checkout at that SHA
+  #   * `.git` stripped afterwards (cleanup-git-dir default) so downstream
+  #     content-filtered tasks keep identical cache keys / build times
+  #   * no submodules (repo has none), no LFS (repo uses none).
+  # Token auth stays in the repository URL (oauth2:${GITLAB_CLONE_TOKEN}),
+  # exactly as before — no ssh-key plumbing (the May task note is stale).
+  #
+  # This task ALSO emits the resolved COMMIT sha as a task value (sha). A
+  # hand-rolled clone does NOT provide git/clone's RWX_GIT_COMMIT_SHA, so
+  # resolve-commit — which used to read that var — reads tasks.code.values.sha
+  # instead. The peel-to-commit must happen here, the only task where `.git`
+  # still exists (it is stripped below). Without this, the var'less clone left
+  # resolve-commit reading an unset RWX_GIT_COMMIT_SHA, aborting every
+  # tag/main release build under `set -eu` with
+  # `RWX_GIT_COMMIT_SHA: unbound variable`, cascading to verify-images /
+  # deploy-ephemeral (ka-0000007563, regression from ka-0000007550).
+  - key: code
+    run: |
+      set -eu
+      : "${GITLAB_CLONE_TOKEN:?GITLAB_CLONE_TOKEN is required}"
+      REPO="https://oauth2:${GITLAB_CLONE_TOKEN}@gitlab.com/Acme/Platform/gardenio.git"
+      SHA="${COMMIT_SHA}"
+      MAX_ATTEMPTS=5
+
+      # Redact the token from any tracing/output; never echo $REPO.
+      git init -q -b main
+      git remote add origin "$REPO"
+      git config --local maintenance.auto false
+      git config --local gc.auto 0
+
+      attempt=1
+      while :; do
+        echo "git-clone attempt ${attempt}/${MAX_ATTEMPTS} for ${SHA}"
+        if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch --no-auto-gc --depth=1 origin "+${SHA}:refs/rwx/git-clone/checkout"; then
+          echo "git-clone: fetch succeeded on attempt ${attempt}"
+          break
+        else
+          rc=$?
+          if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+            echo "git-clone: fetch FAILED after ${MAX_ATTEMPTS} attempts (last exit ${rc})" >&2
+            exit "$rc"
+          fi
+          # Exponential backoff: 5s, 10s, 20s, 40s.
+          sleep_s=$((5 * (1 << (attempt - 1))))
+          echo "git-clone: fetch failed (exit ${rc}); retrying in ${sleep_s}s" >&2
+          sleep "$sleep_s"
+          attempt=$((attempt + 1))
+        fi
+      done
+
+      git checkout -q --detach "$(git rev-parse refs/rwx/git-clone/checkout^{commit})"
+      git clean -fdq
+      echo "Checked out git repository at $(git rev-parse HEAD)"
+
+      # Emit the resolved COMMIT sha for resolve-commit / downstream image
+      # labels. `HEAD` is the peeled commit (the fetch/checkout above already
+      # dereferenced any annotated/signed tag via ^{commit}), so this is the
+      # correct OCI image.revision on every ref shape — lightweight tag,
+      # annotated/signed tag, branch, PR (ka-0000007563 / ka-0000004286).
+      git rev-parse HEAD > "$RWX_VALUES/sha"
+
+      # Strip .git for cache-key parity with git/clone's cleanup-git-dir default.
+      rm -rf .git
+    env:
+      GITLAB_CLONE_TOKEN:
+        value: ${{ secrets.GITLAB_CLONE_TOKEN }}
+        cache-key: excluded
+      COMMIT_SHA: ${{ init.commit-sha }}
+
+  # ── Resolve the pushed ref to its underlying COMMIT sha ──────────────
+  # The `code` task's tasks.code.values.sha is the *resolved commit*: for an
+  # ANNOTATED tag its fetch/checkout dereferences the tag object to the
+  # commit it points at (git rev-parse <tag>^{commit}), and it emits HEAD.
+  # init.commit-sha (= event.git.sha) is instead the pushed ref object
+  # itself — for an annotated tag that is the ANNOTATED TAG OBJECT sha, NOT
+  # a commit (git rev-parse <tag> vs <tag>^{commit}).
+  #
+  # Stamping the tag-object sha into org.opencontainers.image.revision
+  # made every -rc image mismatch the promote-time release-integrity gate
+  # (ka-0000004203 in .rwx/promote.yml), which asserts each -rc image's
+  # revision == the tag's COMMIT (the gate is dispatched with --ref $TAG,
+  # so RWX resolves it to the commit). Tags 2026.219.9 / .10 failed@promote
+  # for exactly this — they are the first ANNOTATED (signed) release tags,
+  # a regression from e0d37b8db (fix/ka-0000005321, "SSH-sign release
+  # commit + tag"; -m/-s makes the tag annotated even unsigned). Every
+  # prior release tag was lightweight, so tag-object == commit and the
+  # label happened to match.
+  #
+  # Re-emit the resolved commit (from tasks.code.values.sha) as this task's
+  # own value so the ~37 downstream image/build tasks keep consuming a
+  # single stable ref (tasks.resolve-commit.values.sha) unchanged. This used
+  # to read git/clone's RWX_GIT_COMMIT_SHA; the retry-wrapped hand-rolled
+  # clone (ka-0000007550) no longer provides that var, so resolve-commit
+  # aborted under `set -eu` with `RWX_GIT_COMMIT_SHA: unbound variable`,
+  # cascading to verify-images / deploy-ephemeral (ka-0000007563). For
+  # branch / PR / cli refs the pushed ref is already a commit, so this
+  # equals init.commit-sha — no behavior change off the tag path.
+  # ka-0000004286.
+  - key: resolve-commit
+    use: [code]
+    cache: false
+    run: |
+      set -eu
+      : "${CODE_SHA:?resolve-commit: tasks.code.values.sha is empty}"
+      printf '%s' "$CODE_SHA" > "$RWX_VALUES/sha"
+      echo "resolved commit sha=${CODE_SHA} (pushed ref init.commit-sha=${INIT_COMMIT_SHA})"
+    env:
+      CODE_SHA: ${{ tasks.code.values.sha }}
+      INIT_COMMIT_SHA: ${{ init.commit-sha }}
+
+  # ── Go toolchain ───────────────────────────────────────────────────
+  - key: go
+    call: golang/install 1.2.1
+    with:
+      go-version: "1.25"
+
+  # ── Rust toolchain (for coop) ──────────────────────────────────────
+  # Pin version to match coop/rust-toolchain.toml and ci.yml.
+  # Without pinning, every Rust stable release changes the rustc binary
+  # hash, invalidating all Cargo fingerprints in coop-precompiled cache.
+  #
+  # No `filter:` — the previous filter pinned cache keys to two files but RWX
+  # already cache-busts a task when the run script (i.e. the rustup version
+  # string) changes, so the filter was redundant and Tommy flagged it as wrong
+  # cache pinning that prevented the toolchain layer from being shared cleanly.
+  - key: rust
+    run: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 -c rustfmt -c clippy -c llvm-tools
+      . "$HOME/.cargo/env"
+      rustc --version
+      sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config libssl-dev
+
+  # ── Controller Go mod download (cached) ─────────────────────────────
+  - key: gardenio-deps
+    use: [code, go]
+    run: |
+      cd gardenio/controller && GOWORK=off go mod download
+    filter:
+      - gardenio/controller/go.mod
+      - gardenio/controller/go.sum
+      # controller go.mod has `replace gardenio/clicreds =>
+      # ../clicreds`; without the local module's go.mod/go.sum in the task
+      # workspace the RWX filter drops it and `go mod download` FATALs
+      # "open .../gardenio/clicreds/go.mod: no such file or directory", so no
+      # images get pushed (ka-0000003839).
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+
+  # ── kbeads Go mod download (cached) ─────────────────────────────────
+  - key: kbeads-deps
+    use: [code, go]
+    run: cd kbeads && go mod download
+    filter:
+      - kbeads/go.mod
+      - kbeads/go.sum
+      # kbeads go.mod has `replace gardenio/clicreds =>
+      # ../gardenio/clicreds` — same local-module materialization need as
+      # gardenio-deps above (ka-0000003839).
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+
+  # ── Coop pre-compiled external deps ─────────────────────────────────
+  # Stubs out workspace crate sources (fn main(){} / empty lib) so only
+  # external deps are compiled and cached. Re-runs only when Cargo.lock,
+  # Cargo.toml files, or proto definitions change — not on every .rs edit.
+  - key: coop-precompiled
+    use: [code, rust]
+    timeout: 25m
+    # Heavy data mover: cargo fetches and compiles ~600 external crates,
+    # producing ~3GB of intermediate artifacts that we tar into precompiled-tar.
+    # Bigger agent + tmpfs keeps the workspace in RAM (no spill to disk).
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    filter:
+      - coop/Cargo.lock
+      - coop/**/Cargo.toml
+      - coop/proto/**
+      - coop/rust-toolchain.toml
+      - .rwx/coop-precompiled.epoch
+    run: |
+      . "$HOME/.cargo/env"
+      export RUSTC_WRAPPER=""
+      cd coop
+      # Remove tests/specs from the workspace before any cargo command.
+      # Cargo requires src/lib.rs to exist to auto-discover targets, but .rs
+      # files aren't in our filter so the file is absent in this task.
+      # Back up Cargo.toml, then remove tests/specs from the workspace.
+      # Cargo requires src/lib.rs to exist to auto-discover targets, but .rs
+      # files aren't in our filter so the file is absent in this task.
+      cp Cargo.toml Cargo.toml.orig
+      sed -i '/"tests\/specs"/d' Cargo.toml
+      cargo fetch
+      # Stub workspace crate sources — valid Rust, no cross-workspace deps.
+      # src/ dirs don't exist (no .rs files in filter), so mkdir -p first.
+      mkdir -p crates/cli/src crates/mux/src
+      printf 'fn main() {}\n' > crates/cli/src/main.rs
+      printf ''               > crates/cli/src/lib.rs
+      printf 'fn main() {}\n' > crates/mux/src/main.rs
+      printf ''               > crates/mux/src/lib.rs
+      CARGO_TARGET_DIR=/tmp/coop-target cargo build --release --workspace
+      # Restore original files so they don't leak into the layer and
+      # overwrite real sources/config in downstream tasks that `use` this task.
+      mv Cargo.toml.orig Cargo.toml
+      rm -f crates/cli/src/main.rs crates/cli/src/lib.rs \
+            crates/mux/src/main.rs crates/mux/src/lib.rs
+      cd ..
+      # Purge ALL workspace crate artifacts so build-coop is forced to
+      # recompile the real workspace crates. This includes:
+      #   - stub binaries (coop, coopmux)
+      #   - stub .rlib/.rmeta/.d files in deps/
+      #   - fingerprints that would tell cargo the stubs are up-to-date
+      rm -f /tmp/coop-target/release/coop /tmp/coop-target/release/coopmux
+      rm -rf /tmp/coop-target/release/.fingerprint/coop-* \
+             /tmp/coop-target/release/.fingerprint/coopmux-*
+      rm -f /tmp/coop-target/release/deps/coop-* \
+            /tmp/coop-target/release/deps/coopmux-* \
+            /tmp/coop-target/release/deps/libcoop-* \
+            /tmp/coop-target/release/deps/libcoopmux-*
+      # Only pack the three subdirs that Cargo uses for incremental reuse:
+      #   deps/        — compiled .rlib / .rmeta files (external deps only)
+      #   build/       — build-script outputs (bindgen, protobuf, etc.)
+      #   .fingerprint — change-detection records (workspace crates excluded)
+      # This skips the stub binaries and per-crate incremental data, reducing
+      # artifact size from ~3 GB uncompressed to ~200-400 MB compressed.
+      tar -czf coop-precompiled.tar.gz \
+        -C /tmp/coop-target/release \
+        deps build .fingerprint
+    outputs:
+      # Skip uploading the filesystem layer — consumers (build-coop) only ever
+      # read the precompiled-tar artifact, never raw files from the layer.
+      # Eliminates teardown time for this multi-GB target/ tree.
+      filesystem: false
+      artifacts:
+        - key: precompiled-tar
+          path: coop-precompiled.tar.gz
+
+  # ── Build all Go binaries → single artifact directory ───────────────
+  # Consolidates 6 separate build tasks into one. Sequential builds in a
+  # single task share Go's build cache, so shared packages are compiled
+  # once instead of 6 times. Saves ~2-3 minutes total build time.
+  - key: build-go-binaries
+    use: gardenio-deps
+    # Reuse Go's incremental build cache between runs (see top-level
+    # tool-cache vault). Most touches don't recompile the full DAG, so this
+    # is a big win on the critical path.
+    tool-cache: build-go-binaries
+    run: |
+      cd gardenio/controller
+      REF_NAME="${REF_NAME#refs/tags/}"
+      REF_NAME="${REF_NAME#refs/heads/}"
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      VERSION_LDFLAGS="-s -w -X main.version=${REF_NAME} -X main.commit=${COMMIT_SHA}"
+      # gb reports its build via `gb version`/`gb --version` and drives the
+      # version-skew signal (ka-0000002965), so it needs version/commit (which
+      # it previously did NOT get — BARE_LDFLAGS was the root cause of the stale
+      # laptop-binary friction report) plus branch + build date.
+      GB_LDFLAGS="${VERSION_LDFLAGS} -X gardenio/controller/internal/buildinfo.Branch=${REF_NAME} -X gardenio/controller/internal/buildinfo.Date=${BUILD_DATE}"
+      # Coverage instrumentation: pass --init cover=1 to enable.
+      COVER_FLAGS=""
+      if [ "${COVER}" = "1" ]; then
+        COVER_FLAGS="-cover -coverpkg=./..."
+        echo "=== Coverage instrumentation ENABLED ==="
+      fi
+      mkdir -p ../../go-binaries
+      T0=$(date +%s)
+      echo "=== Building 14 Go binaries (shared build cache) ==="
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/controller ./cmd/controller/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${GB_LDFLAGS}" -o ../../go-binaries/gb ./cmd/gb/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/slack-bridge ./cmd/slack-bridge/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/jira-bridge ./cmd/jira-bridge/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/gitlab-bridge ./cmd/gitlab-bridge/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/roles-server ./cmd/roles-server/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/claudemore ./cmd/claudemore/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/beads-viewer ./cmd/beads-viewer/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/repro-cockpit ./cmd/repro-cockpit/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/trigger-engine ./cmd/trigger-engine/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/edge-auth ./cmd/edge-auth/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/scif-portal ./cmd/scif-portal/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/grafana-bridge ./cmd/grafana-bridge/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/alertmanager-bridge ./cmd/alertmanager-bridge/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/idp-log-shipper ./cmd/idp-log-shipper/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/ava-log-shipper ./cmd/ava-log-shipper/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/traefik-log-shipper ./cmd/traefik-log-shipper/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/bridge-log-shipper ./cmd/bridge-log-shipper/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries/core-log-shipper ./cmd/core-log-shipper/
+      T1=$(date +%s)
+      echo "=== All Go binaries built in $((T1-T0))s ==="
+      ls -la ../../go-binaries/
+    env:
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+      REF_NAME: ${{ init.ref-name }}
+      COVER: ${{ init.cover }}
+    filter:
+      - gardenio/controller/**/*.go
+      - gardenio/controller/**/*.html
+      - gardenio/controller/**/*.md
+      - gardenio/controller/**/*.js
+      - gardenio/controller/**/*.css
+      - gardenio/controller/**/web/**
+      - gardenio/controller/go.mod
+      - gardenio/controller/go.sum
+      # controller imports the local clicreds module via `replace =>
+      # ../clicreds`; the build needs its full source, not just go.mod, or
+      # `go build` FATALs on the missing local module (ka-0000003839).
+      - gardenio/clicreds/**/*.go
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+    outputs:
+      artifacts:
+        - key: go-binaries
+          path: go-binaries
+
+  # ── Build coop from source → artifact ───────────────────────────────
+  # External deps are pre-compiled by coop-precompiled; this task only
+  # compiles the two workspace crates (coop + coopmux), which is fast.
+  # `rust` must be in the use list — coop-precompiled's layer is a delta
+  # that doesn't include the Rust toolchain itself. Without it, build-coop
+  # downloads a fresh rustc whose binary hash doesn't match the fingerprints
+  # in the precompiled cache, causing Cargo to recompile all deps.
+  - key: build-coop
+    use: [code, rust, coop-precompiled]
+    # Reuse Cargo's incremental build cache between runs (see top-level
+    # tool-cache vault). Complements coop-precompiled (which caches external
+    # crates) by also caching workspace-crate compilations across runs.
+    tool-cache: build-coop
+    timeout: 10m
+    filter:
+      - coop/**/*.rs
+      - coop/**/*.toml
+      - coop/proto/**
+      - coop/Cargo.lock
+      - coop/crates/web/dist/**
+      - .rwx/coop-precompiled.epoch
+    run: |
+      . "$HOME/.cargo/env"
+      export RUSTC_WRAPPER=""
+      mkdir -p /tmp/coop-target/release
+      echo "=== build-coop: extracting precompiled deps ==="
+      T0=$(date +%s)
+      tar -xzf ${{ tasks.coop-precompiled.artifacts.precompiled-tar }} -C /tmp/coop-target/release
+      T1=$(date +%s)
+      echo "  extract: $((T1-T0))s"
+      echo "  precompiled deps: $(find /tmp/coop-target/release/deps -name '*.rlib' 2>/dev/null | wc -l) rlibs"
+      cd coop
+      # Coverage instrumentation: pass --init cover=1 to enable.
+      if [ "${COVER}" = "1" ]; then
+        export RUSTFLAGS="-C instrument-coverage"
+        echo "=== Coverage instrumentation ENABLED ==="
+      fi
+      echo "=== build-coop: cargo build (workspace crates only if cache works) ==="
+      CARGO_TARGET_DIR=/tmp/coop-target cargo build --release \
+        --workspace --exclude coop-specs
+      T2=$(date +%s)
+      echo "  cargo build: $((T2-T1))s"
+      mkdir -p ../coop-bin
+      cp /tmp/coop-target/release/coop ../coop-bin/coop
+      cp /tmp/coop-target/release/coopmux ../coop-bin/coopmux
+      strip --strip-debug ../coop-bin/coop ../coop-bin/coopmux 2>/dev/null || true
+      ls -la ../coop-bin/
+      echo "=== build-coop total: $((T2-T0))s ==="
+      # Sanity check: real binaries are >1MB; stubs are ~300KB.
+      for bin in ../coop-bin/coop ../coop-bin/coopmux; do
+        size=$(stat -c%s "$bin")
+        if [ "$size" -lt 1000000 ]; then
+          echo "FATAL: $bin is only ${size} bytes — likely a stub binary" >&2
+          exit 1
+        fi
+      done
+    env:
+      COVER: ${{ init.cover }}
+    outputs:
+      artifacts:
+        - key: coop-binaries
+          path: coop-bin
+
+  # ── Build kd from source → artifact (MONOREPO: no more download) ───
+  - key: build-kd
+    use: kbeads-deps
+    # Reuse Go's incremental build cache between runs (see top-level
+    # tool-cache vault).
+    tool-cache: build-kd
+    run: |
+      cd kbeads
+      REF_NAME="${REF_NAME#refs/tags/}"
+      REF_NAME="${REF_NAME#refs/heads/}"
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      # kd reports its build via `kd version`/`kd --version`, and the SAME
+      # binary runs the daemon (`kd serve`) whose X-Kbeads-Version header drives
+      # the version-skew signal (ka-0000002965). Inject version/commit/branch/date.
+      KD_LDFLAGS="-s -w -X main.Version=${REF_NAME} -X main.Commit=${COMMIT_SHA} -X gardenio/kbeads/internal/buildinfo.Branch=${REF_NAME} -X gardenio/kbeads/internal/buildinfo.Date=${BUILD_DATE}"
+      # Coverage instrumentation: pass --init cover=1 to enable.
+      COVER_FLAGS=""
+      if [ "${COVER}" = "1" ]; then
+        COVER_FLAGS="-cover -coverpkg=./..."
+        echo "=== Coverage instrumentation ENABLED ==="
+      fi
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${KD_LDFLAGS}" \
+        -o ../kd-bin/kd ./cmd/kd/
+      ls -la ../kd-bin/
+    env:
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+      COVER: ${{ init.cover }}
+    filter:
+      - kbeads/**/*.go
+      - kbeads/**/*.sql
+      - kbeads/go.mod
+      - kbeads/go.sum
+      # kbeads imports the local clicreds module via `replace =>
+      # ../gardenio/clicreds`; the build needs its full source materialized
+      # or `go build` FATALs on the missing local module (ka-0000003839).
+      - gardenio/clicreds/**/*.go
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+    outputs:
+      artifacts:
+        - key: kd-binaries
+          path: kd-bin
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Coverage-instrumented build tasks (W2, ka-0000005395)
+  # Always-on parallel siblings of the non-cover builds. Always compile
+  # with coverage instrumentation, regardless of init.cover. Output to
+  # *-cover artifacts so the *-cover push tasks have a stable input.
+  # The chart's gardenio.imageRef helper appends "-cover" to the repo name
+  # when global.coverage.enabled=true, pulling these images instead.
+  # PR builds skip these to keep CI fast.
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── Build cover-instrumented Go binaries → artifact ────────────────
+  - key: build-go-binaries-cover
+    use: gardenio-deps
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    tool-cache: build-go-binaries-cover
+    run: |
+      cd gardenio/controller
+      REF_NAME="${REF_NAME#refs/tags/}"
+      REF_NAME="${REF_NAME#refs/heads/}"
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      VERSION_LDFLAGS="-s -w -X main.version=${REF_NAME} -X main.commit=${COMMIT_SHA}"
+      # See the non-cover build block above: gb needs version/commit/branch/date
+      # for `gb version` + the skew signal (ka-0000002965).
+      GB_LDFLAGS="${VERSION_LDFLAGS} -X gardenio/controller/internal/buildinfo.Branch=${REF_NAME} -X gardenio/controller/internal/buildinfo.Date=${BUILD_DATE}"
+      COVER_FLAGS="-cover -coverpkg=./..."
+      mkdir -p ../../go-binaries-cover
+      T0=$(date +%s)
+      echo "=== Building 11 Go binaries (COVER ON) ==="
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/controller ./cmd/controller/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${GB_LDFLAGS}" -o ../../go-binaries-cover/gb ./cmd/gb/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/slack-bridge ./cmd/slack-bridge/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/jira-bridge ./cmd/jira-bridge/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/gitlab-bridge ./cmd/gitlab-bridge/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/roles-server ./cmd/roles-server/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/claudemore ./cmd/claudemore/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/beads-viewer ./cmd/beads-viewer/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/repro-cockpit ./cmd/repro-cockpit/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/trigger-engine ./cmd/trigger-engine/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/grafana-bridge ./cmd/grafana-bridge/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/alertmanager-bridge ./cmd/alertmanager-bridge/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/idp-log-shipper ./cmd/idp-log-shipper/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/ava-log-shipper ./cmd/ava-log-shipper/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/traefik-log-shipper ./cmd/traefik-log-shipper/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/bridge-log-shipper ./cmd/bridge-log-shipper/
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${VERSION_LDFLAGS}" -o ../../go-binaries-cover/core-log-shipper ./cmd/core-log-shipper/
+      T1=$(date +%s)
+      echo "=== All cover Go binaries built in $((T1-T0))s ==="
+      ls -la ../../go-binaries-cover/
+    env:
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+      REF_NAME: ${{ init.ref-name }}
+    filter:
+      - gardenio/controller/**/*.go
+      - gardenio/controller/**/*.html
+      - gardenio/controller/**/*.md
+      - gardenio/controller/**/*.js
+      - gardenio/controller/**/*.css
+      - gardenio/controller/**/web/**
+      - gardenio/controller/go.mod
+      - gardenio/controller/go.sum
+      # See build-go-binaries — controller's `replace => ../clicreds` needs
+      # the local module source materialized for the cover build too
+      # (ka-0000003839).
+      - gardenio/clicreds/**/*.go
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+    outputs:
+      artifacts:
+        - key: go-binaries-cover
+          path: go-binaries-cover
+
+  # ── Build cover-instrumented coop/coopmux → artifact ───────────────
+  - key: build-coop-cover
+    use: [code, rust, coop-precompiled]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    tool-cache: build-coop-cover
+    timeout: 15m
+    # Rust + LTO + -C instrument-coverage on the workspace blows the default
+    # agent memory budget (SIGKILL during rustc), see ka-0000001251. Match the
+    # coop-precompiled tier so the cover build has headroom.
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    filter:
+      - coop/**/*.rs
+      - coop/**/*.toml
+      - coop/proto/**
+      - coop/Cargo.lock
+      - coop/crates/web/dist/**
+      - .rwx/coop-precompiled.epoch
+    run: |
+      . "$HOME/.cargo/env"
+      export RUSTC_WRAPPER=""
+      mkdir -p /tmp/coop-target-cover/release
+      tar -xzf ${{ tasks.coop-precompiled.artifacts.precompiled-tar }} -C /tmp/coop-target-cover/release
+      cd coop
+      export RUSTFLAGS="-C instrument-coverage"
+      echo "=== build-coop-cover: cargo build with instrument-coverage ==="
+      CARGO_TARGET_DIR=/tmp/coop-target-cover cargo build --release \
+        --workspace --exclude coop-specs
+      mkdir -p ../coop-bin-cover
+      cp /tmp/coop-target-cover/release/coop ../coop-bin-cover/coop
+      cp /tmp/coop-target-cover/release/coopmux ../coop-bin-cover/coopmux
+      # Do NOT strip — coverage profiles need symbol info.
+      ls -la ../coop-bin-cover/
+      for bin in ../coop-bin-cover/coop ../coop-bin-cover/coopmux; do
+        size=$(stat -c%s "$bin")
+        if [ "$size" -lt 1000000 ]; then
+          echo "FATAL: $bin is only ${size} bytes — likely a stub binary" >&2
+          exit 1
+        fi
+      done
+    outputs:
+      artifacts:
+        - key: coop-binaries-cover
+          path: coop-bin-cover
+
+  # ── Build cover-instrumented kd → artifact ─────────────────────────
+  - key: build-kd-cover
+    use: kbeads-deps
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    tool-cache: build-kd-cover
+    run: |
+      cd kbeads
+      REF_NAME="${REF_NAME#refs/tags/}"
+      REF_NAME="${REF_NAME#refs/heads/}"
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      # See build-kd: version/commit/branch/date for `kd version` + skew signal.
+      KD_LDFLAGS="-s -w -X main.Version=${REF_NAME} -X main.Commit=${COMMIT_SHA} -X gardenio/kbeads/internal/buildinfo.Branch=${REF_NAME} -X gardenio/kbeads/internal/buildinfo.Date=${BUILD_DATE}"
+      COVER_FLAGS="-cover -coverpkg=./..."
+      mkdir -p ../kd-bin-cover
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${COVER_FLAGS} \
+        -ldflags="${KD_LDFLAGS}" \
+        -o ../kd-bin-cover/kd ./cmd/kd/
+      ls -la ../kd-bin-cover/
+    env:
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+    filter:
+      - kbeads/**/*.go
+      - kbeads/**/*.sql
+      - kbeads/go.mod
+      - kbeads/go.sum
+      # See build-kd — kbeads' `replace => ../gardenio/clicreds` needs the
+      # local module source materialized for the cover build too
+      # (ka-0000003839).
+      - gardenio/clicreds/**/*.go
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+    outputs:
+      artifacts:
+        - key: kd-binaries-cover
+          path: kd-bin-cover
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Push tasks — crane-append layers to ubuntu:24.04, push to $IMAGE_REGISTRY.
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── Shared crane install + registry login ─────────────────────────────
+  # Auth: uses REGISTRY_USER + REGISTRY_TOKEN from vault, falls back to
+  # GHCR_TOKEN + GITHUB_USER for legacy compatibility.
+  - key: install-crane
+    cache: false
+    run: |
+      set -ex
+      curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+        | tar xz -C /tmp crane
+      sudo mv /tmp/crane /usr/local/bin/
+      IMAGE_REGISTRY="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}"
+      REGISTRY_HOST="${IMAGE_REGISTRY%%/*}"
+      REG_USER="${REGISTRY_USER:-$GITHUB_USER}"
+      REG_TOKEN="${REGISTRY_TOKEN:-$GHCR_TOKEN}"
+      set +x  # never xtrace the token into the log (ka-0000002171)
+      echo "$REG_TOKEN" | crane auth login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin
+      set -x
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      GITHUB_USER: ${{ secrets.GITHUB_USER }}
+
+  # ── Push controller ─────────────────────────────────────────────────
+  - key: push-controller
+    use: [code, build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      # Tag strategy: main → main-<sha>, tag → <calver>-rc, other → as-is
+      # (mutable :latest retired — F7 ka-0000006416; main-<sha> is per-commit
+      # immutable, deploy paths pin <calver>/<calver>-rc, nothing pulls :latest)
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/controller /tmp/layer/controller
+      chmod 755 /tmp/layer/controller
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/controller"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /controller --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push slack-bridge ───────────────────────────────────────────────
+  - key: push-slack-bridge
+    use: [code, build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/slack-bridge /tmp/layer/slack-bridge
+      chmod 755 /tmp/layer/slack-bridge
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/slack-bridge"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /slack-bridge --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push jira-bridge ────────────────────────────────────────────────
+  - key: push-jira-bridge
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/jira-bridge /tmp/layer/jira-bridge
+      chmod 755 /tmp/layer/jira-bridge
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/jira-bridge"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /jira-bridge --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push gitlab-bridge ──────────────────────────────────────────────
+  - key: push-gitlab-bridge
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/gitlab-bridge /tmp/layer/gitlab-bridge
+      chmod 755 /tmp/layer/gitlab-bridge
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/gitlab-bridge"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /gitlab-bridge --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push roles-server ─────────────────────────────────────────────
+  - key: push-roles-server
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/roles-server /tmp/layer/roles-server
+      chmod 755 /tmp/layer/roles-server
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/roles-server"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /roles-server --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push claudemore ───────────────────────────────────────────────
+  # Thin Anthropic Messages-API reverse-proxy fronting litellm (ka-0000007035).
+  - key: push-claudemore
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/claudemore /tmp/layer/claudemore
+      chmod 755 /tmp/layer/claudemore
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/claudemore"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /claudemore --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push beads-viewer ──────────────────────────────────────────────
+  - key: push-beads-viewer
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/beads-viewer /tmp/layer/beads-viewer
+      chmod 755 /tmp/layer/beads-viewer
+      # /gb is invoked as a subprocess to render the agent prime view
+      # (see cmd/beads-viewer/prime.go). Same source tree as the viewer so
+      # rendered output matches what agents see.
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/gb /tmp/layer/gb
+      chmod 755 /tmp/layer/gb
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/beads-viewer"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /beads-viewer --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push repro-cockpit ─────────────────────────────────────────────
+  # Read-only repro-run observation UI (epic ka-0000003364). Mirrors
+  # push-beads-viewer, but the cockpit does NOT shell out to /gb (that is the
+  # viewer's prime.go path), so its layer carries only the single binary.
+  - key: push-repro-cockpit
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/repro-cockpit /tmp/layer/repro-cockpit
+      chmod 755 /tmp/layer/repro-cockpit
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/repro-cockpit"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /repro-cockpit --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push trigger-engine ────────────────────────────────────────────
+  - key: push-trigger-engine
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/trigger-engine /tmp/layer/trigger-engine
+      chmod 755 /tmp/layer/trigger-engine
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/trigger-engine"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /trigger-engine --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push edge-auth (Stage 3 / W-B-12b, ka-0000000422) ───────────────
+  - key: push-edge-auth
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/edge-auth /tmp/layer/edge-auth
+      chmod 755 /tmp/layer/edge-auth
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/edge-auth"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /edge-auth --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push scif-portal (acme-scif v1.1 Phase D, ka-0000004280) ────────
+  - key: push-scif-portal
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/scif-portal /tmp/layer/scif-portal
+      chmod 755 /tmp/layer/scif-portal
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/scif-portal"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /scif-portal --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push grafana-bridge (Phase1 W2, ka-0000006776) ──────────────────
+  # `code` is in `use:` so the dashboard JSON source tree is available to bake
+  # into the image (ka-0000002799). The dashboards are NO LONGER shipped in the
+  # Helm chart (they used to render into grafana_dashboard ConfigMaps, stored
+  # twice per revision in the release-history Secret — the ~200KB double-store
+  # that overflowed the K8s 1 MiB Secret limit and stranded prod, ka-0000003724).
+  # They now ride in this image at /dashboards; the bridge backfills them into
+  # type=dashboard beads on startup (idempotent on uid) and provisions the live
+  # ConfigMaps at runtime. See gardenio/docs/dashboard-sync.md.
+  - key: push-grafana-bridge
+    use: [code, build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/grafana-bridge /tmp/layer/grafana-bridge
+      chmod 755 /tmp/layer/grafana-bridge
+      # Bake the dashboard JSON models the bridge backfills into type=dashboard
+      # beads (GRAFANA_DASHBOARDS_DIR=/dashboards). World-readable so the image's
+      # `nobody` user can read them under readOnlyRootFilesystem.
+      mkdir -p /tmp/layer/dashboards
+      cp gardenio/helm/gardenio/dashboards/*.json /tmp/layer/dashboards/
+      chmod 644 /tmp/layer/dashboards/*.json
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/grafana-bridge"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /grafana-bridge --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Build grafana-assistant-plugin dist (C4 ka-0000007568, Path C) ──
+  # Compile the custom in-repo Grafana app plugin
+  # (gardenio/grafana-plugins/gardenio-assistant-app) to dist/ here, where npm
+  # has network — so the runtime initContainer that seeds it into Grafana's
+  # plugins dir is a pure `cp` with zero off-cluster egress. Output a tarball
+  # of dist/ that push-grafana-assistant-plugin crane-appends at /plugin.
+  - key: build-grafana-assistant-plugin
+    use: [code]
+    # No `ref-name != 'pr'` guard: compile the plugin dist on PRs/MRs too, so a
+    # broken webpack/tsc/eslint OR Go build is caught pre-merge (like
+    # build-go-binaries/-coop/-kd) rather than only red-lining the main-push
+    # pipeline. The PUSH task below stays gated off PRs — PRs validate the build
+    # but publish nothing.
+    if: ${{ init.build-target == 'all' }}
+    # npm install (~1300 packages) + a Go cross-compile of the SDK-backed plugin
+    # backend (ka-0000000293) on a cold module cache need more than the old 15m.
+    timeout: 25m
+    # npm install is a heavy data mover; the Go build adds the SDK module graph.
+    agent:
+      cpus: 4
+      memory: 8gb
+    filter:
+      - gardenio/grafana-plugins/gardenio-assistant-app
+      # Source the same Node pin as the runtime agent image so a bump in
+      # versions.env/checksums.env propagates here too (no silent drift).
+      - gardenio/images/agent/install/versions.env
+      - gardenio/images/agent/install/checksums.env
+    run: |
+      set -ex
+      # Pin Node 24 to match the plugin's verified toolchain (engines.node>=22,
+      # packageManager npm@11.12.1). Source the SAME pin files the runtime
+      # agent image uses (gardenio/images/agent/install/node.sh sources these
+      # too), so the CI plugin builder and the agent image stay byte-locked on
+      # Node version + sha256 — no duplicate literals that could silently drift
+      # on a future bump. Still self-contained: no cross-task dependency on the
+      # agent-install-node layer (we read the env files, not its install
+      # output). Checksum verification before unpack hardens against an
+      # out-of-band swap of the upstream tarball (ka-0000006289 finding 4).
+      # The runtime egress envelope is untouched — this only hardens the
+      # ephemeral CI-builder lane.
+      source gardenio/images/agent/install/versions.env
+      source gardenio/images/agent/install/checksums.env
+      curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_FULL_VERSION}/node-v${NODE_FULL_VERSION}-linux-x64.tar.xz"
+      echo "${NODE_SHA256_X64}  /tmp/node.tar.xz" | sha256sum -c -
+      sudo tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+      rm -f /tmp/node.tar.xz
+      node --version && npm --version
+
+      # Go toolchain for the plugin BACKEND (ka-0000000293). Reuse GO_FULL_VERSION
+      # from versions.env (sourced above) so the CI builder stays byte-locked on
+      # the same Go pin the agent image uses — no duplicate literal to drift. The
+      # backend is a tiny MCP reverse-proxy built with mage (the Grafana SDK build
+      # target), exactly as plugin.json's `executable` expects.
+      curl -fsSL -o /tmp/go.tar.gz "https://go.dev/dl/go${GO_FULL_VERSION}.linux-amd64.tar.gz"
+      sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+      rm -f /tmp/go.tar.gz
+      export PATH="/usr/local/go/bin:${PATH}"
+      go version
+
+      cd gardenio/grafana-plugins/gardenio-assistant-app
+      # .npmrc pins ignore-scripts=true (supply-chain hardening); npm honours it.
+      npm ci
+      npm run build
+      # plugin.json is what Grafana keys plugin discovery on — fail loudly if the
+      # build did not emit it rather than ship an empty layer.
+      test -f dist/plugin.json
+
+      # Build the Go backend into dist/ (mage build:linux -> amd64, matching the
+      # prod grafana nodeSelector). GOWORK=off keeps this an isolated module
+      # build (the repo go.work would otherwise pull it into the workspace).
+      GOWORK=off go run github.com/magefile/mage@v1.15.0 build:linux
+      # The arch-suffixed gpx_ binary is what Grafana spawns as the plugin
+      # backend; the chart initContainer asserts it before seeding, so fail the
+      # build here if mage did not emit it.
+      test -f dist/gpx_gardenio_assistant_app_linux_amd64
+
+      tar -czf /tmp/assistant-plugin-dist.tar.gz -C dist .
+    outputs:
+      artifacts:
+        - key: assistant-plugin-dist
+          path: /tmp/assistant-plugin-dist.tar.gz
+
+  # ── Push grafana-assistant-plugin (C4 ka-0000007568, Path C) ────────
+  # Dist-only artifact image: ships the compiled plugin at /plugin on a
+  # shell-bearing ubuntu base so the Grafana pod's copy-only initContainer
+  # (sh -c 'cp -r /plugin/. ...') can seed it. No entrypoint — never run as a
+  # server. The image carries the standard provenance label so promote.yml's
+  # build-vs-tag gate covers it like every other gardenio image.
+  - key: push-grafana-assistant-plugin
+    use: [build-grafana-assistant-plugin, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/plugin
+      tar -xzf ${{ tasks.build-grafana-assistant-plugin.artifacts.assistant-plugin-dist }} -C /tmp/layer/plugin
+      # Sanity: the layer must carry plugin.json AND the gpx_ backend binary
+      # (matches the initContainer's pre-copy assertions + the Dockerfile RUN
+      # test). The backend is load-bearing — without it the chat box falls back
+      # to the broken embedded MCP path (ka-0000000293).
+      test -f /tmp/layer/plugin/plugin.json
+      test -f /tmp/layer/plugin/gpx_gardenio_assistant_app_linux_amd64
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/grafana-assistant-plugin"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Build grafana-llm-app-plugin dist (C6/prod prereq ka-0000007541) ─
+  # Download + CHECKSUM-VERIFY the PINNED grafana-llm-app foundation plugin here,
+  # where the builder has network — so the runtime initContainer that seeds it
+  # into Grafana's plugins dir is a pure `cp` with ZERO off-cluster egress. This
+  # is what lets PROD run with grafana.plugins.allowCatalogEgress:FALSE under
+  # default-deny-egress (boot-time catalog install would otherwise force a
+  # 0.0.0.0/0:443 hole on the grafana-egress NetworkPolicy). Output a tarball of
+  # the dist that push-grafana-llm-app-plugin crane-appends at /plugin. Mirrors
+  # build-grafana-assistant-plugin (C4); difference: pinned UPSTREAM artifact
+  # (download + verify) rather than an in-repo compile.
+  - key: build-grafana-llm-app-plugin
+    use: [code]
+    # No `ref-name != 'pr'` guard: download + verify on PRs/MRs too, so a broken
+    # pin (404 / checksum drift) is caught pre-merge rather than only red-lining
+    # the main-push pipeline. The PUSH task below stays gated off PRs.
+    if: ${{ init.build-target == 'all' }}
+    timeout: 10m
+    filter:
+      - gardenio/images/grafana-llm-app-plugin/pin.env
+    run: |
+      set -ex
+      # pin.env is the SINGLE SOURCE OF TRUTH for version + checksum + URL (shared
+      # with the Dockerfile build path). Source it so the pin lives in one place.
+      . gardenio/images/grafana-llm-app-plugin/pin.env
+      echo "Fetching grafana-llm-app ${GRAFANA_LLM_APP_VERSION} (${GRAFANA_LLM_APP_OS}/${GRAFANA_LLM_APP_ARCH})"
+      curl -fsSL -o /tmp/plugin.zip "${GRAFANA_LLM_APP_URL}"
+      # FAIL LOUDLY on checksum mismatch — a tampered/rotated upstream artifact
+      # must never be baked in silently.
+      echo "${GRAFANA_LLM_APP_SHA256}  /tmp/plugin.zip" | sha256sum -c -
+      rm -rf /tmp/extracted && unzip -q /tmp/plugin.zip -d /tmp/extracted
+      # The zip extracts to a single top-level dir named after the plugin id; lay
+      # its CONTENTS at /tmp/dist so push crane-appends them straight at /plugin.
+      mkdir -p /tmp/dist
+      cp -r "/tmp/extracted/${GRAFANA_LLM_APP_PLUGIN_ID}/." /tmp/dist/
+      # plugin.json keys discovery; MANIFEST.txt is the Grafana signature that lets
+      # the seeded copy load WITHOUT an unsigned-allow. Both must be present.
+      test -f /tmp/dist/plugin.json
+      test -f /tmp/dist/MANIFEST.txt
+      tar -czf /tmp/llm-app-plugin-dist.tar.gz -C /tmp/dist .
+    outputs:
+      artifacts:
+        - key: llm-app-plugin-dist
+          path: /tmp/llm-app-plugin-dist.tar.gz
+
+  # ── Push grafana-llm-app-plugin (C6/prod prereq ka-0000007541) ──────
+  # Dist-only artifact image: ships the pinned grafana-llm-app plugin at /plugin
+  # on a shell-bearing ubuntu base so the Grafana pod's copy-only initContainer
+  # (sh -c 'cp -r /plugin/. ...') can seed it. No entrypoint — never run as a
+  # server. Carries the standard provenance label so promote.yml's build-vs-tag
+  # gate covers it like every other gardenio image. Mirrors
+  # push-grafana-assistant-plugin (C4).
+  - key: push-grafana-llm-app-plugin
+    use: [build-grafana-llm-app-plugin, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/plugin
+      tar -xzf ${{ tasks.build-grafana-llm-app-plugin.artifacts.llm-app-plugin-dist }} -C /tmp/layer/plugin
+      # Sanity: the layer must carry plugin.json + the signed manifest (matches the
+      # initContainer's pre-copy assertion and the Dockerfile RUN test).
+      test -f /tmp/layer/plugin/plugin.json
+      test -f /tmp/layer/plugin/MANIFEST.txt
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/grafana-llm-app-plugin"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Build grafana-vl-datasource-plugin dist (Phase-2 forensics ka-0000007948) ─
+  # Download + CHECKSUM-VERIFY the PINNED VictoriaLogs datasource plugin here,
+  # where the builder has network — so the runtime initContainer that seeds it
+  # into Grafana's plugins dir is a pure `cp` with ZERO off-cluster egress. This
+  # is what lets PROD run with grafana.plugins.allowCatalogEgress:FALSE under
+  # default-deny-egress (boot-time catalog install would otherwise force a
+  # 0.0.0.0/0:443 hole on the grafana-egress NetworkPolicy, ka-0000007541). Output
+  # a tarball of the dist that push-grafana-vl-datasource-plugin crane-appends at
+  # /plugin. Mirrors build-grafana-llm-app-plugin (C6): a pinned UPSTREAM artifact
+  # (download + verify) rather than an in-repo compile.
+  - key: build-grafana-vl-datasource-plugin
+    use: [code]
+    # No `ref-name != 'pr'` guard: download + verify on PRs/MRs too, so a broken
+    # pin (404 / checksum drift) is caught pre-merge rather than only red-lining
+    # the main-push pipeline. The PUSH task below stays gated off PRs.
+    if: ${{ init.build-target == 'all' }}
+    timeout: 10m
+    filter:
+      - gardenio/images/grafana-vl-datasource-plugin/pin.env
+    run: |
+      set -ex
+      # pin.env is the SINGLE SOURCE OF TRUTH for version + checksum + URL (shared
+      # with the Dockerfile build path). Source it so the pin lives in one place.
+      . gardenio/images/grafana-vl-datasource-plugin/pin.env
+      echo "Fetching victoriametrics-logs-datasource ${VL_DATASOURCE_VERSION}"
+      curl -fsSL -o /tmp/plugin.zip "${VL_DATASOURCE_URL}"
+      # FAIL LOUDLY on checksum mismatch — a tampered/rotated upstream artifact
+      # must never be baked in silently.
+      echo "${VL_DATASOURCE_SHA256}  /tmp/plugin.zip" | sha256sum -c -
+      rm -rf /tmp/vl-extracted && unzip -q /tmp/plugin.zip -d /tmp/vl-extracted
+      # The zip extracts to a single top-level dir named after the plugin id; lay
+      # its CONTENTS at /tmp/vl-dist so push crane-appends them straight at /plugin.
+      mkdir -p /tmp/vl-dist
+      cp -r "/tmp/vl-extracted/${VL_DATASOURCE_PLUGIN_ID}/." /tmp/vl-dist/
+      # plugin.json keys discovery; MANIFEST.txt is the Grafana signature that lets
+      # the seeded copy load WITHOUT an unsigned-allow; the amd64 backend binary is
+      # what Grafana spawns for this backend datasource on our amd64 nodes. All
+      # three must be present.
+      test -f /tmp/vl-dist/plugin.json
+      test -f /tmp/vl-dist/MANIFEST.txt
+      test -f /tmp/vl-dist/victoriametrics_logs_backend_plugin_linux_amd64
+      tar -czf /tmp/vl-datasource-plugin-dist.tar.gz -C /tmp/vl-dist .
+    outputs:
+      artifacts:
+        - key: vl-datasource-plugin-dist
+          path: /tmp/vl-datasource-plugin-dist.tar.gz
+
+  # ── Push grafana-vl-datasource-plugin (Phase-2 forensics ka-0000007948) ──
+  # Dist-only artifact image: ships the pinned VictoriaLogs datasource plugin at
+  # /plugin on a shell-bearing ubuntu base so the Grafana pod's copy-only
+  # initContainer (sh -c 'cp -r /plugin/. ...') can seed it. No entrypoint — never
+  # run as a server. Carries the standard provenance label so promote.yml's
+  # build-vs-tag gate covers it like every other gardenio image. Mirrors
+  # push-grafana-llm-app-plugin (C6).
+  - key: push-grafana-vl-datasource-plugin
+    use: [build-grafana-vl-datasource-plugin, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/plugin
+      tar -xzf ${{ tasks.build-grafana-vl-datasource-plugin.artifacts.vl-datasource-plugin-dist }} -C /tmp/layer/plugin
+      # Sanity: the layer must carry plugin.json + the signed manifest + the amd64
+      # backend binary (matches the initContainer's pre-copy assertion and the
+      # Dockerfile RUN test).
+      test -f /tmp/layer/plugin/plugin.json
+      test -f /tmp/layer/plugin/MANIFEST.txt
+      test -f /tmp/layer/plugin/victoriametrics_logs_backend_plugin_linux_amd64
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/grafana-vl-datasource-plugin"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Build geo-table dist (edge IDP L1b enrichment, ka-0000005851) ────
+  # Fetch the upstream iptoasn ip2asn+country dump and range->CIDR convert it to
+  # the FULL CIDR->{ASN,country} table the edge/audit L1 resolver consumes
+  # (auditxform.ParseGeoTable). This runs where the builder HAS network so the
+  # runtime initContainer that seeds the table into the shipper's emptyDir is a
+  # pure `cp` with ZERO off-cluster egress — the same zero-egress posture the
+  # grafana plugin prebakes rely on (default-deny-egress friendly).
+  #
+  # WHY AN IMAGE, NOT A ConfigMap: the full table is ~1M CIDRs / ~26 MiB
+  # (--no-description), vastly over the 1 MiB etcd cap on BOTH ConfigMap and
+  # Secret — so the chart's geoTable.data ConfigMap mount cannot carry a global
+  # table. See gardenio/images/geo-table/Dockerfile for the full design rationale
+  # (why not filter/allowlist/coarsen). --no-description halves the table
+  # (~49.5 -> ~26.4 MiB); the resolver ignores that column.
+  #
+  # NON-DETERMINISM IS INTENTIONAL (no pinned checksum, unlike the plugin
+  # prebakes): iptoasn republishes ~daily and we WANT fresh geo data at each
+  # release build. The >1000-entry sanity floor (shared with build-geo-table.py +
+  # .rwx/geo-table-mirror.yml) fails a truncated/format-changed fetch loudly.
+  #
+  # No `ref-name != 'pr'` guard: fetch + convert on PRs/MRs too, so a broken
+  # upstream (404 / format drift) reds the MR pipeline pre-merge rather than only
+  # the main-push. The PUSH task below stays gated off PRs.
+  - key: build-geo-table
+    use: [code]
+    if: ${{ init.build-target == 'all' }}
+    cache: false
+    timeout: 10m
+    run: |
+      set -ex
+      UPSTREAM="${GEO_UPSTREAM_URL:-https://iptoasn.com/data/ip2asn-combined.tsv.gz}"
+      echo "=== fetching $UPSTREAM ==="
+      # --retry-all-errors so a mid-stream HTTP/2 reset (curl 92, seen in CI on
+      # the iptoasn mirror) is retried like a transport error, not treated as a
+      # hard failure — --retry alone does NOT retry a partially-transferred body.
+      curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "$UPSTREAM" -o /tmp/ip2asn.tsv.gz
+      echo "=== converting range dump -> CIDR geo table (no-description) ==="
+      mkdir -p /tmp/geo-dist
+      # pipefail: a converter non-zero (e.g. all-AS0) fails the whole task — never
+      # publish a partial/empty table. --no-description drops the column the
+      # resolver ignores, halving the table so the shipper's pull stays small.
+      zcat /tmp/ip2asn.tsv.gz | python3 scripts/build-geo-table.py --no-description > /tmp/geo-dist/geo-table.txt
+      LINES=$(grep -cv '^#' /tmp/geo-dist/geo-table.txt || true)
+      echo "=== geo-table.txt: ${LINES} CIDR entries ==="
+      head -5 /tmp/geo-dist/geo-table.txt
+      # Sanity floor: a healthy combined dump is >100k prefixes. A tiny result
+      # means a truncated fetch or an upstream format change — fail loudly rather
+      # than ship a table that blinds the console.
+      if [ "${LINES:-0}" -lt 1000 ]; then
+        echo "ERROR: only ${LINES} entries — upstream fetch/format looks broken" >&2
+        exit 1
+      fi
+      tar -czf /tmp/geo-table-dist.tar.gz -C /tmp/geo-dist .
+    outputs:
+      artifacts:
+        - key: geo-table-dist
+          path: /tmp/geo-table-dist.tar.gz
+
+  # ── Push geo-table (edge IDP L1b enrichment, ka-0000005851) ─────────
+  # Data-only artifact image: ships the built geo table at /geo-table on a
+  # shell-bearing ubuntu base so the traefik-log-shipper pod's copy-only
+  # initContainer (sh -c 'cp -r /geo-table/. ...') can seed it. No entrypoint —
+  # never run as a server. Carries the standard provenance label so promote.yml's
+  # build-vs-tag gate covers it like every other gardenio image. Mirrors
+  # push-grafana-vl-datasource-plugin.
+  - key: push-geo-table
+    use: [build-geo-table, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/geo-table
+      tar -xzf ${{ tasks.build-geo-table.artifacts.geo-table-dist }} -C /tmp/layer/geo-table
+      # Sanity: the layer must carry a non-empty table (matches the initContainer's
+      # pre-copy assertion and the Dockerfile RUN test).
+      test -s /tmp/layer/geo-table/geo-table.txt
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/geo-table"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push alertmanager-bridge (Phase1 W3, ka-0000006776) ─────────────
+  - key: push-alertmanager-bridge
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/alertmanager-bridge /tmp/layer/alertmanager-bridge
+      chmod 755 /tmp/layer/alertmanager-bridge
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/alertmanager-bridge"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /alertmanager-bridge --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push idp-log-shipper (IDP Phase-2 transport, ka-0000007889) ─────
+  # The CloudWatch->VictoriaLogs audit-log shipper (cmd/idp-log-shipper).
+  # Same crane-append-on-ubuntu layout as the bridge family; nonroot,
+  # ENTRYPOINT on the binary. Deployed by the off-by-default idpLogShipper
+  # chart component.
+  - key: push-idp-log-shipper
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/idp-log-shipper /tmp/layer/idp-log-shipper
+      chmod 755 /tmp/layer/idp-log-shipper
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/idp-log-shipper"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /idp-log-shipper --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push ava-log-shipper (edge-IDP apex AVA-OCSF transport, ka-0000002267) ─
+  # The AVA-OCSF-accesslog -> VictoriaLogs CloudWatch puller (cmd/ava-log-shipper).
+  # Same crane-append-on-ubuntu layout as the sibling shippers; nonroot,
+  # ENTRYPOINT on the binary. Deployed by the off-by-default avaLogShipper chart
+  # component.
+  - key: push-ava-log-shipper
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/ava-log-shipper /tmp/layer/ava-log-shipper
+      chmod 755 /tmp/layer/ava-log-shipper
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/ava-log-shipper"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /ava-log-shipper --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push traefik-log-shipper (edge-IDP L0 transport, ka-0000001563) ─
+  # The Traefik-access-log -> VictoriaLogs streamer (cmd/traefik-log-shipper).
+  # Same crane-append-on-ubuntu layout as the bridge family; nonroot,
+  # ENTRYPOINT on the binary. Deployed by the off-by-default traefikLogShipper
+  # chart component.
+  - key: push-traefik-log-shipper
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/traefik-log-shipper /tmp/layer/traefik-log-shipper
+      chmod 755 /tmp/layer/traefik-log-shipper
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/traefik-log-shipper"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /traefik-log-shipper --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push bridge-log-shipper (non-AVA webhook-audit transport, ka-0000000320) ─
+  # The jira/gitlab-bridge webhook-stdout -> VictoriaLogs streamer
+  # (cmd/bridge-log-shipper). Same crane-append-on-ubuntu layout as the bridge
+  # family; nonroot, ENTRYPOINT on the binary. Deployed by the off-by-default
+  # bridgeLogShipper chart component.
+  - key: push-bridge-log-shipper
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/bridge-log-shipper /tmp/layer/bridge-log-shipper
+      chmod 755 /tmp/layer/bridge-log-shipper
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/bridge-log-shipper"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /bridge-log-shipper --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push core-log-shipper (general gardenio-pod slog transport, ka-0000005209) ─
+  # The controller/slack-bridge/trigger-engine/grafana-bridge stdout ->
+  # VictoriaLogs streamer (cmd/core-log-shipper) — the WRITE side of `gb logs`.
+  # Same crane-append-on-ubuntu layout as bridge-log-shipper; nonroot, ENTRYPOINT
+  # on the binary. Deployed by the off-by-default coreLogShipper chart component.
+  - key: push-core-log-shipper
+    use: [build-go-binaries, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/core-log-shipper /tmp/layer/core-log-shipper
+      chmod 755 /tmp/layer/core-log-shipper
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/core-log-shipper"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /core-log-shipper --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push kbeads (MONOREPO: built from source, no cross-repo dispatch) ─
+  - key: push-kbeads
+    use: [build-kd, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/usr/local/bin /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-kd.artifacts.kd-binaries }}/kd /tmp/layer/usr/local/bin/kd
+      chmod 755 /tmp/layer/usr/local/bin/kd
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/kbeads"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /usr/local/bin/kd --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ── Push coop/coopmux (MONOREPO: built from source) ────────────────
+  - key: push-coop
+    use: [build-coop, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      # Coop binary image
+      mkdir -p /tmp/coop-layer/usr/local/bin /tmp/coop-layer/etc/ssl/certs
+      cp ${{ tasks.build-coop.artifacts.coop-binaries }}/coop /tmp/coop-layer/usr/local/bin/coop
+      chmod 755 /tmp/coop-layer/usr/local/bin/coop
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/coop-layer/etc/ssl/certs/
+      tar -cf /tmp/coop-layer.tar -C /tmp/coop-layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/coop"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/coop-layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /usr/local/bin/coop --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+
+      # Coopmux image
+      mkdir -p /tmp/mux-layer/usr/local/bin /tmp/mux-layer/etc/ssl/certs
+      cp ${{ tasks.build-coop.artifacts.coop-binaries }}/coopmux /tmp/mux-layer/usr/local/bin/coopmux
+      chmod 755 /tmp/mux-layer/usr/local/bin/coopmux
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/mux-layer/etc/ssl/certs/
+      tar -cf /tmp/mux-layer.tar -C /tmp/mux-layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/coopmux"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/mux-layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /usr/local/bin/coopmux --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Coverage-instrumented push tasks (W2, ka-0000005395)
+  # Push *-cover image variants pulled by the chart when global.coverage.enabled
+  # is true. NEVER tag latest — these are E2E-only images; production must
+  # never accidentally consume them. The Kyverno disallow-cover-images
+  # ClusterPolicy is the second line of defense at admission time.
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── Push controller-cover ──────────────────────────────────────────
+  - key: push-controller-cover
+    use: [code, build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/controller /tmp/layer/controller
+      chmod 755 /tmp/layer/controller
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/controller-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /controller --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push slack-bridge-cover ────────────────────────────────────────
+  - key: push-slack-bridge-cover
+    use: [code, build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/slack-bridge /tmp/layer/slack-bridge
+      chmod 755 /tmp/layer/slack-bridge
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/slack-bridge-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /slack-bridge --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push jira-bridge-cover ─────────────────────────────────────────
+  - key: push-jira-bridge-cover
+    use: [build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/jira-bridge /tmp/layer/jira-bridge
+      chmod 755 /tmp/layer/jira-bridge
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/jira-bridge-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /jira-bridge --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push gitlab-bridge-cover ───────────────────────────────────────
+  - key: push-gitlab-bridge-cover
+    use: [build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/gitlab-bridge /tmp/layer/gitlab-bridge
+      chmod 755 /tmp/layer/gitlab-bridge
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/gitlab-bridge-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /gitlab-bridge --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push roles-server-cover ────────────────────────────────────────
+  - key: push-roles-server-cover
+    use: [build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/roles-server /tmp/layer/roles-server
+      chmod 755 /tmp/layer/roles-server
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/roles-server-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /roles-server --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push beads-viewer-cover ────────────────────────────────────────
+  - key: push-beads-viewer-cover
+    use: [build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/beads-viewer /tmp/layer/beads-viewer
+      chmod 755 /tmp/layer/beads-viewer
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/gb /tmp/layer/gb
+      chmod 755 /tmp/layer/gb
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/beads-viewer-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /beads-viewer --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push trigger-engine-cover ──────────────────────────────────────
+  - key: push-trigger-engine-cover
+    use: [build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/trigger-engine /tmp/layer/trigger-engine
+      chmod 755 /tmp/layer/trigger-engine
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/trigger-engine-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /trigger-engine --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push grafana-bridge-cover ──────────────────────────────────────
+  # `code` in `use:` — same dashboard-baking as push-grafana-bridge above
+  # (ka-0000002799) so the cover image the E2E coverage shard deploys carries
+  # /dashboards too, otherwise its backfill would find no models.
+  - key: push-grafana-bridge-cover
+    use: [code, build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/grafana-bridge /tmp/layer/grafana-bridge
+      chmod 755 /tmp/layer/grafana-bridge
+      # Bake the dashboard JSON models (see push-grafana-bridge for rationale).
+      mkdir -p /tmp/layer/dashboards
+      cp gardenio/helm/gardenio/dashboards/*.json /tmp/layer/dashboards/
+      chmod 644 /tmp/layer/dashboards/*.json
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/grafana-bridge-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /grafana-bridge --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push alertmanager-bridge-cover ─────────────────────────────────
+  - key: push-alertmanager-bridge-cover
+    use: [build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/alertmanager-bridge /tmp/layer/alertmanager-bridge
+      chmod 755 /tmp/layer/alertmanager-bridge
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/alertmanager-bridge-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /alertmanager-bridge --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push idp-log-shipper-cover (IDP Phase-2 transport, ka-0000007889) ─
+  - key: push-idp-log-shipper-cover
+    use: [build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/idp-log-shipper /tmp/layer/idp-log-shipper
+      chmod 755 /tmp/layer/idp-log-shipper
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/idp-log-shipper-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /idp-log-shipper --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push traefik-log-shipper-cover (edge-IDP L0 transport, ka-0000001563) ─
+  - key: push-traefik-log-shipper-cover
+    use: [build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/traefik-log-shipper /tmp/layer/traefik-log-shipper
+      chmod 755 /tmp/layer/traefik-log-shipper
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/traefik-log-shipper-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /traefik-log-shipper --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push bridge-log-shipper-cover (non-AVA webhook-audit transport, ka-0000000320) ─
+  - key: push-bridge-log-shipper-cover
+    use: [build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/bridge-log-shipper /tmp/layer/bridge-log-shipper
+      chmod 755 /tmp/layer/bridge-log-shipper
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/bridge-log-shipper-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /bridge-log-shipper --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push core-log-shipper-cover (general gardenio-pod slog transport, ka-0000005209) ─
+  - key: push-core-log-shipper-cover
+    use: [build-go-binaries-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-go-binaries-cover.artifacts.go-binaries-cover }}/core-log-shipper /tmp/layer/core-log-shipper
+      chmod 755 /tmp/layer/core-log-shipper
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/core-log-shipper-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /core-log-shipper --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push kbeads-cover ──────────────────────────────────────────────
+  - key: push-kbeads-cover
+    use: [build-kd-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      mkdir -p /tmp/layer/usr/local/bin /tmp/layer/etc/ssl/certs
+      cp ${{ tasks.build-kd-cover.artifacts.kd-binaries-cover }}/kd /tmp/layer/usr/local/bin/kd
+      chmod 755 /tmp/layer/usr/local/bin/kd
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/layer/etc/ssl/certs/
+      tar -cf /tmp/layer.tar -C /tmp/layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/kbeads-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /usr/local/bin/kd --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+  # ── Push coop/coopmux cover variants ───────────────────────────────
+  - key: push-coop-cover
+    use: [build-coop-cover, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      # coop-cover image
+      mkdir -p /tmp/coop-layer/usr/local/bin /tmp/coop-layer/etc/ssl/certs
+      cp ${{ tasks.build-coop-cover.artifacts.coop-binaries-cover }}/coop /tmp/coop-layer/usr/local/bin/coop
+      chmod 755 /tmp/coop-layer/usr/local/bin/coop
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/coop-layer/etc/ssl/certs/
+      tar -cf /tmp/coop-layer.tar -C /tmp/coop-layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/coop-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/coop-layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /usr/local/bin/coop --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+
+      # coopmux-cover image
+      mkdir -p /tmp/mux-layer/usr/local/bin /tmp/mux-layer/etc/ssl/certs
+      cp ${{ tasks.build-coop-cover.artifacts.coop-binaries-cover }}/coopmux /tmp/mux-layer/usr/local/bin/coopmux
+      chmod 755 /tmp/mux-layer/usr/local/bin/coopmux
+      cp /etc/ssl/certs/ca-certificates.crt /tmp/mux-layer/etc/ssl/certs/
+      tar -cf /tmp/mux-layer.tar -C /tmp/mux-layer .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/coopmux-cover"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/mux-layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" --entrypoint /usr/local/bin/coopmux --user nobody --label "org.opencontainers.image.revision=${COMMIT_SHA}" --label "org.opencontainers.image.ref.name=${REF_NAME}" --label "org.gardenio.cover=1" -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Agent image — 8 parallel cached install tasks + 1 assembly task.
+  # Each install task filters on its own .rwx/agent-*.lock file so only
+  # the relevant cache is busted when a version changes.
+  #
+  # MONOREPO CHANGE: coop and kd come from build-coop and build-kd tasks
+  # (built from source) instead of download-coop and download-kd
+  # (downloaded from GitHub releases).
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── System packages: apt-get + dpkg copy + shared libs ──────────────
+  - key: agent-install-syspackages
+    use: [code]
+    timeout: 10m
+    # Heavy data mover: apt-get + dpkg unpack of ~150 packages, then a sweep
+    # over /usr/lib to collect transitive shared libs. Bigger agent + tmpfs
+    # makes the apt unpack and copy loop noticeably faster.
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    filter:
+      - gardenio/.rwx/agent-syspackages.lock
+      - gardenio/images/agent/install/versions.env
+    run: |
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+      source gardenio/images/agent/install/versions.env
+
+      OUT=/tmp/syspackages
+      mkdir -p $OUT/usr/local/bin $OUT/usr/bin $OUT/etc
+
+      # Snapshot pre-install state for auto-resolution of transitive deps
+      dpkg-query -W -f '${Package}\n' | sort > /tmp/before.txt
+
+      sudo apt-get -y update
+      sudo apt-get -y install --no-install-recommends $BASE_PACKAGES $AGENT_PACKAGES
+
+      # Auto-resolve: capture newly installed packages (transitive deps like
+      # postgresql-client-16 that aren't listed explicitly).
+      dpkg-query -W -f '${Package}\n' | sort > /tmp/after.txt
+      TRANSITIVE_PACKAGES=$(comm -13 /tmp/before.txt /tmp/after.txt)
+
+      # Build complete package list: explicit packages + transitive deps.
+      # CRITICAL: The RWX runner may have some packages pre-installed (git,
+      # curl, jq, sudo, etc.) — these won't appear in the before/after diff
+      # but MUST be copied since the ubuntu:24.04 base image lacks them.
+      ALL_PACKAGES=$(echo "$BASE_PACKAGES $AGENT_PACKAGES $TRANSITIVE_PACKAGES" | tr ' ' '\n' | sort -u)
+
+      # Extract all files from all required packages
+      for pkg in $ALL_PACKAGES; do
+        dpkg -L "$pkg" 2>/dev/null | while read -r f; do
+          [ -e "$f" ] || continue
+          [ -d "$f" ] && { mkdir -p "$OUT$f"; continue; }
+          mkdir -p "$OUT$(dirname "$f")" && cp -a "$f" "$OUT${f}" 2>/dev/null || true
+        done || true
+      done
+
+      # Resolve shared library deps for all binaries via ldd
+      for pkg in $ALL_PACKAGES; do
+        dpkg -L "$pkg" 2>/dev/null | grep -E '^/usr/(s?bin|local/bin)/' | while read -r bin; do
+          [ -f "$bin" ] && [ -x "$bin" ] || continue
+          ldd "$bin" 2>/dev/null | grep "=> /" | awk '{print $3}' | while read -r lib; do
+            [ -f "$lib" ] || continue
+            mkdir -p "$OUT$(dirname "$lib")"
+            cp -n "$lib" "$OUT${lib}" 2>/dev/null || true
+          done || true
+        done || true
+      done
+
+      # gcc internals
+      find /usr/libexec/gcc -name 'cc1*' -o -name 'lto1' 2>/dev/null | while read -r bin; do
+        ldd "$bin" 2>/dev/null | grep "=> /" | awk '{print $3}' | while read -r lib; do
+          [ -f "$lib" ] || continue
+          mkdir -p "$OUT$(dirname "$lib")"
+          cp -n "$lib" "$OUT${lib}" 2>/dev/null || true
+        done || true
+      done || true
+
+      # ICU, headers, misc libs
+      find /usr/lib/x86_64-linux-gnu -name 'libicu*.so*' 2>/dev/null | while read -r f; do
+        mkdir -p "$OUT$(dirname "$f")" && cp -a "$f" "$OUT${f}" 2>/dev/null || true
+      done || true
+      [ -d /usr/include/unicode ] && mkdir -p $OUT/usr/include/unicode && cp -a /usr/include/unicode/* $OUT/usr/include/unicode/ 2>/dev/null || true
+      for d in /usr/include/c++/14 /usr/include/c++/13; do
+        if [ -d "$d" ]; then
+          mkdir -p "$OUT$d" && cp -a "$d"/* "$OUT$d/" 2>/dev/null || true
+          td="/usr/include/x86_64-linux-gnu/c++/$(basename $d)"
+          [ -d "$td" ] && mkdir -p "$OUT$td" && cp -a "$td"/* "$OUT$td/" 2>/dev/null || true
+          break
+        fi
+      done
+      find /usr/lib/x86_64-linux-gnu/pkgconfig -name 'icu*.pc' 2>/dev/null | while read -r f; do
+        mkdir -p "$OUT$(dirname "$f")" && cp "$f" "$OUT${f}" 2>/dev/null || true
+      done || true
+      cp -r /usr/lib/git-core $OUT/usr/lib/ 2>/dev/null || true
+      [ -d /usr/libexec/gcc ] && mkdir -p $OUT/usr/libexec && cp -r /usr/libexec/gcc $OUT/usr/libexec/ 2>/dev/null || true
+      for bin in /usr/bin/x86_64-linux-gnu-as /usr/bin/x86_64-linux-gnu-ld /usr/bin/as /usr/bin/ld; do
+        [ -f "$bin" ] || continue
+        ldd "$bin" 2>/dev/null | grep "=> /" | awk '{print $3}' | while read -r lib; do
+          [ -f "$lib" ] || continue
+          mkdir -p "$OUT$(dirname "$lib")" && cp -n "$lib" "$OUT${lib}" 2>/dev/null || true
+        done || true
+      done
+      for script in /usr/lib/x86_64-linux-gnu/libc.so /usr/lib/x86_64-linux-gnu/libm.so; do
+        [ -f "$script" ] || continue
+        grep -oP '/lib/x86_64-linux-gnu/\S+' "$script" 2>/dev/null | tr -d ')' | while read -r ref; do
+          [ -f "$OUT$ref" ] && continue
+          src="/usr${ref}"; [ -f "$src" ] || src="$ref"; [ -f "$src" ] || continue
+          mkdir -p "$OUT$(dirname "$ref")" && cp "$src" "$OUT$ref" 2>/dev/null || true
+        done || true
+      done
+      find /usr/lib/x86_64-linux-gnu -name 'libcurl-gnutls*' 2>/dev/null | while read -r f; do
+        mkdir -p "$OUT$(dirname "$f")" && cp -a "$f" "$OUT${f}" 2>/dev/null || true
+      done || true
+      ln -sf python3 $OUT/usr/bin/python
+      ln -sf gcc $OUT/usr/bin/cc
+
+      # Compilation support files: CRT objects, static archives, and linker scripts.
+      # These are NOT binaries so ldd sweeps miss them, and dpkg -L may skip them
+      # if the package was pre-installed on the RWX runner. Copy them explicitly.
+      echo "=== Copying compilation support files ==="
+      LIBDIR=/usr/lib/x86_64-linux-gnu
+      for f in $LIBDIR/crt1.o $LIBDIR/crti.o $LIBDIR/crtn.o $LIBDIR/Scrt1.o \
+               $LIBDIR/libc_nonshared.a $LIBDIR/libmvec_nonshared.a \
+               $LIBDIR/libpthread_nonshared.a $LIBDIR/libc.so $LIBDIR/libm.so; do
+        if [ -f "$f" ]; then
+          mkdir -p "$OUT$(dirname "$f")" && cp -a "$f" "$OUT$f"
+          echo "  copied: $f"
+        fi
+      done
+      # GCC support files (crtbegin.o, crtend.o, libgcc*.a, specs, etc.)
+      for d in /usr/lib/gcc/x86_64-linux-gnu/14 /usr/lib/gcc/x86_64-linux-gnu/13; do
+        if [ -d "$d" ]; then
+          mkdir -p "$OUT$d" && cp -a "$d"/* "$OUT$d/"
+          echo "  copied: $d/* (gcc support)"
+          break
+        fi
+      done
+
+      # Verify critical linker files are present
+      LINK_FAILURES=0
+      for f in crt1.o crti.o crtn.o libc.so libc_nonshared.a; do
+        if [ ! -f "$OUT$LIBDIR/$f" ]; then
+          echo "FAIL: missing linker file $LIBDIR/$f"
+          LINK_FAILURES=$((LINK_FAILURES + 1))
+        fi
+      done
+      for f in crtbegin.o crtend.o libgcc.a; do
+        found=""
+        for d in $OUT/usr/lib/gcc/x86_64-linux-gnu/14 $OUT/usr/lib/gcc/x86_64-linux-gnu/13; do
+          [ -f "$d/$f" ] && found=1 && break
+        done
+        if [ -z "$found" ]; then
+          echo "FAIL: missing gcc file $f"
+          LINK_FAILURES=$((LINK_FAILURES + 1))
+        fi
+      done
+      if [ "$LINK_FAILURES" -gt 0 ]; then
+        echo "FATAL: $LINK_FAILURES linker support files missing — cannot produce working image"
+        exit 1
+      fi
+      echo "  all linker support files present"
+
+      # CA certificates: dpkg -L misses files generated by post-install hooks.
+      # Include the generated bundle, individual cert symlinks, and config.
+      mkdir -p "$OUT/etc/ssl/certs" "$OUT/usr/local/share/ca-certificates"
+      cp -a /etc/ssl/certs/ca-certificates.crt "$OUT/etc/ssl/certs/" 2>/dev/null || true
+      cp -a /etc/ssl/certs/*.pem "$OUT/etc/ssl/certs/" 2>/dev/null || true
+      cp -a /etc/ca-certificates.conf "$OUT/etc/" 2>/dev/null || true
+
+      sudo tar -czf syspackages.tar.gz -C $OUT .
+    outputs:
+      # Artifact-only producer — validate-agent and push-agent unpack
+      # syspackages.tar.gz directly, never touch this task's filesystem.
+      filesystem: false
+      artifacts:
+        - key: syspackages-tar
+          path: syspackages.tar.gz
+
+  # ── Node.js + Claude Code (agent layer) ────────────────────────────
+  - key: agent-install-node
+    use: [code]
+    timeout: 10m
+    # Heavy data mover: downloads Node + npm-installs Claude Code.
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    filter:
+      - gardenio/images/agent/install/node.sh
+      - gardenio/images/agent/install/versions.env
+      - gardenio/images/agent/install/checksums.env
+      - gardenio/images/agent/install/lib.sh
+      - gardenio/.rwx/agent-node.lock
+    run: |
+      set -e
+      OUT=/tmp/node-layer
+      mkdir -p $OUT/usr/local
+
+      INSTALL_PREFIX=$OUT/usr/local TARGETARCH=amd64 \
+        bash gardenio/images/agent/install/node.sh
+
+      tar -czf node.tar.gz -C $OUT .
+    outputs:
+      # Artifact-only producer (see syspackages note).
+      filesystem: false
+      artifacts:
+        - key: node-tar
+          path: node.tar.gz
+
+  # ── Playwright + Chromium + Chrome + system deps (cached separately) ──
+  # NOTE: installs its own Node.js to avoid depending on agent-install-node,
+  # which would serialize these two tasks. This saves ~2-3 min on the critical path.
+  - key: agent-install-playwright
+    use: [code]
+    timeout: 10m
+    # Heavy data mover: downloads Chromium (~150MB), Chrome (~120MB), and
+    # writes ~500MB of browser bundle data into the layer dir.
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    filter:
+      - gardenio/images/agent/install/playwright.sh
+      - gardenio/images/agent/install/node.sh
+      - gardenio/images/agent/install/versions.env
+      - gardenio/images/agent/install/checksums.env
+      - gardenio/images/agent/install/lib.sh
+      - gardenio/.rwx/agent-playwright.lock
+    run: |
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+      source gardenio/images/agent/install/versions.env
+      OUT=/tmp/playwright-layer
+
+      # Install our own Node.js (avoids sequential dep on agent-install-node)
+      mkdir -p /tmp/node-root/usr/local
+      INSTALL_PREFIX=/tmp/node-root/usr/local TARGETARCH=amd64 \
+        bash gardenio/images/agent/install/node.sh
+      export PATH="/tmp/node-root/usr/local/bin:$PATH"
+
+      mkdir -p $OUT/usr/local
+
+      # Playwright + MCP server (version from versions.env)
+      npm install -g --prefix $OUT/usr/local playwright@${PLAYWRIGHT_VERSION} @playwright/mcp
+
+      # Playwright system deps (from versions.env)
+      # Snapshot pre-install state for auto-resolution
+      dpkg-query -W -f '${Package}\n' | sort > /tmp/pw-before.txt
+      sudo apt-get -y update
+      sudo apt-get -y install --no-install-recommends $PLAYWRIGHT_SYSTEM_DEPS
+      dpkg-query -W -f '${Package}\n' | sort > /tmp/pw-after.txt
+      PW_NEW_PACKAGES=$(comm -13 /tmp/pw-before.txt /tmp/pw-after.txt)
+
+      # Auto-resolve: copy all files from newly installed packages
+      for pkg in $PW_NEW_PACKAGES; do
+        dpkg -L "$pkg" 2>/dev/null | while read -r f; do
+          [ -e "$f" ] || continue
+          [ -d "$f" ] && { mkdir -p "$OUT$f"; continue; }
+          mkdir -p "$OUT$(dirname "$f")" && cp -a "$f" "$OUT${f}" 2>/dev/null || true
+        done || true
+      done
+      # Explicit glob for Chromium-critical .so files (symlinks + versioned targets)
+      for pattern in libnspr4 libnss3 libnssutil3 libsmime3 libssl3 libplc4 libplds4 \
+          libasound libatk-1 libatk-bridge libatspi libcairo libcups libdbus-1 \
+          libdrm libgbm libglib-2 libgobject-2 libpango-1 libX11 libxcb \
+          libXcomposite libXdamage libXext libXfixes libxkbcommon libXrandr \
+          libfontconfig libfreetype libsqlite3 libavahi; do
+        for f in /usr/lib/x86_64-linux-gnu/${pattern}*; do
+          [ -e "$f" ] || continue
+          mkdir -p "$OUT$(dirname "$f")"
+          cp -a "$f" "$OUT$f" 2>/dev/null || true
+        done
+      done
+      # Transitive deps via ldd on key shared libraries.
+      # Use cp -L (dereference symlinks) so we copy the actual .so file, not a
+      # symlink whose target (e.g. libgssapi_krb5.so.2.2) may not be in this layer.
+      # Without -L, dangling symlinks overwrite the real file from syspackages
+      # during assembly, breaking curl (and thus entrypoint nudges).
+      for bin in /usr/lib/x86_64-linux-gnu/libcairo.so* /usr/lib/x86_64-linux-gnu/libpango*.so* \
+          /usr/lib/x86_64-linux-gnu/libgdk*.so* /usr/lib/x86_64-linux-gnu/libgtk*.so* \
+          /usr/lib/x86_64-linux-gnu/libnss3.so* /usr/lib/x86_64-linux-gnu/libcups.so*; do
+        [ -f "$bin" ] || continue
+        ldd "$bin" 2>/dev/null | grep "=> /" | awk '{print $3}' | while read -r lib; do
+          [ -e "$lib" ] || continue
+          mkdir -p "$OUT$(dirname "$lib")" && cp -L "$lib" "$OUT${lib}" 2>/dev/null || true
+        done || true
+      done
+
+      # Install Chromium browser (managed by Playwright).
+      # Install for both the standalone playwright and the @playwright/mcp bundled
+      # version — they may expect different chromium revisions.
+      PLAYWRIGHT_BROWSERS_PATH=$OUT/ms-playwright npx playwright install chromium
+      PLAYWRIGHT_BROWSERS_PATH=$OUT/ms-playwright npx --package=@playwright/mcp playwright install chromium
+      chmod -R 777 $OUT/ms-playwright
+
+      # Install Google Chrome Stable (system browser at /opt/google/chrome/chrome).
+      # This is required for playwright-mcp --browser chrome --headless.
+      curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+        | sudo gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+        | sudo tee /etc/apt/sources.list.d/google-chrome.list > /dev/null
+      sudo apt-get -y update
+      sudo apt-get -y install --no-install-recommends google-chrome-stable
+      # Copy Chrome and its dpkg-installed files to the layer
+      dpkg -L google-chrome-stable 2>/dev/null | while read -r f; do
+        [ -e "$f" ] || continue
+        [ -d "$f" ] && { mkdir -p "$OUT$f"; continue; }
+        mkdir -p "$OUT$(dirname "$f")" && cp -a "$f" "$OUT${f}" 2>/dev/null || true
+      done || true
+
+      # Final ldd sweep: resolve ALL shared libs needed by installed browser binaries.
+      # Use cp -L to dereference symlinks (same rationale as the transitive deps sweep).
+      for bin in $(find $OUT/ms-playwright -name chrome -type f -executable 2>/dev/null) \
+                 /opt/google/chrome/chrome; do
+        [ -f "$bin" ] || continue
+        ldd "$bin" 2>/dev/null | grep "=> /" | awk '{print $3}' | while read -r lib; do
+          [ -e "$lib" ] || continue
+          [ -e "$OUT$lib" ] && continue
+          mkdir -p "$OUT$(dirname "$lib")" && cp -L "$lib" "$OUT${lib}" 2>/dev/null || true
+        done || true
+      done
+
+      # Build fontconfig cache so chromium can discover fonts at runtime.
+      # dpkg -L copies fonts.conf and conf.d/ but not the generated cache.
+      FONTCONFIG_SYSROOT=$OUT fc-cache -f 2>/dev/null || true
+
+      tar -czf playwright.tar.gz -C $OUT .
+    outputs:
+      # Artifact-only producer (see syspackages note). Big win here — the
+      # Chromium install adds ~500MB to the layer that nobody reads.
+      filesystem: false
+      artifacts:
+        - key: playwright-tar
+          path: playwright.tar.gz
+
+  # ── Go toolchain (agent layer) ─────────────────────────────────────
+  - key: agent-install-go
+    use: [code]
+    timeout: 10m
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    filter:
+      - gardenio/images/agent/install/go-tools.sh
+      - gardenio/images/agent/install/versions.env
+      - gardenio/images/agent/install/checksums.env
+      - gardenio/images/agent/install/lib.sh
+      - gardenio/.rwx/agent-go.lock
+    run: |
+      set -e
+      OUT=/tmp/go-layer
+      mkdir -p $OUT/usr/local/bin
+
+      INSTALL_PREFIX=$OUT/usr/local TARGETARCH=amd64 \
+        bash gardenio/images/agent/install/go-tools.sh
+
+      # Strip debug symbols from Go toolchain binaries — saves ~50MB
+      find $OUT -type f -executable | xargs strip --strip-debug 2>/dev/null || true
+      tar -czf go.tar.gz -C $OUT .
+    outputs:
+      # Artifact-only producer (see syspackages note).
+      filesystem: false
+      artifacts:
+        - key: go-tar
+          path: go.tar.gz
+
+  # ── Rust toolchain (agent layer) ───────────────────────────────────
+  - key: agent-install-rust
+    use: [code]
+    timeout: 10m
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    filter:
+      - gardenio/images/agent/install/rust-tools.sh
+      - gardenio/images/agent/install/versions.env
+      - gardenio/images/agent/install/checksums.env
+      - gardenio/images/agent/install/lib.sh
+      - gardenio/.rwx/agent-rust.lock
+    run: |
+      set -e
+      OUT=/tmp/rust-layer
+      mkdir -p $OUT/usr/local/bin
+
+      sudo apt-get update && sudo apt-get install -y gcc libc6-dev pkg-config libssl-dev
+
+      INSTALL_PREFIX=$OUT/usr/local \
+        bash gardenio/images/agent/install/rust-tools.sh
+
+      # Strip debug symbols from Rust toolchain:
+      #   binaries (rustc, cargo, etc.) — saves ~50MB
+      #   stdlib rlibs — DWARF debug info in each .rlib, saves ~200-300MB
+      find $OUT/usr/local/bin $OUT/usr/local/cargo/bin -type f -executable \
+        | xargs strip --strip-debug 2>/dev/null || true
+      find $OUT -name '*.rlib' | xargs strip --strip-debug 2>/dev/null || true
+      tar -czf rust.tar.gz -C $OUT .
+    outputs:
+      # Artifact-only producer (see syspackages note).
+      filesystem: false
+      artifacts:
+        - key: rust-tar
+          path: rust.tar.gz
+
+  # ── CLI tools (agent layer) — downloads only, no heavy compilation ─
+  - key: agent-install-clis
+    use: [code]
+    timeout: 10m
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    filter:
+      - gardenio/images/agent/install/clis.sh
+      - gardenio/images/agent/install/versions.env
+      - gardenio/images/agent/install/checksums.env
+      - gardenio/images/agent/install/lib.sh
+      - gardenio/.rwx/agent-clis.lock
+    run: |
+      set -e
+      OUT=/tmp/clis-layer
+      mkdir -p $OUT/usr/local/bin $OUT/opt
+
+      # Skip whisper-cli here — it builds in agent-install-whisper (parallel).
+      # PG17_DEST pins the baked pg17 client under $OUT/opt/pg17 so it is
+      # captured by `tar -C $OUT` and lands at /opt/pg17 in the final image —
+      # matching the Dockerfile's `COPY --from=cli-tools /opt/`. Without this
+      # override clis.sh would write to the absolute /opt/pg17 on the runner,
+      # which this artifact-only task does not capture (ka-0000003862).
+      SKIP_WHISPER=1 INSTALL_PREFIX=$OUT/usr/local PG17_DEST=$OUT/opt/pg17 TARGETARCH=amd64 \
+        bash gardenio/images/agent/install/clis.sh
+
+      # AWS CLI installs to /opt by default, move to output if needed
+      if [ -d /opt/aws-cli ] && [ ! -d "$OUT/opt/aws-cli" ]; then
+        cp -r /opt/aws-cli $OUT/opt/
+      fi
+
+      sudo tar -czf clis.tar.gz -C $OUT .
+    outputs:
+      # Artifact-only producer (see syspackages note).
+      filesystem: false
+      artifacts:
+        - key: clis-tar
+          path: clis.tar.gz
+
+  # ── whisper-cli (cmake compilation, isolated parallel task) ────────
+  - key: agent-install-whisper
+    use: [code]
+    timeout: 10m
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    filter:
+      - gardenio/images/agent/install/versions.env
+      - gardenio/images/agent/install/checksums.env
+      - gardenio/images/agent/install/lib.sh
+      - gardenio/.rwx/agent-clis.lock
+    run: |
+      set -e
+      source gardenio/images/agent/install/versions.env
+      source gardenio/images/agent/install/checksums.env
+      source gardenio/images/agent/install/lib.sh
+      OUT=/tmp/whisper-layer
+      mkdir -p $OUT/usr/local/bin
+
+      sudo apt-get update && sudo apt-get install -y cmake gcc g++ make
+
+      fetch_verify_stdout \
+        "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v${WHISPER_CPP_VERSION}.tar.gz" \
+        "${WHISPER_CPP_SHA256}" \
+        | tar -xz -C /tmp
+      cmake -S "/tmp/whisper.cpp-${WHISPER_CPP_VERSION}" -B /tmp/whisper-build \
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+      cmake --build /tmp/whisper-build --config Release -j"$(nproc)" --target whisper-cli
+      cp /tmp/whisper-build/bin/whisper-cli $OUT/usr/local/bin/whisper-cli
+      rm -rf /tmp/whisper.cpp-* /tmp/whisper-build
+
+      tar -czf whisper.tar.gz -C $OUT .
+    outputs:
+      # Artifact-only producer (see syspackages note).
+      filesystem: false
+      artifacts:
+        - key: whisper-tar
+          path: whisper.tar.gz
+
+  # ── Terraform provider cache (pre-downloaded providers) ───────────────
+  - key: agent-install-terraform-providers
+    use: [code, agent-install-clis]
+    timeout: 5m
+    filter:
+      - gardenio/images/agent/install/terraform-providers.sh
+      - gardenio/images/agent/install/versions.env
+      - gardenio/.rwx/agent-terraform-providers.lock
+      # The prewarm sanity check runs inline below; re-trigger the layer build
+      # when the check itself changes so a regression in it can't go unexercised.
+      - gardenio/tests/e2e/scripts/test-terraform-prewarm-cache.sh
+    run: |
+      set -e
+      OUT=/tmp/tf-providers-layer
+      mkdir -p $OUT/opt/terraform-plugin-cache $OUT/opt/terragrunt-cache
+
+      # Unpack clis layer to get the terraform binary
+      CLIS_DIR=/tmp/clis-extract
+      mkdir -p $CLIS_DIR
+      tar -xzf ${{ tasks.agent-install-clis.artifacts.clis-tar }} -C $CLIS_DIR
+
+      # Run the provider cache script using the extracted terraform
+      TERRAFORM_BIN=$CLIS_DIR/usr/local/bin/terraform \
+      TF_PLUGIN_CACHE_DIR=$OUT/opt/terraform-plugin-cache \
+        bash gardenio/images/agent/install/terraform-providers.sh
+
+      # ── PREWARM sanity check (ka-0000002834) ──────────────────────────────
+      # The prewarm exists so a `terragrunt init` during EKS provisioning finds
+      # ~700 MB of providers already on disk instead of re-fetching them. Assert
+      # here — the one place a terraform binary AND the freshly-built cache both
+      # exist — that the cache is non-empty, has one binary per declared provider
+      # at the versions.env-pinned version, clears a size floor, AND is actually
+      # CONSUMED (terraform serves a provider "from the shared cache directory").
+      # This catches the silent-empty-cache regression class the bead flagged
+      # BEFORE the layer is tarred into the agent image. Hard gate: `set -e`
+      # above fails the build if the test exits non-zero.
+      PREWARM_CACHE_DIR=$OUT/opt/terraform-plugin-cache \
+      TERRAFORM_BIN=$CLIS_DIR/usr/local/bin/terraform \
+        bash gardenio/tests/e2e/scripts/test-terraform-prewarm-cache.sh
+
+      # Install boto3 into the layer's local site-packages. Ubuntu 24.04's
+      # minimal python3 has no pip and no ensurepip module, so install
+      # python3-pip via apt. The target path matches Python 3.12's default
+      # sys.path entry (/usr/local/lib/python3.12/dist-packages) so boto3
+      # is importable after the layer is appended to the agent image.
+      sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-pip
+      pip3 install --target=$OUT/usr/local/lib/python3.12/dist-packages --no-cache-dir boto3
+
+      tar -czf terraform-providers.tar.gz -C $OUT .
+      rm -rf $CLIS_DIR
+    outputs:
+      filesystem: false
+      artifacts:
+        - key: terraform-providers-tar
+          path: terraform-providers.tar.gz
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Agent base image — cached layer with all 8 agent-install layers + system config.
+  # Only rebuilds when install scripts or lockfiles change. This is the
+  # heavy ~1.8 GB image that changes rarely. push-agent then appends a
+  # thin overlay (~50-100 MB) with project binaries built from source.
+  # ═══════════════════════════════════════════════════════════════════════
+  - key: push-agent-base
+    use: [code, install-crane]
+    if: ${{ init.ref-name != 'pr' && (init.build-target == 'all' || init.build-target == 'agent') }}
+    timeout: 30m
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    # Combined filters from all agent-install-* tasks. When none of these
+    # files change, RWX skips this task entirely — the existing agent-base
+    # image in the registry is still valid.
+    filter:
+      - gardenio/.rwx/agent-syspackages.lock
+      - gardenio/.rwx/agent-node.lock
+      - gardenio/.rwx/agent-playwright.lock
+      - gardenio/.rwx/agent-go.lock
+      - gardenio/.rwx/agent-rust.lock
+      - gardenio/.rwx/agent-clis.lock
+      - gardenio/.rwx/agent-terraform-providers.lock
+      - gardenio/images/agent/install/versions.env
+      - gardenio/images/agent/install/node.sh
+      - gardenio/images/agent/install/playwright.sh
+      - gardenio/images/agent/install/go-tools.sh
+      - gardenio/images/agent/install/rust-tools.sh
+      - gardenio/images/agent/install/clis.sh
+      - gardenio/images/agent/install/terraform-providers.sh
+    run: |
+      set -e
+      T0=$(date +%s)
+      TAG="latest"
+
+      LAYER=/tmp/layer
+      mkdir -p $LAYER
+
+      # Unpack all 8 agent-install layers sequentially — parallel extraction
+      # races on shared directories like /usr/lib/x86_64-linux-gnu/.
+      T_UNPACK=$(date +%s)
+      echo "=== Unpacking layers (sequential — parallel races on shared dirs) ==="
+      sudo tar -xzf ${{ tasks.agent-install-syspackages.artifacts.syspackages-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-playwright.artifacts.playwright-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-node.artifacts.node-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-go.artifacts.go-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-rust.artifacts.rust-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-clis.artifacts.clis-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-whisper.artifacts.whisper-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-terraform-providers.artifacts.terraform-providers-tar }} -C $LAYER
+      echo "=== All layers unpacked in $(($(date +%s) - T_UNPACK))s ==="
+
+      # Restore usrmerge symlinks.
+      # ubuntu:24.04 base has /lib -> usr/lib, /bin -> usr/bin, /sbin -> usr/sbin.
+      # The layer tars create real /lib/, /bin/, /sbin/ directories (from ldd copy
+      # loops that follow the symlinks), which clobber the base image's symlinks
+      # when crane-appended as a flat layer.
+      echo "=== Restoring usrmerge symlinks ==="
+      for dir in lib bin sbin; do
+        if [ -d "$LAYER/$dir" ] && ! [ -L "$LAYER/$dir" ]; then
+          sudo cp -a "$LAYER/$dir/"* "$LAYER/usr/$dir/" 2>/dev/null || true
+          sudo rm -rf "$LAYER/$dir"
+          ln -s "usr/$dir" "$LAYER/$dir"
+          echo "  $dir/ -> usr/$dir (merged $(find $LAYER/usr/$dir -type f 2>/dev/null | wc -l) files)"
+        fi
+      done
+
+      # CA certs + system config
+      mkdir -p $LAYER/etc/ssl/certs
+      cp /etc/ssl/certs/ca-certificates.crt $LAYER/etc/ssl/certs/
+
+      # Agent runs unprivileged — no sudoers, no NOPASSWD. The Dockerfile
+      # (commit 498dfa93, H2) removed the NOPASSWD sudoers entry and dropped
+      # sudo from BASE_PACKAGES. This CI base image path has to match; baking
+      # sudoers.d/agent into the base layer would reintroduce NOPASSWD every
+      # time an agent pod starts, silently reverting the security fix.
+
+      # Agent user (rename ubuntu→agent, UID 1000)
+      cp /etc/passwd $LAYER/etc/passwd
+      sed -i "s/^ubuntu:/agent:/" $LAYER/etc/passwd
+      sed -i "s|/home/ubuntu|/home/agent|" $LAYER/etc/passwd
+      sed -i "s|/bin/sh|/bin/bash|" $LAYER/etc/passwd
+      sudo cp /etc/shadow $LAYER/etc/shadow
+      sudo sed -i "s/^ubuntu:/agent:/" $LAYER/etc/shadow
+      cp /etc/group $LAYER/etc/group
+      sed -i "s/^ubuntu:/agent:/" $LAYER/etc/group
+      mkdir -p $LAYER/home/agent/workspace $LAYER/home/agent/.ssh
+
+      # SSH known hosts
+      ssh-keyscan -t ed25519,ecdsa,rsa github.com gitlab.com \
+        > $LAYER/home/agent/.ssh/known_hosts 2>/dev/null || true
+      chmod 700 $LAYER/home/agent/.ssh
+      chmod 644 $LAYER/home/agent/.ssh/known_hosts 2>/dev/null || true
+
+      # Partial-clone git defaults (system-wide /etc/gitconfig). Must stay in
+      # sync with images/agent/Dockerfile (ka-0000000463). Agent workspaces are
+      # blobless partial clones (git clone --filter=blob:none, see controller
+      # initclone.go), so the agent's own git operations lazily backfill file
+      # contents on demand. fetch.writeCommitGraph keeps ancestry walks fast;
+      # gc.cruftPacks sweeps the loose objects a --filter backfill leaves behind.
+      # The promisor remote is auto-configured by the --filter clone, so there
+      # is nothing to set for it here. Written as a static file (no git binary
+      # in this RWX task) in the system gitconfig format.
+      mkdir -p $LAYER/etc
+      printf '[fetch]\n\twriteCommitGraph = true\n[gc]\n\tcruftPacks = true\n' \
+        > $LAYER/etc/gitconfig
+      chmod 644 $LAYER/etc/gitconfig
+
+      # Fix ownership
+      sudo chown -R 1000:1000 $LAYER/home/agent
+
+      # ── Validation (catches issues before pushing ~1.8 GB) ───────────
+      T_VALIDATE=$(date +%s)
+      echo "=== Validate: shared libs ==="
+      FAILURES=0
+      LIBDIR=usr/lib/x86_64-linux-gnu
+      for lib in libgssapi_krb5.so.2 libcurl.so.4 libssl.so.3 libnss3.so libnspr4.so; do
+        f="$LAYER/$LIBDIR/$lib"
+        if [ -L "$f" ]; then
+          target=$(readlink "$f")
+          [ -e "$LAYER/$LIBDIR/$target" ] && echo "  OK: $lib" || { echo "FAIL: dangling $lib -> $target"; FAILURES=$((FAILURES + 1)); }
+        elif [ -f "$f" ]; then
+          echo "  OK: $lib"
+        else
+          echo "FAIL: missing $lib"; FAILURES=$((FAILURES + 1))
+        fi
+      done
+
+      echo "=== Validate: system binaries ==="
+      # sudo was removed from BASE_PACKAGES in commit 498dfa93 (H2, unprivileged agent).
+      # ffprobe is the metadata half of the ffmpeg toolchain (ships in the same
+      # apt package) and the `video` skill's Phase 1 hard-depends on it
+      # (`ffprobe -show_format -show_streams`); guard it alongside ffmpeg so an
+      # ffmpeg build that dropped ffprobe can never ship green (ka-0000001850).
+      for bin in git curl jq ssh make gcc g++ unzip python3 screen tmux psql ffmpeg ffprobe cmake shellcheck protoc; do
+        [ -f "$LAYER/usr/bin/$bin" ] || [ -L "$LAYER/usr/bin/$bin" ] && echo "  OK: $bin" || { echo "FAIL: $bin missing"; FAILURES=$((FAILURES + 1)); }
+      done
+
+      echo "=== Validate: tool binaries ==="
+      STATIC_BINS="coop kd gb go gopls golangci-lint task quench claudeless hadolint stern yq terraform terragrunt rustc cargo"
+      BIN_DIRS="usr/local/bin usr/local/cargo/bin usr/local/go/bin"
+      for bin in claude node npm npx go gopls golangci-lint rustc cargo \
+                kubectl gh glab docker helm terraform terragrunt uv bun \
+                quench whisper-cli yq stern hadolint claudeless rwx poetry task; do
+        found=""
+        for dir in $BIN_DIRS; do
+          [ -f "$LAYER/$dir/$bin" ] || [ -L "$LAYER/$dir/$bin" ] && { found="/$dir/$bin"; break; }
+        done
+        if [ -n "$found" ]; then
+          echo "  OK: $found"
+        else
+          echo "FAIL: $bin not found"; FAILURES=$((FAILURES + 1))
+        fi
+      done
+
+      echo "=== Validate: playwright ==="
+      chromium=$(find "$LAYER/ms-playwright" -name chrome -type f -executable 2>/dev/null | head -1)
+      [ -n "$chromium" ] && echo "  OK: chromium" \
+        || { echo "FAIL: chromium missing"; FAILURES=$((FAILURES + 1)); }
+
+      echo "=== Validate: baked pg17 client (P4.4 cutover, ka-0000003862) ==="
+      # The pg17 bake is a backgrounded subshell in clis.sh; a partial/failed
+      # bake must NOT ship a green image. Hard-check both binaries are present.
+      for f in pg_dump pg_restore; do
+        if [ -x "$LAYER/opt/pg17/usr/lib/postgresql/17/bin/$f" ]; then
+          echo "  OK: /opt/pg17/.../$f"
+        else
+          echo "FAIL: baked pg17 $f missing (/opt/pg17/usr/lib/postgresql/17/bin/$f)"; FAILURES=$((FAILURES + 1))
+        fi
+      done
+
+      echo "=== Validate: linker support files ==="
+      LIBDIR_FULL="$LAYER/usr/lib/x86_64-linux-gnu"
+      for f in crt1.o crti.o crtn.o libc.so libc_nonshared.a; do
+        if [ -f "$LIBDIR_FULL/$f" ]; then
+          echo "  OK: $f"
+        else
+          echo "FAIL: missing $f"; FAILURES=$((FAILURES + 1))
+        fi
+      done
+      GCC_DIR=""
+      for d in "$LAYER/usr/lib/gcc/x86_64-linux-gnu/14" "$LAYER/usr/lib/gcc/x86_64-linux-gnu/13"; do
+        [ -d "$d" ] && GCC_DIR="$d" && break
+      done
+      if [ -n "$GCC_DIR" ]; then
+        for f in crtbegin.o crtend.o libgcc.a; do
+          [ -f "$GCC_DIR/$f" ] && echo "  OK: gcc/$f" || { echo "FAIL: missing $f in $GCC_DIR"; FAILURES=$((FAILURES + 1)); }
+        done
+      else
+        echo "FAIL: no gcc support directory found"; FAILURES=$((FAILURES + 1))
+      fi
+
+      echo "=== Validate: entrypoint assets ==="
+      [ -d "$LAYER/usr/lib/git-core" ] && echo "  OK: git-core" || { echo "FAIL: git-core"; FAILURES=$((FAILURES + 1)); }
+      for hdr in linux/errno.h linux/limits.h linux/types.h; do
+        [ -f "$LAYER/usr/include/$hdr" ] || { echo "FAIL: $hdr"; FAILURES=$((FAILURES + 1)); }
+      done
+
+      if [ "$FAILURES" -gt 0 ]; then
+        echo ""; echo "FAILED: $FAILURES static validation errors — NOT pushing"; exit 1
+      fi
+      echo "=== Static validation passed in $(($(date +%s) - T_VALIDATE))s ==="
+
+      # ── Compilation smoke tests (merged with ubuntu:24.04 base) ──────
+      # These verify the toolchains in the base layer can actually compile
+      # code, not just that binaries exist. Moved from push-agent so they
+      # only run when the base layer changes.
+      echo "=== Creating layer tar (gzip -1 for speed) ==="
+      T_TAR=$(date +%s)
+      sudo tar --use-compress-program='gzip -1' -cf /tmp/agent-base-layer.tar.gz -C $LAYER .
+      echo "Layer: $(du -h /tmp/agent-base-layer.tar.gz | cut -f1) in $(($(date +%s) - T_TAR))s"
+
+      echo "=== Building merged rootfs for compilation smoke tests ==="
+      ROOTFS=/tmp/rootfs
+      sudo mkdir -p "$ROOTFS"
+      crane export ubuntu:24.04 - | sudo tar -xf - -C "$ROOTFS"
+      sudo tar -xzf /tmp/agent-base-layer.tar.gz -C "$ROOTFS"
+      sudo mount -t proc proc "$ROOTFS/proc"
+
+      echo "=== Validate: compilation smoke tests (merged image) ==="
+      # Test 1: protoc
+      printf 'syntax = "proto3";\npackage test;\nmessage Ping { string id = 1; }\n' | sudo tee "$ROOTFS/tmp/test.proto" >/dev/null
+      if sudo chroot "$ROOTFS" protoc --proto_path=/tmp --cpp_out=/tmp /tmp/test.proto 2>&1; then
+        echo "  OK: protoc compiles .proto"
+      elif sudo chroot "$ROOTFS" protoc --version 2>&1; then
+        echo "  OK: protoc --version (compilation test skipped)"
+      else
+        echo "FAIL: protoc cannot run"; FAILURES=$((FAILURES + 1))
+      fi
+      # Test 2: gcc
+      printf '#include <stdio.h>\nint main() { printf("gcc ok\\n"); return 0; }\n' | sudo tee "$ROOTFS/tmp/smoke_test.c" > /dev/null
+      if sudo chroot "$ROOTFS" /usr/bin/gcc -o /tmp/smoke_test /tmp/smoke_test.c 2>&1; then
+        smoke_out=$(sudo chroot "$ROOTFS" /tmp/smoke_test 2>&1 || true)
+        if echo "$smoke_out" | grep -q "gcc ok"; then
+          echo "  OK: gcc compiles and links C program"
+        else
+          echo "  OK: gcc compiles C program (binary produced, could not verify output in chroot)"
+        fi
+      else
+        echo "FAIL: gcc cannot compile a simple C program"; FAILURES=$((FAILURES + 1))
+      fi
+      # Test 3: rustc
+      printf 'fn main() { println!("rustc ok"); }\n' | sudo tee "$ROOTFS/tmp/smoke_test.rs" > /dev/null
+      if sudo chroot "$ROOTFS" env RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo /usr/local/cargo/bin/rustc -o /tmp/smoke_test_rs /tmp/smoke_test.rs 2>&1; then
+        echo "  OK: rustc compiles and links Rust program"
+      else
+        echo "FAIL: rustc cannot compile a simple Rust program"; FAILURES=$((FAILURES + 1))
+      fi
+      # Test 4: cargo (non-fatal)
+      if sudo chroot "$ROOTFS" /bin/bash -c '
+        export HOME=/tmp
+        export RUSTUP_HOME=/usr/local/rustup
+        export CARGO_HOME=/usr/local/cargo
+        export PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
+        cd /tmp && mkdir -p cargo_smoke && cd cargo_smoke &&
+        /usr/local/cargo/bin/cargo init --name smoke 2>&1 &&
+        /usr/local/cargo/bin/cargo build 2>&1
+      '; then
+        echo "  OK: cargo init + build succeeds"
+      else
+        echo "  WARN: cargo build failed in chroot (non-fatal — direct rustc compilation verified in test 3)"
+      fi
+
+      sudo umount "$ROOTFS/proc" 2>/dev/null || sudo umount -l "$ROOTFS/proc" 2>/dev/null || true
+      sudo rm -rf "$ROOTFS" 2>/dev/null || true
+
+      if [ "$FAILURES" -gt 0 ]; then
+        echo ""; echo "FAILED: $FAILURES compilation smoke test errors — NOT pushing"; exit 1
+      fi
+      echo "=== All compilation smoke tests passed ==="
+
+      # ── Push to registry ─────────────────────────────────────────────
+      T_PUSH=$(date +%s)
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/agent-base"
+      for attempt in 1 2 3; do
+        if crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" \
+             --new_layer /tmp/agent-base-layer.tar.gz --platform linux/amd64; then
+          break
+        fi
+        [ "$attempt" = "3" ] && { echo "FAIL: crane append failed after 3 attempts"; exit 1; }
+        echo "WARN: crane append attempt $attempt failed — retrying in 30s"
+        sleep 30
+      done
+      APPEND_DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${APPEND_DIGEST}" \
+        --user 1000 --workdir /home/agent/workspace \
+        --env PATH="/usr/local/bun/bin:/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        --env PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+        --env RUSTUP_HOME=/usr/local/rustup --env CARGO_HOME=/usr/local/cargo \
+        --env BUN_INSTALL=/usr/local/bun --env HELM_PLUGINS=/usr/local/share/helm/plugins \
+        -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG} in $(($(date +%s) - T_PUSH))s (push) / $(($(date +%s) - T0))s (total)"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+
+  # ── Validate agent image (PRs only — no push, full compilation tests) ──
+  # Assembles the agent layer + merges with ubuntu:24.04 base locally,
+  # then runs the full compilation smoke test suite via chroot. This
+  # catches broken toolchains before merging to main.
+  # NOTE on `use:`: artifact references like
+  #   ${{ tasks.agent-install-syspackages.artifacts.syspackages-tar }}
+  # implicitly create a task dependency (RWX waits for the producer and mounts
+  # its artifact at the path the expression resolves to). We DON'T need to
+  # `use:` those producers — that would also pull in their full filesystem
+  # layers (multi-GB of toolchains, browsers, apt caches) just so we can read
+  # one tar.gz. Per Tommy Graves (RWX): keeping `use:` to `[code, install-crane]`
+  # cut almost all of validate-agent's setup time.
+  - key: validate-agent
+    use: [code, install-crane]
+    if: ${{ init.ref-name == 'pr' }}
+    cache: false
+    timeout: 15m
+    agent:
+      cpus: 4
+      memory: 16gb
+      tmpfs: true
+    # validate-agent is a PR-only leaf task — nothing depends on its
+    # filesystem. Skipping the upload saves ~15s + several GB on every
+    # PR run (the merged rootfs accumulates ~7 GiB).
+    outputs:
+      filesystem: false
+    run: |
+      set -e
+      T0=$(date +%s)
+      LAYER=/tmp/layer
+      mkdir -p $LAYER
+
+      # ── Unpack layers (same as push-agent-base) ──────────────────
+      T_UNPACK=$(date +%s)
+      echo "=== Unpacking layers (sequential — parallel races on shared dirs) ==="
+      sudo tar -xzf ${{ tasks.agent-install-syspackages.artifacts.syspackages-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-playwright.artifacts.playwright-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-node.artifacts.node-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-go.artifacts.go-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-rust.artifacts.rust-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-clis.artifacts.clis-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-whisper.artifacts.whisper-tar }} -C $LAYER
+      sudo tar -xzf ${{ tasks.agent-install-terraform-providers.artifacts.terraform-providers-tar }} -C $LAYER
+      echo "=== All layers unpacked in $(($(date +%s) - T_UNPACK))s ==="
+
+      # Gardenio channel
+      export PATH="$LAYER/usr/local/bun/bin:$LAYER/usr/local/bin:$PATH"
+      export LD_LIBRARY_PATH="$LAYER/usr/lib/x86_64-linux-gnu:$LAYER/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+      mkdir -p $LAYER/channel
+      cp gardenio/images/agent/channel/gardenio-channel.ts $LAYER/channel/
+      cp gardenio/images/agent/channel/package.json $LAYER/channel/
+      cp gardenio/images/agent/channel/bun.lock $LAYER/channel/
+      (cd $LAYER/channel && bun install --frozen-lockfile 2>&1) || (cd $LAYER/channel && bun install 2>&1)
+
+      # Restore usrmerge symlinks
+      for dir in lib bin sbin; do
+        if [ -d "$LAYER/$dir" ] && ! [ -L "$LAYER/$dir" ]; then
+          sudo cp -a "$LAYER/$dir/"* "$LAYER/usr/$dir/" 2>/dev/null || true
+          sudo rm -rf "$LAYER/$dir"
+          ln -s "usr/$dir" "$LAYER/$dir"
+        fi
+      done
+
+      # Project binaries — real kd at kd-bin, wrapper at kd (ka-0000006731).
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/gb $LAYER/usr/local/bin/gb
+      cp ${{ tasks.build-coop.artifacts.coop-binaries }}/coop $LAYER/usr/local/bin/coop
+      cp ${{ tasks.build-kd.artifacts.kd-binaries }}/kd $LAYER/usr/local/bin/kd-bin
+      cp gardenio/images/agent/kd-wrapper.sh $LAYER/usr/local/bin/kd
+      chmod +x $LAYER/usr/local/bin/gb $LAYER/usr/local/bin/coop $LAYER/usr/local/bin/kd $LAYER/usr/local/bin/kd-bin
+
+      # Entrypoint + hooks
+      mkdir -p $LAYER/hooks $LAYER/scenarios
+      cp gardenio/images/agent/hooks/*.sh $LAYER/hooks/
+      chmod +x $LAYER/hooks/*.sh
+      cp gardenio/images/agent/scenarios/*.toml $LAYER/scenarios/
+      cp gardenio/images/agent/entrypoint.sh $LAYER/entrypoint.sh
+      cp gardenio/images/agent/resolve-auth.sh $LAYER/resolve-auth.sh
+      chmod +x $LAYER/entrypoint.sh $LAYER/resolve-auth.sh
+
+      # ── Build local rootfs (base + layer, no push) ────────────────
+      echo "=== Building merged rootfs for validation ==="
+      T_TAR=$(date +%s)
+      sudo tar --use-compress-program='gzip -1' -cf /tmp/agent-layer.tar.gz -C $LAYER .
+      echo "Layer: $(du -h /tmp/agent-layer.tar.gz | cut -f1) in $(($(date +%s) - T_TAR))s"
+
+      ROOTFS=/tmp/rootfs
+      sudo mkdir -p "$ROOTFS"
+      # Export ubuntu:24.04 base as the rootfs foundation.
+      crane export ubuntu:24.04 - | sudo tar -xf - -C "$ROOTFS"
+      # Overlay our layer on top.
+      sudo tar -xzf /tmp/agent-layer.tar.gz -C "$ROOTFS"
+      echo "Rootfs ready in $(($(date +%s) - T_TAR))s"
+
+      # ── Compilation smoke tests ────────────────────────────────────
+      # Mount /proc inside the rootfs — rustc needs /proc/self/exe to
+      # locate its own binary (sysroot discovery).
+      sudo mount -t proc proc "$ROOTFS/proc"
+
+      echo "=== Validate: compilation smoke tests (merged rootfs) ==="
+      FAILURES=0
+
+      # Test 1: protoc compilation
+      printf 'syntax = "proto3";\npackage test;\nmessage Ping { string id = 1; }\n' | sudo tee "$ROOTFS/tmp/test.proto" >/dev/null
+      if sudo chroot "$ROOTFS" protoc --proto_path=/tmp --cpp_out=/tmp /tmp/test.proto 2>&1; then
+        echo "  OK: protoc compiles .proto"
+      elif sudo chroot "$ROOTFS" protoc --version 2>&1; then
+        echo "  OK: protoc --version (compilation test skipped)"
+      else
+        echo "FAIL: protoc cannot run"; FAILURES=$((FAILURES + 1))
+      fi
+
+      # Test 2: C compilation with gcc
+      printf '#include <stdio.h>\nint main() { printf("gcc ok\\n"); return 0; }\n' | sudo tee "$ROOTFS/tmp/smoke_test.c" > /dev/null
+      if sudo chroot "$ROOTFS" /usr/bin/gcc -o /tmp/smoke_test /tmp/smoke_test.c 2>&1; then
+        smoke_out=$(sudo chroot "$ROOTFS" /tmp/smoke_test 2>&1 || true)
+        if echo "$smoke_out" | grep -q "gcc ok"; then
+          echo "  OK: gcc compiles and links C program"
+        else
+          echo "  OK: gcc compiles C program (binary produced, could not verify output in chroot)"
+        fi
+      else
+        echo "FAIL: gcc cannot compile a simple C program"
+        FAILURES=$((FAILURES + 1))
+      fi
+
+      # Test 3: Rust compilation with rustc
+      printf 'fn main() { println!("rustc ok"); }\n' | sudo tee "$ROOTFS/tmp/smoke_test.rs" > /dev/null
+      if sudo chroot "$ROOTFS" env RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo /usr/local/cargo/bin/rustc -o /tmp/smoke_test_rs /tmp/smoke_test.rs 2>&1; then
+        echo "  OK: rustc compiles and links Rust program"
+      else
+        echo "FAIL: rustc cannot compile a simple Rust program"
+        FAILURES=$((FAILURES + 1))
+      fi
+
+      # Test 4: cargo init + build
+      # Non-fatal: cargo's fork+exec of child rustc fails in chroot
+      # environments (ENOENT despite binary existing) due to missing
+      # /dev, incomplete namespace, or seccomp restrictions. Tests 1-3
+      # already validate that protoc, gcc, and rustc compile correctly.
+      if sudo chroot "$ROOTFS" /bin/bash -c '
+        export HOME=/tmp
+        export RUSTUP_HOME=/usr/local/rustup
+        export CARGO_HOME=/usr/local/cargo
+        export PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
+        cd /tmp && mkdir -p cargo_smoke && cd cargo_smoke &&
+        /usr/local/cargo/bin/cargo init --name smoke 2>&1 &&
+        /usr/local/cargo/bin/cargo build 2>&1
+      '; then
+        echo "  OK: cargo init + build succeeds"
+      else
+        echo "  WARN: cargo build failed in chroot (non-fatal — direct rustc compilation verified in test 3)"
+      fi
+
+      # Clean up: umount proc before checking results to avoid rm failures
+      sudo umount "$ROOTFS/proc" 2>/dev/null || sudo umount -l "$ROOTFS/proc" 2>/dev/null || true
+      sudo rm -rf "$ROOTFS" 2>/dev/null || true
+
+      if [ "$FAILURES" -gt 0 ]; then
+        echo ""; echo "FAILED: $FAILURES compilation smoke test errors"; exit 1
+      fi
+      echo "=== All validation passed in $(($(date +%s) - T0))s ==="
+
+  # ── Push agent overlay (thin layer on agent-base) ──────────────────
+  # push-agent now uses agent-base:latest as its base image instead of
+  # ubuntu:24.04. This means it only uploads project binaries, hooks,
+  # config, and channel (~50-100 MB) instead of the full ~1.9 GB.
+  # Compilation smoke tests live in push-agent-base since they test the
+  # base toolchains, not the project binaries.
+  #
+  # NOTE on artifact references: references like
+  #   ${{ tasks.build-go-binaries.artifacts.go-binaries }}
+  # implicitly create task dependencies without pulling in filesystems.
+  - key: push-agent
+    use: [code, install-crane, push-agent-base]
+    if: ${{ init.ref-name != 'pr' && (init.build-target == 'all' || init.build-target == 'agent') }}
+    cache: false
+    timeout: 15m
+    run: |
+      set -e
+      T0=$(date +%s)
+      # Tag strategy: main → main-<sha>, tag → <calver>-rc, other → as-is
+      # (mutable :latest retired — F7 ka-0000006416; main-<sha> is per-commit
+      # immutable, deploy paths pin <calver>/<calver>-rc, nothing pulls :latest)
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      REGISTRY="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}"
+      BASE_REPO="${REGISTRY}/agent-base"
+      REPO="${REGISTRY}/agent"
+
+      # Resolve the base image. push-agent-base pushes agent-base:latest
+      # when install scripts/lockfiles change (filter-cached). When the
+      # base exists in the registry, we use it. If it doesn't exist yet
+      # (first-ever run or registry wipe), fall back to a full monolithic
+      # build via the old path.
+      if crane manifest "${BASE_REPO}:latest" >/dev/null 2>&1; then
+        BASE="${BASE_REPO}:latest"
+        echo "=== Using cached agent-base: ${BASE} ==="
+      else
+        echo "WARN: agent-base:latest not found in registry — falling back to ubuntu:24.04"
+        echo "This is expected on the first run. push-agent-base will create it."
+        BASE="ubuntu:24.04"
+      fi
+
+      LAYER=/tmp/agent-overlay
+      mkdir -p $LAYER
+
+      if [ "$BASE" = "ubuntu:24.04" ]; then
+        # ── Full monolithic build (fallback when agent-base doesn't exist) ──
+        echo "=== FALLBACK: full monolithic build ==="
+        sudo tar -xzf ${{ tasks.agent-install-syspackages.artifacts.syspackages-tar }} -C $LAYER
+        sudo tar -xzf ${{ tasks.agent-install-playwright.artifacts.playwright-tar }} -C $LAYER
+        sudo tar -xzf ${{ tasks.agent-install-node.artifacts.node-tar }} -C $LAYER
+        sudo tar -xzf ${{ tasks.agent-install-go.artifacts.go-tar }} -C $LAYER
+        sudo tar -xzf ${{ tasks.agent-install-rust.artifacts.rust-tar }} -C $LAYER
+        sudo tar -xzf ${{ tasks.agent-install-clis.artifacts.clis-tar }} -C $LAYER
+        sudo tar -xzf ${{ tasks.agent-install-whisper.artifacts.whisper-tar }} -C $LAYER
+        sudo tar -xzf ${{ tasks.agent-install-terraform-providers.artifacts.terraform-providers-tar }} -C $LAYER
+        # Restore usrmerge symlinks
+        for dir in lib bin sbin; do
+          if [ -d "$LAYER/$dir" ] && ! [ -L "$LAYER/$dir" ]; then
+            sudo cp -a "$LAYER/$dir/"* "$LAYER/usr/$dir/" 2>/dev/null || true
+            sudo rm -rf "$LAYER/$dir"
+            ln -s "usr/$dir" "$LAYER/$dir"
+          fi
+        done
+        # System config (normally in agent-base). Agent runs unprivileged —
+        # no sudoers, no NOPASSWD (see commit 498dfa93, H2 security fix).
+        mkdir -p $LAYER/etc/ssl/certs
+        cp /etc/ssl/certs/ca-certificates.crt $LAYER/etc/ssl/certs/
+        cp /etc/passwd $LAYER/etc/passwd
+        sed -i "s/^ubuntu:/agent:/" $LAYER/etc/passwd
+        sed -i "s|/home/ubuntu|/home/agent|" $LAYER/etc/passwd
+        sed -i "s|/bin/sh|/bin/bash|" $LAYER/etc/passwd
+        sudo cp /etc/shadow $LAYER/etc/shadow
+        sudo sed -i "s/^ubuntu:/agent:/" $LAYER/etc/shadow
+        cp /etc/group $LAYER/etc/group
+        sed -i "s/^ubuntu:/agent:/" $LAYER/etc/group
+        mkdir -p $LAYER/home/agent/workspace $LAYER/home/agent/.ssh
+        ssh-keyscan -t ed25519,ecdsa,rsa github.com gitlab.com \
+          > $LAYER/home/agent/.ssh/known_hosts 2>/dev/null || true
+        chmod 700 $LAYER/home/agent/.ssh
+        chmod 644 $LAYER/home/agent/.ssh/known_hosts 2>/dev/null || true
+      fi
+
+      # ── Gardenio channel (MCP nudge delivery) ─────────────────────────
+      # Download bun directly to avoid depending on unpacked base layer.
+      echo "=== Installing gardenio channel ==="
+      BUN_DIR=/tmp/bun-install
+      curl -fsSL https://bun.sh/install | BUN_INSTALL=$BUN_DIR bash 2>&1 || true
+      export PATH="$BUN_DIR/bin:$PATH"
+      mkdir -p $LAYER/channel
+      cp gardenio/images/agent/channel/gardenio-channel.ts $LAYER/channel/
+      cp gardenio/images/agent/channel/package.json $LAYER/channel/
+      cp gardenio/images/agent/channel/bun.lock $LAYER/channel/
+      (cd $LAYER/channel && bun install --frozen-lockfile 2>&1) || (cd $LAYER/channel && bun install 2>&1)
+      echo "  channel: $(ls $LAYER/channel/node_modules 2>/dev/null | wc -l) packages installed"
+
+      # ── Project binaries — ALL FROM SOURCE (monorepo advantage) ──────
+      # Real kd at kd-bin, wrapper at kd to intercept exit code 64
+      # (operator-refusal sentinel; see ka-0000006731).
+      echo "=== Adding project binaries (built from source) ==="
+      mkdir -p $LAYER/usr/local/bin
+      cp ${{ tasks.build-go-binaries.artifacts.go-binaries }}/gb $LAYER/usr/local/bin/gb
+      cp ${{ tasks.build-coop.artifacts.coop-binaries }}/coop $LAYER/usr/local/bin/coop
+      cp ${{ tasks.build-kd.artifacts.kd-binaries }}/kd $LAYER/usr/local/bin/kd-bin
+      cp gardenio/images/agent/kd-wrapper.sh $LAYER/usr/local/bin/kd
+      chmod +x $LAYER/usr/local/bin/gb $LAYER/usr/local/bin/coop $LAYER/usr/local/bin/kd $LAYER/usr/local/bin/kd-bin
+
+      # Hook scripts, scenarios, entrypoint
+      mkdir -p $LAYER/hooks $LAYER/scenarios
+      cp gardenio/images/agent/hooks/*.sh $LAYER/hooks/
+      chmod +x $LAYER/hooks/*.sh
+      cp gardenio/images/agent/scenarios/*.toml $LAYER/scenarios/
+      cp gardenio/images/agent/entrypoint.sh $LAYER/entrypoint.sh
+      cp gardenio/images/agent/resolve-auth.sh $LAYER/resolve-auth.sh
+      chmod +x $LAYER/entrypoint.sh $LAYER/resolve-auth.sh
+
+      # Version metadata
+      mkdir -p $LAYER/etc
+      echo "${TAG}" > $LAYER/etc/gardenio-version
+
+      # Fix ownership for overlay files
+      sudo chown -R 1000:1000 $LAYER/home/agent 2>/dev/null || true
+
+      # ── Validation (overlay binaries) ────────────────────────────────
+      T_VALIDATE=$(date +%s)
+      echo "=== Validate: overlay contents ==="
+      FAILURES=0
+      for bin in gb kd coop; do
+        [ -f "$LAYER/usr/local/bin/$bin" ] && echo "  OK: $bin" || { echo "FAIL: $bin missing"; FAILURES=$((FAILURES + 1)); }
+      done
+      [ -x "$LAYER/entrypoint.sh" ] && echo "  OK: entrypoint.sh" || { echo "FAIL: entrypoint.sh"; FAILURES=$((FAILURES + 1)); }
+      [ -x "$LAYER/resolve-auth.sh" ] && echo "  OK: resolve-auth.sh" || { echo "FAIL: resolve-auth.sh"; FAILURES=$((FAILURES + 1)); }
+      [ -d "$LAYER/channel/node_modules" ] && echo "  OK: channel" || { echo "FAIL: channel"; FAILURES=$((FAILURES + 1)); }
+      [ -d "$LAYER/hooks" ] && echo "  OK: hooks/" || { echo "FAIL: hooks/"; FAILURES=$((FAILURES + 1)); }
+
+      if [ "$FAILURES" -gt 0 ]; then
+        echo ""; echo "FAILED: $FAILURES validation errors — NOT pushing"; exit 1
+      fi
+      echo "=== Validation passed in $(($(date +%s) - T_VALIDATE))s ==="
+
+      # ── Create tar + push ──────────────────────────────────────────
+      T_TAR=$(date +%s)
+      echo "=== Creating overlay tar (gzip -1 for speed) ==="
+      sudo tar --use-compress-program='gzip -1' -cf /tmp/agent-overlay.tar.gz -C $LAYER .
+      LAYER_SIZE=$(du -h /tmp/agent-overlay.tar.gz | cut -f1)
+      echo "Overlay layer: ${LAYER_SIZE} in $(($(date +%s) - T_TAR))s"
+
+      T_PUSH=$(date +%s)
+      # crane append only uploads the new layer — base layers stay in the
+      # registry. With agent-base as base, this uploads ~50-100 MB instead
+      # of ~1.9 GB (a ~15 min savings).
+      for attempt in 1 2 3; do
+        if crane append --base "${BASE}" --new_tag "${REPO}:${TAG}" \
+             --new_layer /tmp/agent-overlay.tar.gz --platform linux/amd64; then
+          break
+        fi
+        [ "$attempt" = "3" ] && { echo "FAIL: crane append failed after 3 attempts"; exit 1; }
+        echo "WARN: crane append attempt $attempt failed — retrying in 30s"
+        sleep 30
+      done
+      # Use digest-based reference for mutate to avoid race conditions when
+      # multiple triggers (GitHub + GitLab) push to the same tag concurrently.
+      APPEND_DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${APPEND_DIGEST}" \
+        --entrypoint /entrypoint.sh --user 1000 --workdir /home/agent/workspace \
+        --env PATH="/usr/local/bun/bin:/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        --env PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+        --env RUSTUP_HOME=/usr/local/rustup --env CARGO_HOME=/usr/local/cargo \
+        --env BUN_INSTALL=/usr/local/bun --env HELM_PLUGINS=/usr/local/share/helm/plugins \
+        --env TF_PLUGIN_CACHE_DIR=/opt/terraform-plugin-cache \
+        --env TG_DOWNLOAD_DIR=/opt/terragrunt-cache \
+        --env TERRAGRUNT_TFPATH=/usr/local/bin/terraform \
+        --label "org.opencontainers.image.revision=${COMMIT_SHA}" \
+        --label "org.opencontainers.image.ref.name=${REF_NAME}" \
+        -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG} in $(($(date +%s) - T_PUSH))s (push) / $(($(date +%s) - T0))s (total)"
+
+      # Verify the pushed image has the correct entrypoint metadata.
+      PUSHED_EP=$(crane config "${REPO}:${TAG}" 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('config',{}).get('Entrypoint') or '')" 2>/dev/null)
+      if [ -z "$PUSHED_EP" ]; then
+        echo "FATAL: ${REPO}:${TAG} has no Entrypoint after crane mutate — aborting"
+        exit 1
+      fi
+      echo "Verified: ${REPO}:${TAG} has Entrypoint=${PUSHED_EP}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+
+
+  # NOTE: promote-images moved to .rwx/promote.yml (ka-0000008209).
+  # GitLab CI dispatches gardenio-promote after rwx-e2e succeeds, before
+  # rwx-deploy-prod and create-release. The previous event-triggered
+  # promote-images here was gated on a redundant in-file e2e-rwx task
+  # (also deleted) and ran in parallel with prod deploy — racing prod.
+
+  # Agent image is now split: push-agent-base (cached ~1.8 GB base) +
+  # push-agent (thin ~50-100 MB overlay). validate-agent still does full
+  # assembly for PR validation.
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # CI runner image — pre-baked deploy/E2E tools (helm, kubectl, AWS CLI, Go)
+  # Used as base image for deploy.yml and e2e.yml standalone pipelines.
+  # Also built here so deploy-rwx and e2e-rwx can install tools from cache.
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - key: push-ci-runner
+    use: [code, install-crane]
+    if: ${{ init.ref-name != 'pr' && init.build-target == 'all' }}
+    cache: false
+    timeout: 10m
+    run: |
+      set -ex
+      if [[ "$REF_NAME" == refs/tags/20* ]]; then
+        TAG="${REF_NAME#refs/tags/}-rc"
+      elif [[ "$REF_NAME" == refs/heads/* ]]; then
+        TAG="main-${COMMIT_SHA:0:7}"
+      else
+        TAG="${REF_NAME}"
+      fi
+
+      # Install tools into a layer directory
+      LAYER=/tmp/ci-runner-layer
+      mkdir -p $LAYER/usr/local/bin $LAYER/usr/local/go
+
+      # kubectl
+      KUBE_VERSION=$(curl -sSfL https://dl.k8s.io/release/stable.txt)
+      curl -sSfL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" \
+        -o $LAYER/usr/local/bin/kubectl
+      chmod +x $LAYER/usr/local/bin/kubectl
+
+      # Helm
+      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
+        | PATH="$LAYER/usr/local/bin:$PATH" HELM_INSTALL_DIR="$LAYER/usr/local/bin" USE_SUDO=false bash
+
+      # AWS CLI
+      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
+      (cd /tmp && unzip -q awscli.zip)
+      /tmp/aws/install --install-dir $LAYER/opt/aws-cli --bin-dir $LAYER/usr/local/bin
+      rm -rf /tmp/awscli.zip /tmp/aws
+
+      # Go 1.25
+      curl -fsSL "https://go.dev/dl/go1.25.9.linux-amd64.tar.gz" | tar -C $LAYER/usr/local -xz
+
+      # crane
+      curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+        | tar xz -C $LAYER/usr/local/bin crane
+
+      # jq (not in base ubuntu:24.04)
+      sudo apt-get update && sudo apt-get install -y -q jq
+      cp $(which jq) $LAYER/usr/local/bin/jq
+
+      tar -cf /tmp/ci-runner-layer.tar -C $LAYER .
+
+      REPO="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}/ci-runner"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/ci-runner-layer.tar --platform linux/amd64
+      DIGEST=$(crane digest "${REPO}:${TAG}")
+      crane mutate "${REPO}@${DIGEST}" \
+        --env "PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin" \
+        --label "org.opencontainers.image.revision=${COMMIT_SHA}" \
+        --label "org.opencontainers.image.ref.name=${REF_NAME}" \
+        -t "${REPO}:${TAG}"
+      echo "Pushed ${REPO}:${TAG}"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ tasks.resolve-commit.values.sha }}
+    outputs:
+      filesystem: false
+
+    filter:
+      - gardenio/images/ci-runner/Dockerfile
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # NOTE: e2e-rwx, install-deploy-tools, and promote-helm-chart moved out
+  # ═══════════════════════════════════════════════════════════════════════
+  #
+  # Per ka-0000008209: the in-file e2e-rwx ran on every main+tag push, with
+  # promote-images and promote-helm-chart gated on it via `use:`. This
+  # raced .gitlab-ci.yml's rwx-deploy-prod job (which only needed rwx-e2e),
+  # so prod could helm-upgrade against -rc-only images.
+  #
+  # Now: GitLab CI's rwx-e2e job (.rwx/e2e.yml) is the sole E2E gate, and
+  # promotion is dispatched by GitLab CI's `promote` job (.rwx/promote.yml)
+  # before rwx-deploy-prod and create-release. Main pushes are covered by
+  # rwx-smoke (.rwx/smoke-rwx.yml). install-deploy-tools had no other
+  # consumers in this file.
+
+
+  # NOTE: Production deploy is now driven by GitLab CI's `rwx-deploy-prod`
+  # job (.gitlab-ci.yml), which dispatches gardenio-deploy --param target=prod
+  # after rwx-e2e passes. The previous gate-prod-deploy task was removed in
+  # ka-0000001296 so prod deploys produce a native GitLab job status, not
+  # an RWX-side fire-and-forget dispatch.

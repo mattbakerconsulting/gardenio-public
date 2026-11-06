@@ -1,0 +1,97 @@
+{{- /* P7 Task 6 (spec D5, §4). One allow-all-but-IMDS egress policy per listed
+       namespace. Policies are additive: a pod selected by any policy here may
+       reach everything except the IMDS addresses, because none of them allows
+       those addresses. An agent pod is selected by imds-deny-agents even when
+       it carries the exemption label. */}}
+{{- /* With landgate on (gd-ParwLpmgID), agent pods also lose the edge: the
+       agents policy admits every namespace but the edge's and cuts the edge
+       CIDRs, and in an exempt-label namespace the general policy no longer
+       selects agent pods (it would admit the edge back by union). Other pods
+       keep the edge: the viewer and landgate reach the issuer through it. */}}
+{{- if .Values.imdsDeny.enabled }}
+{{- $exempt := .Values.imdsDeny.exemptLabelNamespaces | default list }}
+{{- $crewDeny := .Values.landgate.enabled }}
+{{- $edgeNS := .Values.landgate.edgeNamespace | default .Values.edgeBackends.edgeNamespace | default "public-edge" }}
+{{- $edgeCIDRs := .Values.landgate.crewDeny.edgeCIDRs | default list }}
+{{- range $ns := .Values.imdsDeny.namespaces }}
+{{- $honour := has $ns $exempt }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: imds-deny
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: gardenio
+    gardenio.io/policy: imds-deny
+spec:
+  {{- if $honour }}
+  podSelector:
+    matchExpressions:
+      - key: gardenio.io/imds
+        operator: NotIn
+        values: ["allow"]
+      {{- if $crewDeny }}
+      - key: gardenio.io/agent
+        operator: DoesNotExist
+      {{- end }}
+  {{- else }}
+  podSelector: {}
+  {{- end }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector: {}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fd00:ec2::254/128
+{{- if $honour }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: imds-deny-agents
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: gardenio
+    gardenio.io/policy: imds-deny
+spec:
+  podSelector:
+    matchExpressions:
+      - key: gardenio.io/agent
+        operator: Exists
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        {{- if $crewDeny }}
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: NotIn
+                values: [{{ $edgeNS | quote }}]
+        {{- else }}
+        - namespaceSelector: {}
+        {{- end }}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+              {{- if $crewDeny }}
+              {{- range $edgeCIDRs }}
+              - {{ . }}
+              {{- end }}
+              {{- end }}
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fd00:ec2::254/128
+{{- end }}
+{{- end }}
+{{- end }}

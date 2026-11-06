@@ -1,0 +1,46 @@
+{{- if and .Values.agents.enabled .Values.agents.agentServiceAccount.create .Values.agents.agentServiceAccount.clusterReadOnly.enabled }}
+{{/*
+Read-only cluster diagnostic RBAC for the default agent SA.
+
+Off by default. When enabled, binds the default agent ServiceAccount
+(see agent-rbac.yaml) to a narrow ClusterRole granting get/list/watch on
+nodes, namespaces, and pods. Intended for agent pods that need to
+diagnose cluster-level capacity issues (e.g. FailedScheduling sweeps,
+karpenter consolidation audits, namespace-bloat investigations) without
+opting the project into the full cluster-admin SA.
+
+Verbs are intentionally read-only — no exec/log/portforward, no writes.
+Authoring decision: ka-0000003979 option `grant_cluster_access` /
+parent bug ka-0000001900 (operator wants ~5-node target on staging EKS
+but couldn't be answered from inside agent pods due to namespace-scoped
+RBAC).
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.coop.serviceAccountName" . }}-cluster-readonly
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.coop.serviceAccountName" . }}-cluster-readonly
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.coop.serviceAccountName" . }}-cluster-readonly
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.coop.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+  {{- with .Values.agents.agentServiceAccount.clusterReadOnly.extraSubjects }}
+    {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}

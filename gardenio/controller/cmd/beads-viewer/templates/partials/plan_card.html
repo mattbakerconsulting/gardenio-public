@@ -1,0 +1,1017 @@
+{{/* planCard renders one plan card on the /plans index. Lives in a partial
+     (extracted from plans.html by step 3, ka-0000003881) so it is rendered by
+     BOTH the page (the flat grid AND every group section share ONE card markup)
+     AND standalone by handlePlanGardenerRowToggle, which re-renders the whole row
+     in place after a per-gardener enable/disable flip so the unified state chip
+     updates live. The dot is {"Root": $page, "Row": planRowView, "OOB": bool};
+     $root carries the page-level BasePath / ViewerEmail / IsOperator, and .Row is
+     the plan.
+
+     OOB (step "bulk", ka-0000004771): the bulk disable/enable handler
+     (plans_bulk.go) re-renders every affected row and OOB-splats them into one
+     response alongside the cleared toolbar. OOB=true stamps
+     hx-swap-oob="outerHTML" on the <li> (keyed by the stable id="plan-card-{ID}")
+     so multiple updated rows land without needing a per-row hx-target — the same
+     mechanism trigger_row uses for its bulk swap. */}}
+{{- define "planCard" -}}
+{{- $root := .Root}}{{with .Row -}}
+  {{- $planID := .ID -}}
+  <li class="plan-card" id="plan-card-{{.ID}}" data-plan-id="{{.ID}}" data-search="{{.SearchText}}"{{if $.OOB}} hx-swap-oob="outerHTML"{{end}}>
+    <div class="plan-card-head">
+      {{- /* A plan without arms shows "no arms yet" in the arms slot (gd-YvWv4mR4fu):
+           the plan gardener chooses them on its next run. */ -}}
+      {{- if .Heraldry}}<span class="heraldry-slot">{{heraldry .Heraldry 40}}</span>{{else}}<span class="heraldry-slot"><span class="chip arms-none" title="No arms yet: the plan gardener chooses them">no arms yet</span></span>{{end}}
+      {{/* Bulk multi-select checkbox (step "bulk", ka-0000004771; RE-KEYED to the
+           plan epic by the close-out work ka-0000005361). Wired up by the
+           generalized project_bulk.js (scope=plans).
+
+           THE VALUE IS THE PLAN-EPIC ID, not the bound gardener's trigger-bead id.
+           It carried the gardener id originally because the only bulk verbs were
+           enable/disable, which flip the gardener bead's `enabled` field — so the
+           checkbox rendered ONLY on a plan with a non-retired gardener bound.
+           Measured on the live daemon (2026-08-12): 48 of 56 OPEN PLANS HAVE NO
+           BOUND GARDENER, so that gate hid the selection model on 86% of the pile
+           — and "bulk Mark complete", the whole point of the close-out ask
+           (thread ka-0000001785), is a verb on the PLAN, not on its gardener.
+           Every plan has an epic id, so keying on it makes the checkbox universal
+           and lets one selection serve all three verbs; the enable/disable
+           handlers now resolve epic → gardener server-side (plans_bulk.go).
+
+           Operator-gated (read-only viewers see no checkbox). project_bulk.js
+           selectAll() only checks boxes already in the DOM, and handlePlans
+           renders only the filtered rows, so "Select all" selects exactly the
+           currently-filtered plans — nothing hidden. */}}
+      {{- if $root.IsOperator -}}
+      <input type="checkbox" class="plans-row-select" name="bead_id" value="{{.ID}}"
+             aria-label="Select plan {{.Title}}">
+      {{- end -}}
+      <a class="plan-card-title" href="{{$root.BasePath}}/plans/{{.ID}}" title="{{.Title}}">{{or .ShortTitle .Title}}</a>
+      {{/* Id + freshness travel as ONE tail group (ka-0000002389) so the head
+           row can wrap them BELOW the title when the lane is too narrow to
+           give the title a workable width, instead of the two permanently
+           eating ~140px of every title line. See .plan-card-head-tail. */}}
+      <span class="plan-card-head-tail">
+      <span class="plan-card-id"><a href="{{$root.BasePath}}/plans/{{.ID}}"><code>{{.ID}}</code></a></span>
+      {{/* Freshness stamp in the head row (ka-0000005352 iter-52). RELOCATED here
+           from the top .plan-card-meta chip-strip below, and rendered in the
+           COMPACT age vocabulary (.AgoCompact, "7h"/"2d"/"1w" — the same fmtTimeAgo
+           form the decision "· 32d" / escalation "· 40d" / stall / crew / MR / step
+           facets already use) instead of the wide "updated 7 hours ago". Measured
+           on the live prod board: the top chip-strip is the dominant vertical sink
+           (117px/card ≈ 41% of card height), wrapping to 3-6 lines on EVERY card,
+           and this stamp — pushed right by margin-left:auto — stranded ALONE on its
+           own wrapped line on 66/75 cards (88%). Moving it up beside the ID (where
+           "when" metadata belongs) reclaims a wrapped line on every card (all 75
+           shrink ~24px, 0 grow), and the compact form costs almost no title width
+           so the 2-line title clamp is preserved. Keeps the .plan-card-updated /
+           .plan-card-updated-stale classes + the FreshnessStale loud-tint + the
+           full "Last change <RFC>" tooltip (the precise instant + the stale reason);
+           the long humanized ".Ago" now lives only in that tooltip. Gated on
+           .AgoCompact so an undatable plan renders no stamp, exactly as before. */}}
+      {{- if .AgoCompact}}<span class="meta plan-card-updated{{if .FreshnessStale}} plan-card-updated-stale{{end}}"{{if .AgoRFC}} title="Last change {{.AgoRFC}}{{if .FreshnessStale}} — this plan has not moved in over a week (stale){{end}}"{{else}} title="Last change {{.Ago}}"{{end}} aria-label="updated {{.Ago}}">{{.AgoCompact}}</span>{{end}}
+      </span>
+    </div>
+    <div class="plan-card-meta">
+      {{/* Blocker-state facet on the status chip (ka-0000005352 iter-55). A plan
+           epic with raw status=blocked lands in the loud STALLED board lane, but
+           the status chip rendered a bare word with NOTHING about WHY it is
+           blocked — and the .chip-status-blocked CSS rule was missing entirely
+           (default gray, no border, unlike open/in_progress/closed). Worse,
+           measured live 4 of 5 blocked plans had EVERY forward blocks-edge blocker
+           already CLOSED, so the loud "blocked" chip was a card-vs-truth
+           false-stall (the mission's family: iter-6/19/23/26/49/51). Fold a
+           compact blocker facet onto the chip: a LOUD "· N blocked · Xage" (the
+           ⛔ escalation-badge count+age idiom, tinting loud past 7d via
+           .chip-status-blocked-open + -stale) when open blockers remain, or a CALM
+           "· ✓ cleared" marker (the iter-29/41 calm-marker idiom) telling the
+           operator a status=blocked plan can now be unblocked when every blocker
+           is closed. Additive — the raw status word + the board lane are
+           UNTOUCHED (a blocked plan stays blocked until the operator flips it);
+           the facet just tells the truth about the blockers. .Blocked.Any is the
+           gate (a blocked plan with no resolvable blocks-edge renders the bare
+           word exactly as before), and it is populated only for a raw
+           status=blocked plan (planBlockedBulk is scoped to those ids) so no other
+           status chip is touched. Zero daemon calls when no plan is blocked. */}}
+      {{- if and (eq .Status "blocked") .Blocked.Any -}}
+      <span class="chip chip-status chip-status-blocked{{if .Blocked.HasOpen}} chip-status-blocked-open{{if .BlockedOldestStale}} chip-status-blocked-stale{{end}}{{else}} chip-status-blocked-cleared{{end}}"
+            title="{{.Status}}{{if .Blocked.HasOpen}} — {{.Blocked.Open}} of {{.Blocked.Total}} blocker{{if ne .Blocked.Total 1}}s{{end}} still open{{if .BlockedOldestAge}}; oldest open {{.BlockedOldestAge}}{{if .BlockedOldestStale}} (stale){{end}}{{end}}{{else}} — all {{.Blocked.Total}} blocker{{if ne .Blocked.Total 1}}s{{end}} closed; this plan can be unblocked{{end}}">{{.Status}}{{if .Blocked.HasOpen}}<span class="chip-status-blocked-facet"> · {{.Blocked.Open}} blocked{{with .BlockedOldestAge}} <span class="chip-status-blocked-age">· {{.}}</span>{{end}}</span>{{else}}<span class="chip-status-blocked-facet chip-status-blocked-cleared-facet"> · &#x2713; cleared</span>{{end}}</span>
+      {{- else -}}
+      <span class="chip chip-status chip-status-{{.Status}}">{{.Status}}</span>
+      {{- end -}}
+      {{/* Authoring-lifecycle chip (ka-0000000851): draft → ready → building, the
+           SAME PlanState + .plan-lifecycle-chip-* styling the /plans/{id} cockpit
+           header renders — already computed on the row (planStateOf), just dropped
+           on the index. Rendered only for a plan that opted into the lifecycle;
+           legacy/hand-marked plans (unset state) show only the status chip, exactly
+           like the detail card.
+
+           Terminal-reconcile (ka-0000005352 iter-27): renders off .LifecycleChip
+           — the plan_state reconciled against the epic's terminal status
+           (planLifecycleChipState) — NOT the raw .PlanState. A plan CLOSED/DEFERRED
+           while its plan_state field still reads a non-terminal value
+           (draft/ready/building — never rewound by a hand-close or drain cascade)
+           no longer renders that stale chip beside the closed status chip; most
+           egregiously it no longer shows "building" ("the gardener is dispatching
+           crew step by step") on a FINISHED plan. A genuine `complete` still
+           renders (truthful terminal signal). Same card-vs-truth family as
+           iter-19/23 (stall), iter-24 (freshness), iter-25 (terminal CTA). Also
+           adds the `complete` tooltip branch the index dropped, so a completed
+           plan's chip reads the SAME copy as the cockpit header (plan_agent.html)
+           instead of falling through to the "Building…" text.
+
+           Awaiting-approval wait-age (ka-0000005352 iter-47): the READY chip is
+           the #3 attention tier (planAttentionReady, ranked ABOVE stalled — one
+           operator tap "Approve & build" unblocks the whole plan) yet was the LAST
+           attention-relevant card signal carrying no wait-age. Fold the ready-wait
+           ("ready · 4d") onto the chip face after the word — the twin of the
+           decision chip's "· 32d" (iter-4) and the now/next step's "· 5d" (iter-43)
+           — so an operator scanning the board sees HOW LONG a plan has awaited
+           approval, not just that it is ready. Past planReadyStaleThreshold (7d) the
+           chip gains .plan-lifecycle-chip-ready-stale so an aged approval pops (the
+           calm-then-loud two-tier its siblings use). Rendered ONLY on the READY arm
+           (.ReadyWaitAge is empty for draft/building/complete and for an undatable
+           ready plan, which then reads exactly as before — chip word only). Ages on
+           the epic's OWN updated_at (the ready-transition write), a different
+           primitive from the freshness stamp's folded lastActivity, so it is a CTA
+           age ("awaiting your approval since"), never redundant with the freshness
+           tint (see planReadyWaitAge). */}}
+      {{- if .LifecycleChip}}<span class="chip plan-lifecycle-chip plan-lifecycle-chip-{{.LifecycleChip}}{{if .ReadyWaitStale}} plan-lifecycle-chip-ready-stale{{end}}"
+            title="{{if eq .LifecycleChip "draft"}}Draft — the plan agent is still researching / clarifying. Nothing builds until you approve.{{else if eq .LifecycleChip "ready"}}Ready — finalized and awaiting a deliberate “Approve &amp; build”. Nothing builds until approved.{{if .ReadyWaitAge}} Awaiting your approval for {{.ReadyWaitAge}}{{if .ReadyWaitStale}} (stale){{end}}.{{end}}{{else if eq .LifecycleChip "complete"}}Complete — this plan is done; the plan is closed and the gardener disabled. Reopen to resume work.{{else if eq .LifecycleChip "abandoned"}}Abandoned — this plan was given up on without finishing; the plan is closed and the gardener disabled. Reopen to resume work.{{else}}Building — approved; the bound gardener is dispatching crew step by step.{{end}}">{{.LifecycleChip}}{{if .ReadyWaitAge}} <span class="plan-lifecycle-chip-age" aria-label="awaiting approval {{.ReadyWaitAge}}">· {{.ReadyWaitAge}}</span>{{end}}</span>{{end}}
+      {{/* CLOSE-OUT badge + one-tap retire (task ka-0000004467; Matt's ask, thread
+           ka-0000001785: "we need a better way to close out plans so we dont have
+           to look at every plan we've every made" — decision ka-0000001273 chose
+           build-now).
+
+           THE SIGNAL WAS ALREADY BEING PAID FOR. When a plan epic's issue-kind
+           subtree fully drains, the daemon deliberately does NOT hard-close the
+           plan (the operator's Mark-complete is the gate) — it stamps the
+           `autoclose-ready` label, writes an audit comment, and publishes a
+           bead-updated event (kbeads flagPlanEpicReady). The viewer never read the
+           label: before this, `grep autoclose` across the whole beads-viewer
+           returned ONE hit, a code comment. So a finished plan looked exactly like
+           a live one and the index accumulated every plan ever made.
+
+           Two roads to the badge (planNeedsCloseout): the daemon's flag (.Flagged,
+           the authoritative one — it verified every child closed AND MR work
+           merged) and the viewer-derived drained case (StepsAllDone). Both are
+           needed because the flag fires only from the auto-close CASCADE, so a plan
+           drained before that feature — or by a path that skipped it — is
+           drained-but-unflagged forever (measured live: 5 open plans had zero open
+           children, only 2 carried the flag).
+
+           The LEVER IS GATED ON LEGALITY (.CanComplete), not merely on being
+           drained. The daemon admits only building→complete plus any edge from
+           unset, so a drained draft/ready plan CANNOT reach complete — one of the
+           two live flagged plans is exactly that (plan_state=ready). Rendering a
+           one-tap Mark complete there would post a request guaranteed to 400, so
+           such a plan gets the badge plus a tooltip naming the blocked lifecycle
+           instead of a dead button. That case is what `plan_state=abandoned` is
+           for (step ka-0000001377, deferred by decision ka-0000001273).
+
+           Lives in the meta chip-strip beside the lifecycle chip — NOT on the
+           progress row where the sibling "✓ steps done" marker sits — because that
+           row renders only inside the has-steps arm, and a daemon-FLAGGED plan can
+           have no rendered steps at all (it would then show no badge). row=1 makes
+           the lever re-render the WHOLE card in place, the same seam the index's
+           Approve & build uses. */}}
+      {{- with .Closeout}}{{if .Show -}}
+      <span class="chip plan-closeout-chip{{if .Flagged}} plan-closeout-chip-flagged{{end}}"
+            title="{{if .Flagged}}The daemon flagged this plan `autoclose-ready`: every issue-kind child is closed and its MR-linked work merged. It is awaiting your Mark-complete.{{else}}Every rendered step is closed but this plan is still open — it looks finished.{{end}}{{if .BlockedReason}} It cannot be one-tap completed: it is {{.BlockedReason}}{{end}}">{{if .Flagged}}&#x2713; drained{{else}}&#x2713; looks done{{end}}</span>
+      {{- if and $root.IsOperator .CanComplete -}}
+      <button type="button" class="bead-action plan-closeout-btn"
+              hx-post="{{$root.BasePath}}/plans/{{$planID}}/complete"
+              hx-vals='{"row":"1"}'
+              hx-target="closest .plan-card" hx-swap="outerHTML"
+              hx-disabled-elt="this"
+              hx-confirm="{{if .OpenSteps}}{{.OpenSteps}} step{{if ne .OpenSteps 1}}s{{end}} still open — mark this plan complete anyway? It closes the plan and stops the gardener (you can Reopen later).{{else}}Mark this plan complete? It closes the plan and stops the gardener (you can Reopen later).{{end}}"
+              title="Retire this plan — closes it and disables the bound gardener (Reopen restores it)">Mark complete</button>
+      {{- end -}}
+      {{- end}}{{end -}}
+      {{/* Priority pill (ka-0000007970): the plan epic's 0-4 priority, ALREADY on
+           the row (planRowView.Priority, straight off the batched list query — no
+           extra daemon call) and rendered by the /deck card face, but dropped by
+           the index until now. Reuses the SAME deck-prio color vocabulary (P0/P1
+           loud red = urgent, P3/P4 quiet gray = deprioritized) so the two surfaces
+           agree. Density discipline "add signal, not rows": rendered ONLY when the
+           priority differs from the P2 baseline default — a routine P2 plan adds no
+           ink, an urgent P0/P1 pops, a shelved P3/P4 reads quiet — so an operator
+           scanning the board sees urgency at a glance without every card carrying a
+           pill. */}}
+      {{- if ne .Priority 2}}<span class="plan-prio-chip plan-prio-chip-{{.Priority}}" title="Priority {{.Priority}} (0 = highest)">P{{.Priority}}</span>{{end}}
+      {{/* Project chip (ka-0000005352 iter-60): the plan epic's project label, a
+           click-through to /plans?project=X so an operator can narrow a mixed board
+           to one project. But on a board ALREADY scoped to that project — a
+           ?project=X filter is active — every rendered card shares project X
+           (handlePlans appends the project:X label to the list query), the page H1
+           already reads "Plans · X", and the filter dropdown shows X selected. So
+           the chip is pure redundant ink AND a dead-end link (its href points right
+           back at the same filtered page). Suppress it there — the priority pill's
+           "render only where the value discriminates" density discipline, in the
+           mission's "more info in LESS space" spirit: on a filtered board every card
+           reclaims the chip's width from the meta row (which the latest audit flagged
+           as near its wrapping ceiling), with zero information loss (the project is
+           named once in the H1). $root.ProjectFilter is the active ?project= value,
+           threaded into every render path so a single-row/​bulk re-render stays
+           byte-consistent with its neighbours: the page dot carries it directly, and
+           the row/OOB re-renders read it from the Referer (refererPlansProject). An
+           UNFILTERED board (empty ProjectFilter) renders the chip exactly as before —
+           there the project label genuinely discriminates a mixed board. The
+           `ne .Project $root.ProjectFilter` guard is defensive: a ?project= page never
+           lists a card whose project differs from the filter, but if one ever did, its
+           (discriminating) chip would still render.
+
+           Also suppressed on a ?group=project board (ka-0000005352 iter-62): there the
+           cards are sectioned into one heading-per-project (groupPlanRows), and each
+           section's <h2> already names the project — so the per-card chip is the SAME
+           redundant ink AND dead-end self-link the ?project= filter case is, just
+           reached via grouping instead of filtering. $root.GroupKey is the active
+           ?group= value, threaded into every render path exactly like ProjectFilter
+           (the page dot carries it directly; the single-row + bulk-OOB re-renders read
+           it from the Referer via refererPlansGroup) so a swapped-in card stays
+           byte-consistent with its unswapped neighbours. An ungrouped or
+           group-by-status/user board (GroupKey != "project") renders the chip exactly
+           as before — there the project label still discriminates within the section. */}}
+      {{- if and .Project (ne .Project $root.ProjectFilter) (ne $root.GroupKey "project")}}<a class="chip chip-type" href="{{$root.BasePath}}/plans?project={{.Project}}">{{.Project}}</a>{{end}}
+      {{/* Creator chip (S2, ka-0000002728) — SUPPRESSED on a board already scoped
+           to this operator (ka-0000005352 iter-61). The /plans index is
+           default-scoped to the viewer's OWN operator id (S1 "filter-by-me by
+           default"), and a ?operated_by=X link scopes it to one operator; on such
+           a board every card shares that operator, the header chip already reads
+           "Showing your N plans" / "Showing work operated by X", and this chip's
+           own filter href points right back at the same scoped page — pure
+           redundant ink AND a dead-end self-link. planCreatorChipScoped returns
+           the empty string when the card's operator matches $root.EffectiveOperatedBy
+           (the resolved scope), so the whole span drops — the project-chip (iter-60)
+           "render only where the value discriminates" discipline in the mission's
+           "more info in LESS space" spirit. $root.EffectiveOperatedBy is threaded
+           into every render path (page dot carries it directly; single-row + bulk-OOB
+           re-renders recover it from the Referer + viewer via refererPlansOperatedBy)
+           so a swapped-in row stays byte-consistent with its unswapped neighbours. An
+           UNSCOPED ("all"/anonymous) board passes an empty scope → the chip renders
+           exactly as before, where the creator genuinely discriminates a mixed board.
+
+           Also suppressed on a ?group=user board (ka-0000005352 iter-63): there the
+           cards are sectioned into one heading-per-operator (groupPlanRows /
+           planUserGroupKey), and each section's <h2> already names the operator — so
+           the per-card creator chip is the SAME redundant ink AND dead-end self-link
+           the ?operated_by= scope case is, just reached via grouping instead of
+           scoping. This completes the redundant-ink family's 2×2 (project + creator) ×
+           (filter/scope + group): iter-60 project·?project=, iter-61 creator·
+           ?operated_by=, iter-62 project·?group=project, and now creator·?group=user.
+           $root.GroupKey is the active ?group= value, ALREADY threaded into every
+           render path by iter-62 (the page dot carries it directly; the single-row +
+           bulk-OOB re-renders read it from the Referer via refererPlansGroup) so a
+           swapped-in card stays byte-consistent with its unswapped neighbours. An
+           ungrouped or group-by-project/status board (GroupKey != "user") renders the
+           chip exactly as before — there the operator still discriminates within the
+           section. */}}
+      {{- if ne $root.GroupKey "user"}}{{- $creator := planCreatorChipScoped . $root.BasePath $root.ViewerEmail $root.EffectiveOperatedBy -}}
+      {{- if $creator}}<span class="plan-card-creator"><span class="creator-by">by</span>{{$creator}}</span>{{end}}{{end}}
+      {{/* Open-decision "N to answer" chip — the TOP attention signal (an open
+           clarifying question literally blocks the plan). Iteration 4
+           (ka-0000004999) folds the OLDEST open decision's wait-age into the SAME
+           chip so the count carries temporal urgency: the attention ranker
+           already drains decisions oldest-waiting-first to surface the measured
+           >30-day tail, but the card face showed only a bare count — an operator
+           could not tell a decision rotting 32 days from one filed an hour ago.
+           The age suffix ("· 32d") renders only when derivable (a fresh decision
+           with an unset stamp reads exactly as before); past the staleness
+           threshold the chip gains .chip-attention-stale so an aged, human-blocking
+           decision pops out of the board. Zero extra daemon cost — read off the
+           decision beads the index step-walk already hydrated.
+
+           Terminal-reconcile (ka-0000005352 iter-46): gate on .ShowDecisionChip,
+           NOT the raw .OpenDecisions — a TERMINAL (closed/deferred) plan suppresses
+           the whole "N to answer" chip FACE. The chip is the #1 attention tier
+           (planAttentionDecision = iota, ranked ABOVE the ⛔ escalation badge), a
+           loud "you must answer this NOW" call, and a finished plan's leftover open
+           decisions block only its un-closed steps — answering them advances
+           nothing. This is the decision twin of iter-39's ShowEscalationBadge
+           suppression (whose own doc overlooked the higher-tier chip beside it), so
+           the whole decision→escalation "one human action unblocks it" family is now
+           uniformly terminal-reconciled — like the now/next chip + Dispatch
+           (iter-25), crew live-pulse (iter-30), lifecycle chip (iter-27/28),
+           freshness stamp (iter-38), and MR-pill tint (iter-45). Display-only:
+           .OpenDecisions is untouched, so the attention ranker + board lane (both
+           key off it) are byte-identical, and the cockpit still lists the decisions
+           as detail-page history — only this board-scan chip is quieted. Live proof:
+           closed plans ka-0000003452 (×3) + ka-0000000492 (×1) rendered the loud
+           chip on a done plan. */}}
+      {{- if .ShowDecisionChip}}<a class="chip chip-attention{{if .OpenDecisionStale}} chip-attention-stale{{end}}" href="{{$root.BasePath}}/plans/{{.ID}}#decisions" title="{{.OpenDecisions}} open clarifying question{{if ne .OpenDecisions 1}}s{{end}} waiting on you{{if .OldestDecisionAge}} — oldest waiting {{.OldestDecisionAge}}{{if .OpenDecisionStale}} (stale){{end}}{{end}}">{{.OpenDecisions}} to answer{{if .OldestDecisionAge}} <span class="chip-attention-age">· {{.OldestDecisionAge}}</span>{{end}}</a>{{end}}
+      {{/* Blocked-by-escalation badge — the #2 attention tier
+           (planAttentionEscalation), a HARDER stop than ⚠ stalled: a privileged
+           operator must act before the blocked work can move. Iteration 8
+           (ka-0000003887) folds the OLDEST open escalation's wait-age into the
+           SAME badge — "⛔ escalation · 40d" — so the count carries the temporal
+           urgency the attention ranker already sorts on (age IS urgency;
+           escalations are drained oldest-first). The age suffix renders only when
+           derivable (a fresh escalation with an unset stamp reads exactly as
+           before, count only); past planEscalationStaleThreshold (>7d) the badge
+           gains .plan-esc-badge-stale so an aged, work-blocking approval reads
+           even louder. The refs are ALREADY hydrated + sorted by
+           planEscalationsBulk, so this is zero extra daemon cost — the symmetric
+           parallel of the decision chip's iter-4 wait-age.
+
+           Operation-type on the FACE (ka-0000005352 iteration 37): the ⛔ badge
+           was the LAST attention-tier badge whose face still hid its whole
+           DISCRIMINATOR — WHAT the operator must do — in the hover tooltip,
+           exactly the gap iter-10 closed for the ⚠ stall badge (its "· no
+           gardener" reason). Every badge read an identical "⛔ blocked by
+           escalation" whether the remediation was a ~5-second gitlab_mr_merge
+           approve or a real terraform_apply / aws_iam infra action (measured
+           live: 22 cards, gitlab_mr_merge the largest family). Fold the OLDEST
+           escalation's humanized op-type ("· merge MR" / "· AWS IAM" / "·
+           terraform") onto the face after the age — a WHAT-to-do qualifier, the
+           twin of the age's WHEN. It names the SAME oldest ref the age does
+           (EscalationOldestOp ⇄ EscalationOldestAge share OldestOperationLabel /
+           OldestAge's oldest-first head), so the two facets never disagree.
+           Rendered ONLY when humanizeEscalationOp recognizes the type — a
+           legacy/unrecognized operation_type leaves the face age-only, exactly
+           as iter-8, so a novel op never dumps a raw snake_case token here.
+
+           Terminal-reconcile (ka-0000005352 iteration 39): gate on
+           .ShowEscalationBadge, NOT the raw .Escalations.Count — a TERMINAL
+           (closed/deferred) plan suppresses the whole ⛔ badge FACE. The badge is
+           the #2 attention tier, a loud "a privileged operator must act NOW"
+           call, and a finished plan's escalations block only its leftover open
+           steps — approving them advances nothing. This was the LAST unreconciled
+           forward/act-now signal on a terminal card; its siblings the now/next
+           chip + Dispatch button (iter-25), the crew live-pulse (iter-30), and the
+           lifecycle chip (iter-27/28) were all already reconciled. Display-only:
+           .Escalations.Count is untouched, so the attention ranker + board lane
+           (both key off it) are byte-identical, and the cockpit banner still lists
+           the escalations as detail-page history — only this board-scan badge is
+           quieted. Live proof: closed plan ka-0000000539 rendered "⛔ blocked by
+           escalation ×3 · merge MR · 3d" on a done plan. */}}
+      {{- if .ShowEscalationBadge}}<a class="plan-esc-badge{{if .EscalationStale}} plan-esc-badge-stale{{end}}" href="{{$root.BasePath}}/plans/{{.ID}}#plan-escalations" title="Blocked by {{if eq .Escalations.Count 1}}an open escalation{{else}}{{.Escalations.Count}} open escalations{{end}}{{if .EscalationOldestAge}} — oldest waiting {{.EscalationOldestAge}}{{if .EscalationStale}} (stale){{end}}{{end}}:{{range .Escalations.Escalations}}
+{{.Title}}{{if .OperationType}} ({{.OperationType}}){{end}}{{end}}"><span class="plan-esc-badge-label">⛔ blocked by escalation{{if gt .Escalations.Count 1}} ×{{.Escalations.Count}}{{end}}</span>{{if .EscalationOldestOp}}<span class="plan-esc-badge-op">· {{.EscalationOldestOp}}</span>{{end}}{{if .EscalationOldestAge}}<span class="plan-esc-badge-age">· {{.EscalationOldestAge}}</span>{{end}}</a>{{end}}
+      {{/* Stall REASON on the badge FACE (ka-0000001697, iteration 10): the
+           ⚠ stalled badge was the ONLY attention-tier badge still hiding its
+           whole discriminator in the hover tooltip — its four distinct
+           conditions (dead-agent orphan, gardener paused, no gardener), each with
+           a DIFFERENT remediation, all rendered identical "⚠ stalled" text. Fold
+           the compact reason ("· no gardener" / "· gardener paused" / "· 2 dead
+           steps") onto the face so an operator scanning the board knows WHAT to
+           fix without hovering — the same density win the decision chip (iter-4,
+           "· 32d") and escalation badge (iter-8, "· 40d") already shipped. The
+           label is a pure projection of the SAME Stall fields deriveStall set
+           (BadgeLabel mirrors its precedence), so it can never disagree with the
+           Reason tooltip and costs zero extra daemon call. Rendered only when
+           classifiable; an unclassifiable stall falls back to bare "⚠ stalled"
+           exactly as before.
+
+           Dead-agent orphan wait-age (ka-0000005352 iteration 11): the ⚠ badge
+           was the LAST attention-tier badge whose face carried no temporal
+           signal — its siblings the decision chip ("· 32d", iter-4) and the
+           escalation badge ("· 40d", iter-8) both surface their urgency, yet a
+           plan whose orphaned step froze days ago read identically to one
+           orphaned 90 minutes ago. Fold the oldest dead-agent orphan's frozen
+           duration onto the face ("· 3d") after the reason, tinting the whole
+           badge loud (.plan-stall-badge-stale) once it crosses the 1-day
+           staleness bar. The age carries what the "updated Xh ago" meta beside
+           it actively HIDES: that stamp is the plan's NEWEST activity, so a plan
+           with one live-churning step + one dead orphan reads misleadingly fresh
+           while the orphan rots — AgeLabel surfaces the orphan's true age.
+           Rendered ONLY for a dead-agent stall with a datable orphan; the
+           gardener-paused/no-gardener conditions carry no age (the "updated" meta
+           already IS their "stalled since") and an undatable orphan reads
+           reason-only, both exactly as before. Zero extra daemon call — rides the
+           SAME stallStepRef.UpdatedAt the stall pass already collected.
+
+           Verdict re-scope when live crew coexist (ka-0000005352 iteration 23):
+           a dead-agent orphan on step A is a real stall even while other steps
+           have live crew, so the plan stays flagged — but rendering the loud
+           plan-level "⚠ stalled" beside the crew chip's "● N crew · M working"
+           read as a self-contradiction (the mission-named false-stall). When
+           .Stall.Orphaned (dead-agent stall reconciled against live crew), the
+           badge headline softens to the per-step "⚠ N orphaned" (HeadlineLabel /
+           HeadlineCount) and drops the "· N dead step" face reason (FaceLabel is
+           empty — the count now rides the headline) so "5 working · ⚠ 1
+           orphaned" reads as coherent siblings. A genuinely-unwatched orphan (no
+           live crew) keeps HeadlineLabel "stalled" + the full "· N dead step"
+           reason exactly as before. The orphan wait-age still rides along in
+           both. */}}
+      {{/* Gate on ShowBadge, not Stalled (ka-0000005352 iteration 26): a
+           gardener-state stall on a card ALREADY carrying the ⛔ escalation badge
+           above is suppressed (reconcileStallWithEscalation), so the two badges
+           no longer give contradictory remediation ("a privileged op must act"
+           vs "bind a gardener"). Stalled itself stays true — the card keeps its
+           Stalled/Blocked lane slot and attention tier — only this face drops. A
+           dead-agent orphan stays loud (ShowBadge true). */}}
+      {{- if .Stall.ShowBadge}}<span class="plan-stall-badge{{if .Stall.AgeStale}} plan-stall-badge-stale{{end}}" title="{{if .Stall.Orphaned}}{{.Stall.DeadSteps}} step{{if ne .Stall.DeadSteps 1}}s{{end}} orphaned under a dead agent (other crew still working the plan): {{end}}Stalled: {{.Stall.Reason}}{{if .Stall.AgeLabel}} — oldest dead-agent step frozen {{.Stall.AgeLabel}}{{if .Stall.AgeStale}} (stale){{end}}{{end}}">⚠ {{with .Stall.HeadlineCount}}{{.}} {{end}}{{.Stall.HeadlineLabel}}{{with .Stall.FaceLabel}} <span class="plan-stall-badge-reason">· {{.}}</span>{{end}}{{with .Stall.AgeLabel}} <span class="plan-stall-badge-age">· {{.}}</span>{{end}}</span>{{end}}
+      {{/* Freshness-staleness tint (ka-0000005352 iter-38): the "updated Xh ago"
+           stamp was the LAST card age-signal with no stale escalation — every
+           other wait-age (decision chip .chip-attention-stale, escalation badge
+           .plan-esc-badge-stale, stall badge .plan-stall-badge-stale, stuck/queued
+           crew facets) already tints loud past its bar, but the plan's own freshness
+           stamp rendered the same muted gray whether it moved 6 minutes or 3 weeks
+           ago. .FreshnessStale (planFreshnessStale: an ACTIVE plan whose newest
+           activity crossed planFreshnessStaleThreshold, 7d) recolors the stamp so a
+           rotting/abandoned open plan pops out of the board. Gated on non-terminal
+           status IN THE Go DERIVATION, so a terminal plan's honest "3 weeks ago"
+           history stays calm — a finished plan is SUPPOSED to look old. Zero new ink:
+           only recolors existing text, so the card footprint is unchanged.
+
+           RELOCATED to the head row (ka-0000005352 iter-52): the freshness stamp
+           now renders beside the plan ID in .plan-card-head, in the compact age
+           form (.AgoCompact), so it no longer occupies a wrapped line in this
+           top chip-strip — the dominant vertical sink. Its class + stale-tint +
+           tooltip semantics are unchanged; only its location and the on-face text
+           length changed. */}}
+    </div>
+    {{- if .StepsTotal -}}
+    {{/* Two-line layout (ka-0000005352 iter-91): the segmented bar sits on its own
+         top line (full card width) and the text facets wrap in a sub-row beneath it.
+         BEFORE this, .plan-progress was a single flex row holding the bar (flex:1) +
+         every facet as white-space:nowrap siblings with NO flex-wrap — so on a 239px
+         board lane, once a card carried more than the "N/M steps · X%" label the row
+         overflowed the card box and SILENTLY CLIPPED the rightmost facets off the
+         right edge (measured live 2026-08-15: 53 of 81 cards overflowed by up to
+         165px — the iter-58 "· phase P/T", iter-59 "· last ship Nd", iter-84
+         "⛔ N" step-tally, and iter-41 "✓ steps done" ghost were RENDERED BUT
+         INVISIBLE on ~2/3 of the board). Worse, the flex:1 bar lost its basis fight
+         with the nowrap text and collapsed to 0px width, so the segmented bar itself
+         disappeared on those cards too. Wrapping the facets beneath the bar makes
+         every facet visible inside the card and restores the bar — zero signal
+         removed, the mission's "more info in LESS space" in its purest form. This is
+         the row-level twin of the iter-22 crew-chip self-cap (ka-0000000417) and the
+         iter-89 MR-pill clamp (ka-0000006484): a nowrap facet strip with no width
+         cap that spilled and clipped. */}}
+    <div class="plan-progress" title="{{.StepsClosed}} of {{.StepsTotal}} steps done">
+      {{/* Segmented progress bar (ka-0000007226): the bar was a single green fill =
+           PctDone% against a dead-empty gray track — a channel that only re-stated
+           the "· {{.PctDone}}%" already printed in the label beside it, its whole
+           remainder carrying zero information. Now it paints the FOUR lifecycle
+           buckets that partition StepsTotal exactly — done (green) · in-progress
+           (orange) · blocked (red) · not-started (gray) — so the bar's OWN
+           footprint reads the plan's distribution at a glance (a half-blocked plan
+           shows a big red chunk the bare percent hid). Each segment's width is
+           flex-grow ∝ its count (flex-basis 0), so the segments are drift-free —
+           no percent rounding can overflow the track or leave a sliver — and a
+           zero-count bucket renders no segment. Reuses the SAME status hues as the
+           task-grid squares + step-tally chips so the surfaces agree. role=img +
+           aria-label carry the breakdown for assistive tech; per-segment titles
+           give the hover detail. Complementary to the taskgrid below (per-task
+           IDENTITY) and the tally chips (exact counts): the bar is the one place
+           that shows PROPORTION. */}}
+      <div class="plan-progress-bar" role="img"
+           aria-label="{{.StepsClosed}} done, {{.StepsInProgress}} in progress, {{.StepsBlocked}} blocked, {{.StepsNotStarted}} not started of {{.StepsTotal}} steps">
+        {{- if .StepsClosed}}<span class="plan-progress-seg plan-progress-seg-done" style="flex-grow: {{.StepsClosed}}" title="{{.StepsClosed}} done"></span>{{end}}
+        {{- if .StepsInProgress}}<span class="plan-progress-seg plan-progress-seg-inprogress" style="flex-grow: {{.StepsInProgress}}" title="{{.StepsInProgress}} in progress"></span>{{end}}
+        {{- if .StepsBlocked}}<span class="plan-progress-seg plan-progress-seg-blocked" style="flex-grow: {{.StepsBlocked}}" title="{{.StepsBlocked}} blocked"></span>{{end}}
+        {{- if .StepsNotStarted}}<span class="plan-progress-seg plan-progress-seg-todo" style="flex-grow: {{.StepsNotStarted}}" title="{{.StepsNotStarted}} not started"></span>{{end}}
+      </div>
+      {{- /* Facet sub-row (ka-0000005352 iter-91): every text facet below wraps
+           inside this flex-wrap row instead of spilling off the card's right edge.
+           Each facet keeps its own white-space:nowrap so a facet never breaks
+           mid-token; the ROW wraps between whole facets. */ -}}
+      <div class="plan-progress-facets">
+      <span class="plan-progress-label">{{.StepsClosed}}/{{.StepsTotal}} steps · {{.PctDone}}%</span>
+      {{/* Phase-position milestone (ka-0000005352 iter-58): for a MULTI-PHASE plan,
+           WHICH phase of how many is currently in flight — "· phase 2/5". The
+           segmented bar + "N/N steps · X%" label answer "how far through the
+           TASKS" and the now/next chip names ONE step, but neither answers WHICH
+           PHASE the plan is on — the coarse lifecycle milestone the mission names
+           ("add lifecycle/step-breakdown signals"). Measured live (2026-08-11):
+           3 of 16 active plans are multi-phase (4-5 phases via fields.phase_order)
+           yet the card showed the phase STRUCTURE (grid rows) without ever saying
+           which phase is in flight. PhaseCur/PhaseTotal (planPhasePosition) are
+           derived off the SAME Grid the card renders, so the facet can never
+           disagree with the phase rows below. Calm neutral (a milestone, context
+           like the step tally — not a red attention alarm), reusing the progress
+           label's own muted ink. Gated on PhaseTotal >= 2, so a single-phase or
+           pure-flat plan adds no ink (the facet self-suppresses where there is no
+           milestone to show — the same "signal only where it means something"
+           discipline the priority pill uses). Zero extra daemon call. */}}
+      {{- if ge .PhaseTotal 2}}<span class="plan-progress-phase" title="This multi-phase plan is on phase {{.PhaseCur}} of {{.PhaseTotal}} — the earliest phase still carrying an unfinished step (see the phase rows below)">· phase {{.PhaseCur}}/{{.PhaseTotal}}</span>{{end}}
+      {{/* Progress-recency "last ship · Nd" facet (ka-0000005352 iter-59): how long
+           since this plan last CLOSED a step — the delivery-momentum twin of the
+           head-row freshness stamp. The freshness stamp ages on the newest ANYTHING
+           (epic touch, step edit, crew heartbeat, comment), so a plan whose crew
+           heartbeat + comments churn reads FRESH even while it has shipped no step in
+           weeks; this facet ages on the newest step-CLOSE, answering the orthogonal
+           "is the plan actually moving forward". Measured live (2026-08-11): plan
+           ka-0000008223 read a CALM freshness stamp (newest activity 3.3d, below the
+           7d bar) yet its newest step closed 18.1d prior — a fortnight-plus delivery
+           drought no card signal surfaced. Calm muted by default (context, like the
+           step tally — a healthy plan ships and reads a small "last ship · 2h");
+           tints loud (.plan-progress-lastship-stale) once the drought crosses the
+           same 7d bar the freshness stamp uses, so a stalled-delivery plan pops. The
+           Go derivation (planLastShipAge) gates it to the non-redundant case — a
+           non-terminal, fresh-reading plan with a datable last-ship AND open steps
+           left, whose freshness stamp is not already loud — so LastShipAge is empty
+           (and this renders nothing) for a terminal, no-step-closed, ghost-done, or
+           already-freshness-stale plan, all of which then read exactly as before.
+           Zero extra daemon call — derived off the same batched child walk. */}}
+      {{- if .LastShipAge}}<span class="plan-progress-lastship{{if .LastShipStale}} plan-progress-lastship-stale{{end}}" title="This plan last closed a step {{.LastShipAge}} ago{{if .LastShipStale}} — over a week with no step shipped (delivery drought), even though it has recent activity{{end}}. Distinct from the head-row freshness stamp, which tracks any activity (crew heartbeats, comments) — this tracks forward progress." aria-label="last shipped a step {{.LastShipAge}} ago">· last ship {{.LastShipAge}}</span>{{end}}
+      {{/* Live step-status breakdown (ka-0000000851): the two "needs attention"
+           counts an operator scans for — how many steps are moving now, how many
+           are wedged — beside the closed/total the bar already shows. Derived from
+           the SAME batched grid (tallyPlanGrid), so it always agrees with the bar
+           and the detail timeline. Each count renders only when non-zero, so a
+           plan with nothing in flight and nothing blocked adds no extra ink. */}}
+      {{- if or .StepsInProgress .StepsBlocked -}}
+      <span class="plan-step-tally" aria-label="Step status breakdown">
+        {{- if .StepsInProgress}}<span class="plan-step-tally-item plan-step-tally-inprogress" title="{{.StepsInProgress}} step{{if ne .StepsInProgress 1}}s{{end}} in progress">▶ {{.StepsInProgress}}</span>{{end}}
+        {{- if .StepsBlocked}}<span class="plan-step-tally-item plan-step-tally-blocked" title="{{.StepsBlocked}} step{{if ne .StepsBlocked 1}}s{{end}} blocked">⛔ {{.StepsBlocked}}</span>{{end}}
+      </span>
+      {{- end -}}
+      {{/* Ghost-done marker (ka-0000005352 iter-41): a calm "✓ steps done" chip on a
+           plan whose RENDERED steps are ALL closed (full-green 100% bar) but whose
+           epic status is still NON-terminal — a plan that finished its steps but was
+           never closed (measured live: 11 of 72 cards, all last moved ~4 weeks prior,
+           none carrying any forward signal). The card already shows every OTHER
+           disposition (working/queued/stuck crew, in-progress/blocked step tally) but
+           never plan-level "all steps done", so a finished-but-unclosed plan read
+           identically to a genuinely-active one in the OPEN/IN-PROGRESS lane. This
+           surfaces the completion so an operator can close it (or file the wrap-up).
+           Reads CALM green (a healthy "done" state, the deliberate opposite of the red
+           ⚠/⛔ attention chips — the plan is complete, not blocked), reusing the
+           progress-bar's own done hue so the marker and the full-green bar agree.
+           Rendered only when StepsAllDone (StepsAllDone already folds in the
+           !planStatusTerminal guard, so a genuinely CLOSED/DEFERRED plan's 100% bar
+           stays calm history with NO marker, and the empty-in-flight guard so it never
+           renders beside a live ▶/⛔ tally). The step-tally block above is empty by
+           definition when all-done, so the two never both render. */}}
+      {{- if .StepsAllDone}}<span class="plan-steps-done" title="All {{.StepsClosed}} rendered step{{if ne .StepsClosed 1}}s{{end}} done, but this plan is still open — it may be ready to close or need a wrap-up">&#x2713; steps done</span>{{end}}
+      </div>
+    </div>
+    {{- else -}}
+    <div class="plan-progress-empty meta">No steps yet</div>
+    {{- end -}}
+    {{/* Mini task-grid (Matt's ask, ka-0000001226): one row per phase, one
+         color square per task. Each square is an <a> to the task bead, so the
+         shared preview_popover.js gives the hover preview + click-through for
+         free (it treats any ka-XXX anchor as a bead link — no per-square JS).
+         data-status drives the square color (planned/blocked/in-progress/
+         finished). An empty phase renders a labeled, square-less row so the
+         plan's phase structure still reads. Board-mode card clicks pass anchor
+         navigation through (plans_board.js isNativeInteractive), so a square
+         click opens the task rather than the plan peek drawer. */}}
+    {{- with .Grid -}}
+    <div class="plan-taskgrid" aria-label="Task grid">
+      {{- range . -}}
+      <div class="plan-taskgrid-row">
+        {{/* Phase label (ka-0000005352 iter-88): the boilerplate "Phase N — " lead
+             is split server-side (splitPhaseLabel) into a compact fixed-width
+             .plan-taskgrid-phase-tag ("P1") so the reclaimed ~60px of the 239px
+             lane goes to the DISTINGUISHING phase name — measured live, 92/155
+             labels carried the prefix and 132/155 clipped, so the ordinal+word
+             was crowding the name out of view. The untouched full .Title still
+             rides the row's title tooltip (below), so zero information is lost;
+             the "Other" trailer and hand-titled rows carry no tag and render the
+             name verbatim, exactly as before. */}}
+        {{- if .Title}}<span class="plan-taskgrid-phase" title="{{.Title}}">{{if .PhaseTag}}<span class="plan-taskgrid-phase-tag">{{.PhaseTag}}</span>{{end}}<span class="plan-taskgrid-phase-label">{{.PhaseName}}</span></span>{{end}}
+        <span class="plan-taskgrid-squares">
+          {{- range .Squares}}<a class="plan-taskgrid-sq" data-status="{{.Status}}"
+             href="{{$root.BasePath}}/{{.ID}}"
+             title="#{{.Number}} {{.Title}} — {{.Status}}"
+             aria-label="Task {{.ID}} ({{.Status}}): {{.Title}}"></a>{{else}}<span class="plan-taskgrid-empty">no tasks</span>{{end}}
+        </span>
+      </div>
+      {{- end -}}
+    </div>
+    {{- end -}}
+    {{- with .CurrentOrNextStep -}}
+    {{/* The "now / next" step chip deep-links into the plan detail, anchored at
+         the clicked step (#step-{ID}). plan_focus_step.js reads that hash on
+         arrival and highlight+scrolls the matching timeline row for ~10s (Matt's
+         ask, ka-0000000150). Rendered as an <a> only when the step carries an id
+         (it always does off pickCurrentOrNextStep); a blank id degrades to the
+         old non-interactive <div> so the chip never becomes a dead link.
+
+         Three kind states (ka-0000002840, iteration 14): "now" (in_progress,
+         orange) · "blocked" (the next open step is status=blocked and CANNOT
+         start — red, so a wedged next step no longer reads as a calm
+         ready-to-go "next") · "next" (open/ready, calm blue). The Kind /
+         KindLabel / KindTitle projections on planCardStep are the SINGLE source
+         of truth for the class, the pill word, and the tooltip lead-in, so the
+         three can never disagree — the template stays a thin render. */}}
+    {{/* In-progress "now" step age (ka-0000005352 iter-43): the "· 5d" since the
+         step went in_progress, folded onto the chip face after the title — the
+         LAST card signal naming a specific step that carried no temporal facet
+         (every sibling wait-age already does: decision "· 32d", escalation
+         "· 40d", stall "· 3d", stuck/queued crew "· 6h"/"· 12m", MR "· 8d"). So a
+         step running 3 minutes no longer reads identically to one grinding 2
+         weeks. NowAge renders only on the in_progress ("now") arm (setStepAge
+         gates on Kind); a next step has not started, so it carries none.
+         Past planStallStaleThreshold (24h — the SAME bar the ⚠ stall badge uses
+         for a frozen step) the whole chip tints loud (plan-card-step-now-stale)
+         so a long-grinding step pops out of the board. */}}
+    {{/* Blocked step wedge-age (ka-0000005352 iter-48): the twin of the "now"
+         running-age for the BLOCKED arm iter-43 deferred. A status=blocked step's
+         wedge-age ("· 5d" since it went blocked) was surfaced by NO other card
+         signal — deriveStall counts only in_progress steps so the ⚠ stall badge
+         never fires for a blocked step, a plain status=blocked step with no
+         blocks-edge never fires the ⛔ escalation badge, and the freshness stamp
+         shows the plan's NEWEST activity (which hides the wedge). So a step
+         blocked 6 days read identically to one blocked 6 minutes. BlockedAge
+         folds it on after the title, tinting the whole chip loud
+         (plan-card-step-blocked-stale) past the same 24h bar. Renders only on the
+         blocked arm (setStepAge gates on Kind); a now/next step carries none. */}}
+    {{- if .ID -}}
+    <a class="plan-card-step plan-card-step-link{{if .NowStale}} plan-card-step-now-stale{{end}}{{if .BlockedStale}} plan-card-step-blocked-stale{{end}}" href="{{$root.BasePath}}/plans/{{$planID}}#step-{{.ID}}"
+       title="{{.KindTitle}}: {{.Title}}{{if .NowAge}} — running {{.NowAge}}{{if .NowStale}} (stale){{end}}{{end}}{{if .BlockedAge}} — blocked {{.BlockedAge}}{{if .BlockedStale}} (stale){{end}}{{end}} — open the plan and jump to this task">
+      <span class="plan-step-kind plan-step-kind-{{.Kind}}">{{.KindLabel}}</span>
+      <span class="plan-step-num">#{{.Number}}</span>
+      <span class="plan-step-title">{{or .ShortTitle .Title}}</span>
+      {{- if .NowAge}}<span class="plan-step-age" aria-label="running {{.NowAge}}">· {{.NowAge}}</span>{{end}}
+      {{- if .BlockedAge}}<span class="plan-step-age" aria-label="blocked {{.BlockedAge}}">· {{.BlockedAge}}</span>{{end}}
+    </a>
+    {{- else -}}
+    <div class="plan-card-step{{if .NowStale}} plan-card-step-now-stale{{end}}{{if .BlockedStale}} plan-card-step-blocked-stale{{end}}" title="{{.KindTitle}}: {{.Title}}{{if .NowAge}} — running {{.NowAge}}{{if .NowStale}} (stale){{end}}{{end}}{{if .BlockedAge}} — blocked {{.BlockedAge}}{{if .BlockedStale}} (stale){{end}}{{end}}">
+      <span class="plan-step-kind plan-step-kind-{{.Kind}}">{{.KindLabel}}</span>
+      <span class="plan-step-num">#{{.Number}}</span>
+      <span class="plan-step-title">{{or .ShortTitle .Title}}</span>
+      {{- if .NowAge}}<span class="plan-step-age" aria-label="running {{.NowAge}}">· {{.NowAge}}</span>{{end}}
+      {{- if .BlockedAge}}<span class="plan-step-age" aria-label="blocked {{.BlockedAge}}">· {{.BlockedAge}}</span>{{end}}
+    </div>
+    {{- end -}}
+    {{- end -}}
+    <div class="plan-card-meta">
+      {{/* The unified plan-agent state chip (step 7, ka-0000003685): the SAME
+           plan_agent_chip partial the detail card header renders, fed from the
+           page-wide gardener + plan-agent bulk joins — so a paused-gardener plan is
+           visibly distinct from a running one right on the index, and the two
+           surfaces always agree.
+
+           Terminal-reconcile (ka-0000005352 iter-54): gate on .Chip.Label — the
+           reconcileTerminal pass clears the "not started" none-face on a
+           closed/deferred plan (a FINISHED plan no longer reads "closed · 100% ·
+           ✓ steps done · not started" at once), leaving an empty Label. Guard so a
+           bare empty pill never renders, matching the plan_peek partial's own
+           {{if .Label}} gate. A non-terminal / real-loop-word chip keeps its Label
+           and renders exactly as before. */}}
+      {{- with .Chip}}{{if .Label}}{{template "plan_agent_chip" .}}{{end}}{{end -}}
+      {{/* Live-crew chip (ka-0000004801): surface the crew the plan gardener has
+           dispatched onto steps right on the index — not just the cockpit. A
+           dense "● N crew · M working" pill in the SAME agent-state meta row
+           (data-density rule: add signal, not rows). The live-dot (green,
+           pulsing) shows only while a crew is working now, reusing the cockpit
+           tally's plan-crew-dot vocabulary; the "M working" and "K stuck" facets
+           render only when non-zero so a plan with only finished crew reads just
+           "N crew". Links to the cockpit's crew roster (#plan-crew) for the full
+           who/what/how. Rendered only when the plan has any crew (Crew.Any). */}}
+      {{/* Cumulative crew SPEND (ka-0000004218, iteration 12): the crew chip
+           answered "who / how many / working / stuck" but never "how much has
+           this plan burned" — the one first-class operator concern (a plan
+           accretes crew that each cost real budget) with no representation on the
+           board. Fold a compact "· $12.34" facet onto the SAME chip (add signal,
+           not rows), summed over the crew beads the rollup already hydrated via
+           the shared agentSpendUSD helper — so it costs zero extra daemon call and
+           reads the same dollars as each crew's own agent-card cost chip and the
+           cockpit roster header. Rendered only when spend is known (HasSpend), so
+           a plan whose crew have not yet reported cost adds no ink. */}}
+      {{- with .Crew}}{{if .Any -}}
+      <a class="plan-card-crew{{if .HasLive}} plan-card-crew-live{{end}}" href="{{$root.BasePath}}/plans/{{$planID}}#plan-crew"
+         title="{{.Total}} crew agent{{if ne .Total 1}}s{{end}} dispatched onto this plan's steps{{if .Working}} — {{.Working}} working now{{if .HasStarting}} ({{.Starting}} still starting up){{end}}{{if .WorkingOldestAge}} (longest running {{.WorkingOldestAge}}){{end}}{{end}}{{if .Idle}}, {{.Idle}} queued{{if .QueuedOldestAge}} (oldest {{.QueuedOldestAge}}{{if .QueuedOldestStale}}, pool starved{{end}}){{end}}{{end}}{{if .Done}}, {{.Done}} done{{end}}{{if .Failed}}, {{.Failed}} stuck or failed{{if .StuckOldestAge}} (oldest stuck {{.StuckOldestAge}}{{if .StuckOldestStale}}, stale{{end}}){{end}}{{end}}{{if .HasSpend}}. {{.SpendLabel}} spent so far{{end}}. Open the crew roster.">
+        {{- if .HasLive}}<span class="plan-card-crew-dot" aria-hidden="true"></span>{{end}}
+        <span class="plan-card-crew-total">{{.Total}} crew</span>
+        {{/* Working RUNTIME facet (ka-0000005352): fold the longest-running live
+             crew's elapsed runtime ("· 4h") onto the "· M working" count — the LAST
+             live-crew facet on the card carrying a count but no temporal signal (its
+             queued "· 12m" iter-32 + stuck "· 6h" iter-13 siblings both do). Aged on
+             CreatedAt (runtime), NOT last-activity: a working crew heartbeats so its
+             updated_at is always fresh, so a last-activity age would read ~0s — runtime
+             is the meaningful primitive, the live-effort twin of the calm "· $N" spend
+             facet ("3 working · 4h · $12"). Calm (context, not an alarm — a genuinely-
+             wedged crew is re-bucketed to the loud stuck facet). Rendered only when
+             derivable (WorkingOldestAge non-empty); an undatable working crew reads
+             count-only exactly as before. */}}
+        {{/* "(K starting)" honest sub-qualifier (ka-0000005352): of the M live crew,
+             K are still BOOTING (spawning agent_state) — dispatched, pod coming up,
+             not yet grinding the step. spawning ∈ agentStateAlive so it already rides
+             the green pulse + face + Working count (HasLive/faces/stall-exemption
+             untouched — a booting crew IS live and watching the plan); this only tells
+             the sub-truth so a just-spawned pod doesn't read identical to a crew that
+             has been working for an hour. The active twin of the queued≠done (iter-31)
+             and stale≠working (iter-42) honesty splits. Gated 0<K<M (HasStarting): an
+             all-spawning set adds no qualifier (bare "· K working" already reads "just
+             started"), a set with none reads exactly as before. Calm muted — a booting
+             crew is context, not an alarm. */}}
+        {{- if .Working}}<span class="plan-card-crew-working">· {{.Working}} working{{if .HasStarting}} <span class="plan-card-crew-starting" aria-label="{{.Starting}} still starting up">({{.Starting}} starting)</span>{{end}}{{if .WorkingOldestAge}} <span class="plan-card-crew-working-age">{{.WorkingOldestAge}}</span>{{end}}</span>{{end}}
+        {{/* Idle/queued facet (ka-0000005352 iter-31): a crew DISPATCHED onto a
+             step but not yet working — an open idle/queued agent_state whose pod is
+             capacity-deferred in the pool. Before this it folded silently into the
+             "done" tally (which the index chip never even shows), so a plan whose
+             crew are all waiting for a pod slot rendered just "N crew" with no hint
+             that N crew are queued and NOTHING has started. This surfaces the wait
+             as a calm neutral "· N queued" facet (the deliberate opposite of the
+             loud red stuck facet — a queued crew is not an alarm, it is context
+             like spend: the pool will start it), completing the mission-named
+             working/blocked/idle crew dispositions. Rendered only when non-zero, so
+             a plan with none adds no ink; a terminal plan folds idle→done
+             (reconcileTerminal) so a closed plan never reads "queued". */}}
+        {{/* Queued wait-age (ka-0000005352 iter-32): the "· N queued" facet iter-31
+             shipped was the LAST card signal that carried a count but no age — its
+             siblings the decision chip ("· 32d"), escalation badge ("· 40d"), stall
+             badge ("· 3d"), and stuck facet ("· 6h") all surface HOW LONG. A crew
+             queued 2 minutes ago (the pool will slot it imminently) read identically
+             to one queued 3 hours ago (the pool is genuinely starved). Fold the oldest
+             queued crew's wait ("· 12m") onto the facet, tinting the whole facet loud
+             (plan-card-crew-queued-stale) once it crosses planCrewQueuedStaleThreshold
+             so a pool-starved plan pops out of the board — the calm-by-default,
+             loud-when-egregious two-tier treatment the stuck facet already gives. The
+             age rides along only when derivable (an undatable queued crew reads exactly
+             as iter-31 — count only). Zero extra daemon call — the age is derived off
+             the SAME queued beads the tally already read. */}}
+        {{- if .Idle}}<span class="plan-card-crew-idle{{if .QueuedOldestStale}} plan-card-crew-queued-stale{{end}}" title="{{.Idle}} crew dispatched onto a step but not yet working — waiting on a pod slot (queued in the pool){{if .QueuedOldestAge}}; oldest queued {{.QueuedOldestAge}}{{if .QueuedOldestStale}} (pool starved){{end}}{{end}}">· {{.Idle}} queued{{if .QueuedOldestAge}} <span class="plan-card-crew-queued-age">{{.QueuedOldestAge}}</span>{{end}}</span>{{end}}
+        {{/* Finished-crew facet (ka-0000005352 iter-64): "· N done" — the count of
+             crew that finished (CLOSED cleanly) on this plan. "done" was the LAST
+             crew disposition the cockpit roster header carried (plan_crew.html's
+             "N done" chip) that the index chip FACE never surfaced — working,
+             queued, stuck, failed, and spend all render on BOTH surfaces, but a
+             finished crew was legible on the index only in this chip's hover
+             tooltip. This closes that index↔cockpit parity gap, completing the
+             crew-tally family on the board face — an operator scanning the board
+             sees a plan has already SHIPPED crew, not just how many are on it now.
+
+             Gated on .HasDoneFacet (0 < Done < Total), NOT the cockpit's bare
+             Done > 0 — the priority-pill / redundant-ink (iter-60..63) "render only
+             where the value discriminates" discipline. When every crew is done
+             (Done == Total) the bare "N crew" total beside the ABSENCE of any
+             working/queued/stuck facet already reads "all N finished", so "N crew ·
+             N done" would be pure redundant ink; and reconcileTerminal folds
+             Working+Idle into Done on a terminal plan, so a closed roster hits
+             Done == Total and self-suppresses the facet (matching the iter-30
+             crew-live terminal quiet). The MIXED case — some crew done while others
+             still work/queue/stick — is exactly where "· N done" adds signal. Reads
+             the SAME Done tally the cockpit chip renders, so the two never disagree.
+             Calm neutral (finished crew is context/history, like spend + the
+             closed-failed marker — the deliberate opposite of the loud red stuck
+             facet). Zero extra daemon call. */}}
+        {{- if .HasDoneFacet}}<span class="plan-card-crew-done" title="{{.Done}} crew agent{{if ne .Done 1}}s{{end}} finished on this plan">· {{.Done}} done</span>{{end}}
+        {{/* Two-tier stuck facet (iter-9 count → iter-13 wait-age → iter-29
+             open/closed split). The "· ⚠ K" count told an operator HOW MANY crew
+             are stuck; the "· 6h" suffix folds on HOW LONG the longest-wedged
+             REACHABLE crew has waited — the last attention signal on the card that
+             carried no age, completing the decision-chip / escalation-badge /
+             stall-badge family.
+
+             The count itself is now split by REACHABILITY (ka-0000005352 iter-29),
+             the last open-vs-closed conflation the stuck-crew family still carried.
+             The red click-through avatars (iter-9) and the wait-age (iter-13) were
+             already OPEN-only — a closed-failed crew has no reachable terminal and
+             its "age" is its death, not an ongoing wait — but the FACE count still
+             lumped open + closed into one loud attention-red "⚠ K". Measured on the
+             live board, 17/17 cards carrying the facet had ZERO open stuck crew, so
+             every red count was pure closed history: a false "act now" pointing at
+             nothing clickable.
+
+             Now the LOUD "⚠ K" facet counts OPEN (reachable) stuck crew only — the
+             ones a human can jump to and unstick — and keeps the wait-age + stale
+             tint, matched by the red avatars below. The CLOSED-failed remainder
+             renders as a separate CALM, muted "· ✕ K" historical marker — reusing
+             the SAME ✕ "failed" glyph iter-20 stamps on the hidden-MR overflow, but
+             calm-gray here (context, like spend — not an alarm), so a plan whose
+             failures are all done reads quiet. The color carries actionability (loud
+             red ⚠ = reachable, act now; calm gray ✕ = closed, recorded), the glyph
+             carries meaning. A card with both shows a loud open count AND a calm
+             closed count. Zero new daemon fan-out — both counts already on the
+             rollup. */}}
+        {{- if .HasOpenStuck}}<span class="plan-card-crew-failed{{if .StuckOldestStale}} plan-card-crew-stuck-stale{{end}}" title="{{.OpenStuck}} stuck crew still reachable — jump to a terminal to unstick{{if .StuckOldestAge}} (oldest stuck {{.StuckOldestAge}}{{if .StuckOldestStale}}, stale{{end}}){{end}}">· ⚠ {{.OpenStuck}}{{if .StuckOldestAge}} <span class="plan-card-crew-stuck-age">{{.StuckOldestAge}}</span>{{end}}</span>{{end}}
+        {{- if .HasClosedFailed}}<span class="plan-card-crew-failed-closed" title="{{.ClosedFailed}} crew failed and closed on this plan (historical — no reachable terminal to unstick)">· ✕ {{.ClosedFailed}}</span>{{end}}
+        {{- if .HasSpend}}<span class="plan-card-crew-spend" title="Total crew spend on this plan so far">· {{.SpendLabel}}</span>{{end}}
+      </a>
+      {{/* Live-crew faces (ka-0000002189): surface WHO is working the plan now,
+           not just how many — one click-through avatar (initials in a dot) per
+           live crew, each deep-linking to that agent's terminal/bead page so an
+           operator can jump straight to a specific working crew from the index
+           (previously only reachable via the cockpit). Data-density: denser than
+           the count alone, same meta row. A "+N" overflow past the render cap
+           links to the cockpit crew roster. Rendered only when live crew exist
+           (Faces non-empty), so a plan with only finished crew adds no avatars. */}}
+      {{/* Each face avatar carries the STEP the crew is working (ka-0000004037,
+           iter-15): the initials answer WHO, a compact "#N" tag answers WHAT part
+           of the plan — the same "#N: title" the cockpit crew roster shows, so the
+           index avatar no longer drops the step context. The "#N" matches the
+           mini-grid square #N on the same card. Rendered only when the step number
+           resolves (StepNumber > 0); an unresolvable step reads initials-only,
+           exactly as before. The step title folds into the hover tooltip. */}}
+      {{- if .Faces -}}
+      <span class="plan-card-crew-faces" role="group" aria-label="Live crew working now">
+        {{- range .Faces -}}
+        <a class="plan-card-crew-face" href="{{.URL}}"{{if .External}} target="_blank" rel="noopener"{{end}}
+           title="{{.Name}} — working now{{if .StepNumber}} on step #{{.StepNumber}}{{if .StepTitle}}: {{.StepTitle}}{{end}}{{end}}. {{if .External}}Open its live terminal.{{else}}Open its bead page.{{end}}"
+           aria-label="Live crew {{.Name}}, working now{{if .StepNumber}} on step {{.StepNumber}}{{if .StepTitle}} {{.StepTitle}}{{end}}{{end}}">{{.Initials}}{{if .StepNumber}}<span class="plan-card-crew-face-step" aria-hidden="true">#{{.StepNumber}}</span>{{end}}</a>
+        {{- end -}}
+        {{- if .FacesHidden}}<a class="plan-card-crew-face plan-card-crew-face-more" href="{{$root.BasePath}}/plans/{{$planID}}#plan-crew"
+           title="{{.FacesHidden}} more crew working now — open the crew roster">+{{.FacesHidden}}</a>{{end}}
+      </span>
+      {{- end -}}
+      {{/* Stuck-crew faces (ka-0000003793): the crew an operator most needs to
+           REACH — an OPEN crew stuck rate-limited / failing / budget-exceeded.
+           The working strip above answers "who's healthily on it"; a stuck crew
+           was previously only the bare "· ⚠ N" count on the chip, with no
+           click-through, so finding WHICH crew is stuck (and jumping to its
+           terminal to unstick it) meant opening the cockpit first. These surface
+           it RED right on the index — one click-through avatar per open stuck
+           crew, so the crew that needs attention is reachable from the board like
+           the working crew are. Only OPEN stuck crew get an avatar (a live,
+           reachable terminal); a historical closed-failed crew stays in the "⚠ N"
+           tally only. Rendered only when open stuck crew exist (HasStuck), so a
+           plan with none — or only healthy crew — adds no ink. Same render cap +
+           "+N" overflow to the cockpit roster as the working strip. */}}
+      {{- if .HasStuck -}}
+      <span class="plan-card-crew-faces plan-card-crew-faces-stuck" role="group" aria-label="Stuck crew needing attention">
+        {{- range .StuckFaces -}}
+        <a class="plan-card-crew-face plan-card-crew-face-stuck" href="{{.URL}}"{{if .External}} target="_blank" rel="noopener"{{end}}
+           title="{{.Name}} — stuck (rate-limited / failing){{if .StepNumber}} on step #{{.StepNumber}}{{if .StepTitle}}: {{.StepTitle}}{{end}}{{end}}. {{if .External}}Open its live terminal to unstick it.{{else}}Open its bead page.{{end}}"
+           aria-label="Stuck crew {{.Name}}, needs attention{{if .StepNumber}} on step {{.StepNumber}}{{if .StepTitle}} {{.StepTitle}}{{end}}{{end}}">{{.Initials}}{{if .StepNumber}}<span class="plan-card-crew-face-step" aria-hidden="true">#{{.StepNumber}}</span>{{end}}</a>
+        {{- end -}}
+        {{- if .StuckFacesHidden}}<a class="plan-card-crew-face plan-card-crew-face-stuck plan-card-crew-face-more" href="{{$root.BasePath}}/plans/{{$planID}}#plan-crew"
+           title="{{.StuckFacesHidden}} more stuck crew — open the crew roster">+{{.StuckFacesHidden}}</a>{{end}}
+      </span>
+      {{- end -}}
+      {{/* Queued-crew faces (ka-0000005352 iter-53): the LAST crew disposition that
+           carried a COUNT but no click-through faces. The working strip answers
+           "who's healthily on it" (green), the stuck strip "who needs a human"
+           (red) — but a crew DISPATCHED onto a step and pool-deferred (Idle, the
+           "· N queued" facet, iter-31/32) was only ever a bare count, so finding
+           WHICH crew is waiting for a pod slot meant opening the cockpit roster
+           (which already lists every queued member by name+link). These surface it
+           right on the index — one click-through avatar per open queued crew — so a
+           queued crew is reachable from the board like the working + stuck crew are.
+           Rendered CALM neutral (the deliberate opposite of the loud red stuck strip:
+           a queued crew is context like its own "· N queued" facet's calm tone, NOT
+           an alarm — the pool will slot it). Rendered only when open queued crew exist
+           (HasQueuedFaces), so a plan with none adds no ink; a terminal plan folds
+           Idle→Done (reconcileTerminal) so a closed roster shows none. Same render cap
+           + "+N" overflow to the cockpit roster as the working / stuck strips. */}}
+      {{- if .HasQueuedFaces -}}
+      <span class="plan-card-crew-faces plan-card-crew-faces-queued" role="group" aria-label="Queued crew waiting on a pod slot">
+        {{- range .QueuedFaces -}}
+        <a class="plan-card-crew-face plan-card-crew-face-queued" href="{{.URL}}"{{if .External}} target="_blank" rel="noopener"{{end}}
+           title="{{.Name}} — queued (dispatched onto a step, waiting on a pod slot){{if .StepNumber}} on step #{{.StepNumber}}{{if .StepTitle}}: {{.StepTitle}}{{end}}{{end}}. {{if .External}}Open its live terminal.{{else}}Open its bead page.{{end}}"
+           aria-label="Queued crew {{.Name}}, waiting on a pod slot{{if .StepNumber}} on step {{.StepNumber}}{{if .StepTitle}} {{.StepTitle}}{{end}}{{end}}">{{.Initials}}{{if .StepNumber}}<span class="plan-card-crew-face-step" aria-hidden="true">#{{.StepNumber}}</span>{{end}}</a>
+        {{- end -}}
+        {{- if .QueuedFacesHidden}}<a class="plan-card-crew-face plan-card-crew-face-queued plan-card-crew-face-more" href="{{$root.BasePath}}/plans/{{$planID}}#plan-crew"
+           title="{{.QueuedFacesHidden}} more queued crew — open the crew roster">+{{.QueuedFacesHidden}}</a>{{end}}
+      </span>
+      {{- end -}}
+      {{- end}}{{end -}}
+      {{/* Open-MR pills (Matt's ask: "the plans index should show open MRs so we
+           can click through there too, just like w crew"). One click-through pill
+           per open MR the plan's steps produced — the SAME who/what/click-through
+           parity the crew chip gives, but for the code the plan shipped. Each pill
+           links straight to the GitLab MR (opens in a new tab); a draft reads gray,
+           a ready MR reads blue. Past the inline cap a "+N" pill links to the
+           cockpit timeline (every step's MR pill lives there). Rendered only when
+           the plan has an open MR (MRs.Any) so a plan with none adds no ink. */}}
+      {{- with .MRs}}{{if .Any -}}
+      {{- range .Rendered -}}
+      {{/* CI-status signal (ka-0000002426): the MR pill already told an operator a
+           plan HAS an open MR (draft vs opened), but dropped mr_pipeline_status —
+           the single most important thing about it: is CI green, red, or running?
+           That status is ALREADY on the hydrated MR bead (gitlab-bridge keeps it
+           fresh via the pipeline webhook), so folding a compact glyph + color
+           accent into the pill costs no extra daemon call. A FAILED pipeline tints
+           the whole pill loud red (.plan-card-mr-ci-failed) so it pops out of the
+           board like the ⚠ stall / ⛔ escalation "needs attention" signals — a
+           plan whose open MR is red is a plan that is not moving. success/running/
+           canceled read calm. Rendered only when a pipeline status is known
+           (.CIState non-empty); an MR with no pipeline yet reads exactly as
+           before. Reuses the SAME status vocabulary the /threads + /extern MR
+           pills and the bridge's pipelineIcon use so the surfaces agree. */}}
+      {{/* Open-MR wait-age on the pill FACE (ka-0000005352 iter-40): the MR pill
+           was the LAST card presence-signal carrying no temporal urgency — every
+           sibling wait-context signal already surfaces "how long" (decision chip
+           "· 32d" iter-4, escalation badge "· 40d" iter-8, stall badge "· 3d"
+           iter-11, stuck/queued crew facets "· 6h"/"· 12m" iter-13/32). A green MR
+           opened 40 minutes ago read identically to one open 3 weeks awaiting a
+           human merge. .OpenAge folds the MR's since-opened age ("· 8d") onto the
+           face; .OpenStale tints the whole pill loud (plan-card-mr-stale) once it
+           crosses planMROpenStaleThreshold (7d), the same bar the escalation badge
+           + freshness stamp use, so a long-open MR pops out of the board. Rendered
+           only when derivable (an undatable MR reads exactly as before, no age).
+           Zero extra daemon call — derived off the CreatedAt already hydrated on
+           the MR bead. */}}
+      <a class="plan-card-mr{{if .Draft}} plan-card-mr-draft{{end}}{{if .CIState}} plan-card-mr-ci-{{.CIState}}{{end}}{{if .OpenStale}} plan-card-mr-stale{{end}}" href="{{.URL}}" target="_blank" rel="noopener"
+         title="Open merge request{{if .IID}} !{{.IID}}{{end}}{{if .Title}} · {{.Title}}{{end}}{{if .State}} ({{.State}}){{end}}{{if .PipelineStatus}} — CI {{.PipelineStatus}}{{end}}{{if .OpenAge}} — open {{.OpenAge}}{{if .OpenStale}} (stale){{end}}{{end}} — opens in GitLab">
+        <span class="plan-card-mr-glyph" aria-hidden="true">&#x2197;</span>
+        <span class="plan-card-mr-iid">{{if .IID}}!{{.IID}}{{else}}MR{{end}}</span>
+        {{- if .Title}}<span class="plan-card-mr-title">{{.Title}}</span>{{end}}
+        {{- if .CIState}}<span class="plan-card-mr-ci plan-card-mr-ci-glyph-{{.CIState}}" aria-label="CI {{.PipelineStatus}}">{{.CIGlyph}}</span>{{end}}
+        {{- if .OpenAge}}<span class="plan-card-mr-age" aria-label="open {{.OpenAge}}">· {{.OpenAge}}</span>{{end}}
+      </a>
+      {{- end -}}
+      {{/* Failing-CI signal on the "+N MR" overflow (ka-0000000387, iteration 20):
+           the inline pills each carry their own CI glyph + loud-red failed tint
+           (iter-5), but past the render cap the overflow collapsed every remaining
+           MR into ONE calm-gray count that dropped all CI signal — so a plan whose
+           HIDDEN MRs were failing read identical to one whose hidden MRs were all
+           green. When any elided MR failed CI (HasFailedHidden), tint the overflow
+           pill loud red (the SAME plan-card-mr-more-failed → plan-card-mr-ci-failed
+           chrome the per-pill CI badge + the ⚠ stall / ⛔ escalation attention
+           signals use) and fold a "· ✕ K" facet onto its face so an operator
+           scanning the board sees the plan has red MRs it cannot individually see.
+           Zero extra daemon call — reads the mr_pipeline_status already hydrated on
+           the elided refs. An all-green/running overflow reads exactly as before
+           (calm dashed pill, count only). */}}
+      {{- if .HasMore}}<a class="plan-card-mr plan-card-mr-more{{if .HasFailedHidden}} plan-card-mr-ci-failed plan-card-mr-more-failed{{end}}" href="{{$root.BasePath}}/plans/{{$planID}}#plan-steps"
+         title="{{.MoreCount}} more open merge request{{if ne .MoreCount 1}}s{{end}}{{if .HasFailedHidden}} — {{.FailedHiddenCount}} with FAILED CI{{end}} — open the plan timeline to see every step's MR">+{{.MoreCount}} MR{{if .HasFailedHidden}} <span class="plan-card-mr-more-ci" aria-label="{{.FailedHiddenCount}} hidden MR{{if ne .FailedHiddenCount 1}}s{{end}} with failed CI">· &#x2715; {{.FailedHiddenCount}}</span>{{end}}</a>{{end}}
+      {{- end}}{{end -}}
+      {{/* Terminal link: preserves the click-through the old assistant-only
+           chip carried. AssistantURL points at the agent's coopmux terminal
+           page when derivable (<COOPMUX_PUBLIC_URL>#<pod_name>, ka-0000007019),
+           else its bead page /{id}. AssistantExternal → open the coopmux page
+           in a new tab. The old /agents/{id} target 404'd (no such route). */}}
+      {{- if .AssistantURL -}}
+      <a class="plan-card-agent-link" href="{{.AssistantURL}}"{{if .AssistantExternal}} target="_blank" rel="noopener"{{end}} title="{{if .AssistantExternal}}Open the plan agent's live coopmux terminal{{else}}Open the plan agent's bead page (screen + full input surface){{end}}">terminal &rarr;</a>
+      {{- end -}}
+      {{/* Per-gardener enable/disable lever (step 3, ka-0000003881). The
+           control-room "decide which gardeners are active" toggle, living ON the
+           /plans row beside the state chip — NOT a new page. Operator-gated
+           (read-only viewers see the chip but no lever); rendered only when a
+           NON-retired gardener is bound (a retired/closed gardener has nothing to
+           resume, matching the detail card's "retired" note). Reuses the SAME
+           gardener_pause_toggle partial the /gardeners rows use — but repointed
+           at the plans-scoped POST /plans/{id}/gardener/pause-toggle handler and
+           targeted at `closest .plan-card` so the WHOLE row re-renders on flip
+           (the unified state chip updates live too, which a self-swap could not
+           do). The enable semantics are NOT forked — the handler delegates to
+           the same setGardenerEnabledCore the detail card + /gardeners use. */}}
+      {{- if and $root.IsOperator .GardenerID (ne .GardenerState "retired") -}}
+      {{- if eq .PlanState "ready" -}}
+      {{/* Fleet-level kickoff lever (ka-0000006826): a ready plan with a bound
+           gardener gets the SAME deliberate "Approve & build" action the cockpit
+           card carries (handlePlanBuild → POST /plans/{id}/build), surfaced right
+           on the index INSTEAD of the pause/resume toggle — which would refuse to
+           resume a still-authoring plan behind the R6 build gate ("Approve the
+           plan for build before starting the gardener"). Reuses the existing
+           handler; row=1 makes it re-render the WHOLE row (the lifecycle chip +
+           gardener state update live) rather than the cockpit #plan-agent card the
+           index has no slot for. */}}
+      <button type="button" class="bead-action plan-card-approve-btn"
+              hx-post="{{$root.BasePath}}/plans/{{.ID}}/build"
+              hx-vals='{"row":"1"}'
+              hx-target="closest .plan-card" hx-swap="outerHTML"
+              hx-disabled-elt="this"
+              hx-confirm="Approve this plan and start the gardener building it, step by step?"
+              title="Approve the plan and enable the bound gardener to build it step by step">Approve &amp; build &#x25B6;</button>
+      {{- else -}}
+      {{template "gardener_pause_toggle" (dict
+          "Pause" (dict "ID" .GardenerID "Paused" (eq .GardenerState "paused") "IsClosed" false)
+          "BasePath" $root.BasePath
+          "PostURL" (printf "%s/plans/%s/gardener/pause-toggle" $root.BasePath .ID)
+          "Target" "closest .plan-card"
+          "Swap" "outerHTML")}}
+      {{- end -}}
+      {{- end -}}
+      {{/* Inline toggle feedback (step 3): a gated enable (still-authoring
+           draft/ready plan — the R6 build gate) or a write failure re-renders the
+           row with this note instead of silently snapping the switch back, so the
+           operator learns WHY the gardener did not start. Empty on the normal page
+           render and on a successful flip. */}}
+      {{- if .GardenerToggleError}}<span class="plan-cap-toggle-err" role="alert" title="{{.GardenerToggleError}}">{{.GardenerToggleError}}</span>{{end}}
+    </div>
+    {{- if $root.IsOperator -}}
+    {{/* Dispatch-next button (Matt's ask, thread ka-0000001290): "instead of
+         sending a line and there's a wake button there should just be a dispatch
+         button in the index card for the agent for the next task to take on."
+         This replaces the old free-text message box: one deliberate click hands
+         the plan's current/next open step (the same step the "now / next" chip
+         above surfaces) to the gardener, spawning one if none is bound. Routes to
+         the plans-scoped /dispatch-next handler, targeted at `closest .plan-card`
+         so the WHOLE row re-renders with the confirmation note — the index has no
+         #plan-agent card to swap, so a row re-render is the honest failure/success
+         surface (unlike the old Wake, which would have failed silently here).
+
+         Rendered only when the plan has an open step to hand off (CurrentOrNextStep
+         is set); a fully-done / all-blocked plan shows no button rather than a dead
+         click.
+
+         Blocked next-step guard (ka-0000005352 iter-44): also gated on
+         .CurrentOrNextStep.Dispatchable — pickCurrentOrNextStep returns the first
+         NON-CLOSED step, which INCLUDES a status=blocked step, and the now/next chip
+         above already paints that a red "BLOCKED · cannot start" pill (iter-14,
+         ka-0000002840). Offering a live "Dispatch #N →" beside it — whose confirm +
+         gardener seed both say the step "is ready to start" — is the exact
+         card-vs-truth contradiction iter-25 killed for a TERMINAL plan. A blocked
+         step is waiting on its own blocker; dispatching crew onto it is the wrong
+         instruction, so the button drops. Any dispatch note (e.g. a stale click the
+         handler refused) still surfaces via the else-if arm below. */}}
+    {{- if and .CurrentOrNextStep .CurrentOrNextStep.ID .CurrentOrNextStep.Dispatchable -}}
+    <div class="plan-card-dispatch">
+      <button type="button" class="bead-action plan-card-dispatch-btn"
+              hx-post="{{$root.BasePath}}/plans/{{.ID}}/dispatch-next"
+              hx-target="closest .plan-card" hx-swap="outerHTML"
+              hx-disabled-elt="this"
+              hx-confirm="Hand step #{{.CurrentOrNextStep.Number}} ({{.CurrentOrNextStep.Title}}) to the plan gardener (spawning one if needed)? It will dispatch a crew agent onto it."
+              title="Hand the next open step (#{{.CurrentOrNextStep.Number}}: {{.CurrentOrNextStep.Title}}) to the plan gardener — it dispatches a crew agent onto it, spawning a gardener if none is bound">
+        Dispatch #{{.CurrentOrNextStep.Number}} &rarr;
+      </button>
+      {{- if .GardenerDispatchNotice}}<span class="plan-card-dispatch-note{{if .GardenerDispatchError}} plan-card-dispatch-note-err{{end}}" role="status">{{.GardenerDispatchNotice}}</span>{{end}}
+    </div>
+    {{- else if .GardenerDispatchNotice -}}
+    {{/* No open step left, but a just-clicked dispatch produced a note (e.g. the
+         step closed between page load and click) — surface it so the click isn't
+         silent. */}}
+    <div class="plan-card-dispatch">
+      <span class="plan-card-dispatch-note{{if .GardenerDispatchError}} plan-card-dispatch-note-err{{end}}" role="status">{{.GardenerDispatchNotice}}</span>
+    </div>
+    {{- end -}}
+    {{- end -}}
+  </li>
+{{- end -}}
+{{- end -}}

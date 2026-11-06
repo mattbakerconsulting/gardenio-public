@@ -1,0 +1,24 @@
+set -uo pipefail
+IMG='{{.ImagePath}}'
+HMNT() { nsenter -t 1 -m -- "$@"; }
+log() { echo "    $*" >&2; }
+# MemAvailable_kB is the kernel's own estimate of how much RAM can be allocated
+# WITHOUT swapping — the exact metric an eager mmap of pages.img would consume.
+# It already accounts for reclaimable page cache / slab; unlike (MemFree +
+# Buffers + Cached) it is what a real workload actually gets. Multiply by 1024
+# so the Go side compares bytes-to-bytes with FT_PAGES_BYTES / FT_PAGES_STAT_BYTES.
+MEM_KB=$(HMNT awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+if [ -n "$MEM_KB" ]; then
+  MEM_BYTES=$(( MEM_KB * 1024 ))
+  echo "FT_NODE_MEM_AVAIL_BYTES=$MEM_BYTES"
+else
+  echo "FT_NODE_MEM_AVAIL_BYTES="
+  log "WARN could not read MemAvailable from host /proc/meminfo (mem-gate will fail-closed)"
+fi
+if [ -n "$IMG" ]; then
+  PAGES_STAT=$(HMNT stat -c %s "$IMG/pages.img" 2>/dev/null)
+  echo "FT_PAGES_STAT_BYTES=${PAGES_STAT:-}"
+else
+  echo "FT_PAGES_STAT_BYTES="
+fi
+echo "FT_MEM_GATE_OK=yes"

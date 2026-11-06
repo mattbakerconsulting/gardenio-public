@@ -1,0 +1,136 @@
+{{define "plan_critique_findings"}}
+{{/* plan_critique_findings — the AUTOMATED crit-style inline plan critique
+     (prototype, task ka-0000002614). Renders computed PROOF / coverage /
+     design-review findings INLINE at the top of the plan narrative column, each
+     as a collapsible <details> row so the panel stays compact and never pushes
+     the narrative off-screen.
+
+     This is the computed-findings sibling of the manual line-comment critique
+     (epic ka-0000002316): that feature lets a human point at a line and comment;
+     this one runs a small deterministic rule set over the plan and surfaces the
+     gaps a reviewer would flag, with a one-click deep link to the exact step or
+     phase each finding fires on.
+
+     Dark-launched: the whole partial only renders when
+     BEADS_VIEWER_PLAN_CRITIQUE_FINDINGS=1 (the handler leaves the .Findings bag
+     nil otherwise, and this template no-ops on an empty bag). Additive + non-
+     destructive: it sits ABOVE #plan-narrative in the same column and reuses the
+     viewer's .chip idiom, so with the flag off the cockpit is byte-identical.
+
+     Data bag: PlanID, BasePath, Findings ([]critiqueFindingView), BlockerCount,
+     WarnCount, InfoCount. */}}
+{{with .Findings}}
+<style>
+  /* Scoped under .plan-critique-findings so nothing here leaks into the rest of
+     the cockpit; reuses the viewer's --accent / --rule / --bg-* tokens so it
+     shares the visual idiom and honors light/dark automatically. */
+  .plan-critique-findings { margin-bottom: 1.4rem; border: 1px solid var(--rule, #d1d5db);
+    border-radius: 10px; background: var(--bg-card, #fff); overflow: hidden; }
+  .plan-critique-findings-head {
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0.6rem 0.85rem; border-bottom: 1px solid var(--rule, #d1d5db);
+    background: var(--bg-alt, #f8fafc);
+  }
+  .plan-critique-findings-title { font-weight: 600; font-size: 0.95rem; display: flex; align-items: center; gap: 0.4rem; }
+  .plan-critique-findings-title svg { width: 1rem; height: 1rem; opacity: 0.7; }
+  .plan-critique-findings-tally { display: flex; gap: 0.35rem; margin-left: auto; flex-wrap: wrap; }
+  .pcf-tally {
+    font-size: 0.72rem; font-weight: 600; padding: 0.1rem 0.45rem; border-radius: 999px;
+    border: 1px solid transparent; white-space: nowrap;
+  }
+  .pcf-tally-block { background: rgba(220,38,38,0.10); border-color: rgba(220,38,38,0.4); color: #b91c1c; }
+  .pcf-tally-warn  { background: rgba(217,119,6,0.10); border-color: rgba(217,119,6,0.4); color: #b45309; }
+  .pcf-tally-info  { background: rgba(37,99,235,0.10); border-color: rgba(37,99,235,0.4); color: #1d4ed8; }
+  .pcf-tally[data-zero="true"] { display: none; }
+
+  .plan-critique-findings-list { list-style: none; margin: 0; padding: 0; }
+  .pcf-item { border-bottom: 1px solid var(--rule-light, #eef1f4); }
+  .pcf-item:last-child { border-bottom: none; }
+
+  /* Each finding is a native <details> disclosure — collapsed by default so the
+     panel is a scannable summary; the operator expands only the ones they want
+     to read. The summary row carries the severity pill, category + title. */
+  .pcf-details > summary {
+    display: flex; align-items: center; gap: 0.55rem; cursor: pointer;
+    padding: 0.55rem 0.85rem; list-style: none; user-select: none;
+  }
+  .pcf-details > summary::-webkit-details-marker { display: none; }
+  .pcf-details > summary::before {
+    content: "▸"; color: var(--text-subtle, #9aa3af); font-size: 0.8rem;
+    transition: transform 0.12s ease; flex: none;
+  }
+  .pcf-details[open] > summary::before { transform: rotate(90deg); }
+  .pcf-details > summary:hover { background: var(--bg-soft, rgba(0,0,0,0.025)); }
+  .pcf-details > summary:focus-visible { outline: 2px solid var(--accent, #1d4ed8); outline-offset: -2px; }
+
+  .pcf-sev {
+    flex: none; font-size: 0.66rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+    padding: 0.1rem 0.4rem; border-radius: 5px; border: 1px solid transparent;
+  }
+  .pcf-sev-block { background: #fef2f2; border-color: rgba(220,38,38,0.45); color: #b91c1c; }
+  .pcf-sev-warn  { background: #fffbeb; border-color: rgba(217,119,6,0.45); color: #b45309; }
+  .pcf-sev-info  { background: #eff6ff; border-color: rgba(37,99,235,0.45); color: #1d4ed8; }
+  /* A colored left rule mirrors the severity so the list reads at a glance. */
+  .pcf-item.pcf-item-block { box-shadow: inset 3px 0 0 rgba(220,38,38,0.7); }
+  .pcf-item.pcf-item-warn  { box-shadow: inset 3px 0 0 rgba(217,119,6,0.7); }
+  .pcf-item.pcf-item-info  { box-shadow: inset 3px 0 0 rgba(37,99,235,0.55); }
+
+  .pcf-cat {
+    flex: none; font-size: 0.68rem; color: var(--text-muted, #64748b);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .pcf-title { font-size: 0.88rem; font-weight: 500; overflow-wrap: anywhere; }
+
+  .pcf-body { padding: 0 0.85rem 0.7rem 1.9rem; font-size: 0.84rem; color: var(--text, #1f2937); }
+  .pcf-detail { margin: 0.1rem 0 0.5rem; line-height: 1.45; overflow-wrap: anywhere; }
+  .pcf-remediation {
+    margin: 0; padding: 0.35rem 0.55rem; border-radius: 6px;
+    background: var(--bg-soft, rgba(0,0,0,0.03)); border-left: 3px solid var(--accent, #1d4ed8);
+    font-size: 0.82rem; line-height: 1.4;
+  }
+  .pcf-remediation strong { color: var(--text-muted, #475569); font-weight: 600; }
+  .pcf-anchor {
+    display: inline-block; margin-top: 0.45rem; font-size: 0.78rem;
+    color: var(--accent, #1d4ed8); text-decoration: none; font-weight: 500;
+  }
+  .pcf-anchor:hover { text-decoration: underline; }
+
+  @media (prefers-color-scheme: dark) {
+    .pcf-sev-block { background: rgba(220,38,38,0.15); }
+    .pcf-sev-warn  { background: rgba(217,119,6,0.15); }
+    .pcf-sev-info  { background: rgba(37,99,235,0.15); }
+  }
+</style>
+<section class="plan-critique-findings" aria-label="Automated plan critique">
+  <div class="plan-critique-findings-head">
+    <span class="plan-critique-findings-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></svg>
+      Automated critique
+    </span>
+    <span class="plan-critique-findings-tally">
+      <span class="pcf-tally pcf-tally-block" data-zero="{{if eq $.BlockerCount 0}}true{{else}}false{{end}}">{{$.BlockerCount}} blocker{{if ne $.BlockerCount 1}}s{{end}}</span>
+      <span class="pcf-tally pcf-tally-warn" data-zero="{{if eq $.WarnCount 0}}true{{else}}false{{end}}">{{$.WarnCount}} warn{{if ne $.WarnCount 1}}s{{end}}</span>
+      <span class="pcf-tally pcf-tally-info" data-zero="{{if eq $.InfoCount 0}}true{{else}}false{{end}}">{{$.InfoCount}} info</span>
+    </span>
+  </div>
+  <ul class="plan-critique-findings-list">
+    {{range .}}
+    <li class="pcf-item pcf-item-{{.SeveritySlug}}">
+      <details class="pcf-details"{{if eq .SeveritySlug "block"}} open{{end}}>
+        <summary>
+          <span class="pcf-sev pcf-sev-{{.SeveritySlug}}">{{.SeverityLabel}}</span>
+          <span class="pcf-cat">{{.Category}}</span>
+          <span class="pcf-title">{{.Title}}</span>
+        </summary>
+        <div class="pcf-body">
+          <p class="pcf-detail">{{.Detail}}</p>
+          {{if .Remediation}}<p class="pcf-remediation"><strong>Fix:</strong> {{.Remediation}}</p>{{end}}
+          {{if .AnchorHref}}<a class="pcf-anchor" href="{{.AnchorHref}}">→ {{.AnchorLabel}}</a>{{end}}
+        </div>
+      </details>
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{end}}
+{{end}}

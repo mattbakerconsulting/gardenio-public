@@ -1,0 +1,157 @@
+# stop-gate-cooldown.toml
+#
+# Claudeless scenario: Stop gate exponential backoff and escape hatch
+#
+# This scenario exercises the `gb hook stop-gate` cooldown/debounce logic
+# without requiring a live kbeads server. It tests the filesystem-based
+# code paths in the Go implementation (gardenio/controller/cmd/gb/hook.go):
+#
+#   Path 1: Job-mode bypass (BOAT_MODE=job → exit 0)
+#   Path 2: Cooldown debounce (/tmp/stop-gate-last-block recent → exit 0)
+#   Path 3: Escape hatch (block count >= 5 → exit 0 + escape message)
+#   Path 4: Cooldown expired (old timestamp → falls through to server emit)
+#   Path 5: State file recording (writes timestamp + count after block)
+#
+# State files used:
+#   /tmp/stop-gate-last-block   — Unix epoch of last block
+#   /tmp/stop-gate-block-count  — Integer consecutive block count
+#   /tmp/stop-gate-yielding     — Marker file created by gb yield
+#
+# Run via: claudeless --scenario tests/e2e/claudeless/stop-gate-cooldown.toml \
+#          -p "Run all test steps"
+
+[claude]
+session_id = "e2e00000-0001-0003-0001-000000000001"
+username = "e2e-gate-test"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+# ── All tests in a single turn ──────────────────────────────────────
+# Claudeless with -p runs one prompt→response cycle. We consolidate
+# all assertions into a single Bash command that tests each code path
+# sequentially and reports PASS/FAIL for each.
+[[responses]]
+on = { contains = "test" }
+say = "Running stop-gate cooldown tests: clean state, job-mode, cooldown debounce, escape hatch."
+tools = [
+  { call = "Bash", input = { command = """PASS=0; FAIL=0; ERRORS=""
+
+# Helper
+check() {
+  local name="$1"; shift
+  if "$@" >/dev/null 2>&1; then
+    PASS=$((PASS + 1))
+    echo "PASS: $name"
+  else
+    FAIL=$((FAIL + 1))
+    ERRORS="$ERRORS\n  - $name"
+    echo "FAIL: $name"
+  fi
+}
+
+echo "=== Stop Gate Cooldown Tests ==="
+
+# ── Test 1: Clean state ──────────────────────────────────────────
+echo "--- Test 1: Clean initial state ---"
+rm -f /tmp/stop-gate-last-block /tmp/stop-gate-block-count /tmp/stop-gate-yielding
+check "No residual last-block file" test ! -f /tmp/stop-gate-last-block
+check "No residual block-count file" test ! -f /tmp/stop-gate-block-count
+check "No residual yielding file" test ! -f /tmp/stop-gate-yielding
+
+# ── Test 2: Job-mode bypass ──────────────────────────────────────
+echo "--- Test 2: Job-mode bypass ---"
+echo '{}' | BOAT_MODE=job gb hook stop-gate >/dev/null 2>&1
+rc=$?
+check "Job-mode exits 0" test $rc -eq 0
+check "Job-mode no last-block file" test ! -f /tmp/stop-gate-last-block
+check "Job-mode no block-count file" test ! -f /tmp/stop-gate-block-count
+
+# ── Test 3: Cooldown debounce (recent block) ─────────────────────
+echo "--- Test 3: Cooldown debounce ---"
+date +%s > /tmp/stop-gate-last-block
+echo '1' > /tmp/stop-gate-block-count
+echo '{}' | gb hook stop-gate >/dev/null 2>&1
+rc=$?
+check "Cooldown debounce exits 0" test $rc -eq 0
+rm -f /tmp/stop-gate-last-block /tmp/stop-gate-block-count
+
+# ── Test 4: Escape hatch at MAX_BLOCKS=5 ────────────────────────
+echo "--- Test 4: Escape hatch (count=5) ---"
+echo '5' > /tmp/stop-gate-block-count
+echo '{}' | gb hook stop-gate >/dev/null 2>&1
+rc=$?
+check "Escape hatch exits 0" test $rc -eq 0
+check "Escape hatch cleaned last-block" test ! -f /tmp/stop-gate-last-block
+check "Escape hatch cleaned block-count" test ! -f /tmp/stop-gate-block-count
+
+# ── Test 5: Escape hatch at count=10 ────────────────────────────
+echo "--- Test 5: Escape hatch (count=10) ---"
+echo '10' > /tmp/stop-gate-block-count
+echo '{}' | gb hook stop-gate >/dev/null 2>&1
+rc=$?
+check "Escape hatch at count=10 exits 0" test $rc -eq 0
+rm -f /tmp/stop-gate-last-block /tmp/stop-gate-block-count
+
+# ── Test 6: Cooldown with custom env var ─────────────────────────
+echo "--- Test 6: Custom STOP_GATE_COOLDOWN_SECS ---"
+# Write timestamp 2s ago with 1s cooldown — should be expired.
+# When cooldown expires, the hook falls through to server emit (not
+# the debounce fast-path). If server is reachable and gate is satisfied,
+# it exits 0 and clears state files. We verify the cooldown expired
+# by confirming state files are cleaned up (the server-allow path
+# calls clearStopGateCooldown).
+TS=$(($(date +%s) - 2))
+echo $TS > /tmp/stop-gate-last-block
+echo '1' > /tmp/stop-gate-block-count
+echo '{}' | STOP_GATE_COOLDOWN_SECS=1 gb hook stop-gate >/dev/null 2>&1
+rc=$?
+check "Expired cooldown exits cleanly (rc=$rc)" test $rc -eq 0
+check "Expired cooldown cleaned state files" test ! -f /tmp/stop-gate-last-block
+rm -f /tmp/stop-gate-last-block /tmp/stop-gate-block-count
+
+# ── Test 7: Escape hatch produces stderr output ─────────────────
+echo "--- Test 7: Escape hatch stderr message ---"
+echo '5' > /tmp/stop-gate-block-count
+STDERR=$(echo '{}' | gb hook stop-gate 2>&1 1>/dev/null)
+rc=$?
+check "Escape hatch mentions escape in stderr" bash -c "echo '$STDERR' | grep -qi escape"
+rm -f /tmp/stop-gate-last-block /tmp/stop-gate-block-count
+
+# ── Test 8: Block count below threshold does not escape ──────────
+echo "--- Test 8: Below escape threshold ---"
+echo '4' > /tmp/stop-gate-block-count
+date +%s > /tmp/stop-gate-last-block
+echo '{}' | gb hook stop-gate >/dev/null 2>&1
+rc=$?
+# count=4 is below MAX_BLOCKS=5, but cooldown is recent → debounce exit 0
+check "Below threshold with recent cooldown exits 0" test $rc -eq 0
+rm -f /tmp/stop-gate-last-block /tmp/stop-gate-block-count
+
+# ── Cleanup ──────────────────────────────────────────────────────
+rm -f /tmp/stop-gate-last-block /tmp/stop-gate-block-count /tmp/stop-gate-yielding
+
+# ── Summary ──────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  echo "Failures:$ERRORS"
+  exit 1
+fi
+echo "All stop-gate cooldown tests passed."
+exit 0""" } }
+]
+
+# ── Fallback ────────────────────────────────────────────────────────
+[default]
+say = "Stop gate cooldown test complete. All paths verified."
+
+# ── Tool config ─────────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

@@ -1,0 +1,159 @@
+# gardener-trigger-bead-closed-match-parent.toml
+#
+# Live-flow scenario for ka-0000002765 §1: bead_event kind=closed,
+# Match on parent==<id> → gardener fires.
+#
+# Engine code covered:
+#   - gardenio/controller/internal/scheduler/triggers.go:541-612
+#     (evaluateEventEntry → filter by event-type, run Match expression,
+#     surface most recent matched event)
+#   - gardenio/controller/internal/scheduler/triggers.go:617-631
+#     (matchesEventType accepts short topic "closed")
+#   - gardenio/controller/internal/scheduler/scheduler.go:213-440
+#     (Reconcile pass → SpawnRun → runs_spawned bump + last_run stamp)
+#
+# Why this is a live-flow test (not shape): gardener-conditions-fan-in.toml
+# only verifies the persisted JSON contains kind=bead_event with the right
+# parent value. This test mutates a real child bead in flight and asserts
+# the scheduler actually fires the run by observing runs_spawned increment.
+# Silent Match-failure (where the entry persists fine but matchesEventType
+# or conditions.Evaluate rejects the event payload) is invisible to shape
+# checks.
+
+[claude]
+session_id = "e2e00000-000c-4000-a000-000000000001"
+username = "e2e-gardener-bead-closed-parent"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 180000
+
+[[responses]]
+on = "*"
+say = "Running gardener-trigger-bead-closed-match-parent: close child → gardener fires."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight ────────────────────────────────────────────────────
+if ! command -v kd >/dev/null 2>&1; then
+  echo "SKIP: kd not present"; exit 0
+fi
+if [ -z "${BEADS_HTTP_URL:-}" ] || [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL/BEADS_TOKEN unset (must run inside e2e shard)"
+  exit 0
+fi
+
+TAG="e2e-cbcp-$$-$(date +%s)"
+echo "tag: $TAG"
+
+# ── Create parent epic + one child task ───────────────────────────
+EPIC_ID=$(kd create "gardener-bead-closed-$TAG" --type=epic -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+echo "epic: $EPIC_ID"
+
+CHILD_ID=$(kd create "child-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$CHILD_ID" ]; then fail "create child"; exit 1; fi
+kd dep add "$CHILD_ID" "$EPIC_ID" --type parent-child >/dev/null 2>&1 || true
+echo "child: $CHILD_ID"
+
+# ── Build focused trigger config: bead_event closed match parent ──
+# Never-firing cron isolates the event path. Set enabled=true so the
+# in-cluster scheduler picks it up on its next reconcile tick.
+TRIGGERS=$(cat <<JSON
+[
+  {"kind":"cron","cron":"0 0 1 1 *","timezone":"UTC"},
+  {"kind":"bead_event","events":["closed"],
+   "match":{"all":[{"field":"parent","op":"==","value":"$EPIC_ID"}]}}
+]
+JSON
+)
+STOP='{"loop_end":{"any":[{"kind":"max_runs"}]},"run_end":{"any":[{"kind":"no_actionable_state"}]},"hard_stop":{"any":[{"kind":"manual_force","field":"force_close","value":"true"}]}}'
+
+SCHED_ID=$(kd create "gardener-sched-$TAG" \
+  --type=schedule \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "role:gardener" -l "project:gardenio" \
+  -f "enabled=true" \
+  -f "role=gardener" \
+  -f "assign_bead=$EPIC_ID" \
+  -f "project=gardenio" \
+  -f "prompt=gardener test prompt — do nothing" \
+  -f "max_runs=1" \
+  -f "cron=0 0 1 1 *" \
+  -f "timezone=UTC" \
+  -f "triggers=$TRIGGERS" \
+  -f "stop=$STOP" \
+  --json 2>&1 | jq -r '.id // empty')
+if [ -z "$SCHED_ID" ]; then fail "create schedule"; exit 1; fi
+echo "schedule: $SCHED_ID"
+
+cleanup() {
+  # Force-close to keep the scheduler from spinning after the test
+  kd update "$SCHED_ID" -f "enabled=false" -f "force_close=true" >/dev/null 2>&1 || true
+  # Best-effort close of any spawned agent bead
+  AGENT=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.last_agent_id // empty')
+  if [ -n "$AGENT" ]; then kd close "$AGENT" >/dev/null 2>&1 || true; fi
+  kd close "$SCHED_ID" >/dev/null 2>&1 || true
+  kd close "$CHILD_ID" >/dev/null 2>&1 || true
+  kd close "$EPIC_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# Give the scheduler one reconcile tick to register the schedule before
+# firing the event — otherwise the event is buffered before triggers load.
+sleep 5
+
+# ── Mutate: close the child (fires bead_event kind=closed) ────────
+kd close "$CHILD_ID" >/dev/null 2>&1 || { fail "kd close child"; exit 1; }
+echo "closed child $CHILD_ID at $(date -u +%FT%TZ)"
+
+# ── Wait for fire: runs_spawned >= 1 or last_agent_id set ─────────
+# Default reconcile interval is 60s (COOP_SYNC_INTERVAL). Allow 150s
+# to cover one full tick from registration + tick after close-event.
+DEADLINE=$(( $(date +%s) + 150 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  RAW=$(kd show "$SCHED_ID" --json 2>/dev/null)
+  RS=$(echo "$RAW" | jq -r '.fields.runs_spawned // "0"')
+  LA=$(echo "$RAW" | jq -r '.fields.last_agent_id // empty')
+  if [ "${RS:-0}" -ge 1 ] 2>/dev/null || [ -n "$LA" ]; then
+    FIRED=1
+    pass "gardener fired (runs_spawned=$RS last_agent_id=$LA)"
+    break
+  fi
+  sleep 5
+done
+
+if [ "$FIRED" = "0" ]; then
+  fail "gardener did not fire within 150s of close event"
+  echo "--- schedule snapshot ---"
+  kd show "$SCHED_ID" 2>/dev/null | head -40 || true
+  echo "--- end ---"
+  exit 1
+fi
+
+# ── Summary ────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "gardener-trigger-bead-closed-match-parent OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-trigger-bead-closed-match-parent scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

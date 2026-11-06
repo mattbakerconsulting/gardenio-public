@@ -1,0 +1,79 @@
+{{- if .Values.tokenRotation.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "gardenio.fullname" . }}-token-rotator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: token-rotator
+---
+{{- $fullname := include "gardenio.fullname" . }}
+{{- $defaultRestart := list
+    (printf "%s-beads"         $fullname)
+    (printf "%s-controller"    $fullname)
+    (printf "%s-coopmux"       $fullname)
+    (printf "%s-slack-bridge"  $fullname)
+    (printf "%s-jira-bridge"   $fullname)
+    (printf "%s-gitlab-bridge" $fullname) }}
+{{- $restartTargets := default $defaultRestart .Values.tokenRotation.restartDeployments }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "gardenio.fullname" . }}-token-rotator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: token-rotator
+rules:
+  # Create the token secret on first run. Create has no name to scope to, so
+  # this is namespace-wide by necessity; the bounded-blast-radius rules below
+  # restrict every other verb to the specific resources the rotator owns.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  # Read/update only the token secret managed by this rotator.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ .Values.beads.tokenSecret | quote }}]
+    verbs: ["get", "update", "patch"]
+  # Create the revoked-tokens ConfigMap on first run.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  # Read/update only the revoked-tokens ConfigMap.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      - {{ printf "%s-revoked-tokens" $fullname | quote }}
+    verbs: ["get", "update", "patch"]
+  # Patch only the deployments/statefulsets that consume the beads token, to
+  # trigger rolling restarts. Scoped via resourceNames — the rotator MUST NOT
+  # be able to annotate arbitrary workloads in the namespace. The list may
+  # contain Deployments or StatefulSets; the rotator tries Deployment first
+  # and falls back to StatefulSet, so both kinds are granted the same names.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    resourceNames:
+      {{- range $restartTargets }}
+      - {{ . | quote }}
+      {{- end }}
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "gardenio.fullname" . }}-token-rotator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: token-rotator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "gardenio.fullname" . }}-token-rotator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.fullname" . }}-token-rotator
+    namespace: {{ .Release.Namespace }}
+{{- end }}

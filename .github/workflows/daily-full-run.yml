@@ -1,0 +1,185 @@
+# DAILY FULL RUN: MAKE IT VISIBLE (owner, 2026-11-01: "A daily or every other
+# day full run that all can see would fix any issues from that";
+# gd-rmHsVjmKse, from draft PR #1896).
+#
+# The run itself is not here. It is the 10:43Z `schedule` trigger of ci.yml
+# and checks.yml on main's tip, the one full main-head run: every path gate's
+# dispatch arm also lets `schedule` through, so every heavy job runs, the
+# gardenhub browser suite included (scripts/check-ci-draft-gate.py proves
+# it). A pull request runs only the light tier and a release tag skips the
+# browser suite when no UI path changed, so this is the backstop for
+# anything those let through.
+#
+# This workflow reports it. When both scheduled runs of the day have
+# finished, it keeps ONE pinned issue, "Daily full CI run: red" (label
+# `ci-daily`), in step with them: on red it opens or updates it with the
+# date, the run URLs, the failing jobs and `scripts/quarantine.sh rows` for
+# their logs; when both are green it comments and closes it. A re-run's
+# completion (retry-lost-runners.yml) reports again, so a lost runner's red
+# closes once the re-run is green. No Slack post (that needs its own owner
+# approval). The README badges show the same two runs.
+#
+# `workflow_run` workflows only ever run from the DEFAULT BRANCH copy of this
+# file. Editing it on a branch changes nothing until it is on main.
+name: daily-full-run
+
+on:
+  workflow_run:
+    workflows: [ci, checks]
+    types: [completed]
+
+permissions: {}
+
+# Both workflows finish at about the same time; one reporter at a time, and
+# never cancel one halfway through an issue update.
+concurrency:
+  group: daily-full-run-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: daily full run report
+    # Evaluated by the service before any runner is allocated: only the
+    # scheduled runs, never a push, PR or dispatch.
+    if: github.event.workflow_run.event == 'schedule'
+    runs-on: gardenio-k3s-light
+    timeout-minutes: 10
+    permissions:
+      actions: read # list the scheduled runs, their jobs and the failed jobs' logs
+      contents: read # the sparse checkout of scripts/quarantine.sh
+      issues: write # the one `ci-daily` issue
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/quarantine.sh
+          sparse-checkout-cone-mode: false
+
+      - name: open, update or close the daily-run issue
+        uses: actions/github-script@v7
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const fs = require('fs');
+            const TITLE = 'Daily full CI run: red';
+            const LABEL = 'ci-daily';
+            const WORKFLOWS = ['ci.yml', 'checks.yml'];
+            const JUDGES = new Set(['ci', 'checks']);  // the aggregates fail because others did
+            const RED = new Set(['failure', 'timed_out', 'cancelled', 'startup_failure']);
+            const LOG_CAP = 32 * 1024 * 1024;
+            const { owner, repo } = context.repo;
+            const trigger = context.payload.workflow_run;
+            const server = process.env.GITHUB_SERVER_URL;
+
+            // The newest scheduled run of each workflow, from the same day as
+            // the one that just finished (both share the 10:43Z cron).
+            const day = trigger.created_at.slice(0, 10);
+            const runs = [];
+            for (const wf of WORKFLOWS) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: wf, event: 'schedule', per_page: 5,
+              });
+              const run = data.workflow_runs.find((r) => r.created_at.slice(0, 10) === day);
+              if (!run) { core.info(`${wf}: no scheduled run on ${day} yet; waiting for it`); return; }
+              if (run.status !== 'completed') {
+                core.info(`${wf}: run ${run.id} still ${run.status}; its completion reports`);
+                return;
+              }
+              runs.push({ wf, run });
+            }
+
+            // Failing jobs of each run's latest attempt, and their logs.
+            const downloadLog = async (jobId) => {
+              const api = `https://api.github.com/repos/${owner}/${repo}/actions/jobs/${jobId}/logs`;
+              try {
+                const head = await fetch(api, { redirect: 'manual', headers: {
+                  authorization: `Bearer ${process.env.GH_TOKEN}`,
+                  accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' } });
+                const loc = head.headers.get('location');
+                const res = loc ? await fetch(loc) : head;
+                if (!res.ok) return '';
+                if (Number(res.headers.get('content-length') || 0) > LOG_CAP) return '';
+                return await res.text();
+              } catch (e) { core.warning(`log ${jobId}: ${e.message}`); return ''; }
+            };
+            const failing = [];
+            let rows = '';
+            for (const { wf, run } of runs) {
+              if (!RED.has(run.conclusion)) continue;
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+                { owner, repo, run_id: run.id, filter: 'latest', per_page: 100 });
+              const bad = jobs.filter((j) => RED.has(j.conclusion) && !JUDGES.has(j.name));
+              let log = '';
+              for (const j of bad) {
+                failing.push(`- \`${wf}\` [${j.name}](${j.html_url}): ${j.conclusion}`);
+                // Job log lines start with a timestamp; quarantine.sh reads bare go test output.
+                log += (await downloadLog(j.id)).replace(/^\S+Z /gm, '') + '\n';
+              }
+              if (!bad.length) failing.push(`- \`${wf}\` [run ${run.id}](${run.html_url}): ${run.conclusion}, no single job red`);
+              const file = `${process.env.RUNNER_TEMP}/failed-${run.id}.log`;
+              fs.writeFileSync(file, log);
+              const out = await exec.getExecOutput('bash', ['scripts/quarantine.sh', 'rows', file],
+                { ignoreReturnCode: true, env: { ...process.env, GITHUB_RUN_ID: String(run.id) } });
+              const body = out.stdout.split('\n').filter((l) => l && !l.startsWith('#')).join('\n');
+              if (body) rows += body + '\n';
+            }
+            const red = runs.some(({ run }) => RED.has(run.conclusion));
+
+            const marker = `<!-- daily-run ${runs.map(({ run }) => `${run.id}:${run.run_attempt}`).join(' ')} -->`;
+            const runLines = runs.map(({ wf, run }) => `- \`${wf}\` ${run.conclusion}: ${run.html_url}`).join('\n');
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: LABEL, per_page: 20 });
+            const issue = open.find((i) => i.title === TITLE);
+            const comments = issue ? await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number: issue.number, per_page: 100 }) : [];
+            const already = comments.some((c) => (c.body || '').includes(marker));
+
+            if (!red) {
+              if (issue && !already) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number,
+                  body: `Green again on ${day} (head ${runs[0].run.head_sha.slice(0, 9)}):\n${runLines}\n${marker}` });
+                await github.rest.issues.update({ owner, repo, issue_number: issue.number,
+                  state: 'closed', state_reason: 'completed' });
+                core.info(`closed #${issue.number}`);
+              } else {
+                core.info(`green on ${day}; no open issue to close`);
+              }
+              return;
+            }
+
+            const body = [
+              `The daily full run on ${day} is red (head ${runs[0].run.head_sha.slice(0, 9)}).`,
+              '', '**Runs**', runLines, '', '**Failing jobs**', failing.join('\n'), '',
+              '**Quarantine rows** (`scripts/quarantine.sh rows` on the failed logs; file the bug bead,',
+              'then push each row to main as its own file, `.github/quarantine.d/<kind>-<name>.tsv`, if the failure is a flake):',
+              '```', rows.trim() || '(no failing go test or golden shot found in the logs)', '```', '',
+              `What this run covers and why: \`gardenio/docs/release-pipeline.md\`, "CI tiers". Updated by ${server}/${owner}/${repo}/actions/runs/${context.runId}.`,
+              marker,
+            ].join('\n');
+            let number;
+            if (issue) {
+              number = issue.number;
+              await github.rest.issues.update({ owner, repo, issue_number: number, body });
+              if (!already) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: number,
+                  body: `Still red on ${day}:\n${runLines}\n${marker}` });
+              }
+            } else {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, name: LABEL, color: 'b60205',
+                  description: 'The daily full CI run is red' });
+              } catch (e) { if (e.status !== 422) throw e; }  // 422: it exists
+              ({ data: { number } } = await github.rest.issues.create({
+                owner, repo, title: TITLE, body, labels: [LABEL] }));
+            }
+            // Pinning is best effort: the issue is the record either way.
+            try {
+              const { repository } = await github.graphql(
+                'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){issue(number:$n){id isPinned}}}',
+                { o: owner, r: repo, n: number });
+              if (!repository.issue.isPinned) {
+                await github.graphql('mutation($id:ID!){pinIssue(input:{issueId:$id}){issue{number}}}',
+                  { id: repository.issue.id });
+              }
+            } catch (e) { core.warning(`could not pin #${number}: ${e.message}`); }
+            core.info(`red on ${day}: #${number}`);

@@ -1,0 +1,131 @@
+{{define "thread_timeline"}}
+{{- $base := .BasePath -}}
+{{- $t := .Thread -}}
+{{/* Phase 2, task 2-5 (ka-0000006034), epic ka-0000000679 — the LIVE fused
+     timeline panes. This is BOTH the inline render (embedded by
+     thread_detail.html) and the htmx ?since= poll target (served standalone by
+     handleThreadTimeline, GET /threads/{id}/timeline). It swaps ITSELF via
+     hx-swap="outerHTML", exactly like the comments partial, so the polled
+     refresh is byte-identical with the first render and brings in new messages
+     AND new spawned-work events without a full reload (rubric B12).
+
+     The cursor (data-thread-latest = max fused-entry timestamp) is echoed on
+     every poll request via hx-vals; the server 304s when it is unchanged so an
+     idle thread does no DOM swap. Polling is gated on tab visibility so a
+     backgrounded tab stops hitting the daemon. The composer form is rendered
+     OUTSIDE this section (thread_detail.html) so a poll never wipes an
+     in-progress draft. */}}
+<section id="thread-timeline" class="thread2-timeline"
+         data-thread-latest="{{with $t.LatestActivity}}{{.UTC.Format "2006-01-02T15:04:05.999999999Z07:00"}}{{end}}"
+         hx-get="{{$base}}/threads/{{$t.ThreadID}}/timeline"
+         hx-trigger="every 8s [document.visibilityState==='visible'], thread-refresh"
+         hx-swap="outerHTML"
+         hx-on:htmx:before-request="this.setAttribute('aria-busy','true')"
+         hx-on:htmx:after-request="this.setAttribute('aria-busy','false')"
+         hx-vals='js:{since: (document.getElementById("thread-timeline") || {}).dataset && document.getElementById("thread-timeline").dataset.threadLatest || ""}'>
+
+  {{if $t.Error}}
+  <div class="banner banner-error" role="alert">{{$t.Error}}</div>
+  {{end}}
+
+  {{/* CONVERSATION LANE — visible by default (rubric B11). The human
+       back-and-forth: comments, the composer's bridge-mediated replies
+       (type=message members, 2-5), plus the wish's own open/close milestones.
+
+       The list sits in an ARIA log (role="log" aria-live="polite") so a screen
+       reader announces messages that arrive on a ?since= swap without the user
+       re-reading the whole thread (rubric (c)/ka-0000001087). The log is a
+       wrapper, not the <ul> itself, so the <ul> keeps its list role and its
+       <li>s stay list items (gd-ddw0WBzm9S). aria-relevant is
+       "additions text": only appended bubbles are announced, not the reorder a
+       full swap technically performs. Each bubble carries data-msg-key so the
+       composer's optimistic-render JS can reconcile its just-sent bubble against
+       the authoritative server echo by an exact key match (rubric (e)). */}}
+  <section class="thread2-lane" aria-label="Conversation">
+    <div class="thread2-lane-head">
+      <h2 class="thread2-lane-title">Conversation</h2>
+      <span class="thread2-lane-count">{{$t.ReplyCount}} repl{{if eq $t.ReplyCount 1}}y{{else}}ies{{end}}</span>
+      {{/* Loading affordance (rubric (a)): visible only while a ?since= poll is
+           in flight (#thread-timeline.htmx-request). aria-hidden — the log's
+           aria-live already announces fresh content to assistive tech. */}}
+      <span class="thread2-refreshing" aria-hidden="true">Updating&hellip;</span>
+    </div>
+
+    {{if $t.HasConversation}}
+    <div class="thread2-convo-log" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Conversation messages">
+    <ul class="thread2-convo" id="thread2-convo">
+      {{range $t.Conversation}}
+      {{if .IsComment}}
+      <li class="thread2-msg" data-msg-key="{{.Key}}">
+        <div class="thread2-msg-meta">
+          <span class="thread2-msg-author">{{if .Author}}{{.Author}}{{else}}&mdash;{{end}}</span>
+          &middot; {{humanizeTime .At}}
+        </div>
+        {{/* Markdown parity (rubric (b)): the body renders through the SAME
+             goldmark+linkify pipeline bead comments use (threadMessageMarkdown),
+             so code spans, links, and lists read identically in /threads and the
+             bead comment view. A <div> (not <p>) hosts the block-level markdown
+             output; .comment-body inherits the per-skin code/pre styling. */}}
+        <div class="thread2-msg-body comment-body">{{threadMessageMarkdown .Text}}</div>
+      </li>
+      {{else}}
+      <li class="thread2-marker{{if eq .Marker "closed this wish"}} thread2-marker-done{{end}}">
+        <span class="thread2-marker-text">{{if .Author}}{{.Author}}{{else}}someone{{end}} {{.Marker}} &middot; {{humanizeTime .At}}</span>
+      </li>
+      {{end}}
+      {{end}}
+    </ul>
+    </div>
+    {{else if not $t.Error}}
+    <div class="thread2-convo-log" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Conversation messages">
+    <ul class="thread2-convo" id="thread2-convo">
+      <li class="thread2-empty-line"><p class="thread2-empty">No conversation yet &mdash; this wish has had no replies. Post a message to start the thread.</p></li>
+    </ul>
+    </div>
+    {{end}}
+  </section>
+
+  {{/* WORK LANE — COLLAPSED by default (rubric B11). The agent "how": every
+       member bead's spawn/close, plus the member roster. One click expands the
+       firehose; the conversation above never has to scroll past it. */}}
+  <section class="thread2-lane" aria-label="Agent work">
+    {{if $t.HasWork}}
+    <details class="thread2-work">
+      <summary>
+        <span class="tw-caret" aria-hidden="true">&#9656;</span>
+        <span>Agent activity</span>
+        <span class="thread2-work-summary-meta">{{$t.WorkMemberCount}} bead{{if ne $t.WorkMemberCount 1}}s{{end}}{{if $t.WorkDoneCount}} · {{$t.WorkDoneCount}} done{{end}}</span>
+      </summary>
+      <div class="thread2-work-body">
+        {{if $t.WorkEvents}}
+        <div class="thread2-work-sub">Activity</div>
+        <ul class="thread2-events">
+          {{range $t.WorkEvents}}
+          <li class="thread2-event">
+            <span class="thread2-event-verb {{if eq .Verb "spawned"}}is-spawn{{else}}is-close{{end}}">{{.Verb}}</span>
+            <span class="thread2-event-title"><a href="{{$base}}/{{.BeadID}}">{{if .BeadTitle}}{{.BeadTitle}}{{else}}{{.BeadID}}{{end}}</a></span>
+            {{if .Actor}}<span class="thread2-event-actor">{{.Actor}}</span>{{end}}
+            <span class="thread2-event-ago">{{humanizeTime .At}}</span>
+          </li>
+          {{end}}
+        </ul>
+        {{end}}
+
+        {{if $t.WorkMembers}}
+        <div class="thread2-work-sub">Beads ({{$t.WorkMemberCount}})</div>
+        <ul class="thread2-members">
+          {{range $t.WorkMembers}}
+          <li class="thread2-member">
+            <a href="{{$base}}/{{.ID}}">{{if .Title}}{{.Title}}{{else}}{{.ID}}{{end}}</a>
+          </li>
+          {{end}}
+        </ul>
+        {{end}}
+      </div>
+    </details>
+    {{else if not $t.Error}}
+    <p class="thread2-empty">No agent work yet &mdash; no plans have been spawned for this wish.</p>
+    {{end}}
+  </section>
+</section>
+{{end}}

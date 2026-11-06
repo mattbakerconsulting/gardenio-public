@@ -1,0 +1,127 @@
+{{template "layout" .}}
+{{define "title"}}Escalations · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+{{with .GardenHref}}{{template "garden_banner" .}}{{end}}
+<h1>Escalations{{if .ProjectFilter}} · {{.ProjectFilter}}{{end}}{{if .StatusFilter}} · {{.StatusFilter}}{{end}}
+  {{if .Escalations}}<span class="meta">({{len .Escalations}})</span>{{end}}
+</h1>
+
+<p class="meta">
+  Privileged-operator actions awaiting review. Read-only here —
+  {{if .ReviewURLEnabled}}use the &ldquo;Review&rdquo; link to approve or reject in the bridge UI.{{else}}use the &ldquo;Review&rdquo; link to open the bead page and approve or reject there.{{end}}
+</p>
+
+{{if .Error}}
+<div class="banner banner-error">{{.Error}}</div>
+{{end}}
+
+{{if or .ProjectFilter .StatusFilter}}
+<p><a href="{{.BasePath}}/escalations">&larr; clear filters</a></p>
+{{end}}
+
+{{if .Truncated}}
+<div class="banner banner-warn">Showing first {{.Limit}} escalations.</div>
+{{end}}
+
+{{if .Escalations}}
+<ul class="bead-list" id="escalations-list">
+  {{range .Escalations}}{{template "escalation_row" (dict "R" . "BasePath" $.BasePath)}}{{end}}
+</ul>
+{{else if not .Error}}
+<p class="empty">{{if .InHand}}Nothing here needs you.{{else}}No pending escalations.{{end}}</p>
+{{end}}
+
+{{if .InHand}}
+<details class="escalations-inhand" id="escalations-inhand">
+  <summary>{{.InHandLine}}</summary>
+  <ul class="bead-list" id="escalations-inhand-list">
+    {{range .InHand}}{{template "escalation_row" (dict "R" . "BasePath" $.BasePath)}}{{end}}
+  </ul>
+</details>
+{{end}}
+
+<style>
+  .escalation-sensitivity-public    { background: rgba(120,120,120,0.18); }
+  .escalation-sensitivity-internal  { background: rgba(76,175,80,0.18); border-color: rgba(76,175,80,0.5); }
+  .escalation-sensitivity-sensitive { background: rgba(255,167,38,0.20); border-color: rgba(255,167,38,0.5); }
+  .escalation-sensitivity-secret    { background: rgba(198,40,40,0.22); border-color: rgba(198,40,40,0.5); }
+  .escalation-status-in-progress    { background: rgba(74,158,255,0.20); border-color: rgba(74,158,255,0.5); }
+  .escalation-spawn-role            { background: rgba(74,158,255,0.15); border-color: rgba(74,158,255,0.45); }
+  /* Inline details disclosure (full context) and the agent / task / plan
+     origin strip (Slack thread gd-AREKDbHx70). */
+  .bead-row-details { margin: 0.25rem 0 0.35rem; font-size: 0.9em; }
+  .bead-row-details > summary { cursor: pointer; opacity: 0.72; font-size: 0.9em; }
+  .bead-row-details-section h4 { margin: 0.5rem 0 0.2rem; font-size: 0.8em; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.7; }
+  .bead-row-details-body { opacity: 0.95; }
+  .bead-row-details-body p:first-child { margin-top: 0; }
+  .bead-row-details-body p:last-child { margin-bottom: 0; }
+  .request-origin { display: inline-flex; flex-wrap: wrap; gap: 0 0.6rem; min-width: 0; }
+  .request-origin > span { min-width: 0; overflow-wrap: anywhere; }
+  .request-origin .bead-row-id { margin-left: 0.3rem; }
+  /* the "In hand" fold (gd-bmOiteQi36): the desk's and the operators' escalations, out of the owner's way */
+  .escalations-inhand { margin: 1rem 0; }
+  .escalations-inhand > summary { cursor: pointer; font-weight: 600; opacity: 0.8; padding: 0.35rem 0; }
+  .escalation-audience-desk, .escalation-audience-operator { background: rgba(120,120,120,0.15); }
+</style>
+
+{{/*
+  Deep-link + legacy-link heal (ka-0000005003, epic ka-0000000887). Every
+  escalation notification ever sent linked /ui/escalations.html#ka-X; the
+  compat redirect (compat_redirect.go) lands those here as /escalations#ka-X.
+  A bare #ka-X resolves to nothing on its own — the pending rows are
+  id="escalation-row-<id>", and a resolved escalation is not in this list at
+  all — so bridge the fragment ourselves: scroll to the row if it is present,
+  otherwise send the operator to the escalation bead itself (the /{id}
+  bead-show page renders resolved escalations too). Guarded to a strict bead-id
+  shape so no other #hash triggers navigation.
+*/}}
+<script>
+(function () {
+  var id = decodeURIComponent((location.hash || "").replace(/^#/, ""));
+  if (!/^kd-[0-9A-Za-z]+$/.test(id)) return;
+  var row = document.getElementById("escalation-row-" + id);
+  if (row) { var fold = row.closest("details"); if (fold) fold.open = true; row.scrollIntoView(); return; }
+  location.replace("{{$.BasePath}}/" + id);
+})();
+</script>
+{{end}}
+
+{{define "escalation_row"}}
+  <li class="bead-row" id="escalation-row-{{.R.ID}}" data-bead-id="{{.R.ID}}" data-last-activity-ts="{{.R.UpdatedAtRFC}}">
+    <div class="bead-row-top">
+      <div class="bead-row-text">
+        <a class="bead-row-title" href="{{.BasePath}}/{{.R.ID}}"
+           hx-get="{{.BasePath}}/{{.R.ID}}"
+           hx-trigger="mouseover once"
+           hx-target="none"
+           hx-swap="none">{{.R.Title}}</a>
+        {{if .R.Context}}
+        <div class="bead-row-desc">{{.R.Context}}</div>
+        {{end}}
+        {{if .R.HasDetails}}
+        <details class="bead-row-details">
+          <summary>details</summary>
+          <div class="bead-row-details-section"><h4>Why this needs a human</h4><div class="bead-row-details-body">{{.R.ContextHTML}}</div></div>
+        </details>
+        {{end}}
+        <div class="chip-strip" aria-label="Escalation attributes">
+          {{if .R.SpawnRole}}<span class="chip chip-type escalation-spawn-role" title="spawn_role">spawn: {{.R.SpawnRole}}</span>{{end}}
+          {{if .R.OperationType}}<span class="chip chip-type" title="operation type">{{.R.OperationType}}</span>{{end}}
+          {{if .R.Sensitivity}}<span class="chip chip-type escalation-sensitivity-{{.R.Sensitivity}}" title="sensitivity">{{.R.Sensitivity}}</span>{{end}}
+          {{if .R.InHand}}<span class="chip chip-type escalation-audience-{{.R.Audience}}" title="who has it">{{if .R.HeldBy}}{{.R.HeldBy}}{{else}}{{.R.Audience}}{{end}}</span>{{end}}
+          {{if eq .R.Status "in_progress"}}<span class="chip chip-type escalation-status-in-progress" title="status">in progress</span>{{else}}<span class="chip chip-type" title="status">{{.R.Status}}</span>{{end}}
+        </div>
+        <div class="bead-row-meta">
+          <span class="bead-row-id">{{.R.ID}}</span>
+          {{if .R.Project}}<span class="chip-type">{{.R.Project}}</span>{{end}}
+          {{if .R.OperatorChipCompactHTML}}<span class="bead-row-operator">{{.R.OperatorChipCompactHTML}}</span>{{end}}
+          {{template "request_origin" (dict "Origin" .R.Origin "BasePath" .BasePath "Compact" true)}}
+          <span class="bead-row-spacer"></span>
+          {{if .R.Ago}}<span class="bead-row-ago">{{.R.Ago}}</span>{{end}}
+          {{if .R.ReviewURL}}<a class="meta" href="{{.R.ReviewURL}}" target="_blank" rel="noopener">Review&nbsp;&rsaquo;</a>{{end}}
+        </div>
+      </div>
+    </div>
+  </li>
+{{end}}

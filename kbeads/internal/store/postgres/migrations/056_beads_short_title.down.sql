@@ -1,0 +1,1 @@
+ALTER TABLE beads DROP COLUMN IF EXISTS short_title;

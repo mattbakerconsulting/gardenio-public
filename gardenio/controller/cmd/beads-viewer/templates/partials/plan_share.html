@@ -1,0 +1,120 @@
+{{/* plan_share — the plan cockpit's Share disclosure (Lands: the Window, PW.4
+     gd-tJe0GrtFDw). A land owner or an operator mints a read-only public
+     window on the plan: a URL anyone holding it can open, with no account.
+
+     Lazy, like plan_pour: the shell renders in the plan header and makes no
+     daemon call; GET /plans/{id}/share fills the panel the first time the
+     disclosure opens. Every daemon call behind the panel runs on the signed-in
+     person's own bearer, and kbeads decides who may share (plan_share.go).
+
+     The shell is called with PlanID and BasePath. */}}
+{{define "plan_share"}}
+<style>
+  .plan-share { margin: 0.5rem 0; }
+  .plan-share-panel { margin-top: 0.5rem; padding: 0.75rem; border: 1px solid var(--border, #d0d7de); border-radius: 6px; max-width: 48rem; }
+  .plan-share-panel h4 { margin: 0.75rem 0 0.35rem; font-size: 0.95rem; }
+  .plan-share-grants { margin: 0.35rem 0; font-size: 0.9rem; }
+  .plan-share-mint { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0.5rem 0; }
+  .plan-share-url { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.35rem 0; }
+  .plan-share-url input { flex: 1 1 20rem; min-width: 0; font-family: var(--mono, monospace); font-size: 0.85rem; padding: 0.3rem; }
+  .plan-share-once { font-weight: 600; }
+  .plan-share-windows { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  .plan-share-windows th, .plan-share-windows td { text-align: left; padding: 0.25rem 0.4rem; border-bottom: 1px solid var(--border, #d0d7de); }
+  .plan-share-windows form { display: inline; }
+  .plan-share-state-live { font-weight: 600; }
+  .plan-share-state-expired, .plan-share-state-revoked { opacity: 0.65; }
+  .plan-share-withheld-list { font-size: 0.85rem; margin: 0.25rem 0 0.5rem 1.2rem; }
+</style>
+<details class="plan-share" id="plan-share">
+  <summary class="bead-action plan-share-toggle" title="Mint a read-only public link to this plan">Share</summary>
+  <div id="plan-share-panel" class="plan-share-panel"
+       hx-get="{{.BasePath}}/plans/{{.PlanID}}/share"
+       hx-trigger="toggle once from:closest details"
+       hx-target="#plan-share-panel"
+       hx-swap="innerHTML">
+    <p class="empty">Loading…</p>
+  </div>
+</details>
+{{end}}
+
+{{/* plan_share_panel — the panel body served by GET /plans/{id}/share and by
+     the mint and revoke POSTs: the minted URL (once), the mint form, the
+     preview, and the plan's windows. */}}
+{{define "plan_share_panel"}}
+{{if .Error}}
+<p class="banner banner-warn plan-share-error">{{.Error}}</p>
+{{else}}
+{{with .Minted}}
+<div class="banner plan-share-minted" role="status">
+  <p class="plan-share-once">This link is shown once: copy it now.</p>
+  <div class="plan-share-url">
+    <input type="text" readonly value="{{.URL}}" aria-label="Window link" onclick="this.select()" id="plan-share-url-{{.ID}}">
+    <button type="button" class="bead-action" onclick="var i=document.getElementById('plan-share-url-{{.ID}}');i.select();navigator.clipboard&&navigator.clipboard.writeText(i.value);this.textContent='Copied'">Copy</button>
+  </div>
+  <p class="plan-share-grants">{{$.Grants}}</p>
+  <p class="meta">Expires {{.ExpiresAt.Format "2006-01-02"}}. Revoke it below at any time.</p>
+</div>
+{{end}}
+{{with .MintError}}<p class="banner banner-warn">{{.}}</p>{{end}}
+{{with .Revoked}}<p class="banner" role="status">Window {{.}} is revoked: its link no longer opens.</p>{{end}}
+
+<p class="plan-share-grants">A window is a read-only public link to this plan. {{.Grants}}</p>
+<form class="plan-share-mint"
+      hx-post="{{.BasePath}}/plans/{{.PlanID}}/share"
+      hx-target="#plan-share-panel"
+      hx-swap="innerHTML">
+  <label for="plan-share-days">Expires in</label>
+  <select id="plan-share-days" name="days"
+          hx-get="{{.BasePath}}/plans/{{.PlanID}}/share"
+          hx-target="#plan-share-panel"
+          hx-swap="innerHTML"
+          hx-trigger="change">
+    {{range .Expiries}}<option value="{{.}}"{{if eq . $.Days}} selected{{end}}>{{.}} days</option>{{end}}
+  </select>
+  <button type="submit" class="bead-action">Create link</button>
+</form>
+
+{{if .Previewed}}
+<h4>What a visitor sees</h4>
+<p><a class="bead-action" href="{{.BasePath}}/plans/{{.PlanID}}/share/preview?days={{.Days}}" target="_blank" rel="noopener">Open the preview</a>
+  <span class="meta">the exact page a window minted now would show, in a new tab</span></p>
+{{if .Withheld}}
+<p class="meta">{{len .Withheld}} field{{if ne (len .Withheld) 1}}s are{{else}} is{{end}} withheld because {{if ne (len .Withheld) 1}}they contain{{else}}it contains{{end}} an internal reference; the page reads &ldquo;{{.WithheldText}}&rdquo; in {{if ne (len .Withheld) 1}}their{{else}}its{{end}} place:</p>
+<ul class="plan-share-withheld-list">
+  {{range .Withheld}}<li><code>{{.Path}}</code> ({{.Rule}})</li>{{end}}
+</ul>
+{{else}}
+<p class="meta">Nothing is withheld: every field passes the window's checks.</p>
+{{end}}
+{{end}}
+
+<h4>Windows on this plan</h4>
+{{if .Windows}}
+<table class="plan-share-windows">
+  <thead><tr><th>Window</th><th>State</th><th>Views</th><th>Last viewed</th><th>Expires</th><th>Created by</th><th></th></tr></thead>
+  <tbody>
+  {{range .Windows}}
+  <tr>
+    <td><code>{{.ID}}</code></td>
+    <td class="plan-share-state-{{.State}}">{{.State}}</td>
+    <td>{{.ViewCount}}</td>
+    <td>{{with .LastViewedAt}}{{humanizeTime .}}{{else}}never{{end}}</td>
+    <td>{{.ExpiresAt.Format "2006-01-02"}}</td>
+    <td>{{.CreatedBy}}</td>
+    <td>{{if eq .State "live"}}
+      <form hx-post="{{$.BasePath}}/plans/{{$.PlanID}}/share/{{.ID}}/revoke"
+            hx-target="#plan-share-panel" hx-swap="innerHTML"
+            hx-confirm="Revoke this window? Its link stops opening for everyone who has it.">
+        <input type="hidden" name="days" value="{{$.Days}}">
+        <button type="submit" class="bead-action">Revoke</button>
+      </form>
+    {{end}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">No windows yet.</p>
+{{end}}
+{{end}}
+{{end}}

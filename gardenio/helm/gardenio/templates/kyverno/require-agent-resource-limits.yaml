@@ -1,0 +1,67 @@
+{{- /*
+Kyverno ClusterPolicy — require CPU/memory limits on AGENT pod containers.
+Admission starter set, audit finding F5 (ka-0000002606).
+
+An agent pod admitted without resource limits can starve co-tenant workloads
+(noisy-neighbour / resource-exhaustion DoS from a compromised or runaway agent,
+A3). The namespace LimitRange (values limitRange) DEFAULTS missing limits, but a
+default is a mutation, not a guarantee. This policy makes the requirement
+explicit at admission for agent pods (gardenio.io/agent) only, so spine workloads
+that rely on the LimitRange default are untouched.
+
+DEFAULT OFF. Kyverno CRD; renders nothing unless
+global.admissionPolicies.requireResourceLimits.enabled AND Kyverno is installed.
+Canonical source: policy/kyverno/require-agent-resource-limits.yaml. See
+gardenio/docs/admission-policies.md.
+*/}}
+{{- if .Values.global.admissionPolicies.requireResourceLimits.enabled }}
+{{- $rl := .Values.global.admissionPolicies.requireResourceLimits }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ include "gardenio.fullname" . }}-require-agent-resource-limits
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission-starter
+  annotations:
+    policies.kyverno.io/title: Require CPU/memory limits on agent pod containers
+    policies.kyverno.io/category: gardenio-admission-starter
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Every container in an agent pod (gardenio.io/agent) must declare
+      resources.limits.cpu and resources.limits.memory, so a compromised or
+      runaway agent cannot starve co-tenants (A3, F5). See
+      policy/kyverno/require-agent-resource-limits.yaml.
+spec:
+  validationFailureAction: {{ $rl.validationFailureAction | default "Audit" }}
+  background: true
+  rules:
+    - name: agent-containers-have-limits
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              selector:
+                matchExpressions:
+                  - key: gardenio.io/agent
+                    operator: Exists
+      validate:
+        message: >-
+          Every container in an agent pod must set resources.limits.cpu and
+          resources.limits.memory. See
+          policy/kyverno/require-agent-resource-limits.yaml.
+        pattern:
+          spec:
+            =(initContainers):
+              - resources:
+                  limits:
+                    memory: "?*"
+                    cpu: "?*"
+            containers:
+              - resources:
+                  limits:
+                    memory: "?*"
+                    cpu: "?*"
+{{- end }}

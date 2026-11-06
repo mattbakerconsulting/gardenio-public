@@ -1,0 +1,73 @@
+{{- /*
+Kyverno ClusterPolicy — require a restricted securityContext on AGENT pods.
+Admission starter set, audit finding F5 (ka-0000002606).
+
+Agent pods run untrusted, LLM-generated workloads and are already built
+restricted-conformant by the controller. PSA "restricted" enforces this on
+fleet namespaces, but the gardenio-system namespace runs at PSA "baseline" (the
+in-namespace litellm/DinD workloads need it), leaving a gap: an agent pod
+scheduled into a baseline namespace could be crafted to escalate privilege or
+run as root (A3). This policy re-asserts the core restricted controls on AGENT
+pods (gardenio.io/agent) regardless of the namespace PSA profile. Scoped to agent
+pods only — the privileged DinD sidecar and root-running litellm/postgres spine
+pods do NOT carry the label and are unaffected.
+
+DEFAULT OFF. Kyverno CRD; renders nothing unless
+global.admissionPolicies.restrictSecurityContext.enabled AND Kyverno is
+installed. Canonical source:
+policy/kyverno/restrict-agent-securitycontext.yaml. See
+gardenio/docs/admission-policies.md.
+*/}}
+{{- if .Values.global.admissionPolicies.restrictSecurityContext.enabled }}
+{{- $sc := .Values.global.admissionPolicies.restrictSecurityContext }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ include "gardenio.fullname" . }}-restrict-agent-securitycontext
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission-starter
+  annotations:
+    policies.kyverno.io/title: Require a restricted securityContext on agent pods
+    policies.kyverno.io/category: gardenio-admission-starter
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Agent pods (gardenio.io/agent) must run as non-root and every container
+      must set allowPrivilegeEscalation=false and privileged=false —
+      re-asserting the restricted controls independent of the namespace PSA
+      profile so the guarantee holds even in the PSA-baseline gardenio-system
+      namespace (A3, F5). See
+      policy/kyverno/restrict-agent-securitycontext.yaml.
+spec:
+  validationFailureAction: {{ $sc.validationFailureAction | default "Audit" }}
+  background: true
+  rules:
+    - name: agent-restricted-securitycontext
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              selector:
+                matchExpressions:
+                  - key: gardenio.io/agent
+                    operator: Exists
+      validate:
+        message: >-
+          Agent pods must run as non-root and every container must set
+          allowPrivilegeEscalation=false and privileged=false. See
+          policy/kyverno/restrict-agent-securitycontext.yaml.
+        pattern:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+            =(initContainers):
+              - securityContext:
+                  allowPrivilegeEscalation: false
+                  =(privileged): false
+            containers:
+              - securityContext:
+                  allowPrivilegeEscalation: false
+                  =(privileged): false
+{{- end }}

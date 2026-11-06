@@ -1,0 +1,215 @@
+{{- /*
+Pre-upgrade migration Job: runs `kd migrate` to completion before the
+beads Deployment rolls. Decouples slow schema migrations from the daemon's
+startup-probe window — see ka-0000005716 (parent) and ka-0000007607 (this
+task). Today's incident (ka-0000006380) was a 313K-row backfill killing
+the daemon container at 60s startup-probe; running it in a Job with
+activeDeadlineSeconds removes that constraint.
+
+Default-enabled. The Job and `kd migrate` ship in the same release tag,
+so by construction the Job's image always has the subcommand. Migrations
+are idempotent, so the daemon's m.Up() after the Job is a sub-second
+no-op via ErrNoChange. Helm hook ordering guarantees Job-then-Deployment
+sequencing — no operator action required.
+
+For embedded postgres installs, only the pre-upgrade hook is registered
+(postgres needs to already exist). External RDS installs (`beads.externalRDS`
+per-instance provisioning OR `postgresExternal` direct master credentials)
+also register the pre-install hook so the schema is created on first install.
+*/ -}}
+{{- if and .Values.beads.migrationJob.enabled (not .Values.fleet.enabled) }}
+{{- $hooks := list "pre-upgrade" -}}
+{{- if or .Values.beads.externalRDS.enabled .Values.postgresExternal.enabled -}}
+  {{- $hooks = list "pre-install" "pre-upgrade" -}}
+{{- end -}}
+{{- /*
+Resolve the DB-password Secret name + key the migrate container consumes
+below, so the wait-for-db-secret initContainer can gate on the exact
+Secret/key materializing (ka-0000003749). The migrate Job is a Helm hook,
+but the postgres-password Secret is a normal release resource — an
+ExternalSecret target (ESO-backed envs), a chart-owned in-box Secret, or a
+per-instance external-RDS Secret. On a fresh / capacity-contended ephemeral
+namespace ESO has not reconciled the target Secret by the time the hook pod
+starts, so the container's env `secretKeyRef` resolution fails the pod with
+`secret "<ns>-postgres-password" not found` and the whole deploy reds.
+*/ -}}
+{{- $dbSecretName := "" -}}
+{{- $dbSecretKey := "" -}}
+{{- if .Values.beads.externalRDS.enabled -}}
+  {{- $dbSecretName = include "gardenio.beads.externalRDS.passwordSecretName" . -}}
+  {{- $dbSecretKey = "password" -}}
+{{- else if .Values.postgresExternal.enabled -}}
+  {{- $dbSecretName = include "gardenio.beads.postgresExternal.passwordSecretName" . -}}
+  {{- /* BEADS_DATABASE_PASSWORD is substituted into BEADS_DATABASE_URL, so use
+         the URL-encoded copy (urlKey, falling back to key). ka-0000005248. */ -}}
+  {{- $dbSecretKey = include "gardenio.beads.postgresExternal.passwordSecretURLKey" . -}}
+{{- else if .Values.postgres.enabled -}}
+  {{- $dbSecretName = (.Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .)) -}}
+  {{- $dbSecretKey = ternary "password_url" "password" .Values.externalSecrets.enabled -}}
+{{- end -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}-migrate
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": {{ join "," $hooks | quote }}
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  # Cap the Job's wall-clock so a stuck migration surfaces a helm-level
+  # failure instead of pinning the upgrade indefinitely. Tune via
+  # beads.migrationJob.activeDeadlineSeconds for envs with very large
+  # backfills (default 30 min).
+  activeDeadlineSeconds: {{ .Values.beads.migrationJob.activeDeadlineSeconds | default 1800 }}
+  # backoffLimit: 0 — let helm fail loudly on first failure instead of
+  # silently retrying. The operator decides whether re-running the Job
+  # (via helm upgrade) or manual psql intervention is appropriate.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: {{ .Values.beads.migrationJob.ttlSecondsAfterFinished | default 600 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.beads.selectorLabels" . | nindent 8 }}
+        gardenio.io/component: beads-migrate
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $dbSecretName }}
+      # Gate `kd migrate` on the postgres-password Secret having been synced
+      # (ka-0000003749). The Secret is mounted optional, so the pod schedules
+      # even before ESO has created it; this initContainer then blocks until
+      # the expected key file appears. Without it the migrate container's env
+      # `secretKeyRef` would hard-fail the pod ("secret not found") whenever
+      # the ESO sync loses the race against this Helm hook on a fresh /
+      # capacity-contended ephemeral namespace. Reuses the migrate image (no
+      # extra pull) and needs no ServiceAccount/RBAC (file poll, not API get).
+      initContainers:
+        - name: wait-for-db-secret
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.beads.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.beads.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              SECRET_FILE="/var/run/db-secret/{{ $dbSecretKey }}"
+              TIMEOUT={{ .Values.beads.migrationJob.waitForSecretTimeoutSeconds | default 300 }}
+              echo "Waiting up to ${TIMEOUT}s for Secret {{ $dbSecretName }} key {{ $dbSecretKey }} to sync (mounted at ${SECRET_FILE})..."
+              elapsed=0
+              # kubelet refreshes a mounted Secret on its sync loop (~60s),
+              # so once ESO creates the Secret this file appears without a
+              # pod restart.
+              while [ ! -s "$SECRET_FILE" ]; do
+                if [ "$elapsed" -ge "$TIMEOUT" ]; then
+                  echo "ERROR: Secret {{ $dbSecretName }} key {{ $dbSecretKey }} not synced after ${TIMEOUT}s — ESO sync did not complete in time." >&2
+                  exit 1
+                fi
+                sleep 3
+                elapsed=$((elapsed + 3))
+              done
+              echo "Secret {{ $dbSecretName }} key {{ $dbSecretKey }} is present after ${elapsed}s."
+          volumeMounts:
+            - name: db-secret
+              mountPath: /var/run/db-secret
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+      {{- end }}
+      {{- with include "gardenio.hookPriorityClassName" $ }}
+      {{ . }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.beads.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.beads.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          command: ["kd", "migrate"]
+          env:
+            # application_name (gd-rXqkv4rSmG): libpq and lib/pq read PGAPPNAME, so
+            # pg_stat_activity and the postgres exporter attribute this client's load.
+            - name: PGAPPNAME
+              value: "kbeads-migrate"
+            {{- if .Values.beads.externalRDS.enabled }}
+            - name: BEADS_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.externalRDS.passwordSecretName" . }}
+                  key: password
+            {{- else if .Values.postgresExternal.enabled }}
+            # Embedded into BEADS_DATABASE_URL below — use the URL-encoded copy
+            # (urlKey, falling back to key). Matches $dbSecretKey above so the
+            # wait-for-db-secret initContainer gates on the same key. ka-0000005248.
+            - name: BEADS_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.postgresExternal.passwordSecretName" . }}
+                  key: {{ include "gardenio.beads.postgresExternal.passwordSecretURLKey" . }}
+            {{- else if .Values.postgres.enabled }}
+            - name: BEADS_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .) }}
+                  key: {{ if .Values.externalSecrets.enabled }}password_url{{ else }}password{{ end }}
+            {{- end }}
+            - name: BEADS_DATABASE_URL
+              value: {{ include "gardenio.beads.databaseURL" . }}
+            # Auto-recover from a prior interrupted migration. Without
+            # this the Job hard-fails on schema_migrations.dirty=true and
+            # the operator has to clear it by hand. Override via
+            # beads.migrationJob.autoRecover if a stricter posture is
+            # wanted in a given env.
+            - name: BEADS_MIGRATE_AUTO_RECOVER
+              value: {{ .Values.beads.migrationJob.autoRecover | default "last-clean" | quote }}
+          resources:
+            {{- toYaml (.Values.beads.migrationJob.resources | default .Values.beads.resources) | nindent 12 }}
+      {{- if $dbSecretName }}
+      volumes:
+        # Optional so the pod still schedules before ESO has created the
+        # Secret; the wait-for-db-secret initContainer above blocks until the
+        # key file materializes (ka-0000003749).
+        - name: db-secret
+          secret:
+            secretName: {{ $dbSecretName }}
+            optional: true
+      {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.beads.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.beads.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- /* migrationJob.tolerations overrides beads.tolerations for THIS Job
+      only. The daemon must stay off the autoscaled tainted pools (agent
+      nodes churn under Karpenter consolidation), but the short-lived migrate
+      hook has nowhere to land when the small untainted system-node set is
+      CPU-packed — it sat Pending to its activeDeadline and failed every prod
+      upgrade (ka-0000001388). Letting just the hook tolerate a pool taint is
+      safe: it runs once and exits. */}}
+      {{- include "gardenio.tolerations" (dict "local" (.Values.beads.migrationJob.tolerations | default .Values.beads.tolerations) "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

@@ -1,0 +1,111 @@
+{
+  "formula_type": "workflow",
+  "phase": "liquid",
+  "default_roles": ["crew"],
+  "vars": [
+    {
+      "name": "EDITION",
+      "required": true,
+      "description": "Edition slug for this run (e.g. 2026-08-04). On the scheduled gardener this is wired to {{fire_time_iso}}. Used as the run-directory name and to namespace the draft so concurrent pours don't collide."
+    },
+    {
+      "name": "PARENT_EPIC",
+      "default": "ka-0000003646",
+      "description": "Standup-convergence research epic every step bead is parented under, so the operator browses one tree per run. The RUBRIC + design live here."
+    },
+    {
+      "name": "PASS_SCORE",
+      "default": "8",
+      "description": "STAND overall (mean of the five dimensions, 0-10) at or above which the critic returns verdict=accept. Operator-tunable; default 8 (the 'good' band)."
+    },
+    {
+      "name": "ST_FLOOR",
+      "default": "4",
+      "description": "Hard floor for the S (Scope) and T (Truth) dimensions. Below this the critic returns verdict=hold (never cross-post) regardless of overall — a scope violation or a false citation is unshippable. See rubric §3."
+    },
+    {
+      "name": "ROUND_CAP",
+      "default": "3",
+      "description": "Maximum writer<->critic rounds before the loop takes the best draft to the gate. Convergence terminates early on accept or on a non-improving (converging=false) round."
+    },
+    {
+      "name": "STANDUP_CHANNEL",
+      "default": "C08QNP80M0T",
+      "description": "Slack channel ID for #daily-stand-up, where an APPROVED edition is cross-posted (gated behind the human decision — never autonomously)."
+    },
+    {
+      "name": "GARDENIO_REPO",
+      "default": "example-org/gardenio",
+      "description": "The GitLab project the standup scopes MRs to. Only MRs in this project (and gardenio chart release tags) count as the fleet's own work — the S (Scope) dimension rejects anything else."
+    }
+  ],
+  "steps": [
+    {
+      "id": "setup",
+      "type": "task",
+      "title": "Standup {{EDITION}}: boot — window + rubric + run dir",
+      "labels": ["project:gardenio", "kind:standup-convergence", "standup:setup"],
+      "description": "## Step 0 — Boot the convergence loop\n\nEstablish the shared ground-truth every round reads. You do NOT write the standup and you do NOT score it here — the writer and critic steps do.\n\n### Do\n1. Read the rubric `gardenio/docs/standup-convergence-rubric.md` (STAND: Scope, Truth, Accepted-format, News, Density) — every round scores against it.\n2. Determine the **coverage window**: from the timestamp of the previous standup edition to now. Find the previous edition from the last closed molecule of this formula, or from the last gardenio entry in #daily-stand-up ({{STANDUP_CHANNEL}}); if neither is locatable, default to the last 24h (or since the last working day on a Monday). Record the window bounds.\n3. Pull ONE recent human entry from #daily-stand-up ({{STANDUP_CHANNEL}}) as the format anchor: `gb slack channel {{STANDUP_CHANNEL}} --limit 8 --include-bots`. The writer/critic compare gardenio's draft against this accepted shape.\n4. Create a scratch run dir `docs/standup/{{EDITION}}/` with `WINDOW.json` (window bounds + prior-edition ref) and an empty `rounds/` dir for per-round `draft.md` + `verdict.json`.\n\n### Deliverables (comment on this bead, then close)\n- Coverage window (from -> to) + prior-edition ref (or 'defaulted to 24h, reason').\n- The accepted-format anchor (one human entry, verbatim) the loop scores against.\n- Path to `docs/standup/{{EDITION}}/WINDOW.json`.\n\nparent({{PARENT_EPIC}})"
+    },
+
+    {
+      "id": "writer-r1",
+      "type": "task",
+      "title": "Standup {{EDITION}}: WRITER round 1 — gather gardenio-only activity + draft",
+      "labels": ["project:gardenio", "kind:standup-convergence", "standup:writer"],
+      "depends_on": ["setup"],
+      "description": "## Round 1 — Writer: gather the window (gardenio only) and draft the entry\n\nProduce the first full draft. Write gardenio's standup entry as ONE participant in #daily-stand-up — the fleet's OWN work only.\n\n### Gather (window from `docs/standup/{{EDITION}}/WINDOW.json`) — SCOPE IS EVERYTHING\n- **Merged gardenio MRs** in {{GARDENIO_REPO}} since the window start: `glab mr list -R {{GARDENIO_REPO}} --merged --per-page 30` (filter by mergedAt >= window start; glab is NOT gh — use `-M`/`--merged`, there is NO `--state` flag). These are 'Changed since yesterday' candidates.\n- **Open gardenio MRs** in flight (same repo, bare `glab mr list` — defaults to open) — 'Priority today' candidates + 'Blocking' if awaiting review.\n- **Closed gardenio epics/releases** in the window: `kd list --project gardenio --status closed --sort -updated_at --limit 40 --json` — keep epics, releases (chart tags), P0/P1 bugs; DROP cron/session/schedule-mirror/standup-self beads (the News dimension's noise filter).\n- **In-progress gardenio epics/plans**: `kd list --project gardenio --status in_progress` + `gb ready --json` — the 'Goal' + 'Priority today'.\n- **Open gardenio decisions/escalations needing a human**: `gb news` / `kd list --type decision --status open --project gardenio` — the 'Blocking / help' line.\n\n**Reject anything that is not the gardenio fleet's own work** — no monorepo/site-deployment MRs, no other project's beads, nothing a human (not a fleet agent) authored. Matt's founding rejection: *'that wasn't you! only gardenio's work should be in here.'*\n\n### Draft to the accepted format (rubric §1)\n```\n*gardenio* — {date}\n:dart: *Goal:* {the epic/plan the fleet is driving — 1 line}\n:white_check_mark: *Changed since yesterday:* {merged MRs, closed epics, releases — bullets, each an MR/bead LINK, impact-ordered, lead item first}\n:technologist: *Priority today:* {top few in-flight threads — bullets, each a link}\n:warning: *Blocking / help:* {open decisions/escalations needing a human — or 'None'}\n```\nEvery MR/tag/ticket a clickable Slack link (`<https://gitlab.com/example-org/gardenio/-/merge_requests/NNN|!NNN>`). No bare IDs. Slim — aim <= ~12 lines. If the window is genuinely quiet, say so honestly in one line (rubric §4) — do NOT pad.\n\n### Deliverables\n- Write the draft to `docs/standup/{{EDITION}}/rounds/r1-draft.md`.\n- Comment: the draft (verbatim) + a one-line source-count per section + a note that every cited item is gardenio-scope.\n\nparent({{PARENT_EPIC}})"
+    },
+    {
+      "id": "critic-r1",
+      "type": "task",
+      "title": "Standup {{EDITION}}: CRITIC round 1 — score draft against STAND",
+      "labels": ["project:gardenio", "kind:standup-convergence", "standup:critic"],
+      "depends_on": ["writer-r1"],
+      "description": "## Round 1 — Critic: score the draft against STAND\n\nRead ONLY the **draft** (`docs/standup/{{EDITION}}/rounds/r1-draft.md`), the **rubric** (`gardenio/docs/standup-convergence-rubric.md`), and the **format anchor** (setup comment). Do NOT read the writer's reasoning — independence is the point.\n\n### Score each STAND dimension 0-10 (rubric §2), with its auto-cap\n- **S — Scope**: every MR resolves to {{GARDENIO_REPO}} + a fleet author; every bead is project:gardenio; count out-of-scope/false-attribution items. ANY out-of-scope item ⇒ S <= 3.\n- **T — Truth**: spot-check EVERY MR/bead/tag citation (`glab -R {{GARDENIO_REPO}} api ...`, `kd show`) — merged-vs-open matches the tense; tallies reconcile. ANY false citation ⇒ T <= 3.\n- **A — Accepted-format**: four canonical sections present + in order (Goal->Changed->Priority->Blocking), accepted emoji+labels, plain bullets, dated header. Missing/reordered section ⇒ A <= 5.\n- **N — News**: right items, impact-ordered, lead is the highest-impact thread, no cron/session/mirror noise. Wrong lead or visible noise ⇒ N <= 5.\n- **D — Density**: <= ~12 lines, every ref a clickable link, zero bare IDs, high signal-per-line. > ~14 lines or a bare id ⇒ D <= 5.\n\n### Decision rule (rubric §3)\n- `overall (mean, weighted toward S+T) >= {{PASS_SCORE}}` AND `S >= {{ST_FLOOR}}` AND `T >= {{ST_FLOOR}}` AND no dim < 4 -> `verdict: accept`\n- `S < {{ST_FLOOR}}` OR `T < {{ST_FLOOR}}` -> `verdict: hold` (never cross-post; writer must fix by removing/correcting, never fabricating)\n- otherwise -> `verdict: revise`\n\n### Output — write `docs/standup/{{EDITION}}/rounds/r1-verdict.json` AND paste in a comment\n```json\n{\"round\":1,\"scores\":{\"scope\":0,\"truth\":0,\"accepted_format\":0,\"news\":0,\"density\":0},\n \"overall\":0.0,\"verdict\":\"accept|revise|hold\",\n \"edits\":[{\"priority\":1,\"dimension\":\"scope\",\"where\":\"Changed-since line 2\",\"problem\":\"...\",\"fix\":\"...\"}]}\n```\nEdits MUST be specific + actionable (what to cut/correct/link/reorder), prioritized. For a `hold`, the edits name exactly what was out-of-scope or unverifiable.\n\nparent({{PARENT_EPIC}})"
+    },
+
+    {
+      "id": "writer-r2",
+      "type": "task",
+      "title": "Standup {{EDITION}}: WRITER round 2 — revise per verdict (or carry forward)",
+      "labels": ["project:gardenio", "kind:standup-convergence", "standup:writer"],
+      "depends_on": ["critic-r1"],
+      "description": "## Round 2 — Writer: revise\n\nFirst read `docs/standup/{{EDITION}}/rounds/r1-verdict.json`.\n\n### Carry-forward short-circuit (terminate early)\n- If round-1 verdict is `accept` OR `hold`: the loop is DONE for writing. Copy `r1-draft.md` -> `r2-draft.md` and `r1-verdict.json` -> `r2-verdict.json` unchanged, comment 'CARRY-FORWARD (round 1 was {accept|hold})', and close. Do NOT re-draft.\n\n### Otherwise (verdict `revise`)\n- Address the prioritized `edits` in order against `r1-draft.md`. Write a NEW draft `docs/standup/{{EDITION}}/rounds/r2-draft.md` (keep r1 for the monotonic-improvement check — don't mutate it).\n- Re-gather ONLY what an edit requires (a missing merged MR, a miscounted tally, an out-of-scope line to cut). Don't churn sections the critic didn't flag.\n- Scope stays inviolable: fix a Scope/Truth edit by REMOVING/CORRECTING the offending line, never by adding unverified filler.\n\n### Deliverables\n- Round-2 draft path + a one-line note per round-1 edit: addressed / can't-because.\n\nparent({{PARENT_EPIC}})"
+    },
+    {
+      "id": "critic-r2",
+      "type": "task",
+      "title": "Standup {{EDITION}}: CRITIC round 2 — re-score + convergence check",
+      "labels": ["project:gardenio", "kind:standup-convergence", "standup:critic"],
+      "depends_on": ["writer-r2"],
+      "description": "## Round 2 — Critic: re-score + convergence check\n\nRead ONLY `docs/standup/{{EDITION}}/rounds/r2-draft.md` + the rubric (not the writer's reasoning).\n\n### Carry-forward short-circuit\n- If `r2-verdict.json` already exists (writer carried forward an accept/hold), comment 'CARRY-FORWARD verdict stands' and close.\n\n### Otherwise score exactly as round 1 (same STAND dimensions, same decision rule: PASS={{PASS_SCORE}}, S/T floor={{ST_FLOOR}}).\nAdditionally compute the **convergence** signal vs round 1:\n- Read `r1-verdict.json`. If `overall(r2) <= overall(r1)` AND verdict is still `revise`, set `\"converging\": false` (not improving — the gate step will take the best draft so far and stop revising).\n- Else `\"converging\": true`.\n\n### Output — `docs/standup/{{EDITION}}/rounds/r2-verdict.json` (round-1 shape + `\"converging\": bool`) + paste in a comment.\n\nparent({{PARENT_EPIC}})"
+    },
+
+    {
+      "id": "writer-r3",
+      "type": "task",
+      "title": "Standup {{EDITION}}: WRITER round 3 — final revision (or carry forward)",
+      "labels": ["project:gardenio", "kind:standup-convergence", "standup:writer"],
+      "depends_on": ["critic-r2"],
+      "description": "## Round 3 — Writer: final revision (round cap = {{ROUND_CAP}})\n\nRead `docs/standup/{{EDITION}}/rounds/r2-verdict.json`.\n\n### Carry-forward short-circuit (terminate early)\n- If round-2 verdict is `accept` OR `hold`, OR `converging` is false: the loop is DONE. Copy `r2-draft.md` -> `r3-draft.md` and `r2-verdict.json` -> `r3-verdict.json` unchanged, comment the carry-forward reason, and close. Do NOT re-draft.\n\n### Otherwise (verdict `revise` and still converging)\n- LAST revision. Address the round-2 `edits`, write `docs/standup/{{EDITION}}/rounds/r3-draft.md`.\n\n### Deliverables\n- Round-3 draft path + per-edit addressed/can't note.\n\nparent({{PARENT_EPIC}})"
+    },
+    {
+      "id": "critic-r3",
+      "type": "task",
+      "title": "Standup {{EDITION}}: CRITIC round 3 — final score",
+      "labels": ["project:gardenio", "kind:standup-convergence", "standup:critic"],
+      "depends_on": ["writer-r3"],
+      "description": "## Round 3 — Critic: final score\n\nRead ONLY `docs/standup/{{EDITION}}/rounds/r3-draft.md` + the rubric.\n\n### Carry-forward short-circuit\n- If `r3-verdict.json` already exists (carried forward), comment 'CARRY-FORWARD verdict stands' and close.\n\n### Otherwise score exactly as before (PASS={{PASS_SCORE}}, S/T floor={{ST_FLOOR}}) and write `docs/standup/{{EDITION}}/rounds/r3-verdict.json`.\nThis is the final round — there is no round 4. The gate step reads this verdict (or the carried-forward one) + picks the best-scoring draft across rounds.\n\nparent({{PARENT_EPIC}})"
+    },
+
+    {
+      "id": "gate",
+      "type": "task",
+      "title": "Standup {{EDITION}}: GATE — human approves the cross-post (never autonomous)",
+      "labels": ["project:gardenio", "kind:standup-convergence", "standup:gate"],
+      "depends_on": ["critic-r3"],
+      "description": "## Final — Gate: converge to a decision, human approves the cross-post\n\nThe loop has terminated (accept, hold, non-converging, or round cap). Read the FINAL verdict `docs/standup/{{EDITION}}/rounds/r3-verdict.json` and pick the **best draft across rounds** (highest `overall` among rounds whose verdict was accept; else the highest-overall draft, unless every round held).\n\n### Build the convergence trajectory\nRead r1/r2/r3 verdicts and assemble the trajectory string, e.g. `r1 6.4 -> r2 7.6 -> r3 8.2 accept`. This is the artifact that proves the loop converged — include it in the decision and the wrap-up.\n\n### File ONE decision + yield (NEVER post autonomously)\nPost the chosen draft for review, then create the gate decision, block the molecule on it, and yield:\n```bash\ngb squawk \"$CHOSEN_DRAFT\"\nDECISION=$(gb decision create --no-wait --requesting-task <this-step-bead> \\\n  --prompt=\"gardenio daily standup {{EDITION}} converged (STAND <s>/<t>/<a>/<n>/<d>, overall <mean>; trajectory <traj>). Approve to cross-post to #daily-stand-up, revise, or cancel?\" \\\n  --options='[{\"id\":\"approve\",\"short\":\"Approve\",\"label\":\"Cross-post to #daily-stand-up as-is\",\"artifact_type\":\"report\"},{\"id\":\"revise\",\"short\":\"Revise\",\"label\":\"I have feedback — revise and re-draft\",\"artifact_type\":\"report\"},{\"id\":\"cancel\",\"short\":\"Cancel\",\"label\":\"Skip today's standup\",\"artifact_type\":\"report\"}]' \\\n  --json | jq -r '.id')\n# Self-suppress the whole MOLECULE from `gb ready` until the operator resolves the gate.\n# `--requesting-task` blocks only THIS gate step, leaving the molecule blocked_by=null;\n# after this crew despawns the delivery-drive reaper flips the molecule back to `open`\n# and the delivery gardener re-dispatches a fresh crew onto it every cycle — a no-op\n# (bug ka-0000006757). Read the molecule id from this gate step's own molecule_id field\n# and block it on the decision (bakes in the 2026-08-07 edition's manual fix).\nMOLECULE=$(kd show <this-step-bead> --json | jq -r '.fields.molecule_id')\nkd dep add \"$MOLECULE\" \"$DECISION\" --type blocks\ngb yield\n```\n\n### Handle the decision\n- **approve**: cross-post the chosen draft to {{STANDUP_CHANNEL}}:\n  `SLACK_THREAD_CHANNEL={{STANDUP_CHANNEL}} SLACK_THREAD_TS=0 gb slack reply \"$CHOSEN_DRAFT\"`\n  then verify it landed: `gb slack channel {{STANDUP_CHANNEL}} --limit 1 --include-bots`.\n- **revise**: read the feedback, revise the chosen draft, re-post via `gb squawk`, and file a fresh decision for re-approval (block the molecule on the fresh decision the same way — `kd dep add \"$MOLECULE\" \"$NEW_DECISION\" --type blocks` — before yielding).\n- **cancel**: do not post; comment 'skipped today' and close.\n- If the final verdict was **hold** (S or T below floor at the cap): do NOT auto-post even on a fast approve — the decision prompt names exactly what was out-of-scope/unverifiable so the human decides with eyes open.\n\n### Deliverables (comment on this bead, then close)\n- Final verdict + convergence trajectory (per-round overall).\n- If posted: the #daily-stand-up permalink + the STAND scorecard.\n- If held/cancelled: the reason.\n- Roll-up comment on {{PARENT_EPIC}} summarizing this edition's loop outcome.\n\nThis closes the molecule. The gardener schedule fires the next edition on its cadence.\n\nparent({{PARENT_EPIC}})"
+    }
+  ]
+}

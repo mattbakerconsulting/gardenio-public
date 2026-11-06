@@ -1,0 +1,47 @@
+{{- if and (not .Values.fleet.enabled) .Values.beads.rbacProbe.enabled }}
+{{- /* Spawn permission snapshot probe (gd-g9zzRfy1WL, PR #1200 gd-SyEYkqe601).
+     At privileged-spawn approval kbeads snapshots the spawn ServiceAccount's
+     effective permissions, then diffs them live on the agent page. It reads
+     RBAC straight from the in-cluster API, so the daemon needs its own
+     ServiceAccount with READ-ONLY access to the four RBAC kinds and nothing
+     else. Deliberately not `impersonate`: an impersonate grant on gc-k8s-live
+     would hand the beads daemon pods/exec in gc-dogfood. No secrets either. */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+# Off at the SA; the beads Deployment opts its pod in explicitly.
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}-rbac-reader
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+rules:
+  # Cluster-scoped because a spawn ServiceAccount's RoleBindings can live in any
+  # namespace (gardenio, gc-dogfood, ...) and ClusterRoleBindings are cluster
+  # resources. Read-only: get + list, no watch, no escalate/bind.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}-rbac-reader
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.beads.fullname" . }}-rbac-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.beads.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

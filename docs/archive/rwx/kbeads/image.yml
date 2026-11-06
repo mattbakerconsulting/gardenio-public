@@ -1,0 +1,238 @@
+# OCI image build for kbeads — crane-based push to GitLab Container Registry.
+#
+# Builds kd binary, installs runtime deps, assembles a layer, and pushes
+# via crane append to ubuntu:24.04 base.
+#
+# OPTIMIZATIONS:
+# - Filter directives on Go build (cached by lockfiles)
+# - Content-based caching on system deps and Go modules
+#
+# ── The clone roots at the MONOREPO root, not at kbeads/ (ka-0000001846) ─────
+# `code` clones the whole gardenio monorepo, so the RWX workspace root holds
+# `coop/`, `kbeads/`, `gardenio/`, `.rwx/` — there is NO `go.mod` at the
+# workspace root (the Go module is `kbeads/go.mod`; the root has only
+# `go.work`). So every `go` invocation below must `cd kbeads` first, and every
+# path naming a file in the component (filter globs, lock files, the built
+# binary's artifact path) needs its `kbeads/` prefix. Without the `cd`,
+# `go mod download` dies with `go: no modules specified (see 'go help mod
+# download')` — MEASURED on 66ca4414, run
+# 09d5c89ceb784c3886a0fc15738392fc against the sibling kbeads/.rwx/ci.yml.
+#
+# `GOWORK=off` is required alongside the `cd`: from inside `kbeads/`, Go walks
+# up and finds the monorepo `go.work`, entering workspace mode over sibling
+# modules this workflow neither stages nor needs. `kbeads/go.mod` also has
+# `replace gardenio/clicreds => ../gardenio/clicreds`, so each Go
+# task's filter must stage that local module too (ka-0000003839). Same
+# convention as the root `.rwx/ci.yml` kbeads tasks.
+#
+# `push-kd` deliberately stays at the workspace root: it only touches /tmp and
+# the `${{ tasks.build-kd.artifacts.kd-binary }}` expansion, neither of which
+# is component-relative.
+
+on:
+  gitlab:
+    push:
+      if: ${{ event.git.branch == 'main' }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: ${{ event.git.ref }}
+      status-checks:
+        name: Image
+    tag-push:
+      if: ${{ starts-with(event.git.ref, 'refs/tags/20') }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: ${{ event.git.ref }}
+      status-checks:
+        name: Image
+    merge-request:
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: pr
+      status-checks:
+        - tasks: [build-kd]
+          name: Image
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      ref-name: cli
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  # ── System deps (cached until lock changes) ────────────────────────
+  - key: system-deps
+    filter:
+      - kbeads/.rwx/system-deps.lock
+    run: |
+      echo "Installing build dependencies (should be cached)..."
+      sudo apt-get update
+      sudo apt-get install -y libicu-dev gcc g++
+
+  # ── Clone kbeads repo ─────────────────────────────────────────────
+  - key: code
+    # ── Clone credential MUST be in the URL (ka-0000006904) ────────────────
+    # With a bare `https://gitlab.com/...` URL, `git/clone` falls back to the
+    # RWX vault-resolved GitLab credential, which is DENIED on the CLI/manual
+    # `rwx run` path: every run aborted in the first task,
+    # `code.get-latest-sha-for-ref`, with `remote: HTTP Basic: Access denied`
+    # / `fatal: Authentication failed` (exit 128) — killing the self-verify
+    # command this repo's CLAUDE.md documents. `secrets.GITLAB_CLONE_TOKEN` is
+    # the credential source the root `.rwx/ci.yml` and `.rwx/e2e.yml` already
+    # use, and it resolves on every trigger (cli, push, tag-push, MR, dispatch).
+    call: git/clone 2.0.3
+    with:
+      repository: https://oauth2:${{ secrets.GITLAB_CLONE_TOKEN }}@gitlab.com/Acme/Platform/gardenio.git
+      ref: ${{ init.commit-sha }}
+
+  # ── Go toolchain (cached by version, keyed off kbeads/go.mod) ─────
+  - key: go
+    call: golang/install 1.2.0
+    with:
+      go-version: "1.25"
+    filter:
+      # There is no `.go-version` in this repo (at the workspace root OR under
+      # kbeads/) — that glob matched nothing. Key off the real module file,
+      # as kbeads/.rwx/ci.yml does (ka-0000001846).
+      - kbeads/go.mod
+
+  # ── Go mod download (cached by lockfiles) ──────────────────────────
+  - key: go-deps
+    use: [code, go, system-deps]
+    run: cd kbeads && GOWORK=off go mod download
+    filter:
+      - kbeads/go.mod
+      - kbeads/go.sum
+      # `replace gardenio/clicreds => ../gardenio/clicreds`
+      # (ka-0000003839).
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+
+  # ── Build kd binary (only when Go code changes) ───────────────────
+  - key: build-kd
+    use: [go-deps]
+    filter:
+      - "kbeads/*.go"
+      - "kbeads/cmd/kd/*.go"
+      - "kbeads/cmd/**/*.go"
+      - "kbeads/internal/**/*.go"
+      - "kbeads/internal/**/*.sql"
+      - "kbeads/gen/**/*.go"
+      - "kbeads/go.mod"
+      - "kbeads/go.sum"
+      # clicreds source needed to build kbeads (ka-0000003839).
+      - "gardenio/clicreds/**"
+    run: |
+      echo "Building kd binary..."
+      TAG="${REF_NAME#refs/tags/}"
+      TAG="${TAG#refs/heads/}"
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      # version/commit/branch/date for `kd version` + the daemon skew header
+      # (ka-0000002965).
+      cd kbeads
+      GOWORK=off CGO_ENABLED=1 GOOS=linux go build \
+        -ldflags="-s -w -X main.Version=${TAG} -X main.Build=${COMMIT_SHA} \
+          -X gardenio/kbeads/internal/buildinfo.Branch=${TAG} \
+          -X gardenio/kbeads/internal/buildinfo.Date=${BUILD_DATE}" \
+        -o kd ./cmd/kd
+    env:
+      COMMIT_SHA: ${{ init.commit-sha }}
+      REF_NAME: ${{ init.ref-name }}
+    outputs:
+      artifacts:
+        - key: kd-binary
+          path: kbeads/kd
+
+  # ── Push kd daemon image to container registry ───────────────────
+  - key: push-kd
+    use: [build-kd]
+    if: ${{ init.ref-name != 'pr' }}
+    cache: false
+    run: |
+      set -e
+      TAG="${REF_NAME#refs/tags/}"
+      TAG="${TAG#refs/heads/}"
+
+      # Install crane
+      curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+        | tar xz -C /tmp crane
+      sudo mv /tmp/crane /usr/local/bin/
+
+      # Login to container registry
+      REG_USER="${REGISTRY_USER:-$GITHUB_USER}"
+      REG_TOKEN="${REGISTRY_TOKEN:-$GHCR_TOKEN}"
+      REG_HOST="${REGISTRY_HOST:-registry.gitlab.com}"
+      echo "$REG_TOKEN" | crane auth login "$REG_HOST" -u "$REG_USER" --password-stdin
+
+      # Install runtime deps on build VM
+      export DEBIAN_FRONTEND=noninteractive
+      sudo apt-get -y update
+      sudo apt-get -y install --no-install-recommends \
+        ca-certificates tzdata libicu74 netcat-openbsd
+
+      # Build layer tree
+      LAYER=/tmp/layer
+      mkdir -p $LAYER/usr/local/bin $LAYER/etc/ssl/certs $LAYER/home/beads
+
+      # Copy runtime deps via dpkg -L
+      for pkg in ca-certificates tzdata libicu74 netcat-openbsd; do
+        dpkg -L "$pkg" 2>/dev/null | while read -r f; do
+          [ -f "$f" ] || continue
+          mkdir -p "$LAYER$(dirname "$f")"
+          cp "$f" "$LAYER${f}" 2>/dev/null || true
+        done || true
+      done
+
+      # Copy shared libs for kd binary
+      ldd ${{ tasks.build-kd.artifacts.kd-binary }} 2>/dev/null | grep "=> /" | awk '{print $3}' | while read -r lib; do
+        [ -f "$lib" ] || continue
+        mkdir -p "$LAYER$(dirname "$lib")"
+        cp -n "$lib" "$LAYER${lib}" 2>/dev/null || true
+      done || true
+
+      # ICU data files (needed at runtime)
+      find /usr/lib/x86_64-linux-gnu -name 'libicu*.so*' 2>/dev/null | while read -r f; do
+        mkdir -p "$LAYER$(dirname "$f")"
+        cp -a "$f" "$LAYER${f}" 2>/dev/null || true
+      done || true
+
+      # Install kd binary
+      cp ${{ tasks.build-kd.artifacts.kd-binary }} $LAYER/usr/local/bin/kd
+      chmod 755 $LAYER/usr/local/bin/kd
+
+      # CA certs
+      cp /etc/ssl/certs/ca-certificates.crt $LAYER/etc/ssl/certs/
+
+      # Agent user (rename ubuntu→beads in passwd/group, UID 1000)
+      cp /etc/passwd $LAYER/etc/passwd
+      sed -i "s/^ubuntu:/beads:/" $LAYER/etc/passwd
+      sed -i "s|/home/ubuntu|/home/beads|" $LAYER/etc/passwd
+      cp /etc/group $LAYER/etc/group
+      sed -i "s/^ubuntu:/beads:/" $LAYER/etc/group
+
+      # Fix ownership
+      sudo chown -R 1000:1000 $LAYER/home/beads
+      sudo chown 1000:1000 $LAYER/usr/local/bin/kd
+
+      # Create tar and push
+      sudo tar -cf /tmp/layer.tar -C $LAYER .
+
+      REPO="registry.gitlab.com/acme/platform/gardenio/kbeads"
+      crane append --base ubuntu:24.04 --new_tag "${REPO}:${TAG}" --new_layer /tmp/layer.tar --platform linux/amd64
+      crane mutate "${REPO}:${TAG}" \
+        --entrypoint /usr/local/bin/kd \
+        --cmd "daemon,start,--foreground,--tcp-addr=:9876,--http-addr=:9877,--log-json" \
+        --user beads \
+        --workdir /home/beads \
+        -t "${REPO}:${TAG}"
+      crane tag "${REPO}:${TAG}" latest
+      echo "Pushed ${REPO}:${TAG} and ${REPO}:latest"
+    env:
+      REF_NAME: ${{ init.ref-name }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      REGISTRY_HOST: ${{ secrets.REGISTRY_HOST }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      GITHUB_USER: ${{ secrets.GITHUB_USER }}

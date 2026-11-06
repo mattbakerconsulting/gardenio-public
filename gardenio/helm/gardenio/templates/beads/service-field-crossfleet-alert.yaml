@@ -1,0 +1,70 @@
+{{- if .Values.agents.metrics.prometheusRule.serviceFieldCrossFleet.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.serviceFieldCrossFleet }}
+# PrometheusRule for the trigger/schedule service-managed-field cross-fleet
+# write detector (Alert A of epic ka-0000005107, task ka-0000006237).
+#
+# The 2026-07-01 jira-bridge outage: a sandbox jira-bridge misconfigured onto
+# the prod beads daemon stamped last_checked on prod trigger:jira beads ~10s
+# before every prod poll, permanently tripping prod's cooldown gate. The prod
+# bridge cooldown-skipped 414 cycles with zero fires and NO page — a silent
+# starvation.
+#
+# kbeads emits gardenio_service_field_crossfleet_write_total{bead_type,
+# bead_fleet,writer_fleet} on every ACCEPTED service-managed-field bypass
+# write whose writing fleet differs from the bead's owning fleet
+# (service_field_policy.go). IMPORTANT: healthy prod polls DO emit this —
+# trigger beads carry fleet="default" while the prod bridge writes as
+# fleet="jira-bridge" — so the alert must filter writer_fleet to values
+# OUTSIDE the expected writer set rather than paging on any rate > 0.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}-service-field-crossfleet
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: kbeads.service_field_crossfleet
+      interval: 1m
+      rules:
+        - alert: ServiceFieldForeignFleetWrite
+          # A fleet OUTSIDE the expected writer set advanced a service-managed
+          # field (last_checked/last_run/...) on a trigger/schedule bead — a
+          # foreign environment is racing this environment's trigger engine
+          # for the fire window (cross-env cooldown starvation). Any
+          # occurrence is actionable: find the writer (writer_fleet label),
+          # cut its access or scale it down, and fix its ExternalName wiring
+          # per the DEVOPS-798 runbook.
+          expr: |
+            sum by (writer_fleet, bead_type) (
+              increase(gardenio_service_field_crossfleet_write_total{writer_fleet!~{{ $cfg.expectedWriterFleets | quote }}}[10m])
+            ) > 0
+          for: 0m
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: kbeads
+            subsystem: service_field_policy
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Foreign fleet {{`{{ $labels.writer_fleet }}`}} is stamping service-managed fields on {{`{{ $labels.bead_type }}`}} beads"
+            description: |
+              An unexpected fleet advanced last_checked/last_run on shared
+              {{`{{ $labels.bead_type }}`}} beads via the service-managed-field
+              bypass. If this fleet belongs to another environment (e.g. a
+              sandbox pointed at this daemon), it is racing this environment's
+              trigger engine and will starve its cooldown gate — the exact
+              mechanism of the 2026-07-01 jira-bridge outage (ka-0000005107).
+              Identify the writer's deployment, scale it down or fix its
+              beads/NATS endpoints, and ensure BEADS_SERVICE_FIELD_FLEETS does
+              not list it.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000006237)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

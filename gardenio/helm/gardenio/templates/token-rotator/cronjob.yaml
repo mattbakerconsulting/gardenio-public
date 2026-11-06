@@ -1,0 +1,207 @@
+{{- if .Values.tokenRotation.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "gardenio.fullname" . }}-token-rotator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: token-rotator
+spec:
+  schedule: {{ .Values.tokenRotation.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            {{- include "gardenio.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: token-rotator
+        spec:
+          serviceAccountName: {{ include "gardenio.fullname" . }}-token-rotator
+          restartPolicy: OnFailure
+          {{- with $.Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            fsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          {{- if $.Values.global.systemPriorityClass.create }}
+          priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+          {{- end }}
+          containers:
+            - name: rotate
+              image: {{ include "gardenio.mirroredImage" (dict "image" .Values.kubectlImage "global" .Values.global) | quote }}
+              imagePullPolicy: {{ .Values.kubectlImage.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              env:
+                - name: RELEASE_NAME
+                  value: {{ .Release.Name | quote }}
+                - name: NAMESPACE
+                  value: {{ .Release.Namespace | quote }}
+                - name: TOKEN_SECRET
+                  value: {{ .Values.beads.tokenSecret | quote }}
+                - name: TOKEN_KEY
+                  value: "token"
+                - name: PREVIOUS_TOKEN_KEY
+                  value: "previous-token"
+                - name: REVOKED_CONFIGMAP
+                  value: {{ include "gardenio.fullname" . }}-revoked-tokens
+                - name: TOKEN_LENGTH
+                  value: {{ .Values.tokenRotation.tokenLength | default 32 | quote }}
+                {{- if .Values.tokenRotation.restartDeployments }}
+                - name: RESTART_DEPLOYMENTS
+                  value: {{ join "," .Values.tokenRotation.restartDeployments | quote }}
+                {{- else }}
+                - name: RESTART_DEPLOYMENTS
+                  value: "{{ include "gardenio.fullname" . }}-beads,{{ include "gardenio.fullname" . }}-controller,{{ include "gardenio.fullname" . }}-coopmux,{{ include "gardenio.fullname" . }}-slack-bridge,{{ include "gardenio.fullname" . }}-jira-bridge,{{ include "gardenio.fullname" . }}-gitlab-bridge"
+                {{- end }}
+                # Beads daemon HTTP endpoint for DB-backed revocation persistence
+                # (ka-0000003722). The rotator POSTs each evicted token hash to
+                # /v1/admin/revoke-token so revocations survive ConfigMap loss.
+                - name: BEADS_HTTP_URL
+                  value: {{ printf "http://%s:%v" (include "gardenio.beads.fullname" .) (.Values.beads.service.httpPort | default 8080) | quote }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  echo "=== Token rotation started ==="
+
+                  # Generate cryptographically secure random token
+                  NEW_TOKEN=$(cat /dev/urandom | tr -dc 'A-Za-z0-9+/' | head -c "$TOKEN_LENGTH" | base64 | tr -d '\n')
+
+                  # Read current token from secret
+                  CURRENT_TOKEN=$(kubectl get secret "$TOKEN_SECRET" -n "$NAMESPACE" \
+                    -o jsonpath="{.data.$TOKEN_KEY}" 2>/dev/null | base64 -d 2>/dev/null || echo "")
+
+                  if [ -z "$CURRENT_TOKEN" ]; then
+                    echo "WARN: No current token found in secret $TOKEN_SECRET. Setting initial token."
+                    kubectl create secret generic "$TOKEN_SECRET" -n "$NAMESPACE" \
+                      --from-literal="$TOKEN_KEY=$NEW_TOKEN" \
+                      --dry-run=client -o yaml | kubectl apply -f -
+                    echo "Initial token set."
+                    exit 0
+                  fi
+
+                  # Read previous token (for revocation tracking)
+                  EVICTED_TOKEN=$(kubectl get secret "$TOKEN_SECRET" -n "$NAMESPACE" \
+                    -o jsonpath="{.data.$PREVIOUS_TOKEN_KEY}" 2>/dev/null | base64 -d 2>/dev/null || echo "")
+
+                  # Track revoked token hash in ConfigMap (append-only audit log)
+                  # AND push to beads daemon /v1/admin/revoke-token so the
+                  # revocation lands in the DB-backed store. The ConfigMap is
+                  # the env-seed bootstrap path; the DB is the durable fallback
+                  # consulted at every daemon startup. Either source alone is
+                  # sufficient to enforce the revocation — see
+                  # docs/secret-rotation.md "Token rotation overlap & revocation HA".
+                  if [ -n "$EVICTED_TOKEN" ]; then
+                    EVICTED_HASH=$(printf '%s' "$EVICTED_TOKEN" | sha256sum | cut -d' ' -f1)
+                    TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+                    # Push to beads daemon for DB-backed persistence. Done BEFORE
+                    # the secret update because the daemon still has the OLD
+                    # auth token live in memory; after the secret update the
+                    # only valid bearer is the new token (which the daemon won't
+                    # see until restart). Best-effort: a transient daemon
+                    # outage must not block rotation, since the ConfigMap path
+                    # below still seeds the revocation at next pod startup.
+                    if [ -n "$BEADS_HTTP_URL" ]; then
+                      HTTP_CODE=$(curl -sS -o /tmp/revoke-resp.json -w '%{http_code}' \
+                        -X POST "$BEADS_HTTP_URL/v1/admin/revoke-token" \
+                        -H "Authorization: Bearer $CURRENT_TOKEN" \
+                        -H "Content-Type: application/json" \
+                        --max-time 10 --connect-timeout 5 \
+                        -d "{\"token_hash\":\"${EVICTED_HASH}\",\"reason\":\"weekly token rotation\"}" 2>/dev/null || echo "000")
+                      if [ "$HTTP_CODE" = "200" ]; then
+                        echo "Revoked token hash persisted to beads DB: ${EVICTED_HASH:0:12}... (http=$HTTP_CODE)"
+                      else
+                        echo "WARN: beads DB revoke-token push failed (http=$HTTP_CODE) — falling back to ConfigMap-only. Hash will be seeded via env on next pod restart."
+                      fi
+                      rm -f /tmp/revoke-resp.json
+                    fi
+
+                    # Read-modify-write the ConfigMap. CRITICAL: distinguish a
+                    # genuine NotFound (legitimate first run, create fresh)
+                    # from a transient apiserver error (DO NOT overwrite — that
+                    # would silently truncate the existing revocation list to
+                    # just the new entry, losing every prior revoked hash).
+                    GET_OUT=$(mktemp)
+                    GET_ERR=$(mktemp)
+                    if kubectl get configmap "$REVOKED_CONFIGMAP" -n "$NAMESPACE" \
+                        -o jsonpath='{.data.revoked-hashes}' >"$GET_OUT" 2>"$GET_ERR"; then
+                      # ConfigMap exists; EXISTING may be empty (data key absent) or populated.
+                      EXISTING=$(cat "$GET_OUT")
+                      CM_STATE="present"
+                    elif grep -q -i 'NotFound\|not found' "$GET_ERR"; then
+                      EXISTING=""
+                      CM_STATE="missing"
+                    else
+                      echo "ERROR: transient failure reading $REVOKED_CONFIGMAP:" >&2
+                      cat "$GET_ERR" >&2
+                      rm -f "$GET_OUT" "$GET_ERR"
+                      echo "Aborting rotation to avoid destructive overwrite of the revocation list."
+                      echo "The evicted hash has already been persisted to the beads DB if reachable above; rerun the CronJob once the apiserver is healthy."
+                      exit 1
+                    fi
+                    rm -f "$GET_OUT" "$GET_ERR"
+
+                    if [ "$CM_STATE" = "missing" ] || [ -z "$EXISTING" ]; then
+                      kubectl create configmap "$REVOKED_CONFIGMAP" -n "$NAMESPACE" \
+                        --from-literal="revoked-hashes=${EVICTED_HASH}" \
+                        --from-literal="last-rotation=${TIMESTAMP}" \
+                        --dry-run=client -o yaml | kubectl apply -f -
+                    else
+                      # Append new hash (keep last 50 entries to bound size)
+                      UPDATED=$(printf '%s\n%s' "$EXISTING" "$EVICTED_HASH" | tail -50 | tr '\n' ',' | sed 's/,$//')
+                      kubectl patch configmap "$REVOKED_CONFIGMAP" -n "$NAMESPACE" \
+                        --type merge -p "{\"data\":{\"revoked-hashes\":\"$UPDATED\",\"last-rotation\":\"$TIMESTAMP\"}}"
+                    fi
+                    echo "Revoked token hash recorded in ConfigMap: ${EVICTED_HASH:0:12}..."
+                  fi
+
+                  # Update secret: rotate current → previous, set new token
+                  kubectl create secret generic "$TOKEN_SECRET" -n "$NAMESPACE" \
+                    --from-literal="$TOKEN_KEY=$NEW_TOKEN" \
+                    --from-literal="$PREVIOUS_TOKEN_KEY=$CURRENT_TOKEN" \
+                    --dry-run=client -o yaml | kubectl apply -f -
+
+                  echo "Token rotated. New token set, previous token preserved."
+
+                  # Trigger rolling restarts by annotating deployments
+                  ROTATION_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                  IFS=',' read -ra DEPLOYS <<< "$RESTART_DEPLOYMENTS"
+                  for DEPLOY in "${DEPLOYS[@]}"; do
+                    DEPLOY=$(echo "$DEPLOY" | tr -d ' ')
+                    if kubectl get deployment "$DEPLOY" -n "$NAMESPACE" >/dev/null 2>&1; then
+                      kubectl patch deployment "$DEPLOY" -n "$NAMESPACE" \
+                        -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"gardenio.io/token-rotation\":\"$ROTATION_TS\"}}}}}"
+                      echo "  Restarted deployment: $DEPLOY"
+                    elif kubectl get statefulset "$DEPLOY" -n "$NAMESPACE" >/dev/null 2>&1; then
+                      kubectl patch statefulset "$DEPLOY" -n "$NAMESPACE" \
+                        -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"gardenio.io/token-rotation\":\"$ROTATION_TS\"}}}}}"
+                      echo "  Restarted statefulset: $DEPLOY"
+                    else
+                      echo "  SKIP: $DEPLOY not found"
+                    fi
+                  done
+
+                  echo "=== Token rotation complete ==="
+          volumes:
+            - name: tmp
+              emptyDir: {}
+{{- end }}

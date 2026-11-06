@@ -1,0 +1,51 @@
+{{/*
+Plain networking.k8s.io/v1 Ingress for the gitlab-bridge /webhook endpoint —
+for clusters WITHOUT Traefik (e.g. prod-gardenio-eks, which runs only the AWS
+Load Balancer Controller, ingressclass "alb"). Deliberately NOT gated on
+gardenio.traefik.ingressRoutesEnabled: it coexists with (does not replace) the
+Traefik IngressRoute in ingressroute.yaml. Traefik envs keep using
+gitlabBridge.ingress; non-Traefik envs flip gitlabBridge.webhookIngress on
+instead. Controller-specific annotations (ALB scheme/target-type/listen-ports/
+certificate-arn/inbound-cidrs) are fully caller-supplied via
+gitlabBridge.webhookIngress.annotations — see values.yaml for examples.
+*/}}
+{{- if and .Values.gitlabBridge.enabled .Values.gitlabBridge.webhookIngress.enabled }}
+{{- if empty .Values.gitlabBridge.webhookIngress.host }}
+{{- fail "gitlabBridge.webhookIngress.enabled is true but gitlabBridge.webhookIngress.host is empty: set the external webhook hostname (e.g. gitlab-webhook.<workload-domain>)." }}
+{{- end }}
+{{- $fullname := printf "%s-gitlab-bridge" (include "gardenio.fullname" .) -}}
+{{- $ing := .Values.gitlabBridge.webhookIngress -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gitlab-bridge
+  {{- with $ing.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $ing.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- with $ing.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ $ing.host | quote }}
+      http:
+        paths:
+          - path: {{ $ing.path | default "/webhook" }}
+            pathType: {{ $ing.pathType | default "Exact" }}
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  # Named port on the gitlab-bridge Service (service.yaml) —
+                  # stays correct if gitlabBridge.service.port is overridden.
+                  name: http
+{{- end }}

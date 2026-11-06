@@ -1,0 +1,212 @@
+# E2E tests — manual only (no auto-trigger on push/PR).
+# Run manually: rwx run .rwx/e2e.yml --init commit-sha=$(git rev-parse HEAD) --wait
+#
+# ── The clone roots at the MONOREPO root, not at coop/ (ka-0000001846) ──────
+# `code` clones the whole gardenio monorepo, so the RWX workspace root holds
+# `coop/`, `kbeads/`, `gardenio/`, `.rwx/` — there is NO `Cargo.toml` at the
+# workspace root (the Rust workspace is `coop/Cargo.toml`), no
+# `tests/e2e/package.json`, and no `.captain/config.yml`. Every cargo/npm/
+# captain invocation below must therefore `cd coop` (or `cd coop/tests/e2e`)
+# first, and every path (filter globs, background-process binaries, output
+# artifact + test-result paths) is workspace-root-relative and needs its
+# `coop/` prefix. Without the `cd`, cargo dies with "could not find Cargo.toml
+# in /var/mint-workspace or any parent directory" (exit 101) — the same defect
+# ka-0000006904 measured in the sibling `coop/.rwx/ci.yml`. Same convention as
+# the root `.rwx/ci.yml` coop tasks (`cd coop && cargo …`).
+#
+# `captain run` in particular resolves BOTH its own config (`.captain/config.yml`)
+# and every path inside it (`tests/e2e/results/…`) relative to its cwd, so it
+# must run from `coop/`, not from the workspace root.
+on:
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tool-cache:
+  vault: default
+
+tasks:
+  # ── System deps ────────────────────────────────────────────────────────
+  - key: system-deps
+    filter:
+      - coop/.rwx/e2e.yml
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y protobuf-compiler curl pkg-config libssl-dev
+
+  # ── Clone (parallel with system-deps) ─────────────────────────────────
+  - key: code
+    # ── Clone credential MUST be in the URL (ka-0000006904) ────────────────
+    # With a bare `https://gitlab.com/...` URL, `git/clone` falls back to the
+    # RWX vault-resolved GitLab credential, which is DENIED on the CLI/manual
+    # `rwx run` path: every run aborted in the first task,
+    # `code.get-latest-sha-for-ref`, with `remote: HTTP Basic: Access denied`
+    # / `fatal: Authentication failed` (exit 128) — killing the self-verify
+    # command this repo's CLAUDE.md documents. `secrets.GITLAB_CLONE_TOKEN` is
+    # the credential source the root `.rwx/ci.yml` and `.rwx/e2e.yml` already
+    # use, and it resolves on every trigger (cli, push, tag-push, MR, dispatch).
+    call: git/clone 2.0.3
+    with:
+      repository: https://oauth2:${{ secrets.GITLAB_CLONE_TOKEN }}@gitlab.com/Acme/Platform/gardenio.git
+      ref: ${{ init.commit-sha }}
+
+  # ── Rust toolchain (cached across workflow runs) ──────────────────────
+  - key: rust
+    use: [code, system-deps]
+    filter:
+      - coop/.rwx/e2e.yml
+      - coop/rust-toolchain.toml
+    run: |
+      # ── Toolchain install is DERIVED from coop/rust-toolchain.toml ──────
+      # Nothing here hand-copies the channel or the component list. That
+      # duplication is what let the `llvm-tools` component conflict bite twice
+      # (ka-0000001846, ka-0000001870); the trigger is characterized in
+      # ka-0000008092 and the two guards below are the measured fix.
+      curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+      . "$HOME/.cargo/env"
+      COOP_TOOLCHAIN=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' coop/rust-toolchain.toml)
+      test -n "$COOP_TOOLCHAIN" || { echo "cannot parse [toolchain] channel from coop/rust-toolchain.toml"; exit 1; }
+      # GUARD 1 — completeness. Argument-less `rustup toolchain install` run
+      # inside `coop/` reads the pin and installs the channel plus EVERY
+      # component it declares, so this task cannot drift from the pin. It MUST
+      # run before RUSTUP_TOOLCHAIN is exported below: the env var suppresses
+      # the toolchain file, and with it the component list.
+      ( cd coop && rustup toolchain install )
+      # Assert the pin's components really landed, HERE in the cheap toolchain
+      # task, instead of surfacing as a confusing failure inside an 8-cpu build.
+      for c in $(sed -n 's/^[[:space:]]*components[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p' coop/rust-toolchain.toml | tr -d '" ' | tr ',' ' '); do
+        rustup component list --toolchain "$COOP_TOOLCHAIN" --installed | grep -q "^${c}-" \
+          || { echo "coop/rust-toolchain.toml declares component '$c' but rustup did not install it"; exit 1; }
+        echo "component ok: $c"
+      done
+      # GUARD 2 — no lazy sync, ever. RUSTUP_TOOLCHAIN outranks
+      # rust-toolchain.toml in rustup's override precedence, so no cargo
+      # invocation in any downstream task re-reads the pin and rustup can never
+      # attempt a component sync into a `tool-cache:`d tree. This is what makes
+      # the fix deterministic rather than probabilistic — see ka-0000008092.
+      export RUSTUP_TOOLCHAIN="$COOP_TOOLCHAIN"
+      echo "$COOP_TOOLCHAIN" | tee $RWX_ENV/RUSTUP_TOOLCHAIN
+      echo "$HOME/.cargo/bin" | tee -a $RWX_ENV/PATH
+      # Disable sccache wrapper (set by rwx/base) — we use RWX content caching.
+      echo "" | tee $RWX_ENV/RUSTC_WRAPPER
+
+  # ── Build coop + coopmux binaries ─────────────────────────────────────
+  - key: build
+    use: rust
+    agent:
+      cpus: 8
+    tool-cache: e2e-build
+    # These globs are the build's real inputs, staged from the monorepo root
+    # (ka-0000001846). The narrow pre-fix set (`coop/crates/*/Cargo.toml` +
+    # `coop/**/*.rs`) MEASURABLY under-stages: run
+    # a845e08a5d23474580b5401536df503f died with `failed to load manifest for
+    # workspace member /var/mint-workspace/coop/tests/specs` (exit 101),
+    # because `tests/specs` is a member of coop/Cargo.toml and cargo refuses
+    # to load the workspace without its manifest. It also missed
+    # `crates/cli/build.rs`'s `../../proto/coop/v1/coop.proto` and the
+    # `include_str!("../../../web/dist/terminal.html")` in transport/mod.rs.
+    filter:
+      - coop/.rwx/e2e.yml
+      - coop/Cargo.lock
+      - coop/Cargo.toml
+      - coop/rust-toolchain.toml
+      - "coop/crates/**"
+      - "coop/proto/**"
+      # The whole member dir, not just its manifest: cargo also needs the
+      # declared target file to exist to PARSE it — staging only Cargo.toml
+      # moved run d6d4cf8d13a3407f8b9d928072663224 on to
+      # `no targets specified in the manifest / either src/lib.rs, src/main.rs,
+      # a [lib] section, or [[bin]] section must be present` (5 files).
+      - "coop/tests/specs/**"
+    run: cd coop && cargo build -p coop -p coopmux
+
+  # ── Node.js + Playwright (parallel with build) ────────────────────────
+  - key: node
+    use: code
+    filter:
+      - coop/.rwx/e2e.yml
+    run: |
+      NODE_VERSION=22.14.0
+      curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+        | sudo tar xJ -C /usr/local --strip-components=1
+      echo "Node $(node --version)"
+      echo "npm $(npm --version)"
+      # bun: preview-fidelity.spec.ts shells out to `bun build` via
+      # tests/e2e/lib/fidelity-server.ts (it bundles fidelity-entry.ts for the
+      # browser at test startup), and this task installed only node+npm — so
+      # the spec died with `Command failed: bun build
+      # /var/mint-workspace/coop/tests/e2e/lib/fidelity-entry.ts ...` in run
+      # 346e730c034f42b18d6f6d1906bf26ab, the first run ever to reach the suite
+      # (ka-0000001846). Install pattern mirrors .rwx/docker.yml.
+      # $HOME, not /usr/local/bun: the task user is unprivileged and the
+      # installer is not run under sudo, so a /usr/local target dies with
+      # `mkdir: cannot create directory '/usr/local/bun': Permission denied`
+      # (run 601d27b7eb174a09ac5aa938f9dee6a7).
+      curl -fsSL https://bun.sh/install | bash
+      echo "$HOME/.bun/bin" | tee -a $RWX_ENV/PATH
+      "$HOME/.bun/bin/bun" --version
+
+  - key: playwright-deps
+    use: node
+    run: |
+      cd coop/tests/e2e
+      npm ci
+      npx playwright install --with-deps chromium
+      # crates/web's deps too: preview-fidelity.spec.ts serves xterm.js + its
+      # stylesheet straight out of `crates/web/node_modules` (WEB_NODE_MODULES
+      # in tests/e2e/lib/fidelity-server.ts), which nothing here installed — so
+      # both fidelity tests died with `ENOENT: no such file or directory, open
+      # '/var/mint-workspace/coop/crates/web/node_modules/@xterm/xterm/css/
+      # xterm.css'` in run ffeded7f77f84f27a11f6b67a2a47949 (ka-0000001846).
+      # bun, not npm: crates/web has a `bun.lock` and no package-lock.json.
+      cd ../../crates/web
+      bun install --frozen-lockfile
+
+  # ── Captain ───────────────────────────────────────────────────────────
+  - key: captain
+    call: rwx/install-captain 1.1.3
+
+  # ── E2E tests ─────────────────────────────────────────────────────────
+  - key: e2e-tests
+    use: [build, playwright-deps, captain]
+    # The suite itself finishes in ~8 min, but `.captain/config.yml` declares
+    # `retries: attempts: 2`, so a run with failures re-executes them twice
+    # more — and run ffeded7f77f84f27a11f6b67a2a47949 was killed by RWX's
+    # DEFAULT task timeout mid-retry, masking a completed suite (9 failed) as
+    # `# Timed Out` (ka-0000001846). Budget for the retries.
+    timeout: 45m
+    # ── Playwright owns the coopmux lifecycle — do NOT start a second one ────
+    # `coop/tests/e2e/playwright.config.ts` declares a `webServer` that launches
+    # `../../target/debug/coopmux` itself, with its own `COOP_MUX_STATE_DIR`,
+    # `COOP_HOT`, the test-only `COOP_ALLOW_PLAINTEXT_BOOTSTRAP=1` (its
+    # fail-closed credential-key policy would otherwise refuse to start), and a
+    # fast `COOP_MUX_HEALTH_CHECK_MS` the account-reconcile tests depend on.
+    # This task used to ALSO run coopmux as an RWX background process and
+    # override `MUX_PORT=9800` — pointing both instances at the same port.
+    # Since the config sets `reuseExistingServer: !process.env.CI`, playwright
+    # refuses to reuse it under CI and the run died with
+    # `http://localhost:9800/api/v1/health is already used, make sure that
+    # nothing is running on the port/url` (run
+    # 8202c9e0f3f0430899f20045ae15240a, ka-0000001846). The duplicate was also
+    # started with different flags and no state dir, so it was never the server
+    # the specs were written against. Deleted; MUX_PORT is left unset so the
+    # config's own default (19800) applies.
+    run: |
+      export CI=true
+      # `cd coop`: captain discovers `.captain/config.yml` in its cwd, and
+      # every path in that config (the `cd tests/e2e` in each suite command,
+      # `tests/e2e/results/*.json`) is coop-relative (ka-0000001846).
+      cd coop
+      captain run coop-e2e-playwright --print-summary
+    outputs:
+      test-results:
+        - path: coop/tests/e2e/results/captain.json
+      artifacts:
+        - key: playwright-traces
+          path: coop/tests/e2e/results/artifacts
+        - key: playwright-results
+          path: coop/tests/e2e/results

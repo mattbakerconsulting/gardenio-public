@@ -1,0 +1,196 @@
+{{- if .Values.agents.metrics.prometheusRule.adviceBudget.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.adviceBudget }}
+# PrometheusRule for the live-corpus advice-budget audit (ka-0000007517,
+# Option 3 of ka-0000006923; P3 epic ka-0000004753). This is the real-time
+# COMPLEMENT to the frozen-fixture CI guard (TestRealCatalogPerArchetypeBudget /
+# TestRealCatalogSnapshotFreshness). That guard keeps CI honest but is
+# snapshot-based: between fixture refreshes it CANNOT see the live corpus grow
+# past budget. This rule closes that gap by alerting on the exact same matched
+# catalog the CI test audits — the controller already publishes it per
+# (project, role, scope) as gardenio_advice_catalog_bytes, simulated through the
+# real delivery pipeline (advice.AuditCatalog, the same code path `gb advice
+# audit` and the CI budget test use), so the dashboard, the CLI, the CI test,
+# and this alert can never diverge.
+#
+# tokens = sum by (project, role) (bytes) / tokenBytesRatio  — sum over the
+# targeting scopes (global / project / role / agent) gives the archetype's TOTAL
+# matched catalog, which is the number the ≤18k-token soft budget / 20k hard
+# ceiling apply to (advice.TokenBytesRatio = 4; ka-0000003733 Part A).
+#
+# Two tiered alerts, mutually exclusive by a band so they never double-fire:
+#   - AdviceCatalogArchetypeOverCeiling: an archetype's matched pool is past the
+#     20k HARD ceiling (the CI budget test's t.Errorf boundary). This is a real,
+#     actionable over-feed: every agent of that (project, role) is being handed
+#     more than the budgeted context RIGHT NOW. Trim the corpus (gb advice audit
+#     / the advice-cut work ka-0000004903) or hunt a delivery-logic regression
+#     that re-admitted advice (broadcast-deny / supersession).
+#   - AdviceCatalogArchetypeApproachingBudget: matched pool is in the
+#     [soft, hard] band (18k–20k) — early warning to trim before it busts.
+#
+# Off by default; per-env overlays opt in (prod may raise severity to page).
+# Requires the monitoring.coreos.com/v1 PrometheusRule CRD.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-advice-budget
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.advice_budget
+      interval: 1m
+      rules:
+        - alert: AdviceCatalogArchetypeOverCeiling
+          # sum over scope -> matched bytes per archetype; / ratio -> ~tokens;
+          # fire above the HARD ceiling. Sustained (for:) because the corpus is a
+          # slow-moving state (advice beads authored/edited, archetype grid on a
+          # 15m refresh TTL), not a spiky signal — the hold rides out a single
+          # cold-scrape/archetype-refresh cycle without smearing a real bust.
+          expr: |
+            sum by (project, role) (gardenio_advice_catalog_bytes) / {{ $cfg.tokenBytesRatio }} > {{ $cfg.hardCeilingTokens }}
+          for: {{ $cfg.for | default "30m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gardenio
+            subsystem: advice
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Advice catalog for {{`{{ $labels.project }}`}}/{{`{{ $labels.role }}`}} is past the {{ div $cfg.hardCeilingTokens 1000 }}k-token HARD ceiling"
+            description: |
+              The matched advice pool for archetype
+              {{`{{ $labels.project }}`}}/{{`{{ $labels.role }}`}} is
+              {{`{{ printf "%.0f" $value }}`}} tokens — past the
+              {{ $cfg.hardCeilingTokens }}-token hard ceiling every agent of that
+              (project, role) pays on every gb prime.
+
+              This is the LIVE-corpus complement to the frozen-fixture CI guard
+              (TestRealCatalogPerArchetypeBudget): the snapshot cannot see growth
+              between refreshes, so this catches a real over-feed the moment it
+              lands. Run `gb advice audit --project {{`{{ $labels.project }}`}}
+              --role {{`{{ $labels.role }}`}} --top 10` to see the heaviest
+              matched beads, then trim the corpus (advice-cut ka-0000004903) or,
+              if the corpus did not grow, hunt a delivery-logic regression that
+              re-admitted advice (broadcast-deny / supersession collapse).
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/advice-hygiene.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        - alert: AdviceCatalogArchetypeApproachingBudget
+          # The [soft, hard] band: over the soft target but not yet past the hard
+          # ceiling. The `and <= hard` clause keeps this mutually exclusive with
+          # the ceiling alert above so an over-ceiling archetype pages exactly one
+          # alert, not both.
+          expr: |
+            (sum by (project, role) (gardenio_advice_catalog_bytes) / {{ $cfg.tokenBytesRatio }} > {{ $cfg.softBudgetTokens }})
+            and
+            (sum by (project, role) (gardenio_advice_catalog_bytes) / {{ $cfg.tokenBytesRatio }} <= {{ $cfg.hardCeilingTokens }})
+          for: {{ $cfg.for | default "30m" | quote }}
+          labels:
+            severity: {{ $cfg.softSeverity | default "ticket" | quote }}
+            component: gardenio
+            subsystem: advice
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Advice catalog for {{`{{ $labels.project }}`}}/{{`{{ $labels.role }}`}} is in the {{ div $cfg.softBudgetTokens 1000 }}k–{{ div $cfg.hardCeilingTokens 1000 }}k soft-budget band"
+            description: |
+              The matched advice pool for archetype
+              {{`{{ $labels.project }}`}}/{{`{{ $labels.role }}`}} is
+              {{`{{ printf "%.0f" $value }}`}} tokens — over the
+              {{ $cfg.softBudgetTokens }}-token soft target but not yet past the
+              {{ $cfg.hardCeilingTokens }}-token hard ceiling. Early warning: trim
+              the corpus (`gb advice audit --project {{`{{ $labels.project }}`}}
+              --role {{`{{ $labels.role }}`}} --top 10`, advice-cut ka-0000004903)
+              before it busts the ceiling.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/advice-hygiene.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        # ----- R4 tripwire (ka-0000002748) -------------------------------------
+        # Two belt-and-suspenders alerts that fire BEFORE silent truncation can
+        # recur, on the two non-byte-catalog latent risks the hardening bundle
+        # (ka-0000002665) identified. They watch DIFFERENT metrics than the two
+        # catalog-token alerts above:
+        #   - render bytes: the abbreviated-render DEMAND per archetype
+        #     (gardenio_advice_prime_render_bytes) against the 60000-byte
+        #     abbreviated budget gb prime actually enforces. This is the exact
+        #     quantity that gets truncated — measured through the same rendering
+        #     gb prime emits (advice.AbbrevRenderBytes), so it cannot drift from
+        #     what an agent receives. Alert at ~80% so pressure is visible with
+        #     headroom to trim before the footer ("... N more … not shown")
+        #     returns. Today's heaviest real render is ~42 KB (70%) — quiet.
+        #   - open pool: the whole open-advice pool (gardenio_advice_open_total,
+        #     emitted by R3) approaching the 500-item server cap R1 addresses.
+        #     Belt-and-suspenders even after R1 ships. Today = ~354 — quiet.
+        - alert: AdvicePrimeRenderApproachingBudget
+          # max over archetypes: fire if ANY real (project, role) render demand
+          # crosses the warn threshold. Sustained (for:) because the corpus is
+          # slow-moving state (advice authored/edited; 15m archetype-refresh TTL),
+          # riding out a single cold-scrape/refresh cycle without smearing.
+          expr: |
+            max by (project, role) (gardenio_advice_prime_render_bytes) > {{ $cfg.renderWarnBytes }}
+          for: {{ $cfg.for | default "30m" | quote }}
+          labels:
+            severity: {{ $cfg.softSeverity | default "ticket" | quote }}
+            component: gardenio
+            subsystem: advice
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Advice render for {{`{{ $labels.project }}`}}/{{`{{ $labels.role }}`}} is past {{ div (mul $cfg.renderWarnBytes 100) $cfg.renderBudgetBytes }}% of the abbreviated byte budget"
+            description: |
+              The abbreviated-render demand for archetype
+              {{`{{ $labels.project }}`}}/{{`{{ $labels.role }}`}} is
+              {{`{{ printf "%.0f" $value }}`}} bytes — past the
+              {{ $cfg.renderWarnBytes }}-byte tripwire ({{ div (mul $cfg.renderWarnBytes 100) $cfg.renderBudgetBytes }}% of the
+              {{ $cfg.renderBudgetBytes }}-byte abbreviated budget gb prime
+              enforces). This is the R4 leading indicator (ka-0000002748): act
+              NOW — before the demand crosses 100% and gb prime starts dropping
+              advice into the "... N more … not shown" footer for every agent of
+              that (project, role). Trim the matched pool (`gb advice audit
+              --project {{`{{ $labels.project }}`}} --role {{`{{ $labels.role }}`}}
+              --top 10`, advice-cut ka-0000004903 / supersession compaction R3)
+              or raise the budget only if trimming is exhausted (deferred Option
+              A, ka-0000002665).
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/advice-hygiene.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        - alert: AdviceOpenPoolApproachingCap
+          # Whole-corpus open pool approaching the 500-item server cap (R1). A
+          # single scalar gauge, no per-archetype dimension.
+          expr: |
+            gardenio_advice_open_total > {{ $cfg.openPoolWarn }}
+          for: {{ $cfg.for | default "30m" | quote }}
+          labels:
+            severity: {{ $cfg.softSeverity | default "ticket" | quote }}
+            component: gardenio
+            subsystem: advice
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Open advice pool is {{`{{ printf \"%.0f\" $value }}`}} — approaching the {{ $cfg.openPoolCap }}-item cap"
+            description: |
+              The open, real (non-fixture, non-expired) advice pool is
+              {{`{{ printf "%.0f" $value }}`}} beads — past the
+              {{ $cfg.openPoolWarn }}-item tripwire, approaching the
+              {{ $cfg.openPoolCap }}-item server-side cap. Above the cap, advice
+              is silently dropped BEFORE budget logic runs (F10, the risk R1
+              addresses). Drain the pool via supersession/expiry compaction (R3,
+              adviceSweeper) or retire stale advice (`gb advice audit`), and
+              confirm R1's paginated cap has shipped. Today ~354 — this should
+              be quiet unless growth accelerated.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/advice-hygiene.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

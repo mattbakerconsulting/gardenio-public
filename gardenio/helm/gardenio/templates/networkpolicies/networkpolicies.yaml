@@ -1,0 +1,2918 @@
+{{- if .Values.networkPolicies.enabled }}
+{{- $releaseName := include "gardenio.fullname" . -}}
+{{- $namespace := .Release.Namespace -}}
+# ─── Default deny ────────────────────────────────────────────────────────────
+# Deny all ingress to all pods in the namespace by default.
+# Each service below explicitly allows what it needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-default-deny-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# ─── Beads daemon ────────────────────────────────────────────────────────────
+# Ingress from: controller, bridges, beads-viewer, Traefik, forwardauth, agent pods, NATS,
+# release-deployer
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-beads-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.beads.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Controller
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: agents
+        # Slack bridge
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: slack-bridge
+        # GitLab bridge
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: gitlab-bridge
+        # JIRA bridge
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: jira-bridge
+        # grafana-bridge (dashboard-out SSE — beads `dashboard` beads → CM)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: grafana-bridge
+        # ForwardAuth (oauth2-proxy)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: forwardauth
+        # beads-viewer (ka-0000003863: beads is the viewer's ONLY backend —
+        # BEADS_HTTP_ADDR=http://{release}-beads:8080 — so the configwatcher
+        # refresh + data path are default-denied without this entry)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads-viewer
+        {{- if and .Values.beads.embedding.enabled .Values.beads.embedding.backfill.enabled }}
+        # Embedding backfill CronJob (ka-0000008129) — drives the resumable
+        # server-side backfill via POST /v1/embeddings/sync-batch on http.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads-embedding-backfill
+        {{- end }}
+        # Agent pods (ka-0000006038: match the always-present gardenio.io/agent
+        # marker, not gardenio.io/app which older controllers do not stamp)
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+        - protocol: TCP
+          port: {{ .Values.beads.service.grpcPort | default 9090 }}
+    {{- if .Values.landNamespaces.enabled }}
+    # Tenant land pods: kd and gb over HTTP and gRPC (landns.DefaultPeers).
+    {{- include "gardenio.landIngressRule" (list 8080 9090) | nindent 4 }}
+    {{- end }}
+    {{- if .Values.releaseDeployer.enabled }}
+    # release-deployer CronJob (gd-VgdO1sx1Ju): HTTP only, its KD_URL
+    # deploy-outcome reports.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: release-deployer
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    {{- end }}
+    {{- if .Values.landgate.enabled }}
+    # landgate (gd-ParwLpmgID): HTTP only, it forwards the land door's /v1/*.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: landgate
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    {{- end }}
+    {{- if .Values.vmagent.enabled }}
+    # vmagent metrics scraping
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.metricsPort | default 9091 }}
+    {{- end }}
+    # Traefik ingress controller (typically in a different namespace)
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    {{- end }}
+{{- if .Values.postgres.enabled }}
+---
+# ─── PostgreSQL ──────────────────────────────────────────────────────────────
+# Ingress from: beads daemon (always), plus the in-cluster Keycloak runtime
+# when it auto-wires to this shared postgres (its create-db initContainer and
+# Quarkus runtime both connect on 5432). Without the keycloak-runtime entry the
+# in-box Keycloak's create-db init container loops forever on Init:0/1 under the
+# default-deny policy (ka-0000007036).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-postgres-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.postgres.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.beads.selectorLabels" . | nindent 14 }}
+        {{- if and .Values.keycloak.enabled .Values.keycloak.runtime.enabled .Values.keycloak.runtime.db.autoWire }}
+        # Keycloak runtime StatefulSet — its create-db initContainer and the
+        # Quarkus runtime both connect to postgres on 5432. (The first-admin
+        # Job carries component=keycloak-runtime-first-admin and talks only to
+        # Keycloak's HTTP API, so it is intentionally not allowed here.)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+        {{- end }}
+        {{- if .Values.litellm.enabled }}
+        # LiteLLM proxy (epic ka-0000007994) — its db-init initContainer
+        # (pg_isready + CREATE DATABASE) and the runtime (spend/virtual-key
+        # state) both connect to postgres on 5432. Without this the db-init
+        # loops forever on Init under default-deny-ingress.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: litellm
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    {{- if and .Values.postgres.exporter.enabled .Values.vmagent.enabled }}
+    # vmagent scrapes the postgres_exporter sidecar (gd-cawNAc0iU7)
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.postgres.exporter.port }}
+    {{- end }}
+{{- end }}
+{{- if and .Values.tls.enabled (not .Values.tls.existingSecretName) (eq .Values.tls.mode "perHost") .Values.networkPolicies.traefik.namespaceSelector }}
+---
+# ─── cert-manager HTTP-01 solver (G7, ka-0000003567) ─────────────────────────
+# In-box, certs are issued over Let's Encrypt HTTP-01 (tls.mode=perHost). For
+# each challenge cert-manager spins up an EPHEMERAL solver pod IN THIS NAMESPACE
+# (labelled acme.cert-manager.io/http01-solver=true) and a higher-priority
+# Ingress so Traefik routes /.well-known/acme-challenge/<token> to it. Under the
+# default-deny-ingress policy that Traefik→solver hop is DROPPED, the challenge
+# 502s, and no cert ever issues (hand-added on the box). Allow Traefik (the same
+# k3s-bundled controller the other routes use) → solver pods on the solver port.
+# Only renders for the credential-free HTTP-01 path (skipped for a pre-supplied
+# cert or the localCA/DNS-01 paths, which need no inbound challenge).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-acme-http01-solver-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      acme.cert-manager.io/http01-solver: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        # cert-manager's HTTP-01 solver listens on :8089 (the solver Service
+        # targets this container port; the solver Ingress maps :80 → 8089).
+        - protocol: TCP
+          port: 8089
+{{- end }}
+{{- if and .Values.keycloak.enabled .Values.keycloak.runtime.enabled }}
+---
+# ─── Keycloak runtime ────────────────────────────────────────────────────────
+# In-cluster Keycloak server. Under the default-deny-ingress policy nothing can
+# reach it unless allowed here (ka-0000007036). Allow:
+#   • Traefik → http 8080 (public login / OIDC discovery — acceptance property
+#     2; TLS ends at the edge)
+#   • EDP keycloak-operator → http 8080, or https 8443 with
+#     keycloak.runtime.clusterKeycloak.tls (gd-PhU6jPtSxa)
+#   • controller → https 8443 (Lands provisioner's admin client, gd-XRsosVFAau,
+#     and its machine-principal token fetch)
+#   • vmagent → management 9000 (health/metrics scrape, when serviceMonitor on)
+# With keycloak.runtime.tls's in-cluster clients on (gd-lYPZlslOM7):
+#   • beads daemon → https 8443 (OIDC discovery; http 8080 too only for the
+#     keycloak.admin REST API, whose URL is a value)
+#   • first-admin Job → https 8443 (kcadm bootstrap of the realm admin)
+#   • role-drift probe CronJob → https 8443 (kcadm reads, gd-L2MyfEe9lL)
+#   • the other machine-principal consumers → https 8443 (token fetch;
+#     gd-PhU6jPtSxa): slack-bridge, grafana-bridge, trigger-engine, coopmux,
+#     github-bridge (release recorder, gd-305kriuXdT) and the
+#     release-deployer CronJob, each with its principal on, and
+#     beads-viewer (also its OIDC discovery + JWKS)
+# Without it, on http 8080:
+#   • forwardauth (oauth2-proxy), beads daemon, first-admin Job, role-drift
+#     probe CronJob
+# (forwardauth's issuer is always an https public URL, so with TLS on it has
+# no direct peer here: it reaches Keycloak through Traefik.)
+{{- $kcClientsTLS := include "gardenio.keycloakRuntime.clientsTLS" . }}
+{{- $kcOperatorNs := .Values.networkPolicies.keycloakOperator.namespaceSelector }}
+{{- $kcOperatorTLS := include "gardenio.keycloakRuntime.clusterKeycloakTLS" . }}
+{{- $kcOperatorHTTP := and $kcOperatorNs (not $kcOperatorTLS) }}
+{{- $kcOperatorHTTPS := and $kcOperatorNs $kcOperatorTLS }}
+{{- /* Machine-principal consumers on 8443, each only when its pod renders and
+       dials the https port: [component label, selector source]. */}}
+{{- $kcMachine := list }}
+{{- range $c := list (list "slack-bridge" .Values.slackBridge) (list "grafana-bridge" .Values.grafanaBridge) (list "trigger-engine" .Values.triggerEngine) (list "coopmux" .Values.coopmux) (list "github-bridge" .Values.githubBridge) (list "release-deployer" .Values.releaseDeployer) }}
+{{- if include "gardenio.keycloakRuntime.machineHTTPS" (dict "root" $ "c" (index $c 1)) }}
+{{- $kcMachine = append $kcMachine (index $c 0) }}
+{{- end }}
+{{- end }}
+{{- if and .Values.beadsViewer.enabled $kcClientsTLS }}
+{{- $kcMachine = append $kcMachine "beads-viewer" }}
+{{- end }}
+{{- $kcBeadsHTTP := or (not $kcClientsTLS) .Values.keycloak.admin.enabled }}
+{{- $kcRoleDrift := include "gardenio.keycloakRuntime.roleDriftProbe.on" . }}
+{{- $kcController := and .Values.agents.enabled (or (and .Values.agents.lands.provisioner.enabled (include "gardenio.keycloakRuntime.tlsEnabled" .)) (and .Values.agents.machinePrincipal.enabled (include "gardenio.keycloak.inClusterCA" .))) }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-keycloak-runtime-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: keycloak-runtime
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- /* Never render an empty from: that admits every source. */}}
+    {{- if or (not $kcClientsTLS) $kcBeadsHTTP $kcOperatorHTTP }}
+    - from:
+        {{- if not $kcClientsTLS }}
+        # forwardauth (oauth2-proxy) — OIDC discovery + code flow
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: forwardauth
+        {{- end }}
+        {{- if $kcBeadsHTTP }}
+        # beads daemon — Keycloak admin REST API{{ if not $kcClientsTLS }} and OIDC discovery{{ end }}
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.beads.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if not $kcClientsTLS }}
+        # first-admin bootstrap Job
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime-first-admin
+        {{- if $kcRoleDrift }}
+        # role-drift probe CronJob (kcadm reads of default-roles, gd-L2MyfEe9lL)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime-role-drift
+        {{- end }}
+        {{- end }}
+        {{- if $kcOperatorHTTP }}
+        # EDP keycloak-operator (G8, ka-0000000554) — usually in a separate
+        # namespace (e.g. "operators"); must reach :8080 to reconcile the
+        # ClusterKeycloak/Realm/Client CRs. Without this its ClusterKeycloak
+        # stays connected:false and realm/clients are created by hand via kcadm.
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $kcOperatorNs | nindent 14 }}
+          {{- if .Values.networkPolicies.keycloakOperator.podSelector }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.keycloakOperator.podSelector | nindent 14 }}
+          {{- end }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.httpPort | default 8080 }}
+    {{- end }}
+    {{- if or $kcClientsTLS $kcController $kcOperatorHTTPS }}
+    # https — in-cluster clients that trust the keycloak-runtime CA
+    - from:
+        {{- if $kcClientsTLS }}
+        # beads daemon — OIDC discovery + JWKS (BEADS_OIDC_DISCOVERY_URL)
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.beads.selectorLabels" . | nindent 14 }}
+        # first-admin bootstrap Job
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime-first-admin
+        {{- if $kcRoleDrift }}
+        # role-drift probe CronJob (gd-L2MyfEe9lL)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime-role-drift
+        {{- end }}
+        {{- end }}
+        {{- if $kcController }}
+        # controller — the Lands provisioner's Keycloak admin client and the
+        # machine-principal token fetch
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.agents.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- range $kcMachine }}
+        # {{ . }} — machine-principal token fetch{{ if eq . "beads-viewer" }}, OIDC discovery + JWKS{{ end }}
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.selectorLabels" $ | nindent 14 }}
+              app.kubernetes.io/component: {{ . }}
+        {{- end }}
+        {{- if $kcOperatorHTTPS }}
+        # EDP keycloak-operator — its ClusterKeycloak dials https and trusts
+        # the CA ConfigMap in its namespace (gd-PhU6jPtSxa)
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $kcOperatorNs | nindent 14 }}
+          {{- if .Values.networkPolicies.keycloakOperator.podSelector }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.keycloakOperator.podSelector | nindent 14 }}
+          {{- end }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+    {{- end }}
+    # Traefik ingress controller — public auth host
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.httpPort | default 8080 }}
+    {{- end }}
+    {{- if .Values.vmagent.enabled }}
+    # vmagent — scrape the Quarkus management interface (health/metrics)
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.managementPort | default 9000 }}
+    {{- end }}
+{{- end }}
+{{- if .Values.nats.enabled }}
+---
+# ─── NATS ────────────────────────────────────────────────────────────────────
+# Ingress from: controller, bridges, beads daemon, coopmux, agent pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-nats-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.nats.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Controller
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: agents
+        # Beads daemon
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+        # Slack bridge
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: slack-bridge
+        # GitLab bridge
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: gitlab-bridge
+        # JIRA bridge
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: jira-bridge
+        # Coopmux
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: coopmux
+        # Agent pods (ka-0000006038)
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+        # NATS cluster peers
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: nats
+      ports:
+        - protocol: TCP
+          port: 4222
+        - protocol: TCP
+          port: 6222
+    {{- if .Values.landNamespaces.enabled }}
+    # Tenant land pods: the client port only, never cluster routes
+    # (landns.DefaultPeers).
+    {{- include "gardenio.landIngressRule" (list 4222) | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- if .Values.litellm.enabled }}
+---
+# ─── LiteLLM proxy (epic ka-0000007994) ─────────────────────────────────────
+# The in-cluster inference chokepoint. Under default-deny-ingress nothing can
+# reach it unless allowed here. Ingress from:
+#   • Agent pods (gardenio.io/app=gardenio) → inference on :4000
+#   • Controller (component=agents) → model_group_alias sync + health (:4000)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-litellm-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.litellm.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.litellm.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Agent pods — cluster-internal inference. (ka-0000006038)
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+        # Controller — litellm alias sync (litellm_aliases.go) + health checks.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: agents
+        {{- if and .Values.grafana.enabled .Values.grafana.llm.enabled }}
+        # Grafana — the grafana-llm-app chat box POSTs completions to the
+        # in-cluster LiteLLM Service on :4000 (epic ka-0000002011, ka-0000006203).
+        # Pairs with the litellm allow in grafana-egress (gated on the same
+        # grafana.llm.enabled). Without this peer, default-deny-ingress on the
+        # litellm pod drops the chat completion request and the OSS Grafana chat
+        # box returns no completion even though grafana-egress permits the send.
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.grafana.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if and .Values.beadsViewer.enabled .Values.beadsViewer.captions.haiku.secretName }}
+        # beads-viewer: bird captions Haiku fallback (gd-TBAYacR31x). Pairs with
+        # the litellm leg in beads-viewer-egress, gated on the same key Secret.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads-viewer
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.litellm.port | default 4000 }}
+    {{- if .Values.landNamespaces.enabled }}
+    # Tenant land pods: inference (landns.DefaultPeers).
+    {{- include "gardenio.landIngressRule" (list 4000) | nindent 4 }}
+    {{- end }}
+{{- if and .Values.litellm.redis.enabled .Values.litellm.redis.deploy.enabled }}
+---
+# ─── LiteLLM Redis (H4, ka-0000003463, epic ka-0000005228) ───────────────────
+# The optional in-chart Redis backing multi-replica router coordination
+# (rate-limit / cooldown / cache). Under default-deny-ingress nothing can reach
+# it unless allowed here. The ONLY client is the litellm proxy pod — this Redis
+# holds ephemeral coordination state and runs auth-less, so the NetworkPolicy IS
+# the isolation boundary. Pairs with the litellm->redis egress leg in
+# default-deny-egress.yaml (a NetworkPolicy flow needs BOTH sides).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-litellm-redis-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.litellm.redis.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.litellm.redis.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # LiteLLM proxy — the sole client of the router-coordination Redis.
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.litellm.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.litellm.redis.port | default 6379 }}
+{{- end }}
+{{- end }}
+{{- if and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled }}
+---
+# ─── ForwardAuth (oauth2-proxy) ──────────────────────────────────────────────
+# Ingress from: Traefik only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-forwardauth-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}-forwardauth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 4180
+    {{- end }}
+{{- if and (eq .Values.keycloak.forwardAuth.sessionStore.type "redis") .Values.keycloak.forwardAuth.sessionStore.redis.deploy.enabled }}
+---
+# ─── ForwardAuth session-store Redis (gd-C2Sl6ClxAY) ─────────────────────────
+# The only client is the oauth2-proxy pod. The Redis is auth-less by default, so
+# this policy IS the isolation boundary. Pairs with the forwardauth->redis
+# egress leg in default-deny-egress.yaml (a flow needs BOTH sides).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-forwardauth-redis-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.forwardAuth.redis.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.forwardAuth.redis.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Chart.Name }}-forwardauth
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.forwardAuth.sessionStore.redis.port | default 6379 }}
+{{- end }}
+{{- end }}
+{{- if .Values.zitiBrowser.enabled }}
+---
+# ─── Private Ziti ForwardAuth (oauth2-proxy) ingress ────────────────────────
+# Traefik drives both browser ForwardAuth checks and /oauth2 callback traffic.
+# edge-auth also validates the private browser cookie at /oauth2/auth before
+# stamping its HMAC identity envelope for /mux and /kd.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-ziti-forwardauth-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}-ziti-forwardauth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+        {{- end }}
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.edgeAuth.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 4180
+{{- end }}
+---
+# ─── Agent pods ──────────────────────────────────────────────────────────────
+# AGENT-TO-AGENT ISOLATION: These policies ensure agent pods cannot communicate
+# with each other. Ingress is restricted to the controller only. Egress is
+# whitelisted to infrastructure services — other agent pods are NOT reachable.
+# This prevents data exfiltration between agents in multi-tenant deployments.
+#
+# Ingress from: controller (health checks) — NO agent-to-agent ingress
+# Egress to: coopmux, beads, NATS, slack-bridge, beads-viewer, and internet APIs — NO agent-to-agent egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-agent-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    {{- include "gardenio.agentPodSelector" . | nindent 4 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Controller health checks — only infrastructure can reach agent pods
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: agents
+        {{- if .Values.coopmux.enabled }}
+        # Coopmux (credential broker / terminal mux) MUST reach each agent's
+        # coop HTTP API to health-check the session at registration
+        # (POST /api/v1/sessions probes the agent's :8080 and rejects the
+        # session if it fails) and to push refreshed credential profiles.
+        # Without this the session never registers, credentials never
+        # distribute, and the agent boots "Not logged in" → every model call
+        # 401s and the agent goes silent. Paired with the coopmux→agent rule
+        # in coopmux-egress (NetworkPolicy needs BOTH sides to allow a flow).
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: coopmux
+        {{- end }}
+        {{- if .Values.vmagent.enabled }}
+        # vmagent metrics scraping
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 9090
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-agent-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    {{- include "gardenio.agentPodSelector" . | nindent 4 }}
+  policyTypes:
+    - Egress
+  egress:
+    # Coopmux (credential broker + terminal mux)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: coopmux
+      ports:
+        - protocol: TCP
+          port: {{ .Values.coopmux.mux.port | default 9800 }}
+    # Beads daemon (HTTP only). gRPC (9090) is intentionally NOT in agent
+    # egress: gb/kd both use HTTP/JSON, agent pods are not configured with
+    # BEADS_SERVER, and gRPC has no admin RPC surface beyond what HTTP
+    # already exposes (see docs/audits/kbeads-grpc-authz.md, F4).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    # NATS (event bus)
+    {{- if .Values.nats.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: nats
+      ports:
+        - protocol: TCP
+          port: 4222
+    {{- end }}
+    # Slack bridge (gb slack commands)
+    {{- if .Values.slackBridge.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: slack-bridge
+      ports:
+        - protocol: TCP
+          port: {{ .Values.slackBridge.service.port | default 8090 }}
+    {{- end }}
+    {{- if .Values.beadsViewer.enabled }}
+    # beads-viewer (gd-WXY7Jm5ugY): `gb commons file` fetches a Commons
+    # attachment from the viewer's machine file route (BEADS_VIEWER_INTERNAL_URL)
+    # on the agent's own token, which reads its own land's files only. Paired
+    # with the agent allow in beads-viewer-ingress.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads-viewer
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beadsViewer.service.port | default 8095 }}
+    {{- end }}
+    {{- if .Values.litellm.enabled }}
+    # In-cluster LiteLLM proxy (epic ka-0000007994) — agents do inference
+    # cluster-internally via this Service IP. The litellm pod carries an RFC1918
+    # IP, which the internet-egress rule below explicitly excludes, so this
+    # podSelector allow is what lets an agent reach inference at all. The proxy
+    # (not the agent) holds the single provider egress, so agents stay
+    # default-deny to the internet.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: litellm
+      ports:
+        - protocol: TCP
+          port: {{ .Values.litellm.port | default 4000 }}
+    {{- end }}
+    {{- if .Values.grafana.enabled }}
+    # In-cluster Grafana HTTP API (escalation ka-0000001504) — agents query
+    # their own dashboards/metrics/traces (e.g. `gb grafana render`) via the
+    # Grafana Service. Grafana carries an RFC1918 IP, which the internet-egress
+    # rule below excludes, so this podSelector allow is what lets an agent reach
+    # observability at all. Paired with the agent allow in grafana-ingress
+    # (NetworkPolicy needs BOTH sides to allow a flow). With the agent path on
+    # (gd-RUhOpXWwmz) agents use the header-stripping port instead.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.grafana.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ include "gardenio.grafana.agentPort" . }}
+    {{- end }}
+    {{- if .Values.mcpGrafana.enabled }}
+    # mcp-grafana MCP server (Track A A1, ka-0000004361) — agents reach the
+    # read-only Grafana MCP tools over streamable-HTTP at
+    # http://<release>-mcp-grafana:<port>/mcp. ClusterIP (RFC1918) so the
+    # internet-egress rule below excludes it; this podSelector allow is what
+    # lets an agent reach it. Paired with the agent allow in mcp-grafana-ingress.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.mcpGrafana.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mcpGrafana.service.port | default 8000 }}
+    {{- end }}
+    {{- if .Values.mcpVictoriaLogs.enabled }}
+    # mcp-victorialogs MCP server (task ka-0000006956) — agents reach the
+    # read-only VictoriaLogs LogsQL query tools over streamable-HTTP at
+    # http://<release>-mcp-victorialogs:<port>/mcp. ClusterIP (RFC1918) so the
+    # internet-egress rule below excludes it; this podSelector allow is what
+    # lets an agent reach it. Paired with the agent allow in
+    # mcp-victorialogs-ingress.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.mcpVictoriaLogs.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mcpVictoriaLogs.service.port | default 8081 }}
+    {{- end }}
+    {{- if .Values.vmsingle.enabled }}
+    # In-cluster VictoriaMetrics (vmsingle) TSDB query API (escalation
+    # ka-0000001504) — agents query metrics/traces series directly (vmselect
+    # /api/v1 surface). vmsingle carries an RFC1918 IP excluded by the
+    # internet-egress rule below, so this podSelector allow is required.
+    # Paired with the agent allow in vmsingle-ingress.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmsingle.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8428
+    {{- end }}
+    {{- if .Values.vlsingle.enabled }}
+    # In-cluster VictoriaLogs (vlsingle) LogsQL select API — agents query EKS
+    # audit / detection logs directly (/select/logsql surface on :9428).
+    # VictoriaLogs carries an RFC1918 IP excluded by the internet-egress rule
+    # below, so this podSelector allow is required. Paired with the agent allow
+    # in vlsingle-ingress.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vlsingle.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9428
+    {{- end }}
+    {{- if .Values.vmagent.enabled }}
+    # In-cluster vmagent ingest (context-crisis Part B, epic ka-0000003733) —
+    # agents PUSH their own metrics (gardenio_prime_hook_bytes,
+    # gardenio_session_boot_context_tokens, session_resume counters) to vmagent's
+    # /api/v1/import/prometheus at :8429 via VMAGENT_URL. vmagent carries an
+    # RFC1918 IP excluded by the internet-egress rule below, so without this
+    # podSelector allow the push is silently dropped even when VMAGENT_URL is set
+    # — the exact reason those series never landed before this fix. Paired with
+    # the agent allow in vmagent-ingress.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8429
+    {{- end }}
+    # DNS resolution — pinned to kube-dns to prevent DNS exfiltration to
+    # arbitrary external resolvers. Selectors are templated via
+    # .Values.networkPolicies.kubeDns.{namespaceSelector,podSelector}.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # NOTE: the broad internet-egress leg (all-IPv4 on 443/80) is NOT here — it
+    # is split into two pod-scoped policies below so DARK agents can be fenced
+    # off the Jira host without touching non-dark egress (ka-0000005242):
+    #   * agent-internet-egress -> NON-dark agents (dark label DoesNotExist):
+    #     full internet, identical to the pre-split rule.
+    #   * dark-agent-egress -> dark agents (dark label Exists): internet MINUS
+    #     the Atlassian CIDRs, so a dark pod can never reach real upstream Jira.
+    # NetworkPolicy is allow-only (union across policies), so the ONLY way to
+    # subtract Atlassian for dark pods is to keep the broad allow away from them
+    # entirely. The in-cluster + DNS allows above still apply to ALL agents.
+---
+# ─── Agent internet egress (NON-dark) ───────────────────────────────────────
+# Internet APIs (HTTPS/HTTP) for non-dark agents — excludes private IP ranges to
+# prevent bypassing pod-level isolation via IP-based routing.
+# 169.254.0.0/16 blocks AWS IMDS (169.254.169.254) so an SSRF or subprocess exec
+# cannot steal node IAM credentials. 100.64.0.0/10 is carrier-grade NAT, used by
+# AWS VPC CNI for pod IPs on some EKS configs — excluding it prevents cross-pod
+# reach via node-assigned ranges.
+#
+# Scoped to agents WITHOUT the gardenio.io/dark marker (ka-0000005242) so dark
+# pods fall through to dark-agent-egress (internet minus Atlassian) instead.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-agent-internet-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: gardenio.io/agent
+        operator: Exists
+      - key: gardenio.io/dark
+        operator: DoesNotExist
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+              {{- if .Values.landgate.enabled }}
+              {{- range .Values.landgate.crewDeny.edgeCIDRs }}
+              - {{ . }}
+              {{- end }}
+              {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+---
+# ─── Dark agent egress (Atlassian-fenced) ───────────────────────────────────
+# Dark-Jira write-token fence, network leg (ka-0000005242). Dark agents (pods
+# carrying gardenio.io/dark) get the SAME broad internet egress as non-dark
+# agents EXCEPT the Atlassian Cloud CIDRs are added to the ipBlock `except` list,
+# so a dark pod can never open a connection to the Jira host — defense
+# in depth over the fenced JIRA_API_TOKEN (pod layer) and the read-only Jira
+# client (client layer). The dark "parallel universe" must never touch real
+# upstream Jira.
+#
+# The Atlassian CIDR list is sourced from jiraBridge.egress.atlassianCIDRs (the
+# same operator-maintained list the jira-bridge egress tightens TO — reused here
+# as a deny so there is one list to refresh). When that list is empty the fence
+# degrades to broad internet at THIS layer only; the pod-layer token fence and
+# the client-layer read-only client still hold.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-dark-agent-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: gardenio.io/dark
+        operator: Exists
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+              {{- range .Values.jiraBridge.egress.atlassianCIDRs }}
+              - {{ . }}
+              {{- end }}
+              {{- if .Values.landgate.enabled }}
+              {{- range .Values.landgate.crewDeny.edgeCIDRs }}
+              - {{ . }}
+              {{- end }}
+              {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+{{- if .Values.agents.enabled }}
+---
+# ─── Controller ─────────────────────────────────────────────────────────────
+# Ingress from: vmagent (metrics scraping)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-controller-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.agents.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.vmagent.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9092
+    {{- end }}
+{{- end }}
+{{- if .Values.slackBridge.enabled }}
+---
+# ─── Slack Bridge ───────────────────────────────────────────────────────────
+# Ingress from: Traefik (API/webhooks), vmagent (metrics scraping)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-slack-bridge-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: slack-bridge
+  policyTypes:
+    - Ingress
+  ingress:
+    # Main HTTP port (Slack webhooks, API, health checks)
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.slackBridge.service.port | default 8090 }}
+    {{- end }}
+    # Internal: controller health check of slack-bridge
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: agents
+      ports:
+        - protocol: TCP
+          port: {{ .Values.slackBridge.service.port | default 8090 }}
+    {{- if .Values.landNamespaces.enabled }}
+    # Tenant land pods: the land listener only (gb say, gb thread;
+    # gd-pXik57wZA9), never the main port.
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: gardenio.io/land
+                operator: Exists
+      ports:
+        - protocol: TCP
+          port: 8091
+    {{- end }}
+    {{- if and .Values.beadsViewer.enabled .Values.slackBridge.commonsActions.enabled }}
+    # beads-viewer (gd-na5unRTCaP): Commons card actions, POST
+    # /api/conversation/inbound on the signed-in person's bearer. The viewer
+    # pod only: this rule is the in-cluster path the bridge's OIDC opens.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads-viewer
+      ports:
+        - protocol: TCP
+          port: {{ .Values.slackBridge.service.port | default 8090 }}
+    {{- end }}
+    {{- if .Values.vmagent.enabled }}
+    # Metrics scraping
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9093
+    {{- end }}
+---
+# Slack bridge egress: beads (HTTP), kube-dns, internet HTTPS (slack.com API).
+# slack-bridge holds the workspace OAuth token and is webhook-fronted, so an
+# SSRF/RCE there must not be able to reach cluster services or node IMDS
+# (169.254.169.254). Private IP ranges are blocked accordingly.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-slack-bridge-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: slack-bridge
+  policyTypes:
+    - Egress
+  egress:
+    # Beads daemon (HTTP)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    # DNS resolution — pinned to kube-dns to prevent DNS exfiltration to
+    # arbitrary external resolvers. Selectors are templated via
+    # .Values.networkPolicies.kubeDns.{namespaceSelector,podSelector}.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if include "gardenio.keycloakRuntime.machineHTTPS" (dict "root" . "c" .Values.slackBridge) }}
+    # In-cluster Keycloak over https — the machine-principal token fetch
+    # (BEADS_OIDC_TOKEN_URL, gd-lYPZlslOM7 / gd-PhU6jPtSxa). This one pod and
+    # port only.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+    {{- end }}
+    {{- if .Values.beadsViewer.enabled }}
+    # beads-viewer (gd-qnF6mJZtkQ): the Commons mirror fetches attachments from
+    # the viewer's machine file route, which admits only a machine principal.
+    # This one pod and port, not the private ranges excluded below.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads-viewer
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beadsViewer.service.port | default 8095 }}
+    {{- end }}
+    # Internet HTTPS (slack.com API) — excludes private IP ranges
+    # so a bridge SSRF bug cannot reach cluster services or node IMDS.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if .Values.beadsViewer.enabled }}
+---
+# ─── beads-viewer (G9, ka-0000001782) ────────────────────────────────────────
+# Under default-deny (both directions) the beads-viewer pod can neither receive
+# Traefik traffic nor reach DNS / the beads daemon / its OIDC issuer — so the
+# forwardauth-gated route 503s at the NetworkPolicy layer and the pod's /readyz
+# never converges (it was hand-patched on the box). Ship the ingress (Traefik +
+# vmagent) and egress (beads, kube-dns, in-cluster keycloak, OIDC/object-store)
+# allow rules.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-beads-viewer-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: beads-viewer
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    # Traefik ingress controller — the public forwardauth-gated route.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beadsViewer.service.port | default 8095 }}
+    {{- end }}
+    {{- if .Values.slackBridge.enabled }}
+    # slack-bridge (gd-qnF6mJZtkQ): the Commons mirror's attachment fetch. The
+    # route it calls admits only a machine principal (routeMachine).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: slack-bridge
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beadsViewer.service.port | default 8095 }}
+    {{- end }}
+    # Agent pods (gd-WXY7Jm5ugY): `gb commons file`, an agent fetching a
+    # Commons attachment on its own token from the machine file route, which
+    # holds it to its own land. Under the edgeBackends fence,
+    # edgeBackends.viewerCallers admits the same pods.
+    - from:
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beadsViewer.service.port | default 8095 }}
+    {{- if .Values.vmagent.enabled }}
+    # vmagent — scrape the internal metrics port.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beadsViewer.metrics.port | default 9095 }}
+    {{- end }}
+---
+# beads-viewer egress: beads daemon (HTTP), kube-dns, in-cluster keycloak
+# (OIDC discovery + JWKS when the runtime is on), object store (MinIO), and
+# internet HTTPS for an external OIDC issuer. Private ranges + IMDS excluded
+# from the internet allow so a viewer SSRF cannot pivot to node/cluster metadata.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-beads-viewer-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: beads-viewer
+  policyTypes:
+    - Egress
+  egress:
+    # Beads daemon (HTTP) — the data source.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    {{- if .Values.beadsViewer.captions.haiku.secretName }}
+    # LiteLLM — bird captions Haiku fallback (gd-TBAYacR31x); pairs with the
+    # beads-viewer peer in litellm-ingress.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.litellm.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.litellm.port | default 4000 }}
+    {{- end }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if and .Values.keycloak.enabled .Values.keycloak.runtime.enabled }}
+    # In-cluster Keycloak — OIDC discovery + JWKS for bearer/cookie validation,
+    # and the machine-principal token fetch (https with keycloak.runtime.tls's
+    # in-cluster clients on, gd-lYPZlslOM7).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          {{- if include "gardenio.keycloakRuntime.clientsTLS" . }}
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+          {{- else }}
+          port: {{ .Values.keycloak.runtime.service.httpPort | default 8080 }}
+          {{- end }}
+    {{- end }}
+    {{- if and .Values.slackBridge.enabled .Values.slackBridge.commonsActions.enabled }}
+    # slack-bridge (gd-na5unRTCaP): Commons card actions go to the bridge's
+    # /api/conversation/inbound. Its http port only.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: slack-bridge
+      ports:
+        - protocol: TCP
+          port: {{ .Values.slackBridge.service.port | default 8090 }}
+    {{- end }}
+    {{- if .Values.objectStore.enabled }}
+    # In-cluster object store (MinIO) — session-archive reads.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    {{- end }}
+    # Internet HTTPS — external OIDC issuer discovery/JWKS when keycloak runs
+    # outside the cluster. Excludes private ranges + IMDS.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if .Values.landing.enabled }}
+---
+# ─── Landing Page ───────────────────────────────────────────────────────────
+# Ingress from: Traefik, and the public edge namespace when edgeBackends is on
+# (it proxies clonk.tv straight to the Service, gd-gQ8hZLd4AQ)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-landing-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.landing.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.landing.service.port }}
+    {{- end }}
+    {{- if .Values.edgeBackends.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.edgeBackends.edgeNamespace | default "public-edge" | quote }}
+      ports:
+        - protocol: TCP
+          port: 80
+    {{- end }}
+{{- end }}
+{{- if .Values.jiraBridge.enabled }}
+---
+# ─── JIRA Bridge ────────────────────────────────────────────────────────────
+# Ingress from: Traefik (webhook fan-in via IngressRoute → in-cluster Service).
+# When Traefik forwards a webhook to the bridge pod, the connection has
+# Traefik's pod IP as source, so default-deny-ingress would otherwise drop it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-jira-bridge-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: jira-bridge
+  policyTypes:
+    - Ingress
+  ingress:
+    # Webhook fan-in from Traefik (cross-namespace).
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.jiraBridge.service.port | default 8091 }}
+    {{- end }}
+    {{- if .Values.vmagent.enabled }}
+    # Metrics scraping
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9093
+    {{- end }}
+---
+# JIRA bridge egress: beads (HTTP), kube-dns, internet HTTPS to Atlassian Cloud.
+#
+# F1b (ka-0000000429): when .Values.jiraBridge.egress.tightenSaaS is true
+# (default), HTTPS egress is pinned to the Atlassian-published CIDR list at
+# .Values.jiraBridge.egress.atlassianCIDRs (sourced from
+# https://ip-ranges.atlassian.com/ — see
+# gardenio/docs/runbooks/jira-bridge-egress-cidrs.md for refresh cadence and
+# fallback procedure). When false, falls back to the prior wide allow
+# (0.0.0.0/0 minus RFC1918+IMDS+CGNAT) so operators have an escape hatch if
+# Atlassian rotates CIDRs and the bridge starts failing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-jira-bridge-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: jira-bridge
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    # DNS resolution — pinned to kube-dns to prevent DNS exfiltration to
+    # arbitrary external resolvers. Selectors are templated via
+    # .Values.networkPolicies.kubeDns.{namespaceSelector,podSelector}.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if and .Values.jiraBridge.egress.tightenSaaS .Values.jiraBridge.egress.atlassianCIDRs }}
+    # F1b: tightened HTTPS egress — only Atlassian-published CIDRs.
+    - to:
+        {{- range .Values.jiraBridge.egress.atlassianCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- else }}
+    # F1b: tightenSaaS=false — wide HTTPS allow (RFC1918+IMDS+CGNAT excluded).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+{{- end }}
+{{- if .Values.gitlabBridge.enabled }}
+---
+# ─── GitLab Bridge ──────────────────────────────────────────────────────────
+# Ingress from: Traefik (webhook fan-in via IngressRoute → in-cluster Service).
+# When Traefik forwards a webhook to the bridge pod, the connection has
+# Traefik's pod IP as source, so default-deny-ingress would otherwise drop it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-gitlab-bridge-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gitlab-bridge
+  policyTypes:
+    - Ingress
+  ingress:
+    # Webhook fan-in from Traefik (cross-namespace).
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.gitlabBridge.service.port | default 8092 }}
+    {{- end }}
+---
+# GitLab bridge egress: beads (HTTP), kube-dns, internet HTTPS (gitlab.com).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-gitlab-bridge-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gitlab-bridge
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    # DNS resolution — pinned to kube-dns to prevent DNS exfiltration to
+    # arbitrary external resolvers. Selectors are templated via
+    # .Values.networkPolicies.kubeDns.{namespaceSelector,podSelector}.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if .Values.githubBridge.enabled }}
+---
+# ─── GitHub Bridge ──────────────────────────────────────────────────────────
+# Ingress from: Traefik (webhook fan-in via IngressRoute → in-cluster Service).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-github-bridge-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: github-bridge
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.githubBridge.service.port | default 8101 }}
+    {{- end }}
+---
+# GitHub bridge egress: beads (HTTP), kube-dns, internet HTTPS
+# (api.github.com for installation-token minting) and, with the release
+# recorder's machine principal on, in-cluster Keycloak https.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-github-bridge-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: github-bridge
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if include "gardenio.keycloakRuntime.machineHTTPS" (dict "root" . "c" .Values.githubBridge) }}
+    # In-cluster Keycloak over https — the release recorder's machine-principal
+    # token fetch (BEADS_OIDC_TOKEN_URL, gd-305kriuXdT). This one pod and port
+    # only.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+    {{- end }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if .Values.grafanaBridge.enabled }}
+---
+# ─── grafana-bridge (W2, ka-0000005077) ─────────────────────────────────────
+# A beads ↔ Grafana ConfigMap-writer that
+# subscribes to beads SSE and renders `dashboard` beads into per-dashboard
+# ConfigMaps labeled grafana_dashboard=1 for the Grafana sidecar to provision.
+# Pair gated together on grafanaBridge.enabled so flipping the bridge off
+# does not strand orphan policies, and disabled in any overlay that does not
+# also enable defaultDenyEgress.
+#
+# Ingress is defensive: grafana-bridge ships NO Service (zero in-cluster
+# dialers — see helm/gardenio/templates/grafana-bridge/, no service.yaml), so
+# the only legitimate caller is the kubelet for liveness/readiness probes
+# which bypass NetworkPolicy by definition. We render an Ingress policy with
+# no `from:` rules — selects the bridge pod into the Ingress policyType and
+# blocks every in-cluster source — to keep ownership symmetric with the rest
+# of the bridge family and to make the "no in-cluster ingress" intent
+# explicit rather than relying on default-deny-ingress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-grafana-bridge-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: grafana-bridge
+  policyTypes:
+    - Ingress
+  # No ingress rules — grafana-bridge has no Service; only kubelet probes reach
+  # it, and kubelet probes are not subject to NetworkPolicy.
+---
+# grafana-bridge egress: beads (HTTP + SSE — beads-egress already allows this
+# from the daemon side, this is the bridge's outbound counterpart), kube-dns,
+# and HTTPS to the Kubernetes API server (the ConfigMap write path —
+# grafana-bridge owns ConfigMaps with managed-by=grafana-bridge per the RBAC
+# Role). The internet 443 rule (minus RFC1918) covers a public EKS API
+# endpoint; for a private/in-cluster endpoint the operator pins the CIDR via
+# networkPolicies.controller.kubeApiServer.cidrs the same way the controller
+# does.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-grafana-bridge-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: grafana-bridge
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if include "gardenio.keycloakRuntime.machineHTTPS" (dict "root" . "c" .Values.grafanaBridge) }}
+    # In-cluster Keycloak over https — the machine-principal token fetch
+    # (BEADS_OIDC_TOKEN_URL, gd-lYPZlslOM7 / gd-PhU6jPtSxa). This one pod and
+    # port only.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keycloak-runtime
+      ports:
+        - protocol: TCP
+          port: {{ .Values.keycloak.runtime.service.httpsPort | default 8443 }}
+    {{- end }}
+    # Kubernetes API server (ConfigMap write path). Excludes private ranges so
+    # a bridge SSRF bug cannot reach other cluster services or IMDS; set
+    # networkPolicies.controller.kubeApiServer.cidrs for a private endpoint.
+    {{- if .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+    - to:
+        {{- range .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if .Values.networkPolicies.apiServerPostDNAT }}
+    {{- include "gardenio.netpol.k3sApiServerPostDNATEgress" . | nindent 4 }}
+    {{- end }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if .Values.grafana.enabled }}
+---
+# ─── Grafana ────────────────────────────────────────────────────────────────
+# Ingress from: Traefik (UI/API via the front door), agent pods (in-cluster
+# observability queries — escalation ka-0000001504)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-grafana-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.grafana.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.grafana.service.port | default 3000 }}
+    {{- end }}
+    # Agent pods — query the Grafana HTTP API for their own metrics/traces.
+    # Paired with the grafana allow in agent-egress. On the header-stripping
+    # port when the agent path is on (gd-RUhOpXWwmz).
+    - from:
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ include "gardenio.grafana.agentPort" . }}
+---
+# Grafana egress: vmsingle (datasource queries), kube-dns, and (gated) the
+# in-cluster LiteLLM proxy for the grafana-llm-app chat box + (gated) grafana.com
+# for boot-time catalog plugin install (ka-0000004453, epic ka-0000002011 Phase A).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-grafana-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.grafana.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.vmsingle.enabled }}
+    # VictoriaMetrics (datasource)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmsingle.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8428
+    {{- end }}
+    {{- if and .Values.grafana.victoriaLogsDatasource.enabled .Values.vlsingle.enabled }}
+    # VictoriaLogs (datasource) — the VictoriaLogs Grafana datasource queries the
+    # in-chart vlsingle store's LogsQL select API for the LogsQL dashboards
+    # (edge-traffic-geomap). Paired with the grafana peer
+    # already present in vlsingle-ingress; ClusterIP, RFC1918 — adds NO off-cluster
+    # reach. Gated on BOTH the datasource toggle AND vlsingle.enabled: without an
+    # in-chart store the datasource has nothing in-cluster to reach (an
+    # out-of-chart url override is an operator's explicit off-chart choice and
+    # would carry its own egress).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vlsingle.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9428
+    {{- end }}
+    {{- if .Values.alertmanager.enabled }}
+    # Alertmanager (datasource) — the Grafana Alertmanager datasource queries the
+    # in-cluster prom/alertmanager Service for firing/silenced alert state and
+    # posts silences (ka-0000004459; epic ka-0000000770). Paired with the grafana
+    # peer in alertmanager-ingress; ClusterIP, RFC1918 — adds NO off-cluster reach.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.alertmanager.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.alertmanager.service.port | default 9093 }}
+    {{- end }}
+    {{- if and .Values.grafana.llm.enabled .Values.litellm.enabled }}
+    # LiteLLM proxy — the grafana-llm-app chat box POSTs completions to the
+    # in-cluster OpenAI-compatible LiteLLM Service (ka-0000004453). Paired with
+    # the grafana peer in litellm-ingress (gated on the same grafana.llm.enabled,
+    # ka-0000006203); ClusterIP, RFC1918.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.litellm.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.litellm.port | default 4000 }}
+    {{- end }}
+    {{- if and .Values.mcpGrafanaWrite.enabled .Values.grafana.assistant.enabled }}
+    # mcp-grafana-write — the gardenio-assistant-app plugin BACKEND (in the Grafana
+    # pod) reverse-proxies the chat box's MCP traffic to the in-cluster
+    # write-capable mcp-grafana instance (ka-0000000293). ClusterIP, RFC1918.
+    # Paired with mcp-grafana-write-ingress (grafana peer). This is the only new
+    # Grafana egress the chat box's grounding/dashboard-create path needs; it adds
+    # NO off-cluster reach.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.mcpGrafanaWrite.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mcpGrafanaWrite.service.port | default 8000 }}
+    {{- end }}
+    {{- if .Values.grafana.plugins.allowCatalogEgress }}
+    # Catalog plugin install (R1, ka-0000004453). GF_INSTALL_PLUGINS fetches the
+    # signed plugin zip from grafana.com at boot. Internet 443/80 with RFC1918 +
+    # IMDS (169.254.0.0/16) + CGNAT (100.64.0.0/10) excluded — mirrors the
+    # controller-egress rule so a Grafana SSRF cannot pivot to cluster services
+    # or node IAM. Leave allowCatalogEgress off when pinning a mirror URL or
+    # pre-baking the plugin into the image (then Grafana keeps zero off-cluster
+    # egress).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+    {{- end }}
+    # DNS resolution — pinned to kube-dns to prevent DNS exfiltration to
+    # arbitrary external resolvers. Selectors are templated via
+    # .Values.networkPolicies.kubeDns.{namespaceSelector,podSelector}.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.mcpGrafana.enabled }}
+---
+# ─── mcp-grafana (Track A A1, ka-0000004361) ────────────────────────────────
+# Ingress from: agent pods (the MCP clients reaching the read-only Grafana
+# tools over streamable-HTTP). Paired with the mcp-grafana allow in agent-egress
+# (NetworkPolicy needs BOTH sides to allow a flow). No Traefik/front-door entry —
+# the Service is ClusterIP-only, dialed in-cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-mcp-grafana-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.mcpGrafana.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.mcpGrafana.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Agent pods — call the read-only Grafana MCP tools over streamable-HTTP.
+    - from:
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mcpGrafana.service.port | default 8000 }}
+{{- end }}
+{{- if .Values.mcpVictoriaLogs.enabled }}
+---
+# ─── mcp-victorialogs (task ka-0000006956) ──────────────────────────────────
+# Ingress from: agent pods (the MCP clients reaching the read-only VictoriaLogs
+# LogsQL query tools over streamable-HTTP). Paired with the mcp-victorialogs
+# allow in agent-egress (NetworkPolicy needs BOTH sides to allow a flow). No
+# Traefik/front-door entry — the Service is ClusterIP-only, dialed in-cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-mcp-victorialogs-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.mcpVictoriaLogs.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.mcpVictoriaLogs.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Agent pods — call the read-only VictoriaLogs MCP tools over streamable-HTTP.
+    - from:
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mcpVictoriaLogs.service.port | default 8081 }}
+{{- end }}
+{{- if .Values.mcpGrafanaWrite.enabled }}
+---
+# ─── mcp-grafana-write ingress (ka-0000000293) ──────────────────────────────
+# The WRITE-CAPABLE mcp-grafana instance is reachable ONLY by the Grafana pod —
+# i.e. the gardenio-assistant-app plugin BACKEND that reverse-proxies the chat
+# box's MCP traffic. NOT agents (that would widen the read-only agent contract),
+# NOT Traefik (never edge-exposed). This single-peer ingress is the network-layer
+# guarantee that the write surface stays in-cluster and off the agent path.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-mcp-grafana-write-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.mcpGrafanaWrite.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.mcpGrafanaWrite.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Grafana pod ONLY (the assistant plugin backend). No agents, no Traefik.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.grafana.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mcpGrafanaWrite.service.port | default 8000 }}
+{{- end }}
+{{- if .Values.vmsingle.enabled }}
+---
+# ─── VictoriaMetrics (vmsingle) ─────────────────────────────────────────────
+# Ingress from: vmagent (write), Grafana (query), vmalert (query + recorded-rule write)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vmsingle-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vmsingle.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        {{- if .Values.vmagent.enabled }}
+        # vmagent (remote write)
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if .Values.grafana.enabled }}
+        # Grafana (datasource queries)
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.grafana.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        # Agent pods — direct metrics/traces queries against the vmsingle TSDB
+        # (escalation ka-0000001504). Paired with the vmsingle allow in
+        # agent-egress.
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+        {{- if .Values.vmalert.enabled }}
+        # vmalert (rule evaluation queries + recorded-series remote write)
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmalert.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if and .Values.vmsingle.ingest.enabled .Values.networkPolicies.traefik.namespaceSelector }}
+        # Traefik (external remote-write ingest — W1, ka-0000002192). Only the
+        # write paths are routed (see templates/vmsingle/ingressroute.yaml);
+        # basicAuth + allow-list front the unauthenticated TSDB write API.
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8428
+{{- end }}
+{{- if .Values.vlsingle.enabled }}
+---
+# ─── VictoriaLogs (vlsingle) ────────────────────────────────────────────────
+# Ingress from: vmalert-logs (LogsQL rule evaluation queries), Grafana (the
+# VictoriaLogs datasource), agent pods (direct LogsQL queries), and — gated —
+# the log shippers, which POST to the /insert API. Mirrors the vmsingle-ingress policy; the only differences are the
+# :9428 listener and the vmalert-logs peer in place of vmalert. VictoriaLogs has
+# no auth of its own, so default-deny + these carve-outs are what bound reach.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vlsingle-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vlsingle.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        {{- if and .Values.vmagent.enabled .Values.vlsingle.metrics.scrape }}
+        # vmagent (self-scrape of VictoriaLogs /metrics on :9428, ka-0000001302).
+        # Gated on the same vlsingle.metrics.scrape toggle as the pod's
+        # prometheus.io/* annotations; without this carve-out the scrape would be
+        # dropped under NP enforcement and the disk-usage rule would silently
+        # never fire.
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if .Values.vmalertLogs.enabled }}
+        # vmalert-logs (LogsQL rule evaluation — /select/logsql/stats_query)
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmalertLogs.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if .Values.grafana.enabled }}
+        # Grafana (VictoriaLogs datasource queries)
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.grafana.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if .Values.mcpVictoriaLogs.enabled }}
+        # mcp-victorialogs (task ka-0000006956) — the standalone VictoriaLogs MCP
+        # server proxies agents' read-only LogsQL queries to the select API on
+        # :9428. Paired with the vlsingle allow in mcp-victorialogs-egress.
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.mcpVictoriaLogs.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        # Agent pods — direct LogsQL queries against the VictoriaLogs select API.
+        # Paired with the vlsingle allow in agent-egress.
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+        {{- if .Values.bridgeLogShipper.enabled }}
+        # Non-AVA webhook-audit transport (task ka-0000000320) — the in-chart
+        # bridge-log-shipper POSTs the jira-bridge + gitlab-bridge webhook
+        # receive-path records to the VictoriaLogs /insert/jsonline API.
+        # Release-relative selector so it binds on the prod release AND the
+        # gardenio-e2e-* namespaces. Rendered only when the shipper is enabled.
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.bridgeLogShipper.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- with .Values.vlsingle.ingest.podSelectorLabels }}
+        # Additional out-of-chart shipper peer — selected by
+        # explicit pod labels when a shipper runs OUTSIDE this chart. Empty (the
+        # default) renders nothing; the in-chart shipper above is the normal path.
+        - podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 9428
+{{- end }}
+{{- if .Values.vmalert.enabled }}
+---
+# ─── vmalert (recording-rule evaluator) ─────────────────────────────────────
+# vmalert egress: vmsingle (query + remote write of recorded series), kube-dns,
+# and — when the in-chart Alertmanager is enabled — the Alertmanager Service
+# (-notifier.url POSTs of firing alerts; epic ka-0000000770, decision
+# ka-0000006149 option (a)).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vmalert-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vmalert.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.vmsingle.enabled }}
+    # VictoriaMetrics (datasource queries + recorded-series remote write)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmsingle.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8428
+    {{- end }}
+    {{- if .Values.alertmanager.enabled }}
+    # Alertmanager (-notifier.url — firing-alert POSTs to the delivery path).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.alertmanager.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.alertmanager.service.port | default 9093 }}
+    {{- end }}
+    # DNS resolution — pinned to kube-dns to prevent DNS exfiltration to
+    # arbitrary external resolvers. Selectors are templated via
+    # .Values.networkPolicies.kubeDns.{namespaceSelector,podSelector}.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.vmalertLogs.enabled }}
+---
+# ─── vmalert-logs (VictoriaLogs / LogsQL rule evaluator) ────────────────────
+# vmalert-logs egress: VictoriaLogs (the LogsQL stats_query datasource), kube-dns,
+# and — when the in-chart Alertmanager is enabled — the Alertmanager Service
+# (-notifier.url POSTs of firing detections). Mirrors the vmalert-egress policy;
+# the only datasource difference is VictoriaLogs:9428 in place of vmsingle:8428.
+# VictoriaLogs is an out-of-chart Service (deployed by ka-0000007261), so its peer
+# is selected by name via .Values.vmalertLogs.victoriaLogs.podSelectorLabels when
+# provided; otherwise egress falls back to allowing the datasource port to any
+# in-namespace pod (still bounded to :9428). DNS is pinned to kube-dns.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vmalert-logs-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vmalertLogs.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # VictoriaLogs (LogsQL stats_query datasource). Peer-selected by the
+    # configured podSelectorLabels when set (VictoriaLogs is deployed out of this
+    # chart), else port-only to any in-namespace pod on the datasource port.
+    - to:
+        {{- with .Values.vmalertLogs.victoriaLogs.podSelectorLabels }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- else }}
+        - podSelector: {}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.vmalertLogs.victoriaLogs.servicePort | default 9428 }}
+    {{- if .Values.alertmanager.enabled }}
+    # Alertmanager (-notifier.url — firing-detection POSTs to the delivery path).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.alertmanager.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.alertmanager.service.port | default 9093 }}
+    {{- end }}
+    # DNS resolution — pinned to kube-dns (no exfiltration to arbitrary resolvers).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.alertmanager.enabled }}
+---
+# ─── Alertmanager (alert → Slack delivery path) ─────────────────────────────
+# Ingress: vmalert (-notifier.url POSTs) + vmagent (metrics scrape). Egress:
+# kube-dns + the internet on 443 (hooks.slack.com incoming webhook). RFC1918 +
+# IMDS + CGNAT excluded so an Alertmanager compromise cannot pivot to node IAM
+# or in-cluster services. Epic ka-0000000770, decision ka-0000006149 option (a).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-alertmanager-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.alertmanager.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  {{- if or .Values.vmalert.enabled .Values.vmalertLogs.enabled .Values.vmagent.enabled .Values.grafana.enabled }}
+  ingress:
+    - from:
+        {{- if .Values.vmalert.enabled }}
+        # vmalert — firing-alert notifications.
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmalert.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if .Values.vmalertLogs.enabled }}
+        # vmalert-logs — firing LogsQL-detection notifications (#3/#5/#6).
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmalertLogs.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if .Values.vmagent.enabled }}
+        # vmagent — metrics scrape (:9093/metrics).
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- if .Values.grafana.enabled }}
+        # Grafana — the Alertmanager datasource queries the alert/silence API
+        # (:9093/api/v2) + posts silences (ka-0000004459). Paired with the
+        # alertmanager allow in grafana-egress.
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.grafana.selectorLabels" . | nindent 14 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.alertmanager.service.port | default 9093 }}
+  {{- else }}
+  # No in-chart peer (vmalert/vmagent/grafana all disabled) → deny ALL ingress.
+  # An empty `from:` list here would be a null-`from` rule, which Kubernetes
+  # reads as allow-from-ALL on :9093 (fail-OPEN). `ingress: []` is the
+  # fail-CLOSED form. (Not hit in prod, where the peers are enabled — this is
+  # the standalone-alertmanager guard.)
+  ingress: []
+  {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-alertmanager-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.alertmanager.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Slack incoming webhook (hooks.slack.com:443). Private ranges + IMDS +
+    # CGNAT excluded so a compromise cannot pivot to node IAM or cross-pod
+    # routing. Tighten to specific CIDRs via
+    # networkPolicies.alertmanager.slackWebhookCIDRs when a stable range exists.
+    {{- if .Values.networkPolicies.alertmanager.slackWebhookCIDRs }}
+    - to:
+        {{- range .Values.networkPolicies.alertmanager.slackWebhookCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- else }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+{{- end }}
+{{- if .Values.vmagent.enabled }}
+---
+# ─── vmagent ingress ────────────────────────────────────────────────────────
+# Ingress to vmagent's :8429 ingest endpoint. Under default-deny-ingress nothing
+# can reach vmagent unless explicitly allowed here. Agent pods PUSH their own
+# metrics (gardenio_prime_hook_bytes, gardenio_session_boot_context_tokens,
+# session-resume counters) to /api/v1/import/prometheus via VMAGENT_URL
+# (context-crisis Part B, epic ka-0000003733). Without this rule the push is
+# dropped at vmagent's side even when agent-egress permits the send — a
+# NetworkPolicy needs BOTH sides. Paired with the vmagent allow in agent-egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vmagent-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vmagent.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Agent pods — push metrics to the vmagent ingest endpoint.
+    - from:
+        - podSelector:
+            {{- include "gardenio.agentPodSelector" . | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: 8429
+---
+# ─── vmagent egress ─────────────────────────────────────────────────────────
+# vmagent egress: vmsingle (remote write), kube-dns, in-namespace scrape targets
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vmagent-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.vmagent.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.vmsingle.enabled }}
+    # VictoriaMetrics (remote write)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmsingle.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8428
+    {{- end }}
+    # DNS resolution — pinned to kube-dns to prevent DNS exfiltration to
+    # arbitrary external resolvers. Selectors are templated via
+    # .Values.networkPolicies.kubeDns.{namespaceSelector,podSelector}.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Scrape targets within the namespace (metrics endpoints)
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.metricsPort | default 9091 }}
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+        - protocol: TCP
+          port: {{ .Values.grafana.service.port | default 3000 }}
+        - protocol: TCP
+          port: 8429
+        {{- if or .Values.monitoring.podStateMetrics.enabled (and .Values.agents.metrics.prometheusRule.vpaGuardrails.enabled .Values.agents.metrics.prometheusRule.vpaGuardrails.recommendationExporter.enabled) }}
+        # pod-state-metrics exporter (vpa-right-sizing board ka-0000000341) and
+        # the vpa-reco-exporter (ka-0000000525) both expose their metrics on
+        # 8080, which the port list above does not otherwise include. Their
+        # dedicated honor_labels scrape jobs target that port.
+        - protocol: TCP
+          port: 8080
+        {{- end }}
+        {{- if and .Values.agents.metrics.prometheusRule.vpaGuardrails.enabled .Values.agents.metrics.prometheusRule.vpaGuardrails.recommenderServiceMonitor.enabled }}
+        # vpa-recommender metrics (vpa-right-sizing board ka-0000000525) — the
+        # Fairwinds recommender serves /metrics on 8942, scraped by the
+        # dedicated vpa-recommender static job.
+        - protocol: TCP
+          port: 8942
+        {{- end }}
+    {{- if .Values.vmagent.kubeletScrape.enabled }}
+    # Kubelet resource-metrics scrape (vpa-right-sizing board ka-0000000341).
+    # The kubelet is a host process, not a pod, so the allowance must be
+    # ipBlock based — bounded to the configured node CIDRs on the kubelet's
+    # fixed port only. Gated on the same knob as the scrape job + ClusterRole.
+    - to:
+        {{- range .Values.vmagent.kubeletScrape.nodeCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 10250
+    {{- end }}
+    {{- if .Values.vmagent.uptimeProbeScrape.enabled }}
+    # Off-cluster availability prober's metrics file in the public status
+    # bucket (S3, Lands Track B §5.8): tcp/443 to public addresses only.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if .Values.vmagent.karpenterScrape.enabled }}
+    # Cross-namespace scrape of the Karpenter controller (GAP-2 prereq
+    # ka-0000006900). default-deny-egress + this vmagent-egress policy
+    # otherwise confine vmagent to same-namespace targets (podSelector:{} =
+    # this namespace only), so the `karpenter` scrape job's connections to
+    # the controller pods in the `karpenter` namespace would be dropped.
+    # Select that namespace by its immutable kubernetes.io/metadata.name
+    # label (set automatically by the NamespaceDefaultLabelName admission
+    # plugin) and allow ONLY the metrics port. Gated on the same knob so no
+    # extra egress opens in any env that has not opted into the scrape.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.vmagent.karpenterScrape.namespace | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.vmagent.karpenterScrape.metricsPort }}
+    {{- end }}
+{{- end }}
+{{- if .Values.monitoring.podStateMetrics.enabled }}
+---
+# ─── pod-state-metrics exporter (vpa-right-sizing board ka-0000000341) ──────
+# Ingress: vmagent only (the dedicated pod-state-metrics scrape job, :8080;
+# the :8081 telemetry port stays unreachable). Egress: the Kubernetes API
+# server for the pods list/watch (same public-endpoint 443 + optional private
+# kubeApiServer.cidrs shape as the controller egress) and kube-dns. Without
+# these, default-deny-{ingress,egress} silently blank the exporter — vmsingle
+# then carries no kube_pod_container_* series with no error anywhere.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-pod-state-metrics-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pod-state-metrics
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.vmagent.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-pod-state-metrics-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pod-state-metrics
+  policyTypes:
+    - Egress
+  egress:
+    # kube-dns
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+    # Kubernetes API server (private/in-cluster endpoints).
+    - to:
+        {{- range .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if .Values.networkPolicies.apiServerPostDNAT }}
+    {{- include "gardenio.netpol.k3sApiServerPostDNATEgress" . | nindent 4 }}
+    {{- end }}
+    # Public EKS API endpoint — 443 minus RFC1918/IMDS/CGNAT, the same
+    # no-pivot envelope as the controller egress.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if and .Values.agents.metrics.prometheusRule.vpaGuardrails.enabled .Values.agents.metrics.prometheusRule.vpaGuardrails.recommendationExporter.enabled }}
+---
+# ─── VPA recommendation-value exporter (vpa-right-sizing board ka-0000000525) ─
+# Ingress: vmagent only (the dedicated vpa-reco-exporter scrape job, :8080; the
+# :8081 telemetry port stays unreachable). Egress: the Kubernetes API server
+# for the CRD discovery + VPA list/watch the kube-state-metrics CRS mode needs,
+# plus kube-dns — same shape as the pod-state-metrics egress above. Without
+# these, default-deny-ingress silently blanks the exporter and the CRS pod
+# cannot reach the API, so vmsingle carries no kube_customresource_vpa_* series
+# with no error anywhere.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vpa-reco-exporter-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.agents.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/part-of: vpa-guardrails
+      app.kubernetes.io/name-suffix: vpa-reco-exporter
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.vmagent.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vpa-reco-exporter-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.agents.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/part-of: vpa-guardrails
+      app.kubernetes.io/name-suffix: vpa-reco-exporter
+  policyTypes:
+    - Egress
+  egress:
+    # kube-dns
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+    # Kubernetes API server (private/in-cluster endpoints).
+    - to:
+        {{- range .Values.networkPolicies.controller.kubeApiServer.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if .Values.networkPolicies.apiServerPostDNAT }}
+    {{- include "gardenio.netpol.k3sApiServerPostDNATEgress" . | nindent 4 }}
+    {{- end }}
+    # Public EKS API endpoint — 443 minus RFC1918/IMDS/CGNAT, the same
+    # no-pivot envelope as the controller / pod-state-metrics egress.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if and .Values.agents.metrics.prometheusRule.vpaGuardrails.enabled .Values.agents.metrics.prometheusRule.vpaGuardrails.recommenderServiceMonitor.enabled }}
+---
+# ─── VPA recommender metrics ingress (vpa-right-sizing board ka-0000000525) ──
+# The Fairwinds vpa-recommender pods (installed by the wrapper chart's charts/vpa
+# in this namespace, NOT by this chart) fall under the release's
+# default-deny-ingress (podSelector: {} matches every pod in the namespace), so
+# vmagent's vpa-recommender scrape job to :8942 would be dropped without an
+# explicit allow. Select the recommender pods by the SAME labels the
+# recommenderServiceMonitor Service uses and permit only vmagent on the metrics
+# port. No egress policy: the recommender's own egress is owned by the vpa
+# subchart, and scraping is inbound to it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-vpa-recommender-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml .Values.agents.metrics.prometheusRule.vpaGuardrails.recommenderServiceMonitor.selectorMatchLabels | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.vmagent.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8942
+    {{- end }}
+{{- end }}
+{{- if .Values.edgeAuth.enabled }}
+---
+# ─── Edge-auth (Stage 3 / W-B-12) ──────────────────────────────────────────
+# Ingress: Traefik only — the shim is the external entrypoint for CLI
+# traffic and is not addressed by in-cluster callers. Egress: kbeads +
+# coopmux Services (proxy upstreams), kube-dns, and HTTPS to the
+# configured GitLab API host (PAT validation, W-B-8) and Microsoft Entra
+# discovery/JWKS endpoints (delegated-token validation).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-edge-auth-ingress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.edgeAuth.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.networkPolicies.traefik.namespaceSelector }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.traefik.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.edgeAuth.service.port | default 8096 }}
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-edge-auth-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.edgeAuth.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # Proxy to in-chart kbeads HTTP API.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: beads
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+    # Proxy to in-chart coopmux.
+    {{- if .Values.coopmux.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: coopmux
+      ports:
+        - protocol: TCP
+          port: {{ .Values.coopmux.mux.port | default 9800 }}
+    {{- end }}
+    {{- if .Values.zitiBrowser.enabled }}
+    # Validate the private browser session cookie through oauth2-proxy before
+    # stamping the daemon HMAC envelope.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Chart.Name }}-ziti-forwardauth
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 4180
+    {{- end }}
+    # DNS resolution — pinned to kube-dns for GitLab and Entra discovery/JWKS
+    # lookups rather than allowing pods to choose another resolver.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicies.kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Public HTTPS for GitLab PAT validation and Microsoft Entra
+    # discovery/JWKS. RFC1918 + IMDS + CGNAT are excluded so a
+    # misconfigured URL cannot pivot to internal services.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- end }}

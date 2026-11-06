@@ -1,0 +1,80 @@
+# Publish site/ (the landing page, gd-BvrNgRwA0W) to GitHub Pages (plan
+# gd-YbG2szFjAN, step gd-cp9AqGuUQT).
+#
+# OFF BY DEFAULT. The deploy job runs only when the repo variable PAGES_ENABLED
+# is 'true'; while it is unset every run is a skipped job and allocates no
+# runner. Two reasons: Pages on a private repo needs a paid plan, and the site
+# must not go public before the repo does (P1 public-ready scrub gd-uNpaF2zvVH,
+# whose step 8 gd-7b0sSXIN5h publishes the history-free snapshot). Turn it on
+# where the site should live, i.e. on the public snapshot repo:
+#
+#   Settings > Pages > Build and deployment > Source: GitHub Actions
+#   Settings > Pages > Custom domain: site.clonk.tv (Enforce HTTPS once the cert is issued)
+#   gh variable set PAGES_ENABLED --body true
+#   gh workflow run pages.yml          # first publish; later ones ride pushes
+#
+# PAGES_RUNNER (optional repo variable) picks the runner. It defaults to the
+# light ARC scale set this repo uses (gardenio/helm/ci); a repo without that
+# scale set (the snapshot) sets it to ubuntu-latest, which is free on a public
+# repo.
+#
+# The domain is site.clonk.tv (owner decision gd-ZAmsLGLCSs). An Actions
+# deploy ignores site/CNAME, so the domain is the Settings line above; the file
+# only records the hostname for a reader and for branch-based publishing. DNS,
+# in the clonk.tv Route 53 zone: a TXT _github-pages-challenge-<owner>.site
+# record (the value comes from the owner's Pages verified-domains setting),
+# then CNAME site -> <owner>.github.io, where <owner> owns the repo that serves
+# the site. Verify first: a CNAME to github.io that no repo has claimed can be
+# taken over.
+#
+# Before uploading, the job runs the P1 guard (scripts/lint-public-strings.sh
+# --all) over site/ alone, so a page carrying an infra id, the owner's
+# account id, a dead internal host or the old GitLab group path is never
+# published. Permissions are the least Pages needs: contents read for the
+# checkout, pages write and id-token write for deploy-pages.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publish at a time, and never cancel one halfway: a newer push queues
+# behind it and publishes the newer tree.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: publish site/ to Pages
+    if: vars.PAGES_ENABLED == 'true'
+    runs-on: ${{ vars.PAGES_RUNNER || 'gardenio-k3s-light' }} # light ARC scale set (gardenio/helm/ci); tar and bash only, no docker
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            /site/
+            /scripts/lint-public-strings.sh
+          sparse-checkout-cone-mode: false
+      - name: Refuse infra ids and internal strings in site/
+        run: bash scripts/lint-public-strings.sh --all site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,313 @@
+{{- if .Values.triggerEngine.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.fullname" . }}-trigger-engine
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trigger-engine
+spec:
+  {{- /* Use an explicit nil-check, NOT `| default 1`: Helm's `default` treats the
+         integer 0 as empty, so `0 | default 1` renders 1 and an intended
+         replicaCount:0 (e.g. the P4.4 cutover actuator freeze, ka-0000008220)
+         would be silently ignored. See gardenio/CLAUDE.md "Go template default
+         with empty strings/zero". */}}
+  replicas: {{ if kindIs "invalid" .Values.triggerEngine.replicaCount }}1{{ else }}{{ .Values.triggerEngine.replicaCount }}{{ end }}
+  # Recreate, NOT the default RollingUpdate (ka-0000006285). trigger-engine is a
+  # single-replica SSE subscriber with NO leader election: it holds a live
+  # beads.bead.closed/updated subscription and fires spawns off it (the formula
+  # step dispatcher, the gardener trigger engine). Under RollingUpdate the
+  # default maxSurge (25% → 1 on a 1-replica Deployment) briefly runs TWO pods,
+  # so for the overlap window there are TWO live subscribers reacting to the
+  # same close event. The durable dispatched_agent stamp is a read-modify-write
+  # PATCH with no compare-and-set, and single_claim_task fails OPEN on a query
+  # error — so a blocker closing inside that overlap is a real double-spawn
+  # candidate (two agents racing one fix branch). Recreate tears the old pod
+  # down before the new one starts, so there is never more than one subscriber.
+  # Mirrors gitlab-bridge / jira-bridge, the other SSE-holding TriggerEngine
+  # singletons in this chart.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: trigger-engine
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: trigger-engine
+      annotations:
+        {{- include "gardenio.doNotDisrupt" . | nindent 8 }}
+        # Scrape the internal :9092 /metrics endpoint. trigger-engine fires
+        # gardeners, so the gardener-loop resume metrics (gardener_resume_total /
+        # gardener_resumes_without_progress, bead ka-0000005353) are produced
+        # here — these annotations are what makes the Prometheus half of the
+        # resume observability layer real (decision ka-0000006918). Mirrors the
+        # slack-bridge pod-annotation scrape pattern.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9092"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: trigger-engine
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.triggerEngine.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.triggerEngine.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8094
+              protocol: TCP
+            - name: metrics
+              containerPort: 9092
+              protocol: TCP
+          env:
+            {{- /* Lands spawn wall for gardener fires (internal/bridge
+                 gardenerPreFireCheck reads it here, in the engine): the same
+                 switch the controller gets, so a tenant land's gardeners fire
+                 once tenant spawns are on. Off renders nothing (only the
+                 steward fires on a tenant land). */}}
+            {{- if .Values.agents.lands.tenantSpawns }}
+            - name: LANDS_TENANT_SPAWNS
+              value: "true"
+            {{- end }}
+            # Beads daemon connection
+            - name: BEADS_HTTP_ADDR
+              value: "http://{{ include "gardenio.beads.host" . }}:{{ include "gardenio.beads.httpPort" . }}"
+            {{- /* The shared static token is injected only while the machine
+                 principal is off (rollback path): with it on, every daemon call
+                 AND the SSE stream authenticate as the Keycloak service account
+                 (gd-5QYwXtV7IA). */}}
+            {{- if and .Values.beads.tokenSecret (not .Values.triggerEngine.machinePrincipal.enabled) }}
+            - name: BEADS_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.tokenSecretName" . }}
+                  key: token
+            {{- end }}
+            {{- /* Machine principal (gd-Hc34EENbO9): the engine's daemon client
+                 authenticates as the Keycloak service account of
+                 triggerEngine.machinePrincipal.clientId (SSE reads included). The secret is a file, never an env var; its
+                 Secret is operator-created and optional, so a missing Secret
+                 still starts the pod and the daemon calls fail closed
+                 (auth_unavailable). Same contract as templates/grafana-bridge. */}}
+            {{- if .Values.triggerEngine.machinePrincipal.enabled }}
+            - name: BEADS_OIDC_TOKEN_URL
+              value: {{ include "gardenio.keycloak.tokenURL" . | quote }}
+            - name: BEADS_OIDC_CLIENT_ID
+              value: {{ .Values.triggerEngine.machinePrincipal.clientId | quote }}
+            - name: BEADS_OIDC_CLIENT_SECRET_FILE
+              value: /var/run/secrets/gardenio-machine/clientSecret
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            # The token URL is the keycloak-runtime https port: trust its CA
+            # (gd-lYPZlslOM7).
+            - name: BEADS_OIDC_CA_FILE
+              value: {{ include "gardenio.keycloakRuntime.caFile" . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* NATS wiring (gd-BBbXQBZTX0): startSchedulerNATSListeners reads
+                   NATS_URL/NATS_TOKEN/NATS_USER directly (no prefix), unlike
+                   coopmux's COOP_MUX_NATS_* names. NATS_TOKEN comes from
+                   gardenio.nats.clientTokenSecretName (the infra-creds Secret
+                   under subject isolation, else nats.auth.clientTokenSecret) and
+                   is omitted when that is empty. It never falls back to the
+                   beads token (gd-5QYwXtV7IA): the auth-disabled server needs
+                   none and the legacy-token server never matched it. */}}
+            {{- $triggerNatsURL := .Values.triggerEngine.natsURL | default (include "gardenio.natsURL" .) }}
+            {{- if $triggerNatsURL }}
+            {{- $triggerNatsTokenSecret := include "gardenio.nats.clientTokenSecretName" . }}
+            - name: NATS_URL
+              value: {{ $triggerNatsURL | quote }}
+            {{- if .Values.nats.auth.subjectIsolation.enabled }}
+            - name: NATS_USER
+              value: infra
+            {{- end }}
+            {{- if $triggerNatsTokenSecret }}
+            - name: NATS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $triggerNatsTokenSecret }}
+                  key: token
+            {{- end }}
+            {{- end }}
+            # Trigger engine poll interval
+            {{- if .Values.triggerEngine.pollInterval }}
+            - name: TRIGGER_POLL_INTERVAL
+              value: {{ .Values.triggerEngine.pollInterval | quote }}
+            {{- end }}
+            # Gardener-liveness steady-state poll allow-list (bug ka-0000004451).
+            # Comma-joined gardener trigger ids the sweep checks across ALL
+            # statuses every cycle, closing the transition-only blind spot where
+            # the declarative assert ka-0000002431 goes silent after a missed
+            # close/disable event. Empty list ⇒ GARDENER_LIVENESS_WATCH_IDS unset
+            # ⇒ the all-status pass is a no-op (never floods).
+            {{- with .Values.triggerEngine.gardenerLiveness.watchIDs }}
+            - name: GARDENER_LIVENESS_WATCH_IDS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            # trigger:bead persistent event buffer (ka-0000004769). When
+            # reconcile.stateFile is set, the trigger-engine polls the daemon
+            # for missed bead mutations and injects synthetic "reconciled"
+            # events into the bead-state trigger pipeline. Survives SSE
+            # outages, postgres failovers, and daemon ring-buffer flushes.
+            {{- if .Values.triggerEngine.reconcile.stateFile }}
+            - name: STATE_FILE
+              value: {{ .Values.triggerEngine.reconcile.stateFile | quote }}
+            {{- end }}
+            {{- if .Values.triggerEngine.reconcile.interval }}
+            - name: RECONCILE_INTERVAL
+              value: {{ .Values.triggerEngine.reconcile.interval | quote }}
+            {{- end }}
+            # Note: trigger-engine no longer talks to Slack directly. notify-action
+            # publishes a trigger-notice message bead; slack-bridge picks it up over
+            # SSE and posts on its own bot credentials. There is no Slack token or
+            # channel env for this pod.
+            - name: LISTEN_ADDR
+              value: ":8094"
+            {{- if .Values.triggerEngine.defaultOperator }}
+            # Designated human operator the engine attributes an autonomous fire
+            # to when the trigger bead carries no walkable human author (its
+            # operated_by/created_by is a sentinel/agent). Closes the gap that
+            # booted JQL/bead/schedule-spawned agents unattributed so every
+            # kbeads write fail-closed with HTTP 400 (ka-0000006023). MUST be a
+            # human shape (slack:U… / oidc:…@…); a non-human value is logged and
+            # ignored. Empty ⇒ no fallback (pre-existing behavior).
+            - name: TRIGGER_ENGINE_DEFAULT_OPERATOR
+              value: {{ .Values.triggerEngine.defaultOperator | quote }}
+            {{- end }}
+            {{- if .Values.global.humanOperator.mode }}
+            # Human-operator spawn gate posture (rollout ka-0000004589). "warn"
+            # (the rollout default) stamps the resolved human + logs a gap but
+            # never refuses; "enforce" fail-closes an autonomous fire with no
+            # resolvable human. Flip to enforce fleet-wide only once the M8/M9
+            # residual metrics are clean. Empty ⇒ code default (warn).
+            - name: GARDENIO_REQUIRE_HUMAN_OPERATOR
+              value: {{ .Values.global.humanOperator.mode | quote }}
+            {{- end }}
+            {{- if .Values.triggerEngine.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.triggerEngine.logLevel | quote }}
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: "{{ .Values.global.coverage.mountPath }}/trigger-engine"
+            {{- end }}
+          # startupProbe + timeoutSeconds: 5 on liveness/readiness (gd-egWmqMoXGJ):
+          # the prior timeoutSeconds: 1 (k8s default) treated a co-tenant node
+          # pinned at 100% CPU as a dead process — the kubelet SIGTERMed a
+          # healthy-but-starved trigger-engine ~19x/26h (CFS throttling delayed
+          # the /healthz response past 1s, not an actual hang). Mirrors the
+          # beads/coopmux/beads-viewer probe shape below, the pattern proven not
+          # to restart under the same contention.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.triggerEngine.resources | nindent 12 }}
+          {{- if or .Values.global.coverage.enabled .Values.triggerEngine.reconcile.stateFile .Values.triggerEngine.machinePrincipal.enabled }}
+          volumeMounts:
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+            {{- if .Values.triggerEngine.reconcile.stateFile }}
+            - name: reconcile-state
+              mountPath: {{ dir .Values.triggerEngine.reconcile.stateFile }}
+            {{- end }}
+            {{- if .Values.triggerEngine.machinePrincipal.enabled }}
+            - name: machine-client-secret
+              mountPath: /var/run/secrets/gardenio-machine
+              readOnly: true
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            {{- include "gardenio.keycloakRuntime.caVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.global.coverage.enabled .Values.triggerEngine.reconcile.stateFile .Values.triggerEngine.machinePrincipal.enabled }}
+      {{- if .Values.global.coverage.enabled }}
+      terminationGracePeriodSeconds: 45
+      {{- end }}
+      volumes:
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+        {{- if .Values.triggerEngine.reconcile.stateFile }}
+        # Reconciler watermark + SSE Last-Event-ID (ka-0000001444). With
+        # persistence.enabled it is a ReadWriteOnce PVC, so BOTH the reconciler
+        # high-water mark and the SSE lastID survive a trigger-engine pod kill —
+        # the exact "kill the pod, close a blocker while down, confirm dispatch
+        # on restart" recovery the acceptance test requires. Without it the
+        # volume is an emptyDir, which survives kbeads restarts (the common
+        # case) but resets on a trigger-engine pod restart, making the recovery
+        # a no-op across that failure. The Deployment already runs
+        # strategy=Recreate unconditionally (ka-0000006285), so a RWO PVC is
+        # never dual-mounted during a rollout.
+        - name: reconcile-state
+          {{- if .Values.triggerEngine.reconcile.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.fullname" . }}-trigger-engine-state
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        {{- if .Values.triggerEngine.machinePrincipal.enabled }}
+        # Machine-principal client secret (gd-Hc34EENbO9). optional: the operator
+        # creates the Secret by hand; without it the pod still starts and the
+        # engine's daemon calls fail closed with auth_unavailable in the log.
+        - name: machine-client-secret
+          secret:
+            secretName: {{ .Values.triggerEngine.machinePrincipal.secretName | quote }}
+            optional: true
+        {{- if include "gardenio.keycloak.inClusterCA" . }}
+        {{- include "gardenio.keycloakRuntime.caVolume" . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.triggerEngine.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.triggerEngine.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- /* Same class as the interactive (thread/dm/gardener) agent pods the
+      controller stamps: agents depend on this pod, so they must not be able
+      to preempt it (gd-cTobdw0kAL). */}}
+      {{- if .Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ .Values.global.systemPriorityClass.name }}
+      {{- end }}
+      {{- with .Values.triggerEngine.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,110 @@
+{{- if and .Values.ziti.enabled .Values.ziti.hostBeads.enabled }}
+# Binds ziti service `beads` (host.v1 -> dolt.beads.svc.cluster.local:3306)
+# with identity k3s-beads-host (role #beads-hosts). Host mode only: this pod
+# never intercepts, it just forwards accepted ziti dials to the Service.
+# Secret `ziti-identity` holds the enrolled identity JSON (see README).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ziti-host
+  namespace: beads
+  labels:
+    app: ziti-host
+    app.kubernetes.io/part-of: gas-city
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # one identity, one session at a time
+  selector:
+    matchLabels:
+      app: ziti-host
+  template:
+    metadata:
+      labels:
+        app: ziti-host
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 2171
+        runAsGroup: 2171
+        seccompProfile:
+          type: RuntimeDefault
+      # The image's entrypoint looks for <ZITI_IDENTITY_BASENAME>.json in
+      # /ziti-edge-tunnel and wants it writable (cert renewals are written
+      # back), so copy the Secret into an emptyDir first.
+      initContainers:
+      - name: copy-identity
+        image: busybox:1.37
+        command: ["sh", "-c", "cp /secret/k3s-beads-host.json /ziti-edge-tunnel/ && chmod 600 /ziti-edge-tunnel/k3s-beads-host.json"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: identity
+          mountPath: /secret
+          readOnly: true
+        - name: identity-dir
+          mountPath: /ziti-edge-tunnel
+      # Class from the gardenio chart (global.systemPriorityClass): the access path,
+      # so a crew burst cannot leave it Pending (gd-2qjxTVMBkC).
+      priorityClassName: gardenio-system-critical
+      containers:
+      - name: ziti-edge-tunnel
+        image: openziti/ziti-edge-tunnel:1.19.1
+        args: ["run-host"]
+        env:
+        - name: ZITI_IDENTITY_BASENAME
+          value: k3s-beads-host
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: identity-dir
+          mountPath: /ziti-edge-tunnel
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          requests: { cpu: 20m, memory: 32Mi }
+          limits: { cpu: 200m, memory: 128Mi }
+      volumes:
+      - name: identity
+        secret:
+          secretName: ziti-identity
+      - name: identity-dir
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+---
+# PDB only (gd-27vcHmrurh) — no topologySpreadConstraints/podAntiAffinity:
+# this pod holds a single enrolled-identity ziti session and runs
+# strategy:Recreate ("one identity, one session at a time" above), so it is
+# architecturally single-replica forever; a spread/anti-affinity block would
+# be dead YAML. maxUnavailable, NOT minAvailable (ka-0000001453): on a
+# 1-replica Deployment minAvailable:1 == maxUnavailable:0, which makes the
+# eviction API refuse the pod forever and wedges a managed-nodegroup drain.
+# maxUnavailable:1 only blocks eviction while the pod is currently unhealthy.
+#
+# STAYS AT 1 IN PHASE 2 TOO (gd-bOJa10GcA6, epic gd-StII9fmzym): that task's
+# "stateless edge" wording named both ziti-host proxies alongside
+# beads-viewer/viewer-authproxy, but this pod is not stateless — it is one
+# enrolled OpenZiti identity's bind session. Two replicas would mean two
+# pods racing to hold that single session, which is exactly what
+# strategy:Recreate exists to prevent even during a rollout. Left at 1
+# deliberately; flagged back to the epic rather than raised.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ziti-host
+  namespace: beads
+  labels:
+    app: ziti-host
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: ziti-host
+{{- end }}

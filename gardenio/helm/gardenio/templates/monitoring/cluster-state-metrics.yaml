@@ -1,0 +1,168 @@
+{{- if .Values.monitoring.clusterMetrics.kubeStateMetrics.enabled }}
+{{- $cfg := .Values.monitoring.clusterMetrics.kubeStateMetrics }}
+{{- $name := printf "%s-cluster-state-metrics" (include "gardenio.fullname" .) }}
+# Cluster-scoped kube-state-metrics feeding the vm-operator monitoring stack
+# (ka-0000006163 — "Instrument the cluster").
+#
+# WHY THIS EXISTS, DISTINCT FROM monitoring.podStateMetrics: the sibling
+# pod-state-metrics exporter is deliberately namespace-scoped to THIS release
+# (--namespaces={{ .Release.Namespace }}) and its series are pulled by the
+# in-chart STATIC vmagent into the in-chart gardenio-vmsingle. That covers the
+# VPA right-sizing board, but leaves the CLUSTER-WIDE observability store
+# (the vm-operator `vmsingle-vm-single` in the `monitoring` namespace, which
+# the EKS capacity/autoscaling analysis actually queries) with NO
+# kube_pod_container_resource_* series — agents run in `gardenio` /
+# `gardenio-e2e-*`, not the release namespace, so the namespace-scoped exporter
+# never sees them.
+#
+# This exporter is CLUSTER-SCOPED (ClusterRole over pods+nodes, no --namespaces
+# filter) and is discovered by the monitoring vm-agent through the VMServiceScrape
+# emitted below: that vm-agent runs selectAllByDefault:true, so a VMServiceScrape
+# in ANY namespace (verified live: it already scraped the RWX-era agents
+# namespace and the per-MR site-api/sponsor-api scrapes) is picked up with no operator change. The
+# --metric-allowlist bounds what enters the shared store's retention to the
+# capacity-signal families (requests/limits/phase/restarts + node
+# capacity/allocatable), so cardinality stays proportional to pod+node count.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-state-metrics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-state-metrics
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-state-metrics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-state-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: cluster-state-metrics
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: cluster-state-metrics
+    spec:
+      serviceAccountName: {{ $name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: kube-state-metrics
+          image: "{{ $cfg.image.repository }}:{{ $cfg.image.tag }}"
+          imagePullPolicy: {{ $cfg.image.pullPolicy }}
+          args:
+            - "--resources={{ join "," $cfg.resourceScope }}"
+            {{- with $cfg.metricAllowlist }}
+            - "--metric-allowlist={{ join "," . }}"
+            {{- end }}
+            - "--port=8080"
+            - "--telemetry-port=8081"
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: telemetry
+              containerPort: 8081
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml $cfg.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-state-metrics
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "gardenio.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-state-metrics
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+# VMServiceScrape so the vm-operator monitoring vm-agent (selectAllByDefault)
+# pulls this exporter's /metrics into vmsingle-vm-single. honorLabels keeps the
+# SUBJECT pod/node identity KSM stamps on each series (the default target
+# relabels would otherwise overwrite them with this exporter pod's identity).
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-state-metrics
+spec:
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: cluster-state-metrics
+  endpoints:
+    - port: metrics
+      path: /metrics
+      honorLabels: true
+      interval: {{ $cfg.interval | default .Values.monitoring.victoriaMetrics.interval | default "30s" }}
+{{- end }}

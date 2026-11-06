@@ -1,0 +1,1342 @@
+# Gardenio tag/release-pipeline staging+test DAG — one RWX run that deploys the
+# release-staging ephemeral and runs the full E2E suite against it.
+#
+# Collapses the front of the tag/release chain — the two GitLab jobs that each
+# dispatched their own RWX workflow and blocked a runner on `rwx results --wait`
+# (rwx-deploy-rwx → rwx-e2e) — into a single embedded-run DAG. GitLab dispatches
+# ONE workflow (gardenio-release) and one reporter job blocks on `rwx results
+# --wait`, so two sleeping runner jobs become one. The ordering the GitLab
+# `needs:` graph encoded (e2e needs deploy) moves inside this run via
+# embedded-run `after:`.
+#
+# Bead: ka-0000007165 (P3, release-DAG epic ka-0000002392). Design:
+# docs/design/full-release-dag.md (R1 — keep one thin reporter, zero
+# gate-semantics change). Mirrors the P1 main-push collapse (.rwx/main.yml,
+# ka-0000004275) and P2 scheduled collapse (.rwx/scheduled.yml, ka-0000007436).
+#
+# DAG (mirrors the prior tag needs: graph for the deploy→e2e front):
+#
+#   deploy-ephemeral ──> e2e
+#
+#   - deploy-ephemeral : gardenio-rwx-tag-<calver> per-instance namespace
+#   - e2e              : full E2E module suite against that ephemeral ns
+#                        (after deploy, matching `rwx-e2e needs: rwx-deploy-rwx`).
+#                        Tag pipelines pass version=<calver> so e2e installs
+#                        coop:<calver>-rc (ka-0000000436). Quarantine preserved.
+#
+# WHY PROMOTE IS NOT EMBEDDED (the key P3 design constraint):
+#
+#   The release-gate task owns the E2E verdict: it parses module results and
+#   fails closed on ANY un-quarantined module failure (0-tolerance,
+#   ka-0000000440). `promote` is a SEPARATE task gated `after:
+#   release-gate.succeeded`, NOT `after: e2e`. This matters because the gate's
+#   verdict is not identical to e2e's own succeeded/failed: quarantined-flake
+#   handling is applied upstream (Captain wraps run-shard.sh), and release-gate
+#   is where that verdict is finalized into an exit code. Keeping promote
+#   `after: release-gate` (not `after: e2e`) ensures promotion follows the
+#   release-gate verdict exactly.
+#
+# WHAT STAYS A SEPARATE GitLab JOB (deliberately NOT embedded here):
+#
+#   * promote — kept separate so it gates on the release-gate verdict, not the
+#     raw e2e sub-run (see above). Still the hard gate before prod
+#     (ka-0000008209).
+#   * rwx-deploy-prod — PROD-TOUCHING. Its own GitLab job so it retains
+#     `resource_group: prod-deploy` (cross-pipeline last-writer serialization,
+#     ka-0000006240), the `.rwx/PROD_DEPLOY_FROZEN` freeze gate (ka-0000004932),
+#     and the deploy.yml monotonic-version guard. A run-level RWX concurrency
+#     pool would serialize the WHOLE run, not just the prod deploy, and a single
+#     run can hold only one exclusive lease (V1 caveat #2, ka-0000004507) — so
+#     prod serialization stays at the GitLab layer.
+#   * rwx-deploy-rwx-singleton — the long-lived gardenio-rwx singleton deploy is
+#     not on the release gate path; it keeps its own job + singleton pool.
+#   * create-release / publish-release-metadata — the native GitLab `release:`
+#     keyword is a runner-only construct (V3, ka-0000004507); these stay GitLab
+#     jobs that needs: the reporter.
+#   * bundle-airgap — manual, allow_failure, out of the gating DAG.
+#
+# Fail-fast: an embedded `after:` runs only if its upstream succeeds, so a
+# failed deploy-ephemeral aborts e2e and fails the run. The reporter inspects
+# the terminal run status + per-module results (it uses `rwx results --wait`,
+# NOT --fail-fast, so it can read module pass/fail and apply the stopgap before
+# deciding the gate). (V4, ka-0000004507)
+#
+# This file posts NO custom GitLab commit status — the reporter job's exit code
+# is the commit status, exactly as the dispatch-only workflows it composes
+# (control-plane decision ka-0000000408, unchanged).
+#
+# Trigger from GitLab CI (tag pipeline):
+#   rwx dispatch gardenio-release \
+#     --ref $CI_COMMIT_TAG \
+#     --param commit-sha=$CI_COMMIT_SHA \
+#     --param version=$CI_COMMIT_TAG \
+#     --param instance-id=tag-${CI_COMMIT_TAG//./-} \
+#     --param skip=$QUARANTINE \
+#     --param host-domain=$GARDENIO_STAGING_HOST_DOMAIN
+#
+# Run manually (CLI):
+#   rwx run .rwx/release.yml \
+#     --init commit-sha=$(git rev-parse HEAD) \
+#     --init version=2026.78.1 \
+#     --init instance-id=tag-2026-78-1 --wait
+
+on:
+  dispatch:
+    - key: gardenio-release
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        version: ${{ event.dispatch.params.version }}
+        instance-id: ${{ event.dispatch.params.instance-id }}
+        skip: ${{ event.dispatch.params.skip }}
+        host-domain: ${{ event.dispatch.params.host-domain }}
+        status-context: ${{ event.dispatch.params.status-context }}
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA to deploy + e2e + promote. Required."
+          required: true
+        - key: version
+          name: Calver version
+          description: |
+            Release calver tag (e.g. 2026.78.1). Threaded into the embedded
+            deploy (Chart.appVersion derivation), e2e (installs coop:<version>-rc
+            instead of coop:main-<sha7>, ka-0000000436), and promote (retag
+            <version>-rc → <version>). Required for a release run.
+          required: true
+        - key: instance-id
+          name: Ephemeral instance ID
+          description: |
+            Selects the per-instance ephemeral namespace
+            (gardenio-rwx-<instance-id>). Tag pipelines pass tag-<calver>
+            (dots→dashes) so they never collide with the main-push pipeline on
+            the same release-bump commit (ka-0000000423). Empty falls back to
+            the first 8 chars of commit-sha inside the embedded deploy/e2e.
+          default: ""
+          required: false
+        - key: skip
+          name: Quarantined modules
+          description: |
+            Comma-separated module names skipped by the gating E2E suite — the
+            same QUARANTINE list the standalone rwx-e2e job used (e.g.
+            local-mode,semantic-search). Empty runs every module.
+          default: ""
+          required: false
+        - key: host-domain
+          name: Staging workload DNS domain
+          description: |
+            DNS domain suffix the deployed staging hosts hang off of, threaded
+            into the embedded deploy + e2e. Phase B (ka-0000002380): GitLab CI
+            passes prod.gardenio.acme.example so release-staging runs as an ephemeral
+            namespace on the consolidated prod cluster (prod-gardenio-eks) with
+            the -prod overlays + gardenio-main cred swap. Defaults to the prod
+            domain; pass aws-poc.gardenio.acme.example for the poc-gardenio-eks rollback
+            (valid until Phase C).
+          default: "prod.gardenio.acme.example"
+          required: false
+        - key: status-context
+          name: Commit-status context (fire-and-forget)
+          description: |
+            When set (e.g. rwx/release), the terminal report-status task POSTs
+            the release verdict to GitLab as an external commit status on
+            commit-sha. Empty = no status POST (manual/CLI dispatches). The
+            tag-pipeline rwx-release job passes rwx/release. Lever C follow-up
+            ka-0000001459.
+          default: ""
+          required: false
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      version: ""
+      instance-id: ""
+      skip: ""
+      host-domain: "prod.gardenio.acme.example"
+      status-context: ""
+
+# ── Cross-pipeline prod-deploy serialization (Lever C follow-up, ka-0000001459) ─
+# When the prod tail collapses into this run (deploy-prod is embedded `after:
+# promote` via `call: deploy.yml target=prod`), the prior separate
+# rwx-deploy-prod GitLab job goes away. That job's cross-pipeline serialization
+# was already moved RWX-side by Lever C !4562 (ka-0000005303): deploy.yml carries
+# a `concurrency-pools` entry id `…:deploy-prod` with `if: target==prod`. The
+# embedded deploy-prod sub-run here calls deploy.yml with target=prod, so it
+# requests that SAME pool — no new pool is declared in release.yml on purpose:
+#   * Declaring a SECOND capacity-1 pool at this file's top level would make the
+#     release run hold TWO exclusive leases at once (this pool for the whole run
+#     + deploy.yml's pool for the embedded sub-run), tripping the "a single run
+#     can hold only one exclusive lease" caveat (V1 #2, ka-0000004507).
+#   * Correctness against the last-writer clobber (ka-0000001063 / ka-0000003492,
+#     fix ka-0000006240) does NOT actually depend on the pool: the deploy.yml
+#     monotonic-version guard REFUSES to deploy a version older than what prod
+#     already runs, so an out-of-order older deploy is a safe no-op regardless of
+#     serialization. The pool is a perf belt (avoid wasted concurrent work); the
+#     monotonic guard is the suspenders (the real gate). So the prod gate is not
+#     weakened even if the embedded sub-run's pool acquisition is partial.
+# Canary item #2 (flagged in the MR): confirm an embedded `call:` sub-run honors
+# its callee's concurrency pool; if not, the monotonic guard still holds the line.
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  # ── Deploy the per-instance ephemeral staging namespace ─────────────
+  # Embeds deploy-rwx.yml with target=ephemeral. Head of the DAG, mirroring
+  # the prior tag `rwx-deploy-rwx` job. version is threaded so the staging
+  # deploy pins the <calver>-rc images (the bare <calver> images do not exist
+  # until the promote task below runs).
+  - key: deploy-ephemeral
+    call: ${{ run.dir }}/deploy-rwx.yml
+    init:
+      commit-sha: ${{ init.commit-sha }}
+      ref-name: ${{ init.version }}
+      version: ${{ init.version }}
+      coverage: ""
+      # Must be present even though coverage="" makes it inert at runtime: an
+      # embedded `call:` run resolves every `${{ init.X }}` reference in the
+      # called file (deploy-rwx.yml consumes init.coverage-storage-class at
+      # line ~1327) at graph-construction time, and a param `default:` only
+      # applies to dispatch/cli triggers — NOT to embeds. Omitting it errors
+      # the whole run before any step runs ("init.coverage-storage-class does
+      # not exist"), the deploy-ephemeral failure that skip-cascaded e2e on tag
+      # 2026.216.6 (ka-0000007682). Same rule as require-substrate below.
+      coverage-storage-class: "gardenio-efs-coverage"
+      instance-id: ${{ init.instance-id }}
+      target: "ephemeral"
+      host-domain: ${{ init.host-domain }}
+
+  # ── Full E2E suite against the ephemeral namespace ──────────────────
+  # Embeds e2e.yml after the ephemeral deploy succeeds — mirrors `rwx-e2e
+  # needs: rwx-deploy-rwx`. Tag pipelines pass version=<calver> + ref-name so
+  # install-coop-claudeless pulls coop:<calver>-rc (built by the per-tag
+  # docker.yml) instead of racing coop:main-<sha7> (ka-0000000436).
+  # golden-gate=true so the gVisor PoC substrate tasks absorb non-zero exits
+  # and a rotating PoC flake can't red the release suite / block promotion
+  # (ka-0000007234), matching the dispatch default.
+  - key: e2e
+    after: deploy-ephemeral
+    call: ${{ run.dir }}/e2e.yml
+    init:
+      commit-sha: ${{ init.commit-sha }}
+      golden-gate: "true"
+      # require-substrate=false: absent gvisor-poc substrate is a clean SKIP, not
+      # a hard NO-GO — matches the e2e.yml dispatch default. Omitting it errors
+      # every embedded e2e task ("init.require-substrate does not exist")
+      # since MR fix/ka-0000002867 added the consumer (ka-0000003519).
+      require-substrate: "false"
+      # require-outbox-rig=false: HARDCODED off on the PROD release path
+      # (ka-0000007489). The outbox readiness gate is a SCHEDULED-only standing
+      # guard — a release must NEVER hard-fail on absent sandbox creds (it would
+      # block promotion/prod). Like require-substrate above, this MUST be present
+      # or every embedded e2e task errors ("init.require-outbox-rig does not exist").
+      require-outbox-rig: "false"
+      # require-slack-ui=false: HARDCODED off on the PROD release path
+      # (ka-0000006398). Like require-outbox-rig above, the slack-ui readiness gate
+      # is a SCHEDULED-only standing guard — a release must NEVER hard-fail on an
+      # absent real-user Slack rig. e2e.yml consumes ${{ init.require-slack-ui }}
+      # (SLACK_UI_REQUIRE, line ~1400) and a param `default:` does NOT apply to
+      # embeds, so this MUST be present here or every embedded e2e task errors
+      # ("init.require-slack-ui does not exist") — the tag-2026.216.15 failure
+      # (ka-0000004976).
+      require-slack-ui: "false"
+      namespace: ""
+      instance-id: ${{ init.instance-id }}
+      keep: "false"
+      only: ""
+      skip: ${{ init.skip }}
+      captain-poison-module: ""
+      version: ${{ init.version }}
+      ref-name: ${{ init.version }}
+      host-domain: ${{ init.host-domain }}
+
+  # ── Tear down the ephemeral namespace once e2e is green ─────────────
+  # 2026-07-09: environment creation was automatic but cleanup relied 100% on
+  # the rwx-reaper CronJob — which deadlocked on prod-gardenio-eks and let 94
+  # ephemerals accumulate in 31h, packing the cluster and wedging production
+  # agent spawns. Every DAG that creates an ephemeral now deletes it in-run.
+  # Green path only (plain `after: e2e` skip-cascades on failure): a FAILED
+  # run's namespace is deliberately left up for triage — the reaper's
+  # ttlMinutes=45 sweep is the bounded backstop (label lifecycle=keep or stamp
+  # a gardenio.io/reap-after lease to hold it longer). Runs in parallel with
+  # the prod tail — nothing after e2e touches the ephemeral namespace, and
+  # report-status does not anchor on this task, so a teardown failure reds
+  # this run's page but can never red the release verdict.
+  - key: teardown-ephemeral
+    after: e2e
+    call: ${{ run.dir }}/teardown-rwx.yml
+    init:
+      instance-id: ${{ init.instance-id }}
+      host-domain: ${{ init.host-domain }}
+
+  # ── Clone the repo (scripts for release-gate + create-release) ──────
+  # release-gate runs scripts/build-e2e-bug-bead-desc.py; create-release runs
+  # scripts/release-notes.sh. No upstream dependency — clones in parallel with
+  # the deploy/e2e front.
+  - key: code
+    # ── Retry-wrapped shallow clone (ka-0000004454) ─────────────────────
+    # Hand-rolled shallow clone with a bounded retry loop instead of
+    # `call: git/clone` — the same pattern proven in docker.yml (ka-0000007550).
+    # The stock package (through 2.0.8) has NO retry and RWX has no task-level
+    # auto-retry, so a single transient gitlab.com blip during fetch-pack
+    # (`Connection to gitlab.com closed by remote host`, exit 128) fails the whole
+    # run — and in a release-DAG task that reds a calver release outright.
+    #
+    # Parity with `git/clone` DEFAULTS (all this task used): shallow `--depth=1`
+    # fetch of the exact SHA (init.commit-sha is a 40-hex commit — no ls-remote
+    # ref resolution), detached checkout at that SHA, `.git` stripped afterwards
+    # (cleanup-git-dir default) for identical downstream cache keys, no submodules,
+    # no LFS. This task consumes only the checked-out working tree — no downstream
+    # `git` ops and no RWX_GIT_COMMIT_SHA — so, unlike docker.yml, it emits no sha.
+    run: |
+      set -eu
+      : "${GITLAB_CLONE_TOKEN:?GITLAB_CLONE_TOKEN is required}"
+      REPO="https://oauth2:${GITLAB_CLONE_TOKEN}@gitlab.com/Acme/Platform/gardenio.git"
+      SHA="${COMMIT_SHA}"
+      MAX_ATTEMPTS=5
+
+      # Redact the token from any tracing/output; never echo $REPO.
+      git init -q -b main
+      git remote add origin "$REPO"
+      git config --local maintenance.auto false
+      git config --local gc.auto 0
+
+      attempt=1
+      while :; do
+        echo "git-clone attempt ${attempt}/${MAX_ATTEMPTS} for ${SHA}"
+        if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch --no-auto-gc --depth=1 origin "+${SHA}:refs/rwx/git-clone/checkout"; then
+          echo "git-clone: fetch succeeded on attempt ${attempt}"
+          break
+        else
+          rc=$?
+          if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+            echo "git-clone: fetch FAILED after ${MAX_ATTEMPTS} attempts (last exit ${rc})" >&2
+            exit "$rc"
+          fi
+          # Exponential backoff: 5s, 10s, 20s, 40s.
+          sleep_s=$((5 * (1 << (attempt - 1))))
+          echo "git-clone: fetch failed (exit ${rc}); retrying in ${sleep_s}s" >&2
+          sleep "$sleep_s"
+          attempt=$((attempt + 1))
+        fi
+      done
+
+      git checkout -q --detach "$(git rev-parse refs/rwx/git-clone/checkout^{commit})"
+      git clean -fdq
+      echo "Checked out git repository at $(git rev-parse HEAD)"
+
+      # Strip .git for cache-key parity with git/clone's cleanup-git-dir default.
+      rm -rf .git
+    env:
+      GITLAB_CLONE_TOKEN:
+        value: ${{ secrets.GITLAB_CLONE_TOKEN }}
+        cache-key: excluded
+      COMMIT_SHA: ${{ init.commit-sha }}
+
+  # ── E2E gate (Lever C follow-up, ka-0000001459) ─────────────────────
+  # The post-E2E processing that USED to live in the fire-blocking GitLab
+  # `rwx-release` job (.gitlab-ci.yml) — module PASS/FAIL parsing, JUnit XML,
+  # the FINAL_STATUS/PASSED_MODULES/FAILED_MODULES dotenv, and bug-bead filing —
+  # moved RWX-side so the GitLab job can go fire-and-forget (no `rwx results
+  # --wait` runner-sleep, ~711 min/48h).
+  #
+  # This task's EXIT CODE is the E2E release gate, identical to the prior GitLab
+  # job's exit code: 0 ⇒ release proceeds (promote/prod), 1 ⇒ release blocked.
+  # The gate is 0-TOLERANCE (ka-0000000440): a fully-succeeded e2e passes; ANY
+  # un-quarantined module failure fails the release. This REPLACED the former
+  # MAX_MODULE_FAILURES=5 count-tolerance stopgap, which masked real regressions
+  # by passing up to 5 failing modules. Known flakes are now tolerated per-module
+  # via .captain/quarantines/gardenio-e2e.yml (applied upstream when Captain wraps
+  # run-shard.sh), so a quarantined module's failure never reaches FINAL_STATUS
+  # here. `promote` is a SEPARATE task that `after: release-gate` (succeeded) — so
+  # embedding promote never silently weakens the gate (the exact design constraint
+  # release.yml's header called out for keeping promote a separate GitLab job).
+  #
+  # SKIP-CASCADE SAFETY (ka-0000006290): this task must (a) ALWAYS run once the
+  # front terminates and (b) read e2e's status in env. RWX only makes a task's
+  # status env-addressable (via the `tasks.<key>.*` accessor) when an
+  # `after:`/`use:` edge exists, and a bare `${{ e2e.succeeded }}` env ref is a
+  # COMPILE error ("e2e does not exist") — the original bug that failed every cut
+  # on the new embedded DAG. A plain `tasks.e2e.*` env ref creates an IMPLICIT
+  # success-required edge (this task would be SKIPPED if e2e fails/skips), which
+  # would defeat the always-run gate. So the e2e edge lives in the `after:`
+  # TERMINAL COVER `(e2e.succeeded || e2e.failed || e2e.skipped)`: it is
+  # always-true once e2e reaches any terminal state, so this task WAITS for e2e
+  # and is NEVER skip-cascaded (a failed/skipped e2e still runs the gate). The
+  # value is then read via the `tasks.e2e.succeeded` accessor in env below.
+  # `deploy-ephemeral` stays in the cover too so the gate also runs when the
+  # ephemeral deploy fails and e2e is skipped (scored fail-closed).
+  #
+  # SELF-INTROSPECTION: it parses the EMBEDDED e2e shard logs by `rwx results
+  # $RWX_RUN_ID` (NO --wait — the run is in-progress and waiting on it would
+  # self-deadlock; the e2e shards are already terminal because this task is after
+  # e2e) and walking .Tasks[].Subtasks recursively for e2e-shard-[0-3] — the SAME
+  # nested-task walk the prior GitLab job already used for the embedded case
+  # (.gitlab-ci.yml:944). Canary item #1 (flagged in the MR): confirm a task can
+  # read its own in-progress run snapshot.
+  #
+  # FAIL-CLOSED: any path that cannot positively confirm the gate (no rwx CLI, no
+  # results JSON, no module data when e2e is not `succeeded`) exits 1.
+  - key: release-gate
+    use: code
+    after: ${{ (deploy-ephemeral.succeeded || deploy-ephemeral.failed) && (e2e.succeeded || e2e.failed || e2e.skipped) }}
+    cache: false
+    timeout: 15m
+    env:
+      RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+      E2E_SUCCEEDED: ${{ tasks.e2e.succeeded }}
+      # ka-0000007840: authoritative signal for "did the ephemeral deploy front
+      # succeed?" — read via the SAME RWX template accessor as E2E_SUCCEEDED
+      # (reliable because this task has an after: edge on deploy-ephemeral),
+      # NOT from the in-progress run snapshot (which can omit the task tree for
+      # embedded runs, ka-0000007176). Used below to NAME the real failed task
+      # for the bug bead when a pre-E2E deploy failure skip-cascades e2e.
+      DEPLOY_EPHEMERAL_SUCCEEDED: ${{ tasks.deploy-ephemeral.succeeded }}
+      VERSION: ${{ init.version }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      # Bug-bead filing (best-effort, IN-CLUSTER) — ka-0000002196 / decision
+      # ka-0000000203 ("in-cluster"). On a failed E2E the gate files a tracking
+      # bug on the DURABLE prod beads daemon by port-forwarding svc/gardenio-beads
+      # in gardenio-system on prod-gardenio-eks and reading the daemon's operator
+      # token (kd-beads-token) in-cluster — the same mechanics e2e.yml already
+      # uses (e2e.yml:1056). This REPLACES the old public POST to
+      # beads.gardenio.app.e2e.dev.acme.example, which is dead: that host + its
+      # ipWhitelist live in the FROZEN legacy 909 cluster and 404 from every RWX
+      # egress, and current prod (acct 133) exposes no public beads write ingress.
+      # It also DROPS the mis-wired BEADS_CI_WRITE_TOKEN (it pointed at the
+      # read-only viewer token secrets.BEADS_TOKEN, never a write token). The AWS
+      # creds below mirror e2e.yml's acct-133 cred routing; they are CORE pipeline
+      # secrets (deploy-ephemeral + e2e already resolved+used them earlier in this
+      # same run), so referencing them here adds no task-PREP strand-risk
+      # (ka-0000006290) — if they were ever absent the pipeline would have failed
+      # before release-gate. kubectl/aws install is LAZY (only on a failed
+      # release, inside the FINAL_STATUS!=succeeded block below), so green
+      # releases never touch the cluster. The whole path is best-effort: any
+      # failure only skips the auto-file, never the gate.
+      AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      EKS_CLUSTER: ${{ secrets.E2E_EKS_CLUSTER }}
+      # Phase 2 POC creds from the non-default gardenio-main vault (ka-0000005509)
+      # — these reach prod-gardenio-eks (acct 133); the default E2E_AWS_* creds
+      # point at the frozen legacy 909 cluster. host-domain routes the swap.
+      POC_AWS_ACCESS_KEY_ID: ${{ vaults.gardenio-main.secrets.E2E_AWS_ACCESS_KEY_ID }}
+      POC_AWS_SECRET_ACCESS_KEY: ${{ vaults.gardenio-main.secrets.E2E_AWS_SECRET_ACCESS_KEY }}
+      POC_EKS_CLUSTER: ${{ vaults.gardenio-main.secrets.E2E_EKS_CLUSTER }}
+      INIT_HOST_DOMAIN: ${{ init.host-domain }}
+      # Durable prod beads daemon — NOT the ephemeral gardenio-rwx-<id> e2e
+      # namespace (teardown-ephemeral reaps it). svc name = gardenio.beads.fullname
+      # = "<release>-beads"; the prod release is named "gardenio" (gardenio-system),
+      # so the service is gardenio-beads.
+      BEADS_NAMESPACE: "gardenio-system"
+      BEADS_SVC: "gardenio-beads"
+      # Bead permalink base — CURRENT prod viewer (prod.gardenio.acme.example/beads).
+      # BEAD_URL below appends /<bead-id>, yielding .../beads/<id> (ka-0000006429).
+      BEADS_VIEW_URL: "https://prod.gardenio.acme.example/beads"
+      BEAD_TITLE: "RWX release E2E failed"
+      # ── Standing parent epic for auto-filed release bugs (ka-0000002823) ──
+      # Operator decision ka-0000002529 chose `parent-at-creation`: the filer
+      # attaches each auto-filed release bug to this epic so it is never born an
+      # orphan and the OrphanSweeper never stamps `needs-intake` (the label that
+      # evicted these bugs into the one lane forbidden to act on releases). The
+      # KEY is the stable identity — the filer POSTs a get-or-create against it,
+      # so the epic is resolved (or re-minted, if it was deleted) every run and
+      # this wiring cannot silently degrade back to parentless filing. Changing
+      # the key mints a NEW epic; only bump the vN suffix deliberately.
+      RELEASE_EPIC_IDEMPOTENCY_KEY: "gardenio-release-failures-epic-v1"
+      RELEASE_EPIC_TITLE: "Auto-filed release-pipeline failures (standing lane epic — captain-release-owner owns)"
+      RELEASE_EPIC_DESC: |
+        STANDING container epic for auto-filed release-pipeline failure bugs, created and
+        maintained by the release-gate auto-filer (.rwx/release.yml). Do not close by hand:
+        it is resolved by get-or-create on a fixed idempotency_key every failed release.
+
+        WHY IT EXISTS: the filer runs in CI with no epic to attach to, so auto-filed release
+        bugs were born parentless; the controller's OrphanSweeper then stamped `needs-intake`
+        on them ~15m later, and that label is on captain-bugfix's hard exclusion list — so a
+        release blocker was routed to the intake lane, whose runbook says "No MRs, no merges,
+        no code, no releases", and hidden from the bug-drain safety net. Operator decision
+        ka-0000002529 resolved this as `parent-at-creation`. Analysis: ka-0000002823.
+
+        LOAD-BEARING LABELS — do not remove:
+          - no-auto-close: the daemon auto-close cascade hard-closes a non-plan epic when its
+            subtree drains. For a standing container that fires exactly when releases are
+            HEALTHY, so every child closing would close this epic (ka-0000001525).
+          - release-pipeline: puts the epic in captain-release-owner's lane query, and exempts
+            the container itself from the orphan sweep while it has no open children.
+
+        A parent-child edge is not a blocking dep, so children still appear in `gb ready`.
+    run: |
+      set -e
+      # rwx CLI — pinned to v3.13.2 (ka-0000006447), same as .gitlab-ci.yml.
+      # Verify exact bytes before install (ka-0000001204 / F3). Digest source
+      # + update procedure: docs/ci-toolchain-checksums.md.
+      if ! command -v rwx >/dev/null 2>&1; then
+        RWX_SHA256=ef4afcad5ed9a6e7d24190050753f35cf1a6d609f07b949a1caa83074c16507e
+        curl -fsSL --retry 3 --retry-delay 3 \
+          https://github.com/rwx-cloud/rwx/releases/download/v3.13.2/rwx-linux-x86_64-static \
+          -o /tmp/rwx
+        echo "${RWX_SHA256}  /tmp/rwx" | sha256sum -c -
+        chmod +x /tmp/rwx && sudo mv /tmp/rwx /usr/local/bin/rwx
+      fi
+      command -v jq >/dev/null 2>&1 || { sudo apt-get update -q && sudo apt-get install -y -q jq python3; }
+      mkdir -p release-summary/junit-results
+
+      # ── Read THIS run's snapshot (no --wait: in-progress, would self-deadlock).
+      # The e2e shards are terminal (this task is after e2e). RWX_RUN_ID is
+      # auto-injected into every task.
+      if [ -z "${RWX_RUN_ID:-}" ]; then
+        echo "FATAL: RWX_RUN_ID not set — cannot introspect the run. Failing closed."
+        exit 1
+      fi
+      RESULTS_JSON=$(rwx results "$RWX_RUN_ID" --output json 2>/dev/null || true)
+      if [ -z "$RESULTS_JSON" ]; then
+        echo "FATAL: empty rwx results for $RWX_RUN_ID — cannot decide gate. Failing closed."
+        exit 1
+      fi
+
+      # ── Compute the real failed-task keys (ka-0000007840) ────────────────
+      # When the ephemeral deploy front (or any pre-E2E setup task) fails, RWX
+      # skip-cascades the `e2e` task, so the shard-log fetch below finds NOTHING
+      # and the bug-bead filer historically emitted the misleading "no
+      # per-module output ... may have failed before any module ran" — blaming
+      # e2e for a DEPLOY failure and sending triage on an e2e-flake dead end
+      # (all of 2026.207.11/.14/.17 died in deploy-ephemeral.deploy-rwx, never
+      # in e2e; ~9h of mis-lane triage). Walk the run snapshot for the actual
+      # failed LEAF task keys (dotted, e.g. deploy-ephemeral.deploy-rwx) and
+      # pass them to the filer as FAILED_TASK_KEYS so the bead names the real
+      # culprit. Best-effort: the embedded in-progress snapshot can omit the
+      # task tree (ka-0000007176), so this may be empty — the authoritative
+      # "deploy front failed" floor comes from the DEPLOY_EPHEMERAL_SUCCEEDED
+      # accessor (an RWX after:-edge value, always reliable) appended below.
+      # The filer's own self-tasks (release-gate/report-status/notify-*) are
+      # excluded — they are not release-content failures.
+      FAILED_TASK_KEYS=$(printf '%s' "$RESULTS_JSON" | jq -r '
+        def leaves($prefix):
+          .[]? | ($prefix + .Key) as $k |
+          ( if ((.Subtasks // []) | length) > 0
+            then (.Subtasks | leaves($k + "."))
+            else {k:$k, r:(.Status.Result // "")} end );
+        [ (.Tasks // []) | leaves("")
+          | select(.r == "failed")
+          | select(.k | test("^(release-gate|report-status|notify-)"; "") | not)
+          | .k ] | join(",")
+      ' 2>/dev/null || true)
+      # Authoritative floor: if the deploy front failed but the snapshot walk
+      # did not surface it (embedded-run tree omission), still name it so the
+      # bead is never left blaming e2e for a deploy death.
+      if [ "${DEPLOY_EPHEMERAL_SUCCEEDED:-true}" != "true" ]; then
+        case ",${FAILED_TASK_KEYS}," in
+          *,deploy-ephemeral,*|*,deploy-ephemeral.*) : ;;
+          *) FAILED_TASK_KEYS="${FAILED_TASK_KEYS:+$FAILED_TASK_KEYS,}deploy-ephemeral" ;;
+        esac
+      fi
+      export FAILED_TASK_KEYS
+      echo "release-gate: FAILED_TASK_KEYS='${FAILED_TASK_KEYS}' (deploy-ephemeral succeeded=${DEPLOY_EPHEMERAL_SUCCEEDED:-<unset>})"
+
+      # ── Pull embedded e2e shard logs (ka-0000007176) ──────────────────
+      # HISTORY: the prior discovery walked `rwx results --output json` for
+      # nested shard task IDs, then fell back to a BARE `--task e2e-shard-N`
+      # fetch. After the Lever C collapse (gardenio-release embeds e2e.yml as
+      # the `e2e` task), BOTH paths are broken:
+      #   1. `rwx results <run> --output json` for an embedded run returns only
+      #      {RunID, ResultStatus, Completed, Prompt} — NO task-ID tree — so
+      #      SHARD_IDS is always empty and the nested path never runs.
+      #   2. The embedded shards are addressed as `e2e.e2e-shard-N` (dotted,
+      #      namespaced under the `e2e` embed). A bare `--task e2e-shard-N`
+      #      key is AMBIGUOUS ("Did you mean e2e.e2e-shard-N?") and exits
+      #      non-zero, so the fallback fetched nothing either.
+      # Net effect: E2E_OUTPUT_FILE stayed EMPTY on every tag release, so
+      # PASSED_MODULES/FAILED_MODULES were always "" and the MAX_MODULE_FAILURES
+      # stopgap below could never count — ANY single failed module hard-failed
+      # the release gate (16 consecutive silent tag failures, 182.7→183.1).
+      # FIX: fetch each shard directly with the DOTTED `e2e.e2e-shard-N` key
+      # (verified against real failed runs). unique-by module name dedups the
+      # per-module retry lines run-shard.sh emits so a flaky-then-passing module
+      # can't inflate FAILED_COUNT past the threshold.
+      LOGS_DIR=$(mktemp -d)
+      E2E_OUTPUT_FILE="${LOGS_DIR}/e2e-output.txt"
+      : > "$E2E_OUTPUT_FILE"
+      FETCHED_ANY=0
+      for SHARD in e2e.e2e-shard-0 e2e.e2e-shard-1 e2e.e2e-shard-2 e2e.e2e-shard-3; do
+        SHARD_DIR="${LOGS_DIR}/${SHARD}"; mkdir -p "$SHARD_DIR"
+        if rwx logs "$RWX_RUN_ID" --task "$SHARD" --output-dir "$SHARD_DIR" > /dev/null 2>&1; then
+          FETCHED_ANY=1
+          find "$SHARD_DIR" -name "*.log" 2>/dev/null | while read -r LF; do
+            sed -E 's/^[^\t]+\t[^\t]+\t//' "$LF"
+          done >> "$E2E_OUTPUT_FILE"
+        else
+          echo "  (shard ${SHARD} log fetch failed or shard not present — skipping)"
+        fi
+      done
+      if [ "$FETCHED_ANY" -eq 0 ] || [ ! -s "$E2E_OUTPUT_FILE" ]; then
+        echo "Warning: failed to fetch e2e task logs — module parsing will be empty"
+      fi
+
+      # ── JUnit XML (same generator as the prior GitLab job) ──
+      export E2E_OUTPUT_FILE
+      python3 - <<'PYEOF' > release-summary/junit-results/e2e-summary.xml
+      import os, re
+      from xml.sax.saxutils import escape
+      e2e_output = ""
+      p = os.environ.get("E2E_OUTPUT_FILE", "")
+      if p and os.path.isfile(p):
+          with open(p, encoding="utf-8", errors="replace") as f:
+              e2e_output = f.read()
+      passed, failed, modules = [], [], []
+      for line in e2e_output.split("\n"):
+          m = re.match(r"MODULE PASSED:\s+(\S+)", line)
+          if m:
+              passed.append(m.group(1)); modules.append({"name": m.group(1), "status": "pass"})
+          m = re.match(r"MODULE FAILED:\s+(\S+)", line)
+          if m:
+              failed.append(m.group(1)); modules.append({"name": m.group(1), "status": "fail"})
+      tests = len(modules); failures = len(failed)
+      lines = ['<?xml version="1.0" encoding="UTF-8"?>']
+      lines.append(f'<testsuites tests="{tests}" failures="{failures}">')
+      lines.append(f'  <testsuite name="gardenio-e2e" tests="{tests}" failures="{failures}">')
+      for mod in modules:
+          name = escape(mod["name"])
+          if mod["status"] == "fail":
+              lines.append(f'    <testcase name="{name}" classname="gardenio.e2e">')
+              lines.append(f'      <failure message="Module {name} failed">Module {name} failed</failure>')
+              lines.append(f'    </testcase>')
+          else:
+              lines.append(f'    <testcase name="{name}" classname="gardenio.e2e" />')
+      lines.append('  </testsuite>'); lines.append('</testsuites>')
+      print("\n".join(lines))
+      PYEOF
+      echo "JUnit XML generated"; cat release-summary/junit-results/e2e-summary.xml
+
+      # ── Module lists + verdict dotenv (consumed by create-release + report) ──
+      # Dedup by module name (run-shard.sh emits one MODULE line per retry
+      # attempt, so a module can appear multiple times). A module that FAILED an
+      # early attempt but PASSED on retry must NOT count as failed — otherwise a
+      # flaky-then-passing module would inflate FAILED_COUNT past the
+      # MAX_MODULE_FAILURES threshold and wrongly red the release (ka-0000007176).
+      # NOTE (hotfix, ka-0000007176): the FAILED subtraction must NOT use
+      # `grep -vxF -f <(...)`. This task runs under `set -e`: on an all-green
+      # run the FAILED sed emits nothing, grep exits 1 (no lines selected),
+      # and the whole gate dies at this line BEFORE writing the dotenv — the
+      # exact failure observed on 2026.183.4 (109/109 modules passed, gate
+      # exit 1, no FINAL_STATUS emitted). grep's exit code conflates "no
+      # matches" with failure; `comm -23 A B` (lines unique to A) is the
+      # set-difference tool with exit 0 on empty output.
+      PASSED_MODULES=$(sed -nE 's/^MODULE PASSED:[[:space:]]+(\S+).*/\1/p' "$E2E_OUTPUT_FILE" | sort -u | paste -sd, -)
+      FAILED_MODULES=$(comm -23 \
+        <(sed -nE 's/^MODULE FAILED:[[:space:]]+(\S+).*/\1/p' "$E2E_OUTPUT_FILE" | sort -u) \
+        <(sed -nE 's/^MODULE PASSED:[[:space:]]+(\S+).*/\1/p' "$E2E_OUTPUT_FILE" | sort -u) | paste -sd, -)
+      # SKIPPED modules (ka-0000000989): run_module emits "MODULE SKIPPED: <name>"
+      # for a module that self-skipped (prerequisite absent / opt-in unset) — 0
+      # assertions ran, so it is NOT a pass and must be visible as its own count,
+      # not silently folded into the green tally. Subtract any module that PASSED
+      # or FAILED on another shard/attempt so a name only counts as skipped when
+      # it skipped everywhere it ran.
+      SKIPPED_MODULES=$(comm -23 \
+        <(sed -nE 's/^MODULE SKIPPED:[[:space:]]+(\S+).*/\1/p' "$E2E_OUTPUT_FILE" | sort -u) \
+        <(sed -nE 's/^MODULE (PASSED|FAILED):[[:space:]]+(\S+).*/\2/p' "$E2E_OUTPUT_FILE" | sort -u) | paste -sd, -)
+      if [ "${E2E_SUCCEEDED:-false}" = "true" ]; then
+        FINAL_STATUS="succeeded"
+      else
+        FINAL_STATUS="failed"
+      fi
+      {
+        echo "FINAL_STATUS=${FINAL_STATUS}"
+        echo "PASSED_MODULES=${PASSED_MODULES}"
+        echo "FAILED_MODULES=${FAILED_MODULES}"
+        echo "SKIPPED_MODULES=${SKIPPED_MODULES}"
+        echo "RWX_RUN_URL=${RWX_RUN_URL:-}"
+        echo "RWX_RUN_ID=${RWX_RUN_ID}"
+      } > release-summary/release-summary.env
+      cp release-summary/junit-results/e2e-summary.xml release-summary/ 2>/dev/null || true
+
+      # ── Bug bead on failure (best-effort, IN-CLUSTER; never fails the gate) ──
+      # ka-0000002196 / decision ka-0000000203 ("in-cluster"). File the tracking
+      # bug on the DURABLE prod beads daemon via a kubectl port-forward to
+      # svc/gardenio-beads in gardenio-system — reading the daemon's operator token
+      # (kd-beads-token) in-cluster. Mirrors e2e.yml:1056. Wrapped so ANY failure
+      # (tool install, kubeconfig, port-forward, POST) only skips the auto-file
+      # and is logged — it can never fail the gate (the whole block is inside a
+      # `( ... ) || true` guard, and the GATE decision below is independent).
+      if [ "$FINAL_STATUS" != "succeeded" ] && [ -n "$VERSION" ]; then
+        ( set +e
+          echo "E2E FAILED for release ${VERSION} — filing bug bead in-cluster"
+
+          # acct-133 cred routing: the durable prod daemon lives on
+          # prod-gardenio-eks (acct 133); default E2E_AWS_* creds point at the
+          # frozen 909 cluster. Swap to the gardenio-main vault creds + resolve the
+          # cluster name exactly as e2e.yml's kubeconfig task does.
+          BF_EKS_CLUSTER="${EKS_CLUSTER:-}"
+          case "${INIT_HOST_DOMAIN:-}" in
+            prod.gardenio.acme.example|aws-poc.gardenio.acme.example)
+              if [ -z "${POC_AWS_ACCESS_KEY_ID:-}" ] || [ -z "${POC_AWS_SECRET_ACCESS_KEY:-}" ]; then
+                echo "WARN: host-domain=${INIT_HOST_DOMAIN} needs gardenio-main POC_* creds but they are empty — skipping auto-file."
+                exit 0
+              fi
+              export AWS_ACCESS_KEY_ID="$POC_AWS_ACCESS_KEY_ID"
+              export AWS_SECRET_ACCESS_KEY="$POC_AWS_SECRET_ACCESS_KEY"
+              if [ "${INIT_HOST_DOMAIN}" = "prod.gardenio.acme.example" ]; then
+                BF_EKS_CLUSTER="prod-gardenio-eks"
+              else
+                BF_EKS_CLUSTER="${POC_EKS_CLUSTER:-}"
+              fi
+              ;;
+          esac
+          if [ -z "$BF_EKS_CLUSTER" ]; then
+            echo "WARN: no EKS cluster resolved (host-domain='${INIT_HOST_DOMAIN:-}') — skipping auto-file."
+            exit 0
+          fi
+
+          # Lazy tool install (only on a failed release): kubectl + AWS CLI.
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBE_VERSION=$(curl -sSfL https://dl.k8s.io/release/stable.txt) || KUBE_VERSION=""
+            [ -n "$KUBE_VERSION" ] && curl -sSfL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl \
+              && sudo install /tmp/kubectl /usr/local/bin/kubectl
+          fi
+          if ! command -v aws >/dev/null 2>&1; then
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip \
+              && (cd /tmp && unzip -q awscliv2.zip && sudo ./aws/install) && rm -rf /tmp/awscliv2.zip /tmp/aws
+          fi
+          if ! command -v kubectl >/dev/null 2>&1 || ! command -v aws >/dev/null 2>&1; then
+            echo "WARN: kubectl/aws unavailable — skipping auto-file."
+            exit 0
+          fi
+
+          if ! aws eks update-kubeconfig --name "$BF_EKS_CLUSTER" --region "${AWS_DEFAULT_REGION:-us-east-1}" >/dev/null 2>&1; then
+            echo "WARN: could not configure kubeconfig for $BF_EKS_CLUSTER — skipping auto-file."
+            exit 0
+          fi
+
+          # Read the daemon's operator token (kd-beads-token) in-cluster — the
+          # same secret the daemon loads as BEADS_AUTH_TOKEN (RoleOperator).
+          BEADS_TOKEN=$(kubectl -n "$BEADS_NAMESPACE" get secret kd-beads-token \
+            -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null || true)
+          if [ -z "$BEADS_TOKEN" ]; then
+            echo "WARN: could not read kd-beads-token from ${BEADS_NAMESPACE} — skipping auto-file."
+            exit 0
+          fi
+
+          # Port-forward the daemon HTTP port (8080) and POST to /v1/beads (the
+          # in-cluster daemon route; the public /ci PathPrefix is a legacy-ingress
+          # concern that does not exist here). The POST carries
+          # X-System-Operator: release-pipeline — this is a TRUE machine-origin
+          # write with no human behind it, and the daemon fail-closes any
+          # static-token write that resolves no operator (400 operator_refusal,
+          # resolver_source=header_missing). The header stamps operated_by=
+          # system:release-pipeline (audit.go WithSystemOperator; honored only on
+          # the primary static-token branch, which kd-beads-token is). Verified
+          # live 2026-07-26: 201 + operated_by=system:release-pipeline.
+          kubectl -n "$BEADS_NAMESPACE" port-forward "svc/${BEADS_SVC}" 19091:8080 >/dev/null 2>&1 &
+          PF_PID=$!
+          trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
+          # Wait for the tunnel (up to ~15s) rather than a fixed sleep.
+          BEADS_HTTP_URL="http://localhost:19091"
+          READY=0
+          for _ in $(seq 1 15); do
+            if curl -sf --max-time 2 "${BEADS_HTTP_URL}/v1/health" >/dev/null 2>&1; then READY=1; break; fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "WARN: beads port-forward not ready — skipping auto-file."
+            exit 0
+          fi
+
+          export E2E_OUTPUT_FILE VERSION RWX_RUN_ID FAILED_TASK_KEYS
+          export RWX_RUN_URL="${RWX_RUN_URL:-}"
+          DESC=$(RUN_URL="${RWX_RUN_URL}" CI_COMMIT_TAG="$VERSION" python3 scripts/build-e2e-bug-bead-desc.py 2>/dev/null || echo "")
+          # Fallback description if the filer produced nothing. Name the real
+          # failed task(s) here too (ka-0000007840) so even the degraded path
+          # never mis-attributes a deploy failure to e2e.
+          if [ -z "$DESC" ]; then
+            if [ -n "${FAILED_TASK_KEYS:-}" ]; then
+              DESC=$(printf 'RWX release %s failed. Failed RWX tasks: %s\n\nRun: %s\nRun ID: %s\nResult: %s' "$VERSION" "$FAILED_TASK_KEYS" "${RWX_RUN_URL}" "$RWX_RUN_ID" "$FINAL_STATUS")
+            else
+              DESC=$(printf 'RWX E2E tests failed for release %s.\n\nRun: %s\nRun ID: %s\nResult: %s' "$VERSION" "${RWX_RUN_URL}" "$RWX_RUN_ID" "$FINAL_STATUS")
+            fi
+          fi
+          # Labels carry TWO distinct meanings and BOTH are required:
+          #   - "release:<version>" is PROVENANCE (which tag failed).
+          #   - "release-pipeline" is POLICY. The operator's always-P0 rule
+          #     (decision ka-0000000928) is implemented in the captain-bugfix
+          #     (ka-0000001007) and captain-release-owner (ka-0000006579)
+          #     prompts, which match only the WORD labels release-pipeline /
+          #     release-pipeline-broken / release-regression / release-blocker.
+          #     A bare "release:<version>" matches NONE of them, so without this
+          #     label the P0 escalation branch is dead code for every auto-filed
+          #     release bug: measured 2026-07-27, 0 of 7 auto-filed release bugs
+          #     ever reached P0, vs 22 of 25 word-labelled ones (ka-0000003811).
+          # priority 1 is the FLOOR, not the ceiling — once the captain can see
+          # the policy label it escalates to P0 on its next cycle.
+          #
+          # DEDUP (ka-0000006212): BEAD_TITLE is a CONSTANT ("RWX release E2E
+          # failed"), so an un-guarded create files a fresh bead on every failed
+          # release even when they are the same flake — measured 6 identical
+          # beads in 32h, each re-triaged by a fresh agent that did not know the
+          # other five existed, and the inflated open_bugs count can trip
+          # captain-bugfix's "widen the budget" signal on phantom volume.
+          # Before creating, look for an EXISTING OPEN bug with the same title
+          # in this project; if found, COMMENT the new version + run URL onto it
+          # instead of minting a duplicate. Dedup on OPEN beads only — once a
+          # captain closes the bug as fixed, a new failure genuinely is a new
+          # bug and should file fresh. This is best-effort and fail-OPEN: any
+          # lookup error falls through to the create-anyway path below, so dedup
+          # can never swallow a filing (the whole block is already best-effort).
+          # Selection (which existing bug to consolidate onto, or none) is the
+          # one error-prone bit, so it lives in a unit-tested helper —
+          # scripts/select-dedup-release-bug.sh — that fails OPEN (empty output
+          # + exit 0) on any error/empty/malformed body. See its _test.sh.
+          #
+          # POLICY-LABEL GUARD (ka-0000002567): the helper consolidates ONLY
+          # onto a title-match that ALREADY carries the always-P0 policy word
+          # label "release-pipeline" (below). Without this guard, dedup would
+          # land every future failure as a comment on the OLDEST title-match —
+          # including a pre-!6155 bead with no word label — and the P0
+          # escalation (decision ka-0000000928) would silently go dead again
+          # (0/7 auto-filed release bugs reached P0 pre-!6155). When no LABELLED
+          # match exists the helper returns empty, so we fall through to the
+          # labelled-create path below — the consolidated bead ALWAYS carries
+          # the policy label, by construction, with no label-write on this path.
+          # The list endpoint hydrates a per-bead "labels" array regardless of
+          # the ?labels= filter, so the guard can see each candidate's labels.
+          #
+          # NOTE (ka-0000002823 interaction): a dedup HIT `exit 0`s here BEFORE
+          # the parent-at-creation block below, so on a dedup hit no new bug is
+          # filed and there is nothing to parent — consistent, not a conflict
+          # (see MR !6174 notes, ka-0000002567). Only the create-anyway fall-
+          # through path reaches the parent block.
+          DEDUP_ID=""
+          LIST_OUT=$(curl -sS --max-time 10 \
+            -H "Authorization: Bearer ${BEADS_TOKEN}" \
+            "${BEADS_HTTP_URL}/v1/beads?type=bug&status=open&labels=project:gardenio&limit=1000" 2>/dev/null || true)
+          if [ -n "$LIST_OUT" ]; then
+            DEDUP_ID=$(printf '%s' "$LIST_OUT" | bash scripts/select-dedup-release-bug.sh "$BEAD_TITLE" "release-pipeline" 2>/dev/null || true)
+          fi
+          if [ -n "$DEDUP_ID" ]; then
+            echo "Dedup: existing open bug ${DEDUP_ID} has the same title — commenting instead of filing a duplicate."
+            CMT=$(printf 'Release gate failed again for %s.\n\nRun: %s\nRun ID: %s\nResult: %s\n\n(Auto-appended by the release-gate filer instead of minting a duplicate bug — dedup on the constant title "%s", ka-0000006212.)' \
+              "$VERSION" "${RWX_RUN_URL}" "$RWX_RUN_ID" "$FINAL_STATUS" "$BEAD_TITLE")
+            CMT_BODY=$(jq -n --arg text "$CMT" '{text: $text}')
+            CMT_OUT=$(curl -sS --max-time 10 -X POST "${BEADS_HTTP_URL}/v1/beads/${DEDUP_ID}/comments" \
+              -H "Authorization: Bearer ${BEADS_TOKEN}" -H "Content-Type: application/json" \
+              -H "X-System-Operator: release-pipeline" \
+              -w $'\n%{http_code}' -d "$CMT_BODY" 2>&1 || true)
+            CMT_CODE=$(printf '%s' "$CMT_OUT" | tail -n1)
+            if [ "$CMT_CODE" -ge 200 ] 2>/dev/null && [ "$CMT_CODE" -lt 300 ] 2>/dev/null; then
+              echo "Dedup comment posted on ${DEDUP_ID} (http ${CMT_CODE}); skipping create."
+              echo "BEAD_ID=${DEDUP_ID}" >> release-summary/release-summary.env
+              echo "BEAD_URL=${BEADS_VIEW_URL%/}/${DEDUP_ID}" >> release-summary/release-summary.env
+              echo "BEAD_DEDUP=1" >> release-summary/release-summary.env
+              exit 0
+            fi
+            echo "WARN: dedup comment on ${DEDUP_ID} failed (http ${CMT_CODE}) — falling through to create-anyway."
+          fi
+          # PARENT AT CREATION (ka-0000002823, operator decision ka-0000002529)
+          #
+          # The label above is necessary but NOT sufficient. This task runs in a
+          # CI pipeline with no epic to attach to, so the bug used to be born
+          # PARENTLESS — and the controller's OrphanSweeper stamps `needs-intake`
+          # on any parentless open/unassigned work bead ~15m later, SILENTLY.
+          # `needs-intake` is on captain-bugfix's hard exclusion list ("Anything
+          # still carrying needs-intake is NOT yours to dispatch"), so the bug was
+          # evicted into the intake lane — whose 325-line runbook says "No MRs, no
+          # merges, no code, no releases". A release blocker was routed to the ONE
+          # lane forbidden to act on releases, and hidden from the bug-drain safety
+          # net. Measured: 4 historical bugs bitten, 2 of them P0.
+          #
+          # The operator resolved this (ka-0000002529, "the release captain seems
+          # like the logical owner") as `parent-at-creation`: give the filer a
+          # stable parent so the bug is born WITH a lane and the sweeper never sees
+          # an orphan at all — rather than adding a sweeper exception or letting
+          # captain-bugfix override needs-intake (which would re-open the
+          # janitor<->groomer fight-loop, decision ka-0000008119).
+          #
+          # The parent is a STANDING epic resolved by GET-OR-CREATE on a fixed
+          # idempotency_key: re-POSTing the same key returns the existing bead
+          # instead of inserting a duplicate (ka-0000002856), so this is
+          # self-healing — if the epic is ever deleted, the next release failure
+          # re-mints it rather than silently reverting to parentless filing. The
+          # epic carries `no-auto-close` (the daemon auto-close cascade would
+          # otherwise hard-close a standing container the moment its subtree
+          # drains — i.e. exactly when releases are healthy, ka-0000001525) and
+          # `release-pipeline` (puts it in captain-release-owner's lane AND exempts
+          # the container itself from the orphan sweep).
+          #
+          # A parent-child edge is NOT a blocking dep (blockingDepTypes =
+          # blocks/blocked-by/depends-on), so the bug still appears in `gb ready`
+          # and the captains' `kd list --no-blockers` sets. This gives the bug a
+          # home WITHOUT hiding it from the lane that fixes it.
+          #
+          # Fail-OPEN throughout: any failure resolving the epic leaves PARENT_ID
+          # empty and files exactly as before (parentless). A release failure must
+          # always get a bug; parenting is a routing improvement, never a
+          # precondition. Selection lives in a unit-tested helper
+          # (scripts/select-release-epic-id.sh) that exits 0 + empty on any
+          # error/malformed/non-epic body.
+          PARENT_ID=""
+          EPIC_BODY=$(jq -n --arg key "$RELEASE_EPIC_IDEMPOTENCY_KEY" --arg title "$RELEASE_EPIC_TITLE" --arg desc "$RELEASE_EPIC_DESC" \
+            '{title: $title, type: "epic", priority: 1, description: $desc,
+              labels: ["project:gardenio", "release-pipeline", "no-auto-close"],
+              idempotency_key: $key}')
+          EPIC_OUT=$(curl -sS --max-time 15 -X POST "${BEADS_HTTP_URL}/v1/beads" \
+            -H "Authorization: Bearer ${BEADS_TOKEN}" -H "Content-Type: application/json" \
+            -H "X-System-Operator: release-pipeline" \
+            -H "X-No-Auto-Parent: 1" \
+            -d "$EPIC_BODY" 2>/dev/null || true)
+          if [ -n "$EPIC_OUT" ]; then
+            PARENT_ID=$(printf '%s' "$EPIC_OUT" | bash scripts/select-release-epic-id.sh || true)
+          fi
+          if [ -n "$PARENT_ID" ]; then
+            echo "Parent epic for release bugs: ${PARENT_ID} (get-or-create on ${RELEASE_EPIC_IDEMPOTENCY_KEY})"
+          else
+            echo "WARN: could not resolve the standing release-failures epic — filing PARENTLESS (ka-0000002823 routing fix inactive this run)."
+          fi
+          BODY=$(jq -n --arg title "$BEAD_TITLE" --arg desc "$DESC" --arg version "$VERSION" --arg parent "$PARENT_ID" \
+            '{title: $title, type: "bug", priority: 1, description: $desc, labels: ["project:gardenio", "release-pipeline", ("release:" + $version)]}
+             + (if $parent == "" then {} else {parent_bead_id: $parent} end)')
+          BEAD_ID=""; HTTP_CODE=""; BEAD_BODY=""; CURL_EXIT=0
+          for ATTEMPT in 1 2 3; do
+            CURL_OUT=$(curl -sS -X POST "${BEADS_HTTP_URL}/v1/beads" \
+              -H "Authorization: Bearer ${BEADS_TOKEN}" -H "Content-Type: application/json" \
+              -H "X-System-Operator: release-pipeline" \
+              -w $'\n%{http_code}' -d "$BODY" 2>&1) || CURL_EXIT=$?
+            HTTP_CODE=$(printf '%s' "$CURL_OUT" | tail -n1)
+            BEAD_BODY=$(printf '%s' "$CURL_OUT" | sed '$d')
+            if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_CODE" -ge 200 ] 2>/dev/null && [ "$HTTP_CODE" -lt 300 ] 2>/dev/null; then
+              BEAD_ID=$(printf '%s' "$BEAD_BODY" | jq -r '.id // empty' 2>/dev/null || true); break
+            fi
+            if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_CODE" -ge 400 ] 2>/dev/null && [ "$HTTP_CODE" -lt 500 ] 2>/dev/null; then
+              echo "Bug bead POST returned ${HTTP_CODE} (4xx, not retrying)"; break
+            fi
+            echo "Bug bead POST attempt ${ATTEMPT}/3 failed (curl_exit=${CURL_EXIT} http_code=${HTTP_CODE}); retrying..."
+            sleep $((ATTEMPT * 2)); CURL_EXIT=0
+          done
+          if [ -n "$BEAD_ID" ]; then
+            echo "Bug bead filed: ${BEAD_ID}"
+            echo "BEAD_ID=${BEAD_ID}" >> release-summary/release-summary.env
+            echo "BEAD_URL=${BEADS_VIEW_URL%/}/${BEAD_ID}" >> release-summary/release-summary.env
+          else
+            echo "ERROR: failed to create bug bead (curl_exit=${CURL_EXIT} http_code=${HTTP_CODE})"
+            echo "BEAD_FILING_FAILED=1" >> release-summary/release-summary.env
+            echo "BEAD_FILING_HTTP_CODE=${HTTP_CODE}" >> release-summary/release-summary.env
+          fi
+        ) || echo "WARN: in-cluster bug-bead filing failed (best-effort) — release gate unaffected."
+      fi
+
+      echo "=== release-gate dotenv ==="; cat release-summary/release-summary.env
+
+      # ── The GATE (0-tolerance: ANY module failure reds the release) ──
+      # HISTORY: this used to be a MAX_MODULE_FAILURES=5 stopgap that passed the
+      # release gate as long as no more than 5 modules failed — a blind
+      # count-of-failures tolerance that MASKED real regressions (ka-0000000440).
+      # It was explicitly a stopgap "until Captain quarantine ships": both of its
+      # removal deps — ka-0000004315 (Captain CLI) and ka-0000002956 (smoke +
+      # per-module flake-quarantine epic) — are CLOSED, and the per-module
+      # replacement is LIVE: Captain wraps run-shard.sh (.rwx/e2e.yml) and applies
+      # .captain/quarantines/gardenio-e2e.yml, so a KNOWN flake is suppressed at
+      # the source (its failure never reddens its shard and never reaches
+      # FINAL_STATUS here) with per-module attribution — strictly better than a
+      # blind count. Any module reaching this gate as failed is therefore an
+      # UN-quarantined failure, and the release must fail closed. To temporarily
+      # tolerate a newly-flaky module, add it to the quarantine list (per-module,
+      # attributed) — never re-introduce a count threshold here.
+      # Structural guard: scripts/check-e2e-module-failure-gate.sh (+ _test.sh).
+      if [ "$FINAL_STATUS" != "succeeded" ]; then
+        echo "E2E did not succeed (FINAL_STATUS=${FINAL_STATUS}, failed_modules='${FAILED_MODULES}') — failing release gate"
+        echo "  Any un-quarantined module failure reds the release (0-tolerance, ka-0000000440)."
+        echo "  To tolerate a known flake, add it to .captain/quarantines/gardenio-e2e.yml."
+        exit 1
+      fi
+      echo "E2E passed — release gate green"
+    outputs:
+      artifacts:
+        - key: release-summary
+          path: release-summary
+
+  # ── Promote RC images + chart → bare calver (Lever C follow-up) ─────
+  # Embeds promote.yml AFTER release-gate succeeds — so the 0-tolerance E2E
+  # verdict in release-gate (ka-0000000440) gates promotion exactly as the prior
+  # GitLab `promote needs: rwx-release` did. The hard gate before prod
+  # (ka-0000008209): prod helm-upgrades against the bare-calver tags, which only
+  # exist after this.
+  - key: promote
+    after: ${{ release-gate.succeeded }}
+    call: ${{ run.dir }}/promote.yml
+    init:
+      commit-sha: ${{ init.commit-sha }}
+      version: ${{ init.version }}
+
+  # ── Prod-deploy freeze gate (ka-0000004932) ─────────────────────────
+  # Was a shell guard at the head of the GitLab rwx-deploy-prod job. Moved here,
+  # BEFORE the embedded prod deploy: if .rwx/PROD_DEPLOY_FROZEN exists in the
+  # released tree, fail this task so deploy-prod (after: prod-freeze-check) is
+  # skipped — the rest of the release (gate, promote, GitLab Release) is
+  # unaffected, exactly as the prior freeze-before-dispatch behavior. Resume by
+  # deleting the marker, merging to main, re-tagging.
+  - key: prod-freeze-check
+    use: code
+    after: ${{ promote.succeeded }}
+    cache: false
+    run: |
+      if [ -f .rwx/PROD_DEPLOY_FROZEN ]; then
+        echo "════════════════════════════════════════════════════════════"
+        echo "PROD DEPLOY FROZEN — .rwx/PROD_DEPLOY_FROZEN is present."
+        echo "The next release to prod is intentionally blocked."
+        echo "Resume: delete .rwx/PROD_DEPLOY_FROZEN, merge to main, re-tag."
+        echo "Tracking: ka-0000004932"
+        echo "════════════════════════════════════════════════════════════"
+        echo "--- freeze marker contents ---"; cat .rwx/PROD_DEPLOY_FROZEN
+        exit 1
+      fi
+      echo "Prod deploy not frozen — proceeding."
+
+  # ── Prod deploy (Lever C follow-up) ─────────────────────────────────
+  # Embeds deploy.yml with target=prod AFTER promote + the freeze check. The
+  # deploy.yml deploy-prod task keeps its monotonic-version guard (refuses to
+  # regress prod to an older version) and reads the dedicated PROD_* secrets.
+  # Post-P4.4 cutover (2026-07-05, ka-0000006191) those PROD_* secrets are
+  # repointed to prod-gardenio-eks / acct 123456789012, and deploy-prod is a
+  # targeted `terraform apply` of composition/canonical-prod (module.gardenio),
+  # NOT a deploy to the frozen america-e2e-eks / acct 234567890123 (D-2
+  # ka-0000001400); deploy.yml hard-fails any prod deploy whose account ≠ 133. Cross-
+  # pipeline serialization is provided by the top-level release-prod-deploy
+  # concurrency pool (see concurrency-pools, above).
+  - key: deploy-prod
+    after: ${{ prod-freeze-check.succeeded }}
+    call: ${{ run.dir }}/deploy.yml
+    init:
+      commit-sha: ${{ init.commit-sha }}
+      version: ${{ init.version }}
+      image-tag: ""
+      target: "prod"
+      status-context: ""
+      # deploy.yml references ${{ init.force-apply }} (added in f43e3facc). An
+      # embedded `call:` resolves its init context from EXACTLY the keys passed
+      # here, so this key must be present or RWX fails init-validation before the
+      # task runs. Empty = normal monotonic behavior (a release always bumps the
+      # chart version; the same-version re-apply escape hatch is dispatch-only).
+      force-apply: ""
+
+  # ── Create the GitLab Release (Lever C follow-up) ───────────────────
+  # Replaces the GitLab-native `release:` keyword (a runner-only construct, V3
+  # ka-0000004507) with a direct POST to the GitLab Releases API, plus the E2E
+  # summary append that update-release-e2e used to PUT in the notify stage.
+  #
+  # GATE = promote (ka-0000000710): the GitLab Release records that the GOLDEN
+  # ARTIFACTS (final-tag images + OCI helm chart) exist and are promoted; that
+  # fact is true the moment `promote` succeeds, INDEPENDENT of whether the prod
+  # cluster rollout (deploy-prod) succeeds. This restores the pre-Lever-C
+  # gating: the prior GitLab job was `create-release needs: [rwx-release,
+  # promote]` — NOT rwx-deploy-prod. The Lever-C collapse (ka-0000001459)
+  # over-tightened it to `after: deploy-prod.succeeded`, so a failed prod deploy
+  # SKIPPED create-release and the promoted tag never landed in `glab release
+  # list` even though its artifacts were golden — a sustained promotion gap
+  # (tags 2026.209.7-.10 built-but-unreleased). Gating on `promote` also matches
+  # the freeze-gate contract (prod-freeze-check comment above): when deploy-prod
+  # is intentionally skipped, "the rest of the release (gate, promote, GitLab
+  # Release) is unaffected".
+  #
+  # The overall release VERDICT stays fail-closed on a prod-deploy failure:
+  # report-status (below) still requires DEPLOY_PROD=true, so a failed
+  # deploy-prod paints the `rwx/release` commit status RED and trips triage —
+  # but the golden Release now EXISTS, making the promotion observable and the
+  # release recoverable (re-deploy version X to prod; no re-tag needed).
+  #
+  # create-release reads nothing from deploy-prod's FS (only `code` +
+  # release-gate's release-summary.env), so gating on `promote` — which runs in
+  # parallel with the prod-freeze-check → deploy-prod branch — is sound.
+  - key: create-release
+    use: [code, release-gate]
+    after: ${{ promote.succeeded }}
+    cache: false
+    timeout: 10m
+    env:
+      GITLAB_CLONE_TOKEN: ${{ secrets.GITLAB_CLONE_TOKEN }}
+      GITLAB_PROJECT_ID: "12345678"
+      VERSION: ${{ init.version }}
+    run: |
+      set -e
+      command -v jq >/dev/null 2>&1 || { sudo apt-get update -q && sudo apt-get install -y -q jq bash; }
+      API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}"
+
+      # Source the release-gate verdict (FINAL_STATUS / PASSED_MODULES / ...).
+      SUMMARY_ENV="$(find . -maxdepth 3 -name release-summary.env 2>/dev/null | head -1)"
+      [ -n "$SUMMARY_ENV" ] && [ -f "$SUMMARY_ENV" ] && . "$SUMMARY_ENV" || true
+
+      bash scripts/release-notes.sh "$VERSION" > release-notes.md
+      echo "--- release notes ---"; cat release-notes.md
+
+      # Append the E2E summary (folds update-release-e2e).
+      PASSED_COUNT=0; FAILED_COUNT=0; SKIPPED_COUNT=0
+      [ -n "${PASSED_MODULES:-}" ] && PASSED_COUNT=$(echo "$PASSED_MODULES" | awk -F, '{print NF}')
+      [ -n "${FAILED_MODULES:-}" ] && FAILED_COUNT=$(echo "$FAILED_MODULES" | awk -F, '{print NF}')
+      # SKIPPED count (ka-0000000989): surfaced alongside pass/fail so a module
+      # that asserted NOTHING (prerequisite absent) is a visible number, not a
+      # silent contributor to the green tally.
+      [ -n "${SKIPPED_MODULES:-}" ] && SKIPPED_COUNT=$(echo "$SKIPPED_MODULES" | awk -F, '{print NF}')
+      TOTAL=$((PASSED_COUNT + FAILED_COUNT))
+      SKIP_SUFFIX=""
+      [ "$SKIPPED_COUNT" -gt 0 ] && SKIP_SUFFIX=", ${SKIPPED_COUNT} skipped"
+      if [ "${FINAL_STATUS:-}" = "succeeded" ]; then
+        HEADLINE="**E2E: ${PASSED_COUNT}/${TOTAL} modules passed${SKIP_SUFFIX}**"
+      elif [ "$TOTAL" -gt 0 ]; then
+        HEADLINE="**E2E: ${PASSED_COUNT}/${TOTAL} modules passed (${FAILED_COUNT} failed${SKIP_SUFFIX})**"
+      else
+        HEADLINE="**E2E: ${FINAL_STATUS:-unknown}**"
+      fi
+      SUMMARY=$(printf '## End-to-end test results\n\n%s\n' "$HEADLINE")
+      if [ -n "${FAILED_MODULES:-}" ]; then
+        SUMMARY=$(printf '%s\nFailed modules: %s\n' "$SUMMARY" "$(echo "$FAILED_MODULES" | sed 's/,/, /g')")
+      fi
+      if [ -n "${SKIPPED_MODULES:-}" ]; then
+        SUMMARY=$(printf '%s\nSkipped modules (asserted nothing — prerequisite absent): %s\n' "$SUMMARY" "$(echo "$SKIPPED_MODULES" | sed 's/,/, /g')")
+      fi
+      [ -n "${RWX_RUN_URL:-}" ] && SUMMARY=$(printf '%s\n[RWX run](%s)\n' "$SUMMARY" "$RWX_RUN_URL")
+      FULL_DESC=$(printf '%s\n\n---\n\n%s\n' "$(cat release-notes.md)" "$SUMMARY")
+
+      # Idempotent: create the Release, or update its description if it exists.
+      EXIST_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+        -H "PRIVATE-TOKEN: ${GITLAB_CLONE_TOKEN}" "${API}/releases/${VERSION}" || echo "000")
+      if [ "$EXIST_CODE" = "200" ]; then
+        echo "Release ${VERSION} exists — updating description."
+        curl -sf -X PUT -H "PRIVATE-TOKEN: ${GITLAB_CLONE_TOKEN}" \
+          "${API}/releases/${VERSION}" --data-urlencode "description=${FULL_DESC}" > /dev/null \
+          && echo "Release ${VERSION} description updated." || echo "WARN: failed to update release description."
+      else
+        echo "Creating Release ${VERSION}."
+        ASSETS=$(jq -n \
+          '{links: [
+            {name: "Helm chart (OCI): gardenio", url: "https://gitlab.com/Acme/Platform/gardenio/-/packages", link_type: "package"},
+            {name: "Container registry (all images)", url: "https://gitlab.com/Acme/Platform/gardenio/container_registry", link_type: "image"}
+          ]}')
+        REL_BODY=$(jq -n --arg tag "$VERSION" --arg name "Release $VERSION" \
+          --arg desc "$FULL_DESC" --argjson assets "$ASSETS" \
+          '{tag_name: $tag, name: $name, description: $desc, assets: $assets}')
+        HTTP_CODE=$(curl -sS -o /tmp/rel.out -w "%{http_code}" -X POST \
+          -H "PRIVATE-TOKEN: ${GITLAB_CLONE_TOKEN}" -H "Content-Type: application/json" \
+          "${API}/releases" -d "$REL_BODY" || echo "000")
+        echo "Releases API HTTP ${HTTP_CODE}"; cat /tmp/rel.out || true
+        if [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "200" ]; then
+          echo "ERROR: failed to create GitLab Release ${VERSION} (HTTP ${HTTP_CODE})"; exit 1
+        fi
+        echo "GitLab Release ${VERSION} created."
+      fi
+
+  # ── Terminal reporter: POST the rwx/release commit status (Lever C) ─
+  # The fire-and-forget reporter (mirror main.yml:218 / deploy.yml report-status).
+  # Computes the overall release verdict and POSTs a single `rwx/release` commit
+  # status to the release commit, so the dispatching GitLab `rwx-release` job can
+  # return immediately after POSTing `pending`. Also folds notify-release-failure
+  # (Slack on a failed release) into this task.
+  #
+  # SKIP-CASCADE SAFETY (ka-0000006290): the reporter must ALWAYS run once the
+  # front terminates and read the four verdict tasks' status in env. RWX makes a
+  # task's status env-addressable (`tasks.<key>.*`) ONLY when an `after:`/`use:`
+  # edge exists; a bare `${{ release-gate.succeeded }}` env ref is a COMPILE
+  # error ("release-gate does not exist") — the original bug. A plain
+  # `tasks.<key>.*` env ref also creates an IMPLICIT success-required edge that
+  # would SKIP the reporter whenever any of the four is not green (exactly the
+  # skip-cascade the watchdog must prevent). So each verdict task is listed in
+  # the `after:` expression with a TERMINAL COVER
+  # `(<task>.succeeded || <task>.failed || <task>.skipped)`: always-true once the
+  # task terminates ⇒ the reporter WAITS for all four and is NEVER skip-cascaded,
+  # while the booleans are read via the `tasks.<key>.succeeded` accessors below.
+  # `deploy-ephemeral` (the always-terminal head) anchors the front. This is also
+  # why there is deliberately NO `use:` here — `use:` requires SUCCESS and would
+  # skip the reporter when release-gate fails. The verdict needs only the
+  # `.succeeded` booleans (env), not any task's FS.
+  #
+  # VERDICT (fail-closed): success iff release-gate AND promote AND deploy-prod
+  # AND create-release all succeeded. Any failure or skip ⇒ failed. This is the
+  # same all-green condition the prior GitLab `needs:` chain (rwx-release →
+  # promote → rwx-deploy-prod → create-release) enforced by job completion.
+  - key: report-status
+    after: ${{ (deploy-ephemeral.succeeded || deploy-ephemeral.failed) && (release-gate.succeeded || release-gate.failed || release-gate.skipped) && (promote.succeeded || promote.failed || promote.skipped) && (deploy-prod.succeeded || deploy-prod.failed || deploy-prod.skipped) && (create-release.succeeded || create-release.failed || create-release.skipped) }}
+    cache: false
+    timeout: 5m
+    env:
+      STATUS_CONTEXT: ${{ init.status-context }}
+      GITLAB_CLONE_TOKEN: ${{ secrets.GITLAB_CLONE_TOKEN }}
+      GITLAB_PROJECT_ID: "12345678"
+      COMMIT_SHA: ${{ init.commit-sha }}
+      VERSION: ${{ init.version }}
+      GATE: ${{ tasks.release-gate.succeeded }}
+      PROMOTE: ${{ tasks.promote.succeeded }}
+      DEPLOY_PROD: ${{ tasks.deploy-prod.succeeded }}
+      CREATE_RELEASE: ${{ tasks.create-release.succeeded }}
+    run: |
+      set -uo pipefail
+      API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}"
+      GATE="${GATE:-false}"; PROMOTE="${PROMOTE:-false}"
+      DEPLOY_PROD="${DEPLOY_PROD:-false}"; CREATE_RELEASE="${CREATE_RELEASE:-false}"
+      if [ "$GATE" = "true" ] && [ "$PROMOTE" = "true" ] && \
+         [ "$DEPLOY_PROD" = "true" ] && [ "$CREATE_RELEASE" = "true" ]; then
+        STATE="success"
+        DESC="gate+promote+deploy-prod+create-release green"
+      else
+        STATE="failed"
+        DESC="gate=${GATE} promote=${PROMOTE} deploy-prod=${DEPLOY_PROD} create-release=${CREATE_RELEASE}"
+      fi
+      echo "report-status: ${STATE} (${DESC}) for ${COMMIT_SHA}"
+
+      # No status-context ⇒ manual/CLI dispatch; skip the commit-status POST and
+      # the Slack notify (matches deploy.yml's report-status no-op). The run's
+      # own exit code below still reflects the verdict for a `rwx run --wait`.
+      if [ -z "${STATUS_CONTEXT:-}" ]; then
+        echo "report-status: no status-context — skipping commit-status POST (manual/CLI dispatch)."
+        if [ "$STATE" = "failed" ]; then exit 1; fi
+        exit 0
+      fi
+
+      if [ -n "${GITLAB_CLONE_TOKEN:-}" ]; then
+        HTTP_CODE=$(curl -sS -o /tmp/status.out -w "%{http_code}" --retry 3 --retry-delay 3 \
+          -X POST -H "PRIVATE-TOKEN: ${GITLAB_CLONE_TOKEN}" \
+          "${API}/statuses/${COMMIT_SHA}" \
+          --data-urlencode "state=${STATE}" \
+          --data-urlencode "context=${STATUS_CONTEXT}" \
+          --data-urlencode "description=${DESC}" \
+          --data-urlencode "target_url=${RWX_RUN_URL:-https://cloud.rwx.com}" || echo "000")
+        echo "GitLab statuses API HTTP ${HTTP_CODE}"; cat /tmp/status.out || true
+        if [ "${HTTP_CODE}" != "200" ] && [ "${HTTP_CODE}" != "201" ]; then
+          echo "ERROR: failed to POST commit status (HTTP ${HTTP_CODE})"; exit 1
+        fi
+      else
+        echo "WARN: GITLAB_CLONE_TOKEN unset — cannot POST ${STATUS_CONTEXT} status."
+        exit 1
+      fi
+
+      # The optional Slack failure ping is a SEPARATE task (notify-release-failure
+      # below), `if:`-gated on this task's verdict. It MUST NOT live here: RWX
+      # resolves a task's `secrets.*` env refs at task-PREP (before the script
+      # runs), so referencing an optional Slack secret in this task's env ABORTS
+      # the whole reporter when that secret is absent from the vault — stranding
+      # the SHA at `pending` (observed on the ka-0000006290 verify run:
+      # report-status never started, "secret SLACK_RELEASE_WEBHOOK not found").
+      # The critical commit-status POST above therefore references NO optional
+      # secret and can never be aborted by a missing one (ka-0000006290).
+
+      # Mirror the red status onto the RWX run itself.
+      if [ "$STATE" = "failed" ]; then
+        echo "report-status: marking RWX run failed to mirror the red commit status"; exit 1
+      fi
+
+  # ── Optional Slack failure ping (folds notify-release-failure) ──────
+  # Split out of report-status so a MISSING Slack secret can never abort the
+  # critical commit-status POST (ka-0000006290): RWX resolves a task's
+  # `secrets.*` env refs at task-PREP, so any task that references a secret
+  # absent from the vault is aborted before its script runs. By `if:`-gating
+  # this task on `tasks.report-status.failed`, the Slack secrets are only
+  # resolved when there is actually a failed release to announce; on a green
+  # release (or a manual/CLI dispatch where report-status exits 0) this task is
+  # skipped and the secrets are never touched. Best-effort: if a Slack secret is
+  # unset the ping is the only thing that fails — the rwx/release status was
+  # already posted by report-status, so the SHA is never stranded.
+  #
+  # TRANSPORT (ka-0000003107): posts via the Slack Web API `chat.postMessage`
+  # using a BOT TOKEN + channel id, NOT a bare incoming webhook. The former
+  # `SLACK_RELEASE_WEBHOOK` secret was never seeded in the RWX `default` vault,
+  # so failure pings were silently never delivered (contributed to golden
+  # sitting frozen for 6+ hours on the 182.6 stall). We reuse secrets already
+  # PRESENT in the same `default` vault the rest of this pipeline resolves from:
+  #   * E2E_SLACK_BOT_TOKEN     — the only Slack bot token secret in .rwx/
+  #                               (smoke-rwx.yml:293); no prod/release-specific
+  #                               bot token exists in the vault.
+  #   * GARDENIO_PROD_SLACK_CHANNEL — the prod channel id (deploy.yml:930), with
+  #     E2E_SLACK_CHANNEL (smoke-rwx.yml:294) as fallback. Prod channel is
+  #     preferred only when it looks like a real Slack id (C…/G…), mirroring
+  #     deploy.yml's ka-0000006101 placeholder guard; otherwise the E2E channel
+  #     wins so a placeholder never suppresses the ping.
+  # Channel membership (ka-0000004511): delivery requires the bot behind
+  # E2E_SLACK_BOT_TOKEN to be a MEMBER of the resolved channel — chat.postMessage
+  # returns `not_in_channel` otherwise, which is exactly the failure this task
+  # would only ever hit on the FIRST real failed release (nothing exercises the
+  # post on a green release). So instead of leaving membership as an unverified
+  # best-effort WARN, the script SELF-HEALS: on a `not_in_channel` reply it calls
+  # `conversations.join` (needs the `channels:join` scope) and retries the post
+  # once. A PUBLIC channel then delivers on that very first failure with no human
+  # in the loop. A PRIVATE channel cannot be self-joined — the bot must be invited
+  # (`/invite @<bot>`) — so that case is logged as a clear, actionable WARN rather
+  # than a silent drop. Never fatal (the rwx/release status is already posted).
+  - key: notify-release-failure
+    after: ${{ report-status.succeeded || report-status.failed || report-status.skipped }}
+    if: ${{ tasks.report-status.failed }}
+    cache: false
+    timeout: 5m
+    env:
+      STATUS_CONTEXT: ${{ init.status-context }}
+      VERSION: ${{ init.version }}
+      SLACK_BOT_TOKEN: ${{ secrets.E2E_SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL: ${{ secrets.GARDENIO_PROD_SLACK_CHANNEL }}
+      SLACK_CHANNEL_FALLBACK: ${{ secrets.E2E_SLACK_CHANNEL }}
+    run: |
+      set -uo pipefail
+      # No status-context ⇒ manual/CLI dispatch: report-status already no-op'd
+      # the POST, so there is nothing to announce.
+      if [ -z "${STATUS_CONTEXT:-}" ]; then
+        echo "notify-release-failure: no status-context — skipping Slack ping (manual/CLI dispatch)."
+        exit 0
+      fi
+      # Best-effort: an unset or unresolved bot token skips the ping without
+      # ever failing the task (the rwx/release status is already posted).
+      if [ -z "${SLACK_BOT_TOKEN:-}" ] || printf '%s' "$SLACK_BOT_TOKEN" | grep -q '\$'; then
+        echo "notify-release-failure: SLACK_BOT_TOKEN unset/unresolved — skipping Slack ping (best-effort)."
+        exit 0
+      fi
+      # Resolve the channel: prefer the prod channel when it is a real Slack id,
+      # else fall back to the E2E channel (mirrors deploy.yml ka-0000006101). An
+      # empty/placeholder value simply fails the pattern and is skipped.
+      CHANNEL=""
+      case "${SLACK_CHANNEL:-}" in
+        C[A-Z0-9]*|G[A-Z0-9]*) CHANNEL="$SLACK_CHANNEL" ;;
+      esac
+      if [ -z "$CHANNEL" ]; then
+        case "${SLACK_CHANNEL_FALLBACK:-}" in
+          C[A-Z0-9]*|G[A-Z0-9]*) CHANNEL="$SLACK_CHANNEL_FALLBACK" ;;
+        esac
+      fi
+      if [ -z "$CHANNEL" ]; then
+        echo "notify-release-failure: no real Slack channel id resolved (prod='${SLACK_CHANNEL:-}' fallback='${SLACK_CHANNEL_FALLBACK:-}') — skipping Slack ping (best-effort)."
+        exit 0
+      fi
+      command -v jq >/dev/null 2>&1 || { sudo apt-get update -q && sudo apt-get install -y -q jq; }
+      SUMMARY_ENV="$(find . -maxdepth 3 -name release-summary.env 2>/dev/null | head -1)"
+      FAILED_MODULES=""; BEAD_URL=""; BEAD_ID=""
+      [ -n "$SUMMARY_ENV" ] && [ -f "$SUMMARY_ENV" ] && . "$SUMMARY_ENV" || true
+      CTX=""
+      [ -n "${FAILED_MODULES:-}" ] && CTX="*Failing modules:* $(echo "$FAILED_MODULES" | sed 's/,/, /g')"
+      if [ -n "${BEAD_ID:-}" ]; then
+        [ -n "${BEAD_URL:-}" ] && BL="*Bug bead:* <${BEAD_URL}|${BEAD_ID}>" || BL="*Bug bead:* \`${BEAD_ID}\`"
+        CTX="${CTX:+$CTX\n}${BL}"
+      fi
+      # Same payload shape as before, now with a top-level `channel` for the
+      # chat.postMessage Web API (was the webhook's implicit channel binding).
+      PAYLOAD=$(jq -cn --arg ch "$CHANNEL" --arg tag "$VERSION" --arg url "${RWX_RUN_URL:-}" --arg ctx "$CTX" \
+        '{channel: $ch,
+          text: (":rotating_light: Release " + $tag + " FAILED"),
+          blocks: ([{type:"section",text:{type:"mrkdwn",text:(":rotating_light: *Release " + $tag + " FAILED*\nRWX run: " + $url)}}]
+            + (if $ctx != "" then [{type:"section",text:{type:"mrkdwn",text:$ctx}}] else [] end))}')
+      post_message() {
+        curl -sS -X POST "https://slack.com/api/chat.postMessage" \
+          -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+          -H "Content-Type: application/json; charset=utf-8" \
+          --data "$PAYLOAD" 2>/dev/null || echo '{"ok":false,"error":"curl_failed"}'
+      }
+      RESP=$(post_message)
+      # not_in_channel ⇒ the bot is not a member of the resolved channel. Verify
+      # membership by self-healing (ka-0000004511): join the channel, then retry
+      # once. conversations.join succeeds for PUBLIC channels the bot may join;
+      # a PRIVATE channel returns an error here and needs a manual /invite.
+      if [ "$(printf '%s' "$RESP" | jq -r '.error // ""' 2>/dev/null)" = "not_in_channel" ]; then
+        echo "notify-release-failure: bot not in ${CHANNEL} — attempting conversations.join (self-heal)."
+        JOIN=$(curl -sS -X POST "https://slack.com/api/conversations.join" \
+          -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+          -H "Content-Type: application/json; charset=utf-8" \
+          --data "$(jq -cn --arg ch "$CHANNEL" '{channel: $ch}')" 2>/dev/null || echo '{"ok":false,"error":"curl_failed"}')
+        if printf '%s' "$JOIN" | jq -e '.ok' >/dev/null 2>&1; then
+          echo "notify-release-failure: joined ${CHANNEL} — retrying Slack ping."
+          RESP=$(post_message)
+        else
+          echo "WARN: conversations.join failed for ${CHANNEL}: $(printf '%s' "$JOIN" | jq -r '.error // "unknown"' 2>/dev/null). If it is a private channel, invite the bot manually (/invite @<E2E bot>)."
+        fi
+      fi
+      if printf '%s' "$RESP" | jq -e '.ok' >/dev/null 2>&1; then
+        echo "notify-release-failure: Slack ping sent for ${VERSION} to ${CHANNEL}."
+      else
+        echo "WARN: Slack notify failed: $(printf '%s' "$RESP" | jq -r '.error // "unknown"' 2>/dev/null) (best-effort — rwx/release status already posted)."
+      fi

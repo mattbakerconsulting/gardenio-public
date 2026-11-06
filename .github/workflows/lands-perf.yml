@@ -1,0 +1,188 @@
+# The Lands performance gate (plan gd-MEGB3dEaHu, step P3.1 gd-7Ns0SDsF7R).
+#
+# Never on a pull request (owner rule 2026-10-31, root CLAUDE.md "CI on pull
+# requests"; task gd-yqSVQsjtyW): it cost about 3,700 runner-minutes a day on
+# PRs. It runs nightly on main, and on demand (workflow_dispatch) when a crew
+# wants a branch measured before merging. A PR that touches the Commons
+# (gardenio/controller/internal/commons/** or gardenhub's web/commons2.js)
+# proves its B12-B17 with one dispatch on its branch, narrowed to the
+# workbench surfaces: gb ci dispatch lands-perf.yml --ref <branch>
+# -f surfaces=commonsthread,commonsplan (Commons v2 step 9, gd-4s2Rw9hgBd).
+#
+# `measure` runs the P0.1 harness
+# (gardenio/controller/internal/gardenhub/testdata/perf_baseline.js, through
+# `make lands-perf-baseline`) on the goldens' fixture farm twice, in parallel:
+# `head` is the commit under test and `base` is what it is graded against, so
+# the difference between the two is the change and nothing else:
+#   schedule  head is main's tip; base is main as it stood 25 h ago, an hour
+#             before the previous nightly, so each night grades the last day
+#             of merges (consecutive nights overlap, never gap) and a
+#             regression shows within a day. Both sides
+#             run on the same night's runners: a head-vs-base pair on one node
+#             class, not a comparison with an artifact measured on another.
+#   dispatch  head is the branch; base is its merge-base with main (on main:
+#             main against itself, a noise check).
+# Both sides run the head's harness (perf_baseline.js and the pan pass it
+# reuses, world_pan_profile.js on world_tenx.js's 10x farm), so a change to
+# the measuring changes it on both. Each records page weight, requests, LCP,
+# Ready, INP, long tasks and the idle heap per surface on the phone and the
+# desktop (medians of 3 runs), and 3 runs of the World's 10 s pan and zoom on
+# the phone, each after a bare full-screen canvas at the same throttle (B7's
+# calibration floor); `head` adds one Playwright trace per surface on the
+# phone. The latency pass (LATENCY=1) drives the workbench surfaces' composer,
+# opens and stream for the Commons v2 budgets B12-B15, on a farm whose Commons
+# stream is live (perfWorld) for every surface on both sides.
+#
+# `gate` then grades head against base with testdata/perf_gate.js, against the
+# B1-B17 budgets of gardenio/docs/commons-ux-rubric.md section 7: it fails
+# when a stable-class budget regresses (or a CPU-class one crosses its noisy
+# CI line), or a Commons v2 one (B12-B17, no ratchet) is over, and writes the
+# deltas to the run summary. The grading rules are perf_gate.js's header.
+#
+# Cost: two medium-tier jobs of ~30 min per run (the pan pass adds about a
+# minute a run).
+# CI-only settings: 60 s idle pass (B8 is per minute; B9 reads the heap after
+# it), and no settled window (no budget reads it).
+name: lands-perf
+
+on:
+  schedule:
+    - cron: '43 10 * * *' # the hour of ci.yml's and checks.yml's nightly full run
+  workflow_dispatch: # measures the branch against its merge-base with main (on main: main against itself, a noise check)
+    inputs:
+      surfaces:
+        description: "comma list of perf_baseline.js surfaces (empty: every one); a Commons PR: commonsthread,commonsplan"
+        required: false
+        default: ""
+
+concurrency:
+  group: lands-perf-${{ github.event_name }}-${{ github.ref }} # a dispatch on main never cancels the nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25.14"
+
+jobs:
+  measure:
+    name: lands perf (${{ matrix.side }})
+    runs-on: gardenio-k3s-medium # same tier and setup as ci.yml's gardenhub-browser job: no docker, headless Chromium
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, base]
+    env:
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # the base is a merge-base with main or main's tip of a day ago: both need main's history
+          # (commits and trees; checking the base out fetches its blobs on demand -- scripts/check-ci-blobless.py)
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: check out the base, with the head's harness
+        if: matrix.side == 'base'
+        run: |
+          set -euo pipefail
+          dir=gardenio/controller/internal/gardenhub/testdata
+          harness="$dir/perf_baseline.js $dir/world_pan_profile.js $dir/world_tenx.js"
+          head=$(git rev-parse HEAD)
+          git fetch -q origin main
+          if [ "${{ github.event_name }}" = schedule ]; then
+            base=$(git rev-list -1 --first-parent --before='25 hours ago' origin/main)
+          else
+            base=$(git merge-base origin/main HEAD)
+          fi
+          git checkout -q --detach "$base"
+          for f in $harness; do git show "$head:$f" > "$f"; done
+          echo "head=$head base=$base (measured with the head's $harness)"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: apt deps
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends xz-utils make
+
+      - name: node (pinned tarball, sha256-verified)
+        run: |
+          set -euo pipefail
+          scripts/ci-fetch-node.sh tar.xz /tmp/node.tar.xz
+          sudo tar -xJ --strip-components=1 -C /usr/local -f /tmp/node.tar.xz
+          node --version
+
+      - name: playwright-core + Chromium
+        working-directory: gardenio/tests/gardenhub-browser
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          sudo env "PATH=$PATH" DEBIAN_FRONTEND=noninteractive node_modules/.bin/playwright-core install-deps chromium
+          node_modules/.bin/playwright-core install chromium
+
+      # The gate's own rules and its budgets against the rubric's table; fails
+      # fast, before half an hour of measuring.
+      - name: perf gate self-test
+        if: matrix.side == 'head'
+        run: make test-lands-perf-gate
+
+      - name: make lands-perf-baseline
+        env:
+          LANDS_PERF_SETTLE: "0"
+          SURFACES: ${{ inputs.surfaces }} # empty on the nightly: every surface
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/lands-perf"
+          trace=""
+          if [ "${{ matrix.side }}" = head ]; then trace="TRACE=$out/traces"; fi
+          make lands-perf-baseline OUT="$out" RUNS=3 IDLE=60 LATENCY=1 SURFACES="$SURFACES" $trace
+
+      - name: upload results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lands-perf-${{ matrix.side }}
+          path: ${{ runner.temp }}/lands-perf
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+  gate:
+    name: lands perf gate
+    runs-on: gardenio-k3s-light # no browser, no node install: perf_gate.js runs inside github-script
+    timeout-minutes: 10
+    needs: [measure]
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: gardenio/controller/internal/gardenhub/testdata
+
+      # Either side may be missing (its job failed): perf_gate.js fails with no
+      # head results, and with no base holds every surface to the budgets.
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: lands-perf-head
+          path: ${{ runner.temp }}/head
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: lands-perf-base
+          path: ${{ runner.temp }}/base
+
+      - name: grade, summarise, comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const path = require('path');
+            const gate = require(path.join(process.env.GITHUB_WORKSPACE, 'gardenio/controller/internal/gardenhub/testdata/perf_gate.js'));
+            const t = process.env.RUNNER_TEMP;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const r = gate.run(path.join(t, 'head', 'results.json'), path.join(t, 'base', 'results.json'), path.join(t, 'gate'), runUrl);
+            await core.summary.addRaw(r.md).write();
+            if (r.failed) core.setFailed(`${r.failed} Lands budget check(s) regressed: this run's summary lists them`);

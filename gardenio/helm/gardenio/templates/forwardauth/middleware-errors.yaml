@@ -1,0 +1,44 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled .Values.keycloak.forwardAuth.forceLogoutOn403.enabled .Values.landing.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- $landingFullname := include "gardenio.landing.fullname" . -}}
+{{- $landingPort := .Values.landing.service.port | default 80 -}}
+# ── Traefik errors Middleware: force-logout on forwardauth 403 ────────────────
+# Catches 403 responses on protected routes (typically the response of the
+# gardenio-forwardauth ForwardAuth middleware when oauth2-proxy rejects a
+# present-but-invalid cookie) and proxies the body through to the landing
+# service's /403 location, which serves a meta-refresh HTML page that bounces
+# the browser through /oauth2/sign_out?rd=<original-url>. End state: stale
+# cookie → cleared local cookie → Keycloak end_session → fresh login flow.
+#
+# Design: gardenio/docs/research/forwardauth-403-force-logout.md
+# Spike notes: gardenio/docs/research/forwardauth-403-force-logout-impl-spike.md
+# Beads: ka-0000000378 (impl), ka-0000006780 (design), ka-0000005759 (epic).
+#
+# WARNING: This middleware fires on ANY 403 on the route, not only on
+# forwardauth's 403. An upstream service that legitimately returns 403 will
+# also be rewritten to a force-logout page (see Risk #3 in the design doc).
+# Keep this OFF by default; flip per-environment behind an operator decision
+# after the disambiguation spike has been validated against the deployed
+# Traefik version.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-forwardauth-errors
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: forwardauth
+spec:
+  errors:
+    status:
+      - "403"
+    service:
+      name: {{ $landingFullname }}
+      port: {{ $landingPort }}
+    # Traefik exposes the original request URI to the errors backend via the
+    # X-Forwarded-Uri request header; the {url} placeholder in `query` is
+    # NOT resolved with that. We therefore pin the path to /403 and let the
+    # nginx /403 location render the meta-refresh URL from
+    # X-Forwarded-Host + X-Forwarded-Uri at request time.
+    query: "/403"
+{{- end }}

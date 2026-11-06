@@ -1,0 +1,220 @@
+# Re-bless the golden browser screenshots on main, once per release window
+# (owner ruling gd-oxDhsqdFVP, task gd-fedEoEGC9i). Feature PRs never commit
+# testdata/golden (scripts/check-no-pr-goldens.py fails them in ci.yml's
+# light tier); this run re-shoots every golden on main's head with
+# `make update-garden-goldens` and, when any image moved, opens the one PR that
+# may change them, on a `bless/goldens-<UTC yyyymmddHHMM>` branch. The merge
+# desk merges it on its light tier like any PR (docs/merge-desk.md).
+#
+# Scheduled, not a PR run, so the heavy runner is allowed here (advice
+# gd-LJUjME0Niq). 30 minutes before each release window (~04:00Z, ~16:00Z).
+# A newer bless PR closes the older one still open: it re-shot the same
+# goldens from a later main.
+#
+# The PR is pushed and opened with a gardenio-io App installation token, never
+# a PAT and never GITHUB_TOKEN: a PR that GITHUB_TOKEN opens starts no workflow
+# run, so the bless PR would never get the light tier the desk merges on.
+# Needs repo variable GARDENIO_IO_APP_ID and secret GARDENIO_IO_APP_PRIVATE_KEY
+# (the App needs contents and pull_requests write).
+name: bless-goldens
+
+on:
+  schedule:
+    - cron: '30 3 * * *'
+    - cron: '30 15 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One bless at a time; a second waits rather than racing the first's PR.
+concurrency:
+  group: bless-goldens
+  cancel-in-progress: false
+
+env:
+  # The exact patch ci.yml pins; bump them together.
+  GO_VERSION: "1.25.14"
+  # The two directories `make update-garden-goldens` rewrites, as
+  # scripts/check-no-pr-goldens.py guards them. Their fonts/ are inputs the
+  # update never writes.
+  GOLDEN_DIRS: >-
+    gardenio/controller/internal/gardenhub/testdata/golden
+    gardenio/controller/cmd/beads-viewer/testdata/golden
+
+jobs:
+  bless:
+    name: re-bless goldens
+    # Main only: a bless off any other branch would open a PR of that branch's
+    # renders against main.
+    if: github.ref == 'refs/heads/main'
+    # The golden job's runner (ci.yml `gardenhub-browser`): no docker needed.
+    runs-on: gardenio-k3s-medium # medium ARC scale set (gardenio/helm/ci); see arc-runners-medium-values.yaml
+    # Setup ~2m + the Makefile's 30m go test -timeout + the PR.
+    timeout-minutes: 50
+    env:
+      CGO_ENABLED: 0
+    steps:
+      # Depth 1 is enough: the push adds one commit on top of main's head.
+      # No persisted GITHUB_TOKEN; the push below uses the App token.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # From here to `make update-garden-goldens`: the ci.yml golden job's
+      # setup, step for step. Change both together.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: apt deps
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends xz-utils make
+
+      - name: node (pinned tarball, sha256-verified)
+        run: |
+          set -euo pipefail
+          scripts/ci-fetch-node.sh tar.xz /tmp/node.tar.xz
+          sudo tar -xJ --strip-components=1 -C /usr/local -f /tmp/node.tar.xz
+          node --version
+
+      - name: playwright-core + Chromium
+        working-directory: gardenio/tests/gardenhub-browser
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          sudo env "PATH=$PATH" DEBIAN_FRONTEND=noninteractive node_modules/.bin/playwright-core install-deps chromium
+          node_modules/.bin/playwright-core install chromium
+
+      # A PASS line as well as a zero exit, as in ci.yml: `-run` matching
+      # nothing also exits 0, and would bless nothing.
+      - name: make update-garden-goldens
+        env:
+          GARDENHUB_BROWSER_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          make update-garden-goldens 2>&1 | tee /tmp/bless-goldens.log
+          grep -E -- '^--- PASS: TestGardenGoldens' /tmp/bless-goldens.log
+          grep -E -- '^--- PASS: TestComposerGoldens' /tmp/bless-goldens.log
+          grep -E -- '^--- PASS: TestLandsGoldens' /tmp/bless-goldens.log
+
+      - name: anything to bless?
+        id: diff
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # GOLDEN_DIRS is a space-separated path list
+          git status --porcelain --untracked-files=all -- $GOLDEN_DIRS > /tmp/bless-status.txt
+          if [ ! -s /tmp/bless-status.txt ]; then
+            echo "every golden matches main's render; nothing to bless"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$(wc -l < /tmp/bless-status.txt) golden files moved:"
+          sed 's/^/  /' /tmp/bless-status.txt
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - id: app
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GARDENIO_IO_APP_ID }}
+          private-key: ${{ secrets.GARDENIO_IO_APP_PRIVATE_KEY }}
+
+      # The medium runner image (actions-runner) has no gh: the first bless with
+      # an App key (42106426670) re-shot every golden and then failed here with
+      # `gh: command not found`. Pinned release, checksum from the same release.
+      - name: gh (pinned release, sha256-verified)
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_CLI_VERSION: 2.101.0
+          GH_CLI_SHA256: 9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null; then gh --version | head -1; exit 0; fi
+          t=gh_${GH_CLI_VERSION}_linux_amd64
+          curl -fsSL -o "/tmp/$t.tar.gz" "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/$t.tar.gz"
+          echo "${GH_CLI_SHA256}  /tmp/$t.tar.gz" | sha256sum -c -
+          tar -xzf "/tmp/$t.tar.gz" -C /tmp
+          mkdir -p "$RUNNER_TEMP/bin" && cp "/tmp/$t/bin/gh" "$RUNNER_TEMP/bin/gh"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/gh" --version | head -1
+
+      - name: push the bless branch and open its PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          stamp=$(date -u +%Y%m%d%H%M)
+          window=$(date -u '+%Y-%m-%d %H:%MZ')
+          branch="bless/goldens-${stamp}"
+          bot="${APP_SLUG}[bot]"
+          bot_id=$(gh api "/users/${bot}" --jq .id)
+          git config user.name "$bot"
+          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
+
+          git switch -c "$branch"
+          # shellcheck disable=SC2086 # GOLDEN_DIRS is a space-separated path list
+          git add -A -- $GOLDEN_DIRS
+          git commit -q -m "test(gardenio/gardenhub): re-bless goldens ${window}" \
+            -m "Re-shot on main ${BASE_SHA} by ${RUN_URL} (gd-fedEoEGC9i)."
+          head_sha=$(git rev-parse HEAD)
+          git push -q "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${branch}"
+
+          # The body: every changed image, main's copy and the branch's copy.
+          # A PR body holds 65536 characters; past ~60000 it says how many more.
+          body=/tmp/bless-body.md
+          {
+            echo "Re-blessed goldens for the ${window} window: \`make update-garden-goldens\` on main \`${BASE_SHA}\`, run ${RUN_URL}."
+            echo
+            echo "Feature PRs never commit goldens (scripts/check-no-pr-goldens.py, gd-fedEoEGC9i); this PR is the one that may. Merge on its light tier like any PR (docs/merge-desk.md). Look at what moved before merging: every row below is a render that changed on main."
+            echo
+            echo "| change | file | main | this branch |"
+            echo "|---|---|---|---|"
+          } > "$body"
+          rows=0; more=0
+          # shellcheck disable=SC2086 # GOLDEN_DIRS is a space-separated path list
+          while IFS=$'\t' read -r st path; do
+            raw="https://github.com/${REPO}/raw"
+            case "$st" in
+              A) row="| added | \`${path}\` | - | [new](${raw}/${head_sha}/${path}) |" ;;
+              D) row="| removed | \`${path}\` | [old](${raw}/${BASE_SHA}/${path}) | - |" ;;
+              *) row="| changed | \`${path}\` | [old](${raw}/${BASE_SHA}/${path}) | [new](${raw}/${head_sha}/${path}) |" ;;
+            esac
+            if [ $(( $(wc -c < "$body") + ${#row} )) -gt 60000 ]; then
+              more=$((more + 1))
+            else
+              printf '%s\n' "$row" >> "$body"; rows=$((rows + 1))
+            fi
+          done < <(git diff --no-renames --name-status HEAD~1 HEAD -- $GOLDEN_DIRS)
+          if [ "$more" -gt 0 ]; then
+            printf '\n... and %d more; see the Files tab.\n' "$more" >> "$body"
+          fi
+          printf '\n🤖 Opened by bless-goldens.yml\n' >> "$body"
+          echo "body lists ${rows} files, ${more} more past the size cap"
+
+          url=$(gh pr create --repo "$REPO" --base main --head "$branch" \
+            --title "re-bless goldens ${window}" --body-file "$body")
+          echo "opened ${url}"
+          echo "### ${url}" >> "$GITHUB_STEP_SUMMARY"
+
+          # An older bless PR still open re-shot the same goldens from an older
+          # main: this one supersedes it.
+          gh pr list --repo "$REPO" --state open --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"bless/goldens-\")) | select(.headRefName != \"${branch}\") | .number" |
+          while read -r n; do
+            gh pr close "$n" --repo "$REPO" --delete-branch --comment "Superseded by ${url}, re-shot from a later main."
+          done
+
+      - name: upload the update log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bless-goldens-log
+          path: /tmp/bless-goldens.log
+          if-no-files-found: ignore
+          retention-days: 14

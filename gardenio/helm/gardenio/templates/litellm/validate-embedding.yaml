@@ -1,0 +1,28 @@
+{{- /*
+LiteLLM Bedrock credential guard (ka-0000007591, Stage-3 ka-0000002573,
+epic ka-0000000560).
+
+When the in-cluster proxy serves ANY Bedrock model — the Titan embedding model
+(litellm.embedding.enabled) OR a Bedrock chat group (litellm.bedrock.enabled) —
+it MUST have a working AWS credential path for the upstream bedrock:InvokeModel
+call. The default litellm pod runs on SA `default` with
+automountServiceAccountToken false and no AWS env, so without one of the two
+strategies the call fails at the Bedrock auth boundary (kbeads semantic search
+breaks, and/or bedrock chat accounts 5xx). Both Bedrock paths share the SINGLE
+litellm.embedding.* credential strategy (one pod, one SA/role). This guard
+fails the render when:
+  - neither credential strategy is configured, or
+  - both are configured at once (ambiguous; pick one).
+
+Caught at chart-render time so a misconfigured overlay never reaches a cluster.
+*/}}
+{{- if and .Values.litellm.enabled (include "gardenio.litellm.needsBedrockCreds" .) }}
+{{- $irsa := .Values.litellm.embedding.irsaRoleArn }}
+{{- $static := .Values.litellm.embedding.staticCredsSecret }}
+{{- if and $irsa $static }}
+{{- fail "litellm.embedding: set EXACTLY ONE credential strategy — both litellm.embedding.irsaRoleArn and litellm.embedding.staticCredsSecret are set. See ka-0000007591." }}
+{{- end }}
+{{- if and (not $irsa) (not $static) }}
+{{- fail "A Bedrock model is enabled (litellm.embedding.enabled, litellm.bedrock.enabled, or litellm.imageGeneration.enabled) but no Bedrock credential path is set: configure litellm.embedding.irsaRoleArn (IRSA) OR litellm.embedding.staticCredsSecret (static AWS keys). Without it the in-cluster Bedrock InvokeModel call fails at the auth boundary. See ka-0000007591 / ka-0000002573 / ka-0000008102." }}
+{{- end }}
+{{- end }}

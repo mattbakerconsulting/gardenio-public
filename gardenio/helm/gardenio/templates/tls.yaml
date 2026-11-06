@@ -1,0 +1,106 @@
+{{- if and .Values.tls.enabled (not .Values.tls.existingSecretName) }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- $mode := .Values.tls.mode | default "wildcard" -}}
+{{- $apexDomain := trimPrefix "*." .Values.tls.domainName -}}
+# ── HTTP → HTTPS redirect (audit F3) ─────────────────────────────────────────
+# Plain HTTP (`web` entrypoint) is handled by a single catch-all redirect
+# IngressRoute defined in templates/https-redirect.yaml. App IngressRoutes only
+# list the `websecure` entrypoint so plain HTTP cannot reach any real backend.
+# Cluster-Traefik must expose both `web` (:80) and `websecure` (:443)
+# entrypoints; without `web` the redirect IngressRoute is never matched.
+#
+# When `tls.existingSecretName` is set (D5 / ephemeral smoketests path —
+# docs/archive/rwx/docs/gardenio-plans/ephemeral-rwx-smoketests.md — or
+# the in-box static-cert / local-CA fallback), this whole block is skipped —
+# the cert is managed externally and referenced by name through the
+# `gardenio.tls.secretName` helper.
+#
+# tls.mode (ka-0000002443, DNS/TLS doc §3 ka-0000004570):
+#   wildcard — ONE cert for `*.domainName` (+ apex). Cloud path: LE DNS-01
+#              wildcard + a Route53 DNSEndpoint when tls.dns.target is set.
+#   perHost  — Gardenio-in-a-Box: NO wildcard (LE cannot issue wildcards over
+#              HTTP-01). One Certificate whose dnsNames ENUMERATE tls.hosts,
+#              issued via an HTTP-01 ClusterIssuer (no DNS credential), into
+#              the SAME shared secret. No external-dns/DNSEndpoint.
+{{- $enumHosts := or (eq $mode "perHost") (eq $mode "localCA") -}}
+{{- if $enumHosts }}
+{{- if not .Values.tls.hosts }}
+{{- fail "tls.mode=perHost/localCA requires a non-empty tls.hosts list (enumerate every served hostname so the single shared cert satisfies sniStrict)." }}
+{{- end }}
+{{- end }}
+# ── cert-manager Certificate ─────────────────────────────────────────────────
+# The certificate secret is referenced by all IngressRoute tls blocks via the
+# gardenio.tls.secretName helper. In wildcard mode it carries the wildcard (and
+# apex); in perHost mode it carries every enumerated host so one served cert
+# covers every SNI (the TLSOption pins sniStrict).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}-wildcard-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  secretName: {{ $fullname }}-wildcard-tls
+  # Pin cert lifetime to avoid drift on cert-manager upgrades (audit F19).
+  duration: 2160h    # 90d
+  renewBefore: 720h  # 30d
+  issuerRef:
+    {{- if eq $mode "perHost" }}
+    name: {{ .Values.tls.issuer | default "letsencrypt-http01" }}
+    {{- else if eq $mode "localCA" }}
+    name: {{ .Values.tls.issuer | default (printf "%s-local-ca-issuer" $fullname) }}
+    {{- else }}
+    name: {{ .Values.tls.issuer | default "letsencrypt-production" }}
+    {{- end }}
+    kind: ClusterIssuer
+  # Pin private-key algorithm (audit F2). cert-manager's default is RSA 2048;
+  # ECDSA P-256 is faster, smaller, and meets modern TLS guidance. rotationPolicy
+  # Always ensures re-issuance regenerates the key (default Never re-uses it).
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  dnsNames:
+    {{- if $enumHosts }}
+    {{- range .Values.tls.hosts }}
+    - {{ . | quote }}
+    {{- end }}
+    {{- else }}
+    - {{ .Values.tls.domainName | quote }}
+    {{- if hasPrefix "*." .Values.tls.domainName }}
+    - {{ $apexDomain | quote }}
+    {{- end }}
+    {{- end }}
+{{- if and (ne $mode "perHost") .Values.tls.dns.target }}
+---
+# ── external-dns DNSEndpoint ─────────────────────────────────────────────────
+# Creates DNS records pointing to the NLB for TLS passthrough.
+# Both the wildcard (*.gardenio.app...) and apex (gardenio.app...) must resolve
+# to the NLB — without the apex record, the base domain falls through to the
+# shared ALB which forwards HTTP to Traefik's web entrypoint, where TLS-only
+# IngressRoutes don't match. ForwardAuth callback lives on the apex domain.
+#
+# NEVER rendered for mode=perHost: the in-box box has no Route53, and sslip.io
+# hostnames resolve publicly with zero records (DNS/TLS doc §3).
+apiVersion: externaldns.k8s.io/v1alpha1
+kind: DNSEndpoint
+metadata:
+  name: {{ $fullname }}-wildcard-dns
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  endpoints:
+    - dnsName: {{ .Values.tls.domainName | quote }}
+      recordType: CNAME
+      targets:
+        - {{ .Values.tls.dns.target | quote }}
+    {{- if hasPrefix "*." .Values.tls.domainName }}
+    - dnsName: {{ $apexDomain | quote }}
+      recordType: CNAME
+      targets:
+        - {{ .Values.tls.dns.target | quote }}
+    {{- end }}
+{{- end }}
+{{- end }}

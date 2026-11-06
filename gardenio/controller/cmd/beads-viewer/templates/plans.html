@@ -1,0 +1,2112 @@
+{{template "layout" .}}
+{{define "title"}}Plans · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+{{with .GardenHref}}{{template "garden_banner" .}}{{end}}
+<style>
+  /* /plans — the iterative-planning index (epic ka-0000001409). One card per
+     plan-labelled epic: title + status/project chips + creator + a step-progress
+     bar + the current/next step + the unified plan-agent state chip + an
+     open-decision "to answer" pill + (operator) a compact spawn/message box.
+     Scoped under
+     .plans-list / .plan-card so it never leaks into other pages. Reuses
+     .chip / .banner / .operator-header-chip / .operator-chip-compact from
+     layout.html. */
+  .plans-blurb { max-width: 60rem; margin: 0.25rem 0 1.25rem; }
+  /* Deck entry point (ka-0000001498). A single-line pill linking /plans → /deck.
+     Understated on desktop (the full index is already comfortable there), and
+     promoted to a full-width, thumb-tall tap target on coarse pointers below —
+     the phone is exactly where the deck earns its place. Uses the shared accent
+     token so it reads as an action, not a filter chip. */
+  .deck-cta { display: inline-flex; align-items: center; gap: 0.5rem;
+              margin: 0 0 1rem; padding: 0.5rem 0.85rem; border-radius: 999px;
+              border: 1px solid var(--accent, #b9851b); text-decoration: none;
+              background: rgba(185,133,27,0.08); color: var(--fg, #1a1a1a);
+              font-size: 0.85rem; line-height: 1; }
+  .deck-cta:hover, .deck-cta:focus { background: rgba(185,133,27,0.16);
+              outline: none; }
+  .deck-cta-glyph { font-size: 1rem; }
+  .deck-cta-label { font-weight: 600; }
+  .deck-cta-count { font-size: 0.78rem; opacity: 0.85; }
+  /* opacity 0.72 (was 0.6): the muted "all clear" count is real status text, so
+     it must clear WCAG AA 4.5:1. At 0.6 the --fg fallback (#1a1a1a) composited on
+     the warm deck wash (#f9f5ed) measured 4.47:1 — a serious axe color-contrast
+     fail on the baseline skin (ka-0000002181). 0.72 lifts it to 6.6:1 while
+     keeping the count visibly secondary to the "Deck" label. */
+  .deck-cta-count-clear { opacity: 0.72; }
+  .deck-cta-arrow { margin-left: auto; opacity: 0.7; }
+  .plans-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.75rem;
+                /* min(22rem, 100%) lets the track shrink below its 22rem floor
+                   when the container is narrower than that (mobile ≤ ~375px),
+                   otherwise the fixed floor forces a track wider than the
+                   viewport and the page scrolls horizontally (ka-0000005165). */
+                grid-template-columns: repeat(auto-fill, minmax(min(22rem, 100%), 1fr)); }
+  /* Vertical rhythm (ka-0000005352 iter-34): the card block padding + inter-row
+     gap were the LAST /plans density lever never touched — untouched since the
+     page's first commit while iterations 1-33 each ADDED or refined a signal, none
+     reduced the structural whitespace. Measured on the live prod board (123 cards):
+     the 0.55rem inter-row gap alone contributed ~41px/card on a 248px median card.
+     Tightening the rhythm — gap 0.55rem→0.45rem, padding 0.85rem/1rem→0.7rem/0.9rem
+     (with the meta-row gap trimmed 0.35rem→0.3rem below) — shrinks EVERY card
+     (~13px median, ~6% board height) and grows NONE, removing zero signal and
+     keeping the same scannable one-signal-per-line layout: the pure
+     "show more info in less space" half of the mission that every prior iteration
+     paid for by ADDING ink. Verified on all 123 live cards: 123 shrink, 0 grow, no
+     new horizontal overflow, both skins, 375px 0-overflow. */
+  .plan-card { border: 1px solid var(--rule, #d7dbe0); border-radius: 10px;
+               padding: 0.7rem 0.9rem; background: var(--card-bg, #fff);
+               display: flex; flex-direction: column; gap: 0.45rem; }
+  .plan-card:hover { border-color: var(--accent, #b9851b); }
+  /* Bulk multi-select (step "bulk", ka-0000004771): a checked row gets a faint
+     tint (mirrors .bead-row.is-selected on /p and .trig-row on /triggers) so the
+     selection is legible at a glance; project_bulk.js toggles .is-selected. The
+     checkbox aligns to the title baseline in the card head. */
+  .plan-card.is-selected { border-color: rgba(33,150,243,0.55); background: rgba(33,150,243,0.06); }
+  .plans-row-select { margin: 0.15rem 0.1rem 0 0; flex: none; cursor: pointer; }
+  /* flex-wrap + the .plan-card-head-tail group below (ka-0000002389) let the
+     id + freshness tokens DROP to their own sub-row when the title can't get a
+     workable width — the board's 17-22rem lanes — instead of permanently
+     stealing ~140px of every title's line. Row-gap is tight (0.1rem) so the
+     dropped tail costs a fraction of the line it buys back. */
+  .plan-card-head { display: flex; flex-wrap: wrap; align-items: baseline;
+                    justify-content: space-between; gap: 0.5rem; row-gap: 0.1rem; }
+  /* Plan title (ka-0000000757, re-tuned ka-0000002389): plan-epic titles run
+     100+ chars (live board: p50 92, p90 120). The original 0.85rem/2-line clamp
+     was measured showing only 26% of the title text — median 23 VISIBLE chars,
+     0 of 76 cards showing a whole title — because the clamp was competing with
+     an id chip + age stamp for a 232px head row, leaving the title just 98px.
+     Two changes, both in the "smaller text but way more of it" direction the
+     operator asked for: (a) the face drops 0.85rem→0.75rem with a tighter 1.22
+     line-height, and (b) the clamp opens 2→5 lines. The title's flex basis
+     (11rem) is what makes the tail drop: below that basis the head wraps and
+     the title gets the card's FULL width, so the two together take the board
+     from 26% → 100% of title text shown (median 23 → 85 chars, 76/76 whole)
+     for +34px of card height (264→298px median). The tooltip + the
+     /plans/{id} link stay as they were. min-width:0 keeps the anchor
+     shrinkable so a long unbroken token can't push the tail off. */
+  .plan-card-title { font-weight: 600; font-size: 0.75rem; line-height: 1.22;
+                     text-decoration: none; color: var(--fg, #1a1a1a);
+                     flex: 1 1 11rem; min-width: 0;
+                     display: -webkit-box; -webkit-box-orient: vertical;
+                     -webkit-line-clamp: 5; line-clamp: 5; overflow: hidden;
+                     overflow-wrap: anywhere; }
+  .plan-card-title:hover { text-decoration: underline; }
+  /* The id + freshness tail (ka-0000002389). Grouped in ONE inline box so the
+     two travel together — either both sit at the end of the title's line (grid
+     view, wide cards) or both drop to a sub-row (board lanes). margin-left:auto
+     keeps them right-aligned in the inline case; flex:0 0 auto keeps them from
+     absorbing width the title should have. */
+  .plan-card-head-tail { display: flex; align-items: baseline; gap: 0.4rem;
+                         flex: 0 0 auto; margin-left: auto; }
+  .plan-card-id { flex: none; white-space: nowrap; }
+  /* Relocated freshness stamp (ka-0000005352 iter-52): the "updated Xh ago" stamp
+     moved OUT of the wrapping .plan-card-meta chip-strip and up into the head row,
+     rendered in the compact "7h"/"2d"/"1w" age form beside the plan ID — reclaiming
+     a wrapped line on every card. Because it is no longer a .plan-card-meta child,
+     it needs its own muted color + stale-tint here (the .plan-card-meta .meta rules
+     below no longer reach it). flex:none + nowrap keeps it a tight tail-of-head
+     token that never steals wrap-width from the two-line-clamped title. */
+  .plan-card-head .plan-card-updated { flex: none; white-space: nowrap; font-size: 0.7rem;
+                     color: #5c5c5c; line-height: 1.3; }
+  html[data-skin^="dark"] .plan-card-head .plan-card-updated { color: #9aa0a6; }
+  .plan-card-head .plan-card-updated.plan-card-updated-stale { color: #a3282a; font-weight: 600; }
+  html[data-skin^="dark"] .plan-card-head .plan-card-updated.plan-card-updated-stale { color: #ff8a8a; }
+  /* ka-0000002181: the plan-card meta row muted its text with opacity veils that
+     composited BELOW WCAG AA (the seeded CI daemon renders these; an empty-card
+     scan never saw them). Each is re-muted via an explicit near-AA colour so the
+     text stays visibly secondary while clearing 4.5:1. Opacity can't be escaped
+     by a child, so a veil on a group is a contrast dead-end. */
+  .plan-card-id code { font-size: 0.72rem; color: #5c5c5c; }
+  html[data-skin^="dark"] .plan-card-id code { color: #9aa0a6; }
+  /* Meta-row gap trimmed 0.35rem→0.3rem (ka-0000005352 iter-34): the two meta rows
+     are the card's tallest region (measured ~55px avg each across the live board);
+     both wrap several chips, so a slightly tighter inter-chip gap tightens the wrap
+     without crowding — part of the same zero-signal-loss rhythm pass as .plan-card.
+     iter-93 (ka-0000005352): the two `.plan-card-meta` chip-strips are the #1
+     vertical sink on the live board — measured 10,706px total across 160 rows
+     (80 cards × 2), the top strip wrapping to a MEDIAN 4 lines (3–6) on nearly
+     every card. The single `gap: 0.3rem` set the ROW gap (vertical space between
+     wrapped chip lines) equal to the column gap, so every extra wrapped line paid
+     the full 0.3rem. Split the shorthand: keep `column-gap: 0.3rem` (horizontal
+     breathing room between chips unchanged) but tighten `row-gap` to 0.18rem so
+     the 3–6 wrapped lines pack closer. Measured live (390px board lane, 80 cards):
+     −476px board-wide, ~6px/card off the tallest region, ZERO chip removed and
+     zero horizontal change. Layout-only (no `color:`) → the iter-85 dark-coverage
+     guard stays green by construction. */
+  .plan-card-meta { display: flex; flex-wrap: wrap; align-items: center; column-gap: 0.3rem; row-gap: 0.18rem; }
+  .plan-card-meta .meta { font-size: 0.75rem; color: #5c5c5c; margin-left: auto; }
+  html[data-skin^="dark"] .plan-card-meta .meta { color: #9aa0a6; }
+  /* Stale-freshness tint (ka-0000005352 iter-38): an ACTIVE plan that has not
+     moved in over a week recolors its "updated Xh ago" stamp loud so a
+     rotting/abandoned open plan pops out of the board — the freshness twin of the
+     decision chip's .chip-attention-stale (same red family, #a3282a light /
+     #ff8a8a dark). Only recolors + weights the existing text: no border, no
+     background, no added ink, so the card footprint is byte-identical (375px can
+     only stay clear). Terminal plans never get the class (planFreshnessStale gates
+     on non-terminal status), so a finished plan's honest "3 weeks ago" stays
+     muted. The rule wins over the muted `.meta` colors above by specificity
+     (two classes) + source order. */
+  .plan-card-meta .meta.plan-card-updated-stale { color: #a3282a; font-weight: 600; }
+  html[data-skin^="dark"] .plan-card-meta .meta.plan-card-updated-stale { color: #ff8a8a; }
+  /* Creator chip (S2): a compact "who created this" marker at the front of the
+     meta row. .plan-card-creator groups the "by" label + the compact chip. The
+     old opacity: 0.8 (× the shared chip veil) dropped the compact chip + "by"
+     text below AA; mute via colour instead and let the chip carry its own ink. */
+  .plan-card-creator { display: inline-flex; align-items: center; gap: 0.25rem;
+                       font-size: 0.75rem; }
+  .plan-card-creator .creator-by { color: #5c5c5c; }
+  html[data-skin^="dark"] .plan-card-creator .creator-by { color: #9aa0a6; }
+  /* opacity: 1 resets the shared `.chip { opacity: 0.6 }` veil (ka-0000002181):
+     .chip-attention carries its own amber ink (#5a4200, 8.56:1 on its wash), but
+     the 0.6 veil composited it to ~3.05:1 — a serious axe fail. Its :hover/active
+     states set their own opacity, so this only lifts the resting state. */
+  .chip-attention { background: #fff3cd; border: 1px solid #e6c96a; color: #5a4200; opacity: 1; }
+  /* Oldest open-decision wait-age (ka-0000004999) — the "· 32d" suffix folded
+     into the "N to answer" chip. Tabular; muted via a lighter weight rather than
+     opacity (ka-0000002181 — at 0.75 the amber age composited to ~4.45:1, just
+     under AA). It inherits the chip's #5a4200 ink (8.56:1 on the amber wash). */
+  .chip-attention-age { font-weight: 400; font-variant-numeric: tabular-nums; }
+  /* Stale variant: an open decision that has waited past planDecisionStaleThreshold
+     (>14d). A human-blocking question rotting that long is the top thing an operator
+     should touch, so the chip goes loud red (matching the P0/P1 urgency vocabulary)
+     instead of the calm amber default, and its age suffix stops dimming. */
+  .chip-attention-stale { background: rgba(229,57,53,0.12); border-color: #d0413f; color: #a3282a; font-weight: 600; }
+  .chip-attention-stale .chip-attention-age { opacity: 1; }
+  /* Compact the card status chip to its meta-row peers (ka-0000005352 iter-92).
+     Every other chip in the first .plan-card-meta row got a compact card-context
+     size — .plan-lifecycle-chip and .chip-type are 0.72rem / 0.1rem-0.5rem pad,
+     .plan-prio-chip is smaller still — but .chip-status alone still wore the fat
+     base .chip filter-pill padding (0.2rem 0.6rem, font 0.9em), making it the
+     TALLEST chip in that row (30px vs the peers' 22px) on every card. Because
+     .plan-card-meta is align-items:center the status chip set the whole row's line
+     height, so trimming it to the lifecycle-chip idiom drops ~8px off all 80 board
+     cards (671px board-wide) and un-wraps the wide "blocked · ✓ cleared" cards —
+     layout-only, no ink change, so the iter-85 dark-coverage guard stays green. */
+  .plan-card .chip-status { padding: 0.1rem 0.5rem; font-size: 0.72rem; }
+  .chip-status-open { border-color: rgba(33,150,243,0.55); }
+  .chip-status-in_progress { border-color: rgba(255,152,0,0.6); }
+  .chip-status-closed { border-color: rgba(76,175,80,0.55); opacity: 0.85; }
+  /* Blocked status chip + blocker-state facet (ka-0000005352 iter-55). The
+     .chip-status-blocked rule was MISSING — a status=blocked plan chip rendered
+     default gray with no border, unlike its open/in_progress/closed siblings. Give
+     it a red-family outline (attention state — the plan is in the STALLED lane) and
+     fold a blocker facet: LOUD "· N blocked · Xage" when open blockers remain
+     (chip-status-blocked-open), tinting the whole chip loud past 7d
+     (chip-status-blocked-stale, the #a3282a / d0413f family the decision + escalation
+     stale tints use), and a CALM green "· ✓ cleared" (chip-status-blocked-cleared,
+     the healthy-done hue the "✓ steps done" marker uses) when every blocker is
+     closed so the operator sees the plan can be unblocked. */
+  .chip-status-blocked { border-color: rgba(229,57,53,0.55); }
+  .chip-status-blocked-open { border-color: #d0413f; color: #a3282a; }
+  .chip-status-blocked-stale { background: rgba(229,57,53,0.12); border-color: #d0413f; color: #a3282a; font-weight: 600; }
+  .chip-status-blocked-cleared { border-color: rgba(76,175,80,0.55); }
+  .chip-status-blocked-facet { font-variant-numeric: tabular-nums; }
+  .chip-status-blocked-age { opacity: 0.85; }
+  .chip-status-blocked-stale .chip-status-blocked-age { opacity: 1; }
+  .chip-status-blocked-cleared-facet { color: #256029; font-weight: 600; }
+  /* Authoring-lifecycle chip (ka-0000000851) — the SAME draft/ready/building chip
+     the /plans/{id} cockpit header renders (plan_detail.html), mirrored here so the
+     index card carries the plan's lifecycle at a glance. Kept in sync with the
+     detail-page rules by copy — both surfaces render the same PlanState. */
+  .plan-lifecycle-chip { font-size: 0.72rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--rule, #cfd4da); text-transform: uppercase; letter-spacing: 0.04em; opacity: 1; }
+  .plan-lifecycle-chip-draft { background: rgba(120,120,120,0.12); border-color: rgba(120,120,120,0.4); color: #555; }
+  .plan-lifecycle-chip-ready { background: rgba(33,150,243,0.12); border-color: rgba(33,150,243,0.5); color: #1e4a72; }
+  /* Awaiting-approval wait-age (ka-0000005352 iter-47). The age suffix on the READY
+     chip carries a lowercase humanized duration ("· 4d"); the chip's own
+     text-transform: uppercase would render it "· 4D", so the age span opts out.
+     Past planReadyStaleThreshold (7d) .plan-lifecycle-chip-ready-stale tints the
+     whole chip loud red (the #a3282a light / #ff8a8a dark family the decision chip's
+     .chip-attention-stale + the freshness stamp's .plan-card-updated-stale already
+     use) so an aged, approval-blocked plan pops out of the board. */
+  .plan-lifecycle-chip-age { text-transform: none; letter-spacing: 0; opacity: 0.85; }
+  .plan-lifecycle-chip-ready-stale { background: rgba(229,57,53,0.12); border-color: #d0413f; color: #a3282a; }
+  .plan-lifecycle-chip-ready-stale .plan-lifecycle-chip-age { opacity: 1; font-weight: 600; }
+  .plan-lifecycle-chip-building { background: rgba(76,175,80,0.16); border-color: rgba(76,175,80,0.55); color: #256029; }
+  /* complete (ka-0000005352 iter-28): iter-27 made planLifecycleChipState PRESERVE a
+     genuine `complete` chip on the index row (it's the one truthful terminal lifecycle
+     signal), but the .plan-lifecycle-chip-complete rule lived only in plan_detail.html —
+     so a completed plan's chip rendered unstyled here. Mirror the slate palette the
+     cockpit + the peek's plan-peek-state-complete already use so the surfaces agree. */
+  .plan-lifecycle-chip-complete { background: rgba(96,125,139,0.16); border-color: rgba(96,125,139,0.5); color: #37474f; }
+  /* abandoned — the DISTINCT terminal state (task ka-0000001377): a muted amber so
+     a "given up on" plan reads visibly differently from a "done" complete chip. */
+  .plan-lifecycle-chip-abandoned { background: rgba(158,110,60,0.14); border-color: rgba(158,110,60,0.5); color: #7a4a1e; }
+  /* Priority pill (ka-0000007970) — the plan epic's 0-4 priority, mirrored from
+     the /deck card face (deck.html .deck-prio) so the two plan surfaces read the
+     same: P0/P1 loud red (urgent), P2 neutral (never rendered here — the baseline
+     default adds no ink), P3/P4 quiet gray (deprioritized). Same fixed-rgba house
+     style as the lifecycle/status chips above. */
+  .plan-prio-chip { display: inline-flex; align-items: center; font-weight: 600;
+                    font-size: 0.7rem; line-height: 1; padding: 0.12rem 0.4rem;
+                    border-radius: 6px; border: 1px solid currentColor;
+                    font-variant-numeric: tabular-nums; }
+  /* P0/P1 are the loud tier, but a P0 (critical / incident-class) must be
+     distinguishable from a P1 (high) WITHIN it (ka-0000005352 iter-36): measured
+     on the live board, 9 P0 plans rendered an identical tinted-red pill to 24 P1
+     plans, so the only P0↔P1 differentiator was the 0.7rem digit — an operator
+     scanning for the drop-everything plans could not spot them. P0 now reads a
+     SOLID filled red (white text) so critical pops out of the board at a glance;
+     P1 keeps the tinted-red outline it had. The 3-tier scheme is preserved (P0/P1
+     loud, P2 neutral, P3/P4 quiet) — this only splits the loud tier's top rung.
+     #fff on #c62828 = 5.62:1 (AA). Zero fan-out — priority is already on the row. */
+  .plan-prio-chip-0 { color: #fff; background: #c62828; border-color: #c62828; }
+  .plan-prio-chip-1 { color: #a3282a; background: rgba(229,57,53,0.10); }
+  .plan-prio-chip-2 { color: #8a5a00; background: rgba(255,152,0,0.10); }
+  .plan-prio-chip-3, .plan-prio-chip-4 { color: #4a5568; background: rgba(120,120,120,0.10); }
+  /* Two-line progress block (ka-0000005352 iter-91): the segmented bar on its own
+     top line (full card width), the wrapping facet sub-row beneath. BEFORE this the
+     .plan-progress was ONE flex row holding the bar (flex:1) + every text facet as a
+     nowrap sibling with no flex-wrap, so on a 239px board lane the facet strip
+     overflowed the card and silently clipped its rightmost facets (measured: 53/81
+     cards spilled up to 165px), while the flex:1 bar collapsed to 0px against the
+     nowrap text. Column layout gives the bar a stable full-width row and lets the
+     facets wrap in place — every facet visible inside the card, bar restored. */
+  .plan-progress { display: flex; flex-direction: column; gap: 0.25rem; }
+  /* Facet sub-row: the text facets (label · phase · last-ship · ⛔ tally · ✓ done)
+     wrap between whole facets inside the card box instead of spilling off it — the
+     row-level twin of the .plan-card-crew self-cap (ka-0000000417 iter-22). Each
+     facet keeps its OWN white-space:nowrap (set on the per-facet rules below) so a
+     facet never breaks mid-token; only the row wraps. */
+  .plan-progress-facets { display: flex; flex-wrap: wrap; align-items: baseline;
+                          gap: 0.15rem 0.4rem; max-width: 100%; }
+  /* Segmented progress bar (ka-0000007226): a flex track whose children are the
+     four lifecycle segments (done/in-progress/blocked/not-started). Each segment
+     is flex-grow ∝ its step count with flex-basis 0, so widths are drift-free
+     (the grows divide the track exactly — no percent rounding can overflow it or
+     leave a sliver) and a zero-count bucket contributes no segment. The track's
+     own gray shows through only if a plan somehow renders no segment at all
+     (never in practice: StepsTotal>0 guarantees ≥1 bucket). Status hues match the
+     task-grid squares + step-tally chips so the surfaces agree. */
+  /* Full-width bar on the block's top line (iter-91: was flex:1 in a single-row
+     .plan-progress; now width:100% in the column so it spans the card and can't
+     collapse against the facet text). flex:none keeps its 7px height in the column. */
+  .plan-progress-bar { flex: none; width: 100%; height: 7px; border-radius: 4px; overflow: hidden;
+                       background: rgba(0,0,0,0.08); display: flex; }
+  .plan-progress-seg { display: block; height: 100%; flex-basis: 0; min-width: 2px;
+                       transition: flex-grow 0.3s ease; }
+  /* The done segment keeps the original bar green (#4caf50); the others reuse the
+     task-grid square hues (orange in-progress, red blocked) at full opacity so a
+     7px-tall sliver still reads, and a quiet gray for the not-started backlog. */
+  .plan-progress-seg-done { background: #4caf50; }
+  .plan-progress-seg-inprogress { background: #ff9800; }
+  .plan-progress-seg-blocked { background: #e53935; }
+  .plan-progress-seg-todo { background: rgba(120,130,140,0.4); }
+  /* The done segment is the leftmost, so round its left corners; the visually
+     last-rendered segment rounds its right corners. Which segment is last varies
+     (not-started is usual, but a fully-in-flight plan ends on in-progress, etc.),
+     so round the last CHILD generically rather than pinning a class. */
+  .plan-progress-seg:first-child { border-top-left-radius: 4px; border-bottom-left-radius: 4px; }
+  .plan-progress-seg:last-child { border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
+  .plan-progress-label { font-size: 0.75rem; opacity: 0.75; white-space: nowrap; }
+  /* Phase-position milestone (ka-0000005352 iter-58): "· phase 2/5" beside the
+     step-progress label for a multi-phase plan. Calm neutral — a milestone marker,
+     context like the step tally, NOT a red attention alarm — so it reuses the
+     progress label's own muted ink + size. tabular-nums so the N/M reads clean. */
+  .plan-progress-phase { font-size: 0.72rem; opacity: 0.72; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  /* Progress-recency "last ship · Nd" facet (ka-0000005352 iter-59): how long since
+     the plan last CLOSED a step — the delivery-momentum twin of the head-row
+     freshness stamp. Calm muted by default (context like the phase/step-tally
+     facets, reusing the progress label's own ink + size), tabular-nums so the age
+     reads clean beside "N/M steps · X%". When the drought crosses the 7d bar the
+     facet tints LOUD, reusing the SAME #a3282a / #ff8a8a stale red the freshness
+     stamp's .plan-card-updated-stale uses (they age on the same 7d bar), so a
+     stalled-delivery plan pops in the shared stale vocabulary. */
+  .plan-progress-lastship { font-size: 0.72rem; opacity: 0.72; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .plan-progress-lastship.plan-progress-lastship-stale { color: #a3282a; opacity: 1; font-weight: 600; }
+  html[data-skin^="dark"] .plan-progress-lastship.plan-progress-lastship-stale { color: #ff8a8a; }
+  /* Live step-status breakdown (ka-0000000851): the "moving now" / "wedged" counts
+     beside the closed/total progress label. Compact chips, status-hued to match the
+     task-grid squares (orange=in-progress, red=blocked), so the card reads more
+     signal in the same footprint. */
+  .plan-step-tally { display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap; }
+  .plan-step-tally-item { font-size: 0.7rem; line-height: 1; padding: 0.1rem 0.32rem; border-radius: 999px; border: 1px solid currentColor; font-variant-numeric: tabular-nums; }
+  .plan-step-tally-inprogress { color: #8a5a00; background: rgba(255,152,0,0.14); border-color: rgba(255,152,0,0.55); }
+  .plan-step-tally-blocked { color: #a3282a; background: rgba(229,57,53,0.12); border-color: rgba(229,57,53,0.55); }
+  /* Ghost-done marker (ka-0000005352 iter-41): "✓ steps done" on a plan whose rendered
+     steps are ALL closed (full-green 100% bar) but whose status is still non-terminal
+     — a plan that finished its steps but was never closed. Reads CALM green (a healthy
+     complete state, the deliberate opposite of the red ⚠/⛔ attention chips) reusing the
+     progress-bar's done hue (#2e7d32 family) so the marker and the full-green bar agree.
+     A compact pill matching the step-tally-item footprint so it adds signal, not a row;
+     nowrap keeps the glyph+label whole. */
+  .plan-steps-done { display: inline-flex; align-items: center; gap: 0.2rem; font-size: 0.7rem; line-height: 1;
+                     padding: 0.1rem 0.32rem; border-radius: 999px; white-space: nowrap;
+                     color: #2e7d32; background: rgba(76,175,80,0.14); border: 1px solid rgba(76,175,80,0.55); }
+  /* Close-out badge + one-tap retire (task ka-0000004467, thread ka-0000001785):
+     "✓ drained" (the daemon's own autoclose-ready flag) / "✓ looks done" (the
+     viewer-derived all-steps-closed case) on a still-OPEN plan that appears
+     finished. Reads CALM green — the same healthy-done hue the .plan-steps-done
+     marker and the full progress bar use, deliberately NOT the red ⚠/⛔ attention
+     vocabulary: this plan is finished, not broken. The daemon-flagged arm is the
+     higher-confidence signal (it verified every child closed AND MR work merged),
+     so it gets a solid border + slightly stronger fill while the derived arm stays
+     dashed — the same confidence-tiering the MR pills use. */
+  .plan-closeout-chip { color: #2e7d32; background: rgba(76,175,80,0.12);
+                        border: 1px dashed rgba(76,175,80,0.6); white-space: nowrap; }
+  .plan-closeout-chip-flagged { background: rgba(76,175,80,0.2); border-style: solid; font-weight: 600; }
+  /* The one-tap lever sits immediately after its badge. Sized to the compact
+     chip-strip footprint so surfacing the exit ramp costs no card height. */
+  .plan-closeout-btn { font-size: 0.7rem; line-height: 1; padding: 0.14rem 0.4rem;
+                       color: #2e7d32; border-color: rgba(76,175,80,0.6); }
+  html[data-skin^="dark"] .plan-closeout-chip { color: #6ee7b7; background: rgba(76,175,80,0.16); border-color: rgba(110,231,183,0.5); }
+  html[data-skin^="dark"] .plan-closeout-chip-flagged { background: rgba(76,175,80,0.26); }
+  html[data-skin^="dark"] .plan-closeout-btn { color: #6ee7b7; border-color: rgba(110,231,183,0.5); }
+  .plan-progress-empty { font-size: 0.78rem; }
+  /* Live-crew chip (ka-0000004801): a dense "● N crew · M working" pill in the
+     agent-state meta row, surfacing the crew the plan gardener has dispatched onto
+     steps. Reuses the cockpit crew tally's green pulsing plan-crew-dot vocabulary
+     (plan_detail.html) so a live crew reads the same on both surfaces. A plain
+     (no-live) chip is neutral-gray; a live one tints green and pulses its dot. */
+  /* The crew chip carries up to four facets (N crew · M working · ⚠ K age ·
+     $spend). A fully-loaded chip grows past a desktop board-lane card (~263px),
+     and because the chip was white-space:nowrap with no width cap it spilled off
+     the card's right edge — the lane's overflow then silently CLIPPED the
+     rightmost facet, so a plan with real spend rendered "· $12" for a true
+     "$128.44" (ka-0000000417): a card-vs-truth lie AND an off-card overflow. Cap
+     the chip to the card width and let its facets WRAP in place (flex-wrap +
+     max-width:100%), each facet an intact, unbreakable flex item — so a
+     fully-loaded chip flows onto a second line inside the card instead of
+     spilling off it, and every facet (spend included) stays visible. This is the
+     SAME self-cap discipline the MR pill (max-width:240px) already uses; the
+     chip stays single-line whenever it fits (the common case). */
+  .plan-card-crew { display: inline-flex; align-items: center; gap: 0.28rem; text-decoration: none;
+                    font-size: 0.72rem; line-height: 1.3; padding: 0.12rem 0.42rem; border-radius: 999px;
+                    border: 1px solid rgba(120,120,120,0.4); background: rgba(120,120,120,0.1); color: #555;
+                    font-variant-numeric: tabular-nums; flex-wrap: wrap; max-width: 100%; }
+  /* Each facet stays intact (never breaks mid-token); the CHIP wraps between
+     facets. Keeps "⚠ 1 6h" / "$128.44" whole while letting the chip reflow. */
+  .plan-card-crew > * { white-space: nowrap; }
+  .plan-card-crew:hover, .plan-card-crew:focus { border-color: rgba(33,150,243,0.55); outline: none; }
+  .plan-card-crew-live { border-color: rgba(76,175,80,0.5); background: rgba(76,175,80,0.14); color: #256029; }
+  .plan-card-crew-working { opacity: 0.9; }
+  /* Working RUNTIME age (ka-0000005352): the "· M working" facet gains a "4h" suffix
+     reading the elapsed RUNTIME of the longest-running live crew — completing the
+     live-crew wait-age family (queued "· 12m" iter-32, stuck "· 6h" iter-13, now-step
+     "· 5d" iter-43; the working count was the last one with no age). Aged on CreatedAt
+     (runtime), the live-effort twin of the calm spend facet — so it reads CALM by
+     design (a long-running working crew is context, not an alarm; a genuinely-wedged
+     crew already surfaces loud via the stuck re-bucket). Sits a touch lighter than the
+     count it qualifies, tabular-nums so it aligns down a column of cards, matching the
+     queued/stuck age suffixes. */
+  .plan-card-crew-working-age { opacity: 0.92; font-variant-numeric: tabular-nums; }
+  /* "(K starting)" sub-qualifier on the "· M working" facet (ka-0000005352): of
+     the M live crew, K are still booting their pod (spawning), not yet grinding.
+     Calm/muted — a booting crew is context, not an alarm (it already rides the
+     green live pulse); it sits a touch lighter than the working count it qualifies,
+     matching the queued/stuck/runtime age suffixes. */
+  .plan-card-crew-starting { opacity: 0.8; font-variant-numeric: tabular-nums; }
+  /* Idle/queued facet (ka-0000005352 iter-31): crew dispatched onto a step but not
+     yet working (waiting on a pod slot). Reads calm/neutral — the deliberate
+     opposite of the loud red stuck facet — because a queued crew is context, not
+     an alarm (the pool will start it), matching the spend/closed-failed facets.
+     tabular-nums so the count aligns down a column of cards. */
+  .plan-card-crew-idle { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  /* Queued wait-age (ka-0000005352 iter-32): the "· N queued" facet gains an "Xh"
+     age suffix reading HOW LONG the longest-waiting queued crew has sat in the pool,
+     completing the decision/escalation/stall/stuck wait-age family (the queued facet
+     was the last card signal with a count but no age). The age sits a touch lighter
+     than the count it qualifies (tabular-nums so it aligns down a column). A queued
+     crew is calm by default (the pool self-recovers), but past
+     planCrewQueuedStaleThreshold the whole facet drops the .plan-card-crew-idle calm
+     and tints the loud stall-red the stuck/stall/escalation "gone stale" marks use,
+     so a pool-starved plan pops out of the board. */
+  .plan-card-crew-queued-age { opacity: 0.92; font-variant-numeric: tabular-nums; }
+  .plan-card-crew-queued-stale { color: #d32f2f; font-weight: 600; opacity: 1; }
+  /* Finished-crew facet (ka-0000005352 iter-64): the "· N done" count of crew that
+     finished cleanly on the plan — the index-face twin of the cockpit roster's
+     "N done" tally chip, closing the last index↔cockpit crew-disposition parity
+     gap. Reads the SAME calm/muted neutral as the spend + closed-failed facets
+     (finished crew is history/context, not an alarm — the deliberate opposite of
+     the loud red ⚠ stuck facet), inheriting the crew ink at reduced opacity with
+     tabular-nums so the count aligns down a column of cards. */
+  .plan-card-crew-done { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  .plan-card-crew-failed { color: #a3282a; }
+  /* Oldest OPEN-stuck crew wait-age (ka-0000002016, iter-13): the "· ⚠ K" stuck
+     facet gains a "6h" age suffix reading HOW LONG the longest-wedged reachable
+     crew has waited — completing the decision/escalation/stall wait-age family.
+     The age sits a touch lighter than the count it qualifies (tabular-nums so it
+     aligns down a column). Past planCrewStuckStaleThreshold the whole facet tints
+     the loud stall-red the ⚠ stall / ⛔ escalation "gone stale" marks use, so an
+     egregiously-stuck crew pops out of the board. */
+  /* opacity 0.92 (was 0.8): #555 crew ink at 0.8 on the crew chip wash measured
+     ~4.05:1 — under AA. 0.92 → ~5.3:1. Latent (live-crew only), same anti-pattern
+     — ka-0000002181. */
+  .plan-card-crew-stuck-age { opacity: 0.92; font-variant-numeric: tabular-nums; }
+  .plan-card-crew-stuck-stale { color: #d32f2f; font-weight: 600; }
+  /* Closed-failed history marker (ka-0000005352 iter-29): the "· ✕ K" count of crew
+     that failed and CLOSED — no reachable terminal, so nothing to act on now. Reads
+     the SAME calm/muted neutral as the spend facet (context, not an alarm), the
+     deliberate opposite of the loud red ⚠ open-stuck facet above: color carries
+     actionability. Kept the crew ink (#555 inherited from .plan-card-crew) rather
+     than red so a card whose failures are all done reads quiet. tabular-nums so the
+     count aligns down a column of cards, matching its sibling facets. */
+  .plan-card-crew-failed-closed { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  /* Crew SPEND facet (ka-0000004218, iter-12): the plan's cumulative crew dollars,
+     folded onto the crew chip. Reads calm/neutral (spend is context, not an alarm
+     like the red stuck facet) with tabular-nums so the figure aligns down a column
+     of cards. */
+  .plan-card-crew-spend { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  .plan-card-crew-dot { width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #4caf50; flex: 0 0 auto;
+                        animation: plan-crew-pulse 1.6s infinite ease-in-out; }
+  @keyframes plan-crew-pulse { 0%,100% { opacity: 0.45; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .plan-card-crew-dot { animation: none; } }
+  /* Live-crew faces (ka-0000002189): a strip of click-through avatar pills — one
+     per crew working the plan NOW — surfacing WHO is on it, not just how many.
+     Each avatar is the crew's actorInitials (a green-tinted pill, sized to the
+     handle's initials since every gardenio- agent shares a leading letter) linking
+     to its terminal/bead page. The "+N" overflow reads dashed and links to the
+     cockpit crew roster. Green vocabulary matches the live-crew chip beside it so
+     the two read as one "who's live" cluster. */
+  .plan-card-crew-faces { display: inline-flex; align-items: center; gap: 0.22rem; flex-wrap: wrap; }
+  .plan-card-crew-face { display: inline-flex; align-items: center; justify-content: center;
+                         min-width: 1.15rem; height: 1.15rem; padding: 0 0.28rem; border-radius: 999px;
+                         font-size: 0.6rem; font-weight: 700; line-height: 1; letter-spacing: 0.01em;
+                         text-decoration: none; text-transform: uppercase; font-variant-numeric: tabular-nums;
+                         color: #256029; background: rgba(76,175,80,0.18);
+                         border: 1px solid rgba(76,175,80,0.55); flex: 0 0 auto; white-space: nowrap; }
+  .plan-card-crew-face:hover, .plan-card-crew-face:focus { border-color: rgba(76,175,80,0.9);
+                         background: rgba(76,175,80,0.3); outline: none; }
+  /* Step tag inside a crew face (ka-0000004037, iter-15): a compact "#N" appended
+     to the initials, naming the plan STEP the crew works — the WHAT beside the WHO,
+     matching the cockpit roster's "#N: title" and the mini-grid square #N on the
+     same card. Sits a shade lighter than the initials (it's context, not the
+     identity), separated by a hairline so it reads as a distinct facet without a
+     gap that would let the pill wrap mid-avatar. tabular-nums keeps the numbers
+     aligned. It inherits the pill's green/red tint via currentColor, so a stuck
+     face's tag reads red like its initials. */
+  /* opacity 0.85 (was 0.72): at 0.72 the step suffix on the green crew-face
+     (#256029) composited to ~3.5:1 — below AA. 0.85 lifts it to ~4.6:1 while
+     staying a visibly-lighter suffix. Latent (only renders with live crew, which
+     the seeded /plans fixtures don't bind) but the same veil anti-pattern this
+     change is clearing — ka-0000002181. */
+  .plan-card-crew-face-step { margin-left: 0.18rem; padding-left: 0.18rem; opacity: 0.85;
+                         font-weight: 600; font-variant-numeric: tabular-nums;
+                         border-left: 1px solid currentColor; }
+  .plan-card-crew-face-more { color: #555; background: rgba(120,120,120,0.12);
+                         border-style: dashed; border-color: rgba(120,120,120,0.5); }
+  .plan-card-crew-face-more:hover, .plan-card-crew-face-more:focus { border-color: rgba(120,120,120,0.8);
+                         background: rgba(120,120,120,0.22); }
+  /* Stuck-crew faces (ka-0000003793): an OPEN crew stuck rate-limited / failing —
+     the one an operator most needs to reach — surfaces as a RED click-through
+     avatar right after the green working strip. Reuses the plan-card-crew-failed
+     red vocabulary so a stuck crew reads as "needs attention, jump here" and pops
+     out of the board like the ⚠ stall / ⛔ escalation signals. A small gap sets
+     the stuck strip off from the working one so the two clusters read distinctly
+     without a divider. The "+N" overflow face keeps the dashed neutral treatment
+     (it links to the roster, it is not itself a stuck crew). */
+  .plan-card-crew-faces-stuck { margin-left: 0.1rem; }
+  .plan-card-crew-face-stuck { color: #a3282a; background: rgba(211,47,47,0.14);
+                         border-color: rgba(211,47,47,0.55); }
+  .plan-card-crew-face-stuck:hover, .plan-card-crew-face-stuck:focus { border-color: rgba(211,47,47,0.9);
+                         background: rgba(211,47,47,0.26); }
+  .plan-card-crew-face-stuck.plan-card-crew-face-more { color: #555; background: rgba(120,120,120,0.12);
+                         border-color: rgba(120,120,120,0.5); }
+  /* Queued-crew faces (ka-0000005352 iter-53): an OPEN crew dispatched onto a step
+     but pool-deferred surfaces as a CALM slate click-through avatar after the green
+     working + red stuck strips. Deliberately NEUTRAL — not green (it is not working
+     yet) and not red (it is not an alarm; the pool will slot it) — matching the calm
+     tone of its own "· N queued" count facet, so a queued crew reads as "waiting,
+     jump here if you want" rather than "act now". A small gap sets the queued strip
+     off from the strips before it. The "+N" overflow keeps the dashed neutral
+     treatment (it links to the roster, it is not itself a queued crew). Slate at this
+     contrast clears AA on both skins. */
+  .plan-card-crew-faces-queued { margin-left: 0.1rem; }
+  .plan-card-crew-face-queued { color: #45505f; background: rgba(100,116,139,0.16);
+                         border-color: rgba(100,116,139,0.55); }
+  .plan-card-crew-face-queued:hover, .plan-card-crew-face-queued:focus { border-color: rgba(100,116,139,0.9);
+                         background: rgba(100,116,139,0.28); }
+  .plan-card-crew-face-queued.plan-card-crew-face-more { color: #555; background: rgba(120,120,120,0.12);
+                         border-color: rgba(120,120,120,0.5); }
+  /* Open-MR pills (Matt's ask: "the plans index should show open MRs so we can
+     click through there too, just like w crew"). One click-through pill per open
+     MR the plan's steps produced, in the SAME agent-state meta row as the crew
+     chip. A draft MR tints neutral-gray; a ready (opened) one tints GitLab-blue.
+     The "+N" overflow pill links through to the cockpit timeline where every
+     step's MR pill lives. Reuses the chip-mr vocabulary from plan_detail. */
+  /* max-width: min(100%,15rem) (ka-0000005352 iter-89). The pill was capped at a
+     bare 15rem (240px), which EXCEEDS the ~210px content box of a 239px board-lane
+     card — so on the board the pill (and its ellipsis-guarded title) overran the
+     card's right edge instead of ellipsizing INSIDE it, defeating the whole point
+     of .plan-card-mr-title's overflow:hidden. Measured live (2026-08-15): 30 of 33
+     rendered MR pills spilled exactly 32px past the card border. min(100%,15rem)
+     clamps the pill to the card's content box on the narrow board (→ title
+     ellipsizes, 0 overflow) while keeping the 15rem ceiling on the wide 395px grid
+     card (a long title there still can't stretch full-width). Layout-only, one
+     declaration; the iter-85 dark-coverage guard is untouched. */
+  .plan-card-mr { display: inline-flex; align-items: center; gap: 0.22rem; text-decoration: none;
+                  font-size: 0.72rem; line-height: 1; padding: 0.12rem 0.42rem; border-radius: 999px;
+                  border: 1px solid rgba(29,107,189,0.5); background: rgba(29,107,189,0.14); color: #1d6bbd;
+                  font-variant-numeric: tabular-nums; white-space: nowrap; max-width: min(100%, 15rem); }
+  .plan-card-mr:hover, .plan-card-mr:focus { border-color: rgba(29,107,189,0.8); outline: none; }
+  .plan-card-mr-draft { border-color: rgba(120,120,120,0.45); background: rgba(120,120,120,0.12); color: #666; }
+  .plan-card-mr-glyph { flex: 0 0 auto; }
+  .plan-card-mr-title { overflow: hidden; text-overflow: ellipsis; opacity: 0.85; }
+  .plan-card-mr-more { border-style: dashed; }
+  /* Open-MR wait-age facet (ka-0000005352 iter-40): the "· 8d" since-opened age
+     on the pill face — the temporal urgency the pill was the last card presence
+     signal to lack. Calm/muted by default (context, like the queued-crew age),
+     tabular so a column of pills aligns. */
+  .plan-card-mr-age { flex: 0 0 auto; opacity: 0.75; font-variant-numeric: tabular-nums; }
+  /* .plan-card-mr-stale tints the WHOLE pill loud amber once the MR has sat open
+     past planMROpenStaleThreshold (7d) — the "aged, awaiting a human merge" mark,
+     mirroring the escalation badge's .plan-esc-badge-stale + the freshness stamp's
+     .plan-card-updated-stale (both 7d). Deliberately AMBER, not the CI-failed RED:
+     a long-open MR is stale (awaiting action), not broken (failing CI), so the two
+     loud states read distinctly. Declared BEFORE .plan-card-mr-ci-failed so a pill
+     that is BOTH stale AND CI-failed keeps the louder CI-failed red chrome (a
+     broken pipeline outranks mere age); the age facet itself stays readable. */
+  .plan-card-mr-stale { border-color: rgba(180,95,6,0.7); background: rgba(180,95,6,0.14); color: #b45f06; }
+  .plan-card-mr-stale:hover, .plan-card-mr-stale:focus { border-color: rgba(180,95,6,0.95); }
+  .plan-card-mr-stale .plan-card-mr-age { opacity: 1; font-weight: 600; }
+  /* CI-status signal on the MR pill (ka-0000002426): fold the MR's
+     mr_pipeline_status — already hydrated on the MR bead — into the existing
+     pill so an operator scanning /plans sees whether the plan's open MR is
+     green / red / running without clicking through. A trailing glyph carries
+     the status; a FAILED pipeline additionally re-tints the WHOLE pill loud red
+     so it pops out of the board like the ⚠ stall / ⛔ escalation signals (a
+     plan whose open MR is red is a plan that is not moving). success reads
+     calm-green, running/pending neutral-blue, canceled muted-gray — the SAME
+     .pipe-* families the /threads + /extern MR pills use, so the surfaces
+     agree. The glyph inherits the pill color by default; only the failed case
+     overrides the pill chrome. */
+  .plan-card-mr-ci { flex: 0 0 auto; font-weight: 600; margin-left: 0.05rem; }
+  .plan-card-mr-ci-failed { border-color: rgba(198,40,40,0.7); background: rgba(198,40,40,0.16); color: #c62828; }
+  .plan-card-mr-ci-failed:hover, .plan-card-mr-ci-failed:focus { border-color: rgba(198,40,40,0.95); }
+  .plan-card-mr-ci-glyph-success  { color: #2c6f30; }
+  .plan-card-mr-ci-glyph-failed   { color: #c62828; }
+  .plan-card-mr-ci-glyph-canceled { color: #888; }
+  /* Failing-CI overflow (ka-0000000387, iteration 20): the "+N MR" pill collapses
+     the elided MRs into one count that drops CI signal. When any hidden MR failed
+     CI the pill gains .plan-card-mr-more-failed and reuses the SAME loud-red
+     .plan-card-mr-ci-failed chrome the per-pill CI badge uses, so the overflow
+     reads as "needs attention" like the ⚠ stall / ⛔ escalation signals. The
+     trailing "· ✕ K" facet names how many hidden MRs are red; it inherits the
+     pill's failed-red color, weighted so the count reads clearly. A dashed
+     border stays (it is still an overflow pill), now red-toned. */
+  .plan-card-mr-more-failed { border-style: dashed; }
+  .plan-card-mr-more-ci { flex: 0 0 auto; font-weight: 600; margin-left: 0.05rem; }
+  /* Mini task-grid (Matt's ask, ka-0000001226): one row per phase, one color
+     square per task. Squares are <a>s to the task bead; the shared
+     preview_popover.js gives hover-preview + click-through (any ka-XXX anchor).
+     data-status paints each square with the same status hues the card chips use
+     (blue=open/planned, orange=in-progress, green=closed/finished, red=blocked,
+     gray=deferred). Kept compact so the grid stays "teeny". */
+  .plan-taskgrid { display: flex; flex-direction: column; gap: 2px; margin: 0.15rem 0 0.1rem;
+                  /* Hard height cap so the grid NEVER grows the card (Matt's ask),
+                     no matter how many phases/tasks: a big plan scrolls inside this
+                     little strip instead of stretching the card (and its whole
+                     CSS-grid row). ~4 rows show before it scrolls. The hover
+                     preview is unaffected by the clip — preview_popover.js appends
+                     a position:fixed popover to <body>, and its capture-phase
+                     scroll listener repositions it as this strip scrolls. */
+                  max-height: 3.1rem; overflow-y: auto; overflow-x: hidden;
+                  scrollbar-width: thin;
+                  /* 1px breathing room so a hovered square's scale-up isn't
+                     clipped by the scroll box. */
+                  padding: 1px; }
+  .plan-taskgrid-row { display: flex; align-items: center; gap: 0.35rem; min-width: 0; }
+  /* Phase label (ka-0000005352 iter-88): a fixed-width ordinal tag ("P1") + the
+     truncating phase name. The wrapper is the flex item that owns the row's
+     label budget (max-width kept at the old 7rem); the tag never shrinks so the
+     ellipsis only ever eats the NAME, and the ~60px the boilerplate "Phase N — "
+     lead used to burn now goes to the distinguishing name. */
+  .plan-taskgrid-phase { flex: 0 0 auto; display: flex; align-items: baseline;
+                         gap: 0.25rem; min-width: 0; max-width: 7rem; }
+  .plan-taskgrid-phase-tag { flex: 0 0 auto; font-size: 0.55rem; font-weight: 600;
+                           line-height: 1; opacity: 0.5; letter-spacing: 0.02em;
+                           font-variant-numeric: tabular-nums; }
+  .plan-taskgrid-phase-label { flex: 0 1 auto; font-size: 0.6rem; opacity: 0.55;
+                           line-height: 1; min-width: 0; overflow: hidden;
+                           text-overflow: ellipsis; white-space: nowrap; }
+  .plan-taskgrid-squares { display: flex; flex-wrap: wrap; gap: 2px; min-width: 0; }
+  .plan-taskgrid-sq { display: block; width: 7px; height: 7px; border-radius: 2px;
+                  background: var(--sq-bg, rgba(120,130,140,0.35));
+                  border: 1px solid var(--sq-bd, rgba(120,130,140,0.5));
+                  box-sizing: border-box; text-decoration: none; cursor: pointer;
+                  transition: transform 0.1s ease, box-shadow 0.1s ease; }
+  .plan-taskgrid-sq:hover, .plan-taskgrid-sq:focus { transform: scale(1.45);
+                  box-shadow: 0 0 0 1.5px rgba(33,150,243,0.4); outline: none; }
+  /* planned / not-started */
+  .plan-taskgrid-sq[data-status="open"] { --sq-bg: rgba(33,150,243,0.28); --sq-bd: rgba(33,150,243,0.6); }
+  /* in progress */
+  .plan-taskgrid-sq[data-status="in_progress"] { --sq-bg: rgba(255,152,0,0.55); --sq-bd: rgba(255,152,0,0.85); }
+  /* blocked */
+  .plan-taskgrid-sq[data-status="blocked"] { --sq-bg: rgba(229,57,53,0.5); --sq-bd: rgba(229,57,53,0.85); }
+  /* finished */
+  .plan-taskgrid-sq[data-status="closed"] { --sq-bg: rgba(76,175,80,0.7); --sq-bd: rgba(76,175,80,0.9); }
+  /* deferred / parked */
+  .plan-taskgrid-sq[data-status="deferred"] { --sq-bg: rgba(120,130,140,0.28); --sq-bd: rgba(120,130,140,0.5); }
+  .plan-taskgrid-empty { font-size: 0.66rem; opacity: 0.4; font-style: italic; }
+  /* Dark-terminal (ka-0000007487): the 0.4 opacity veil drops --text #d6e0ec to
+     ~3.2:1 on the #14181d dark card — under the 4.5:1 AA floor. Lift the veil to
+     0.72 on dark (→ 7.1:1) so the "no tasks" note stays a de-emphasised muted
+     grey without the sub-AA wash. Baseline/light skins keep the 0.4 veil. */
+  html[data-skin^="dark"] .plan-taskgrid-empty { opacity: 0.72; }
+
+  /* ── ZOOMABLE FOREST (?view=tree, plans_tree.go / plan_tree.html) ─────────
+     Every tree is emitted into the SAME 100×120 viewBox, so a zoom level is a
+     TILE WIDTH plus which chrome is revealed — one server-rendered DOM, three
+     CSS classes, no re-layout and no re-fetch. --tree-w is the single knob the
+     three .plans-forest-* classes turn; everything else sizes off it. */
+  .plans-forest-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem;
+                       margin: 0.4rem 0 0.7rem; }
+  .plans-forest-zoom { display: inline-flex; align-items: center; gap: 0.3rem; }
+  .plans-forest-tally { margin: 0 0 0 auto; font-size: 0.75rem; }
+  .plans-forest-needs { color: #a3282a; font-weight: 600; }
+  html[data-skin^="dark"] .plans-forest-needs { color: #ff8a8a; }
+
+  .plans-forest { --tree-w: 108px; }
+  .plans-forest-canopy { --tree-w: 64px; }
+  .plans-forest-grove  { --tree-w: 108px; }
+  .plans-forest-tree   { --tree-w: 240px; }
+
+  .plans-stand { margin: 0 0 1.1rem; }
+  .plans-stand-head { font-size: 0.78rem; font-weight: 600; letter-spacing: 0.02em;
+                      text-transform: uppercase; opacity: 0.75; margin-bottom: 0.35rem;
+                      border-bottom: 1px solid var(--rule, #d7dbe0); padding-bottom: 0.2rem; }
+  /* auto-fill (not auto-fit) so a stand of two trees keeps them tree-sized at the
+     left rather than stretching each to half the page — the stand should read as
+     a clearing with two trees in it, not two billboards. */
+  .plans-stand-trees { display: grid; gap: 0.35rem;
+                       grid-template-columns: repeat(auto-fill, minmax(var(--tree-w), 1fr)); }
+
+  .plans-tree-tile { display: flex; flex-direction: column; align-items: center;
+                     text-decoration: none; color: inherit; border-radius: 8px;
+                     padding: 0.2rem 0.1rem; border: 1px solid transparent;
+                     transition: border-color 0.15s ease, background 0.15s ease; }
+  .plans-tree-tile:hover { border-color: var(--accent, #b9851b); background: rgba(185,133,27,0.06); }
+  .plans-tree-tile:focus-visible { outline: 2px solid rgba(33,150,243,0.7); outline-offset: 1px; }
+  .plans-tree-svg { width: 100%; height: auto; display: block; overflow: visible; }
+
+  .plans-tree-ground { stroke: currentColor; stroke-width: 0.6; opacity: 0.18; }
+  .plans-tree-trunk  { stroke: #7a5c3a; stroke-width: 2.4; stroke-linecap: round; }
+  html[data-skin^="dark"] .plans-tree-trunk { stroke: #a2825e; }
+  .plans-tree-limb   { stroke: #7a5c3a; stroke-width: 1.3; stroke-linecap: round; opacity: 0.75; }
+  html[data-skin^="dark"] .plans-tree-limb { stroke: #a2825e; }
+  .plans-tree-branch-empty .plans-tree-limb { opacity: 0.3; stroke-dasharray: 2 2; }
+
+  /* Crown = attention tier. Calm green by default (a healthy tree); the four
+     attention tiers reuse the EXACT vocabulary the board lanes and the card
+     badges already use, so the forest and the board can never tell different
+     stories about which plan needs a human. */
+  .plans-tree-crown { fill: rgba(76,175,80,0.55); stroke: rgba(76,175,80,0.9); stroke-width: 0.8; }
+  [data-attention="decision"]   .plans-tree-crown { fill: rgba(156,39,176,0.6); stroke: rgba(156,39,176,0.95); }
+  [data-attention="escalation"] .plans-tree-crown { fill: rgba(229,57,53,0.6);  stroke: rgba(229,57,53,0.95); }
+  [data-attention="ready"]      .plans-tree-crown { fill: rgba(33,150,243,0.6); stroke: rgba(33,150,243,0.95); }
+  [data-attention="stalled"]    .plans-tree-crown { fill: rgba(255,152,0,0.65); stroke: rgba(255,152,0,0.95); }
+  [data-attention="closeout"]   .plans-tree-crown { fill: rgba(120,130,140,0.5); stroke: rgba(120,130,140,0.85); }
+  /* An attention tree gets a soft halo so it pops out of a 64px canopy without
+     needing its caption read. */
+  .plans-tree-attn .plans-tree-crown { filter: drop-shadow(0 0 2px currentColor); }
+
+  /* Leaves reuse the mini-task-grid palette VERBATIM (the same four+one status
+     colors as .plan-taskgrid-sq) so a step is the same color wherever you meet
+     it — the grid square, the tree leaf, the timeline row. */
+  .plans-tree-leaf { fill: rgba(120,130,140,0.3); stroke: rgba(120,130,140,0.5); stroke-width: 0.4; }
+  .plans-tree-leaf[data-status="open"]        { fill: rgba(33,150,243,0.28); stroke: rgba(33,150,243,0.6); }
+  .plans-tree-leaf[data-status="in_progress"] { fill: rgba(255,152,0,0.55);  stroke: rgba(255,152,0,0.85); }
+  .plans-tree-leaf[data-status="blocked"]     { fill: rgba(229,57,53,0.5);   stroke: rgba(229,57,53,0.85); }
+  .plans-tree-leaf[data-status="closed"]      { fill: rgba(76,175,80,0.7);   stroke: rgba(76,175,80,0.9); }
+  .plans-tree-leaf[data-status="deferred"]    { fill: rgba(120,130,140,0.28); stroke: rgba(120,130,140,0.5); }
+  .plans-tree-leaf:hover { stroke-width: 1; }
+
+  .plans-tree-crew { fill: rgba(76,175,80,0.85); animation: plans-tree-pulse 2s ease-in-out infinite; }
+  @keyframes plans-tree-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) { .plans-tree-crew { animation: none; } }
+
+  .plans-tree-overflow, .plans-tree-limb-label, .plans-tree-seedling {
+    font-size: 5px; fill: currentColor; opacity: 0.55; }
+  .plans-tree-seedling { font-style: italic; }
+  /* In-SVG limb labels only earn their ink at tree zoom — below that they would
+     overlap into noise. They stay in the DOM (screen readers + Ctrl-F still see
+     the phase names) and are simply not painted. */
+  .plans-tree-limb-label { display: none; }
+  .plans-forest-tree .plans-tree-limb-label { display: block; }
+
+  .plans-tree-caption { display: flex; flex-direction: column; align-items: center;
+                        gap: 0.05rem; width: 100%; margin-top: 0.15rem; text-align: center; }
+  .plans-tree-name { font-size: 0.7rem; line-height: 1.15; font-weight: 600;
+                     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+                     overflow: hidden; overflow-wrap: anywhere; }
+  .plans-tree-nums { font-size: 0.66rem; font-variant-numeric: tabular-nums; }
+  /* Canopy zoom: pure shape. The caption is suppressed — at 64px the whole point
+     is reading the STAND (which trees are on fire, where the work is bunched)
+     rather than any one tree's name. The title tooltip still carries it. */
+  .plans-forest-canopy .plans-tree-caption { display: none; }
+  .plans-forest-tree .plans-tree-name { font-size: 0.78rem; -webkit-line-clamp: 3; }
+  /* Narrow viewports: step the tile widths down so a phone renders a real stand
+     instead of one tree per screen. */
+  @media (max-width: 640px) {
+    .plans-forest-tree { --tree-w: 160px; }
+    .plans-forest-grove { --tree-w: 88px; }
+    .plans-forest-canopy { --tree-w: 52px; }
+    .plans-forest-tally { margin-left: 0; }
+  }
+  /* Current/next step (S3): a single compact line — a small state dot + label +
+     the step title (truncated). "now" (in_progress) reads live; "next" reads
+     queued. */
+  .plan-card-step { display: flex; align-items: baseline; gap: 0.4rem;
+                    font-size: 0.8rem; min-width: 0; }
+  /* The now/next chip is a deep-link into the plan, anchored at the clicked
+     step (ka-0000000150). Keep it visually identical to the old static row but
+     affordant on hover so it reads as clickable. */
+  a.plan-card-step-link { text-decoration: none; color: inherit; border-radius: 6px;
+                          padding: 0.1rem 0.15rem; margin: -0.1rem -0.15rem; transition: background 0.15s ease; }
+  a.plan-card-step-link:hover { background: rgba(33,150,243,0.1); }
+  a.plan-card-step-link:hover .plan-step-title { text-decoration: underline; opacity: 1; }
+  .plan-step-kind { font-weight: 600; font-size: 0.68rem; text-transform: uppercase;
+                    letter-spacing: 0.02em; padding: 0.05rem 0.35rem; border-radius: 999px;
+                    white-space: nowrap; }
+  .plan-step-kind-now { background: rgba(255,152,0,0.16); color: #8a5a00; }
+  .plan-step-kind-next { background: rgba(33,150,243,0.14); color: #16559a; }
+  /* "blocked" kind (ka-0000002840, iteration 14): the next open step is
+     status=blocked and cannot start. Reuses the SAME blocked-red vocabulary the
+     progress-bar blocked segment (#e53935) and the step-tally-blocked chip
+     already use, so the three blocked signals on the card read as one color —
+     a wedged next step no longer hides in the calm "next" blue. */
+  .plan-step-kind-blocked { background: rgba(229,57,53,0.12); color: #a3282a; }
+  .plan-step-title { opacity: 0.85; overflow: hidden; text-overflow: ellipsis;
+                     white-space: nowrap; min-width: 0; }
+  /* ka-0000002181: opacity 0.5 dropped the step number (inherited near-black) to
+     ~3.9:1 on the card. Mute via an explicit AA grey instead. */
+  .plan-step-num { color: #5c5c5c; }
+  html[data-skin^="dark"] .plan-step-num { color: #9aa0a6; }
+  /* In-progress "now" step age (ka-0000005352 iter-43): the "· 5d" running-age
+     folded onto the now/next chip face — the temporal facet the chip was the LAST
+     card signal to lack, completing the wait-age family every sibling already
+     carries (decision "· 32d", escalation "· 40d", stall "· 3d", stuck/queued
+     crew "· 6h"/"· 12m", MR "· 8d"). Calm/muted by default — context, like the
+     queued-crew age it mirrors — reusing the .plan-step-num grey so it reads as a
+     subordinate qualifier to the step title beside it; tabular-nums so a column of
+     "now" ages aligns and the digit doesn't jitter as the age ticks. flex:none so
+     the age never gets squeezed to zero by a long ellipsized title (which owns the
+     flex remainder). */
+  .plan-step-age { flex: none; color: #5c5c5c; font-variant-numeric: tabular-nums; }
+  html[data-skin^="dark"] .plan-step-age { color: #9aa0a6; }
+  /* Stale variant: an in_progress step running (now-stale, iter-43) OR a
+     status=blocked step wedged (blocked-stale, iter-48) past
+     planStallStaleThreshold (24h) — the SAME bar the ⚠ stall badge uses for a
+     frozen dead-agent step. A step grinding — or wedged — a full day is the kind
+     of thing an operator should notice, so the whole chip tints the loud
+     stall-red the ⚠ stall / ⛔ escalation "gone stale" marks use and the age
+     suffix stops dimming — mirroring .plan-card-mr-stale /
+     .plan-card-crew-stuck-stale. Both arms share ONE treatment (the blocked kind
+     pill is already red, the now pill orange); only the surrounding chip + the
+     age go red, so the state word stays legible. */
+  a.plan-card-step-now-stale:hover,
+  a.plan-card-step-blocked-stale:hover { background: rgba(211,47,47,0.12); }
+  .plan-card-step-now-stale .plan-step-title,
+  .plan-card-step-now-stale .plan-step-num,
+  .plan-card-step-blocked-stale .plan-step-title,
+  .plan-card-step-blocked-stale .plan-step-num { color: #a3282a; opacity: 1; }
+  .plan-card-step-now-stale .plan-step-age,
+  .plan-card-step-blocked-stale .plan-step-age { color: #a3282a; font-weight: 600; }
+  html[data-skin^="dark"] .plan-card-step-now-stale .plan-step-title,
+  html[data-skin^="dark"] .plan-card-step-now-stale .plan-step-num,
+  html[data-skin^="dark"] .plan-card-step-now-stale .plan-step-age,
+  html[data-skin^="dark"] .plan-card-step-blocked-stale .plan-step-title,
+  html[data-skin^="dark"] .plan-card-step-blocked-stale .plan-step-num,
+  html[data-skin^="dark"] .plan-card-step-blocked-stale .plan-step-age { color: #ff8a8a; }
+  /* Unified plan-agent chip (step 7, ka-0000003685): the card renders the SAME
+     plan_agent_chip partial as the /plans/{id} card header — loop-primary
+     ("running" / "paused" / "retired", "· live" liveness sub-signal), replacing
+     the old assistant-only .plan-asst-chip. The .plan-agent-chip-* CSS is
+     shared from layout.html; only the card-local terminal link is styled here. */
+  .plan-card-agent-link { font-size: 0.72rem; opacity: 0.75; text-decoration: none;
+                          border: 1px solid var(--rule, #d7dbe0); border-radius: 999px;
+                          padding: 0.05rem 0.45rem; color: inherit; }
+  .plan-card-agent-link:hover { border-color: var(--accent, #b9851b); text-decoration: underline; }
+  /* Stalled-plan warning badge (ka-0000005581): open work with nothing
+     watching it, or a dead-agent step. Loud on purpose — this is the signal
+     that would have caught the ka-0000004457 orphaning. */
+  .plan-stall-badge { display: inline-flex; align-items: center; gap: 0.3rem;
+                      font-size: 0.72rem; font-weight: 600; padding: 0.05rem 0.45rem;
+                      border-radius: 999px; background: rgba(179,38,30,0.1);
+                      border: 1px solid rgba(179,38,30,0.55); color: #7c1d17; }
+  /* Stall reason on the badge face (ka-0000001697, iteration 10): the "· no
+     gardener" / "· gardener paused" / "· N dead steps" discriminator that names
+     WHICH condition stalled the plan — the same "fold the discriminator onto the
+     face" idiom the decision chip's .chip-attention-age and the escalation
+     badge's .plan-esc-badge-age already use. Slightly dimmed so "⚠ stalled" stays
+     the headline and the reason reads as a subordinate qualifier; tabular so the
+     dead-step count doesn't jitter. */
+  .plan-stall-badge-reason { opacity: 0.8; font-weight: 500; font-variant-numeric: tabular-nums; }
+  /* Dead-agent orphan wait-age (ka-0000005352 iteration 11): the "· 3d" suffix
+     folded onto the ⚠ badge face — how long the oldest orphaned step has sat
+     frozen. Slightly dimmed + tabular so the reason stays the headline and the
+     age reads as a subordinate qualifier, the SAME idiom the decision chip's
+     .chip-attention-age and the escalation badge's .plan-esc-badge-age use. */
+  .plan-stall-badge-age { opacity: 0.8; font-variant-numeric: tabular-nums; }
+  /* Stale variant: an orphaned step frozen past planStallStaleThreshold (>1d).
+     A dead-agent step frozen a full day is not respawning on its own and needs a
+     human to rescue it, so the badge goes solid-red (the loudest step past the
+     already-loud translucent default) and its age suffix stops dimming —
+     mirroring .plan-esc-badge-stale. */
+  .plan-stall-badge-stale { background: rgba(179,38,30,0.92); border-color: #7c1d17; color: #fff; }
+  .plan-stall-badge-stale .plan-stall-badge-reason,
+  .plan-stall-badge-stale .plan-stall-badge-age { opacity: 0.95; }
+  /* Blocked-by-escalation badge (epic ka-0000005480, WS3): an open escalation
+     `blocks` one of this plan's steps (or the epic). A HARDER stop than
+     ⚠ stalled — nothing moves until a privileged operator acts — so it reads
+     at least as loud: solid-tinted red, same pill shape, sits beside the
+     stall badge. Links to the cockpit's escalation banner for the details. */
+  /* Wrap by WHOLE facet, not mid-phrase (ka-0000005352 iter-82). Measured on the
+     live prod board (239px board lane): this badge was the single worst vertical
+     sink among the attention signals — it ballooned to 55px / 3 lines on ALL 19
+     cards that carried it (100%), while the ⚠ stall badge, MR pills, decision
+     chip, and lifecycle chip all stayed one line (21-22px). Root cause: the pill
+     was flex-wrap:nowrap with a BARE-TEXT-NODE headline ("⛔ blocked by escalation
+     ×6"), so the headline wrapped mid-phrase AND the "· merge MR" op + "· 1d" age
+     facets could not drop as whole units. Fix (zero wording change, zero new
+     signal — the mission's "more info in LESS space" half): the headline is now
+     its own .plan-esc-badge-label nowrap span, and the badge is flex-wrap:wrap
+     with a tight row-gap, so the label stays intact and each facet drops as a
+     whole unit only when the lane genuinely can't fit them inline. Verified live
+     in-browser: 55px -> 40px per affected card. gap handles the inter-facet
+     spacing that the old leading-space-in-facet approach gave (the facet spans
+     dropped their leading " " so a wrapped facet does not carry a stray space). */
+  .plan-esc-badge { display: inline-flex; align-items: center; flex-wrap: wrap;
+                    gap: 0.05rem 0.3rem;
+                    font-size: 0.72rem; font-weight: 700; padding: 0.05rem 0.45rem;
+                    border-radius: 999px; background: rgba(179,38,30,0.22);
+                    border: 1px solid rgba(179,38,30,0.85); color: #7c1d17;
+                    text-decoration: none; }
+  .plan-esc-badge-label { white-space: nowrap; }
+  .plan-esc-badge:hover { background: rgba(179,38,30,0.32); }
+  /* Oldest blocking-escalation wait-age (ka-0000003887) — the "· 40d" suffix
+     folded into the ⛔ badge. Slightly dimmed + tabular so the "blocked by
+     escalation" label stays the headline and the age reads as a subordinate
+     qualifier, matching the decision chip's .chip-attention-age idiom. */
+  .plan-esc-badge-age { opacity: 0.8; font-variant-numeric: tabular-nums; }
+  /* Operation-type on the badge face (ka-0000005352 iteration 37): the "· merge
+     MR" / "· AWS IAM" / "· terraform" discriminator that names WHAT the operator
+     must DO — the same "fold the discriminator onto the face" idiom the ⚠ stall
+     badge's .plan-stall-badge-reason (iter-10) and this badge's own
+     .plan-esc-badge-age (iter-8) use. Slightly dimmed + medium weight so the
+     "blocked by escalation" label stays the headline and the op reads as a
+     subordinate qualifier beside the age. */
+  .plan-esc-badge-op { opacity: 0.8; font-weight: 500; }
+  /* Stale variant: an escalation that has waited past planEscalationStaleThreshold
+     (>7d). A privileged approval blocking work that long is the top thing an
+     operator should touch, so the badge goes solid-red (the loudest step past the
+     already-loud translucent default) and its age + op suffixes stop dimming. */
+  .plan-esc-badge-stale { background: rgba(179,38,30,0.92); border-color: #7c1d17; color: #fff; }
+  .plan-esc-badge-stale:hover { background: rgba(140,29,23,1); }
+  .plan-esc-badge-stale .plan-esc-badge-age,
+  .plan-esc-badge-stale .plan-esc-badge-op { opacity: 0.95; }
+  /* Inline per-gardener toggle feedback (step 3, ka-0000003881): a gated enable
+     (still-authoring plan) or a write failure re-renders the row with this note
+     beside the toggle, so a rejected flip is explained rather than silently
+     snapping the switch back. */
+  .plan-cap-toggle-err { font-size: 0.72rem; color: #7c1d17; align-self: center;
+                         padding: 0.05rem 0.4rem; border-radius: 6px;
+                         background: rgba(179,38,30,0.14); }
+  /* Dispatch-next button (Matt's ask, thread ka-0000001290): operator-only, one
+     deliberate click that hands the plan's current/next open step to its gardener
+     — replaces the old free-text spawn/wake message box. Compact; sits below the
+     state chip row. The confirmation note re-renders inline beside it. */
+  .plan-card-dispatch { display: flex; gap: 0.45rem; align-items: center; flex-wrap: wrap; margin-top: 0.15rem; }
+  .plan-card-dispatch-btn { font-size: 0.76rem; padding: 0.3rem 0.6rem; white-space: nowrap; }
+  /* Fleet-level "Approve & build" lever (ka-0000006826): the SAME deliberate
+     build gate the cockpit carries, surfaced on the /plans index row for a
+     ready plan with a bound gardener — a green-accented primary so it reads as
+     the one action that starts the plan, distinct from the neutral pause toggle
+     it replaces. Sits in the agent-state meta row where the toggle would be. */
+  .plan-card-approve-btn { font-size: 0.76rem; padding: 0.3rem 0.6rem; white-space: nowrap;
+                           border: 1px solid rgba(76,175,80,0.6); font-weight: 600; }
+  .plan-card-dispatch-note { font-size: 0.72rem; color: #1f7a34; line-height: 1.3; }
+  .plan-card-dispatch-note-err { color: #7c1d17; }
+  /* ── Dark-skin theming for the plan card + its dense signals (ka-0000007937,
+       iteration 16 of plan ka-0000005352). ──────────────────────────────────
+     THE ROOT BUG: the card surface is `background: var(--card-bg, #fff)`, but
+     --card-bg is defined by NO skin — so on the dark skin (--bg #0b0f14,
+     near-black page) every .plan-card rendered a glaring pure-#fff rectangle,
+     never themed for dark at all. The 15 density iterations above then built
+     their signals with LIGHT-mode text colors that only ever ride that white
+     card, so the dark skin got a white card island on a black page — jarring,
+     and several pale signals (the amber "N to answer" chip, the translucent
+     stall/lifecycle chips) washed out even on the white fill. No prior audit
+     caught it: the PACES harness only ever rendered the light skin.
+
+     THE FIX, in two coherent halves (color-only — no box/size/layout change, so
+     the 375px no-overflow gate is untouched):
+       (1) give the card an ACTUAL dark surface on the dark skin by defining
+           --card-bg (#14181d, the --bg-alt-family tone the .plans-search input
+           and other dark surfaces use), plus a token-driven border. This themes
+           the card and every var(--card-bg,#fff) fallback on the page (peek
+           drawer, crew rows, new-plan form) in one place; and
+       (2) now that the card is dark, lift each dense signal's text — and the
+           crew-avatar initials — to a brighter tone drawn from the dark skin's
+           OWN palette (neutral #b8c2d0 ≈ --text-muted, green #6ee7b7 = --accent,
+           red #ff8a8a = --err-fg, amber #f5d578 = --warn-fg, blue #58a6ff
+           matching the existing dark operator-link), nudging a couple of tints
+           one alpha-step so the pill still reads as a tint. Every text/surface
+           pair below measures ≥ 4.5× (mostly 6-11×) WCAG AA over the dark card
+           — versus the 1.2-2.4× the light-mode colors would score on a dark
+           card. The solid-red STALE badge variants (rgba(179,38,30,0.92) +
+           white text) already pass and are left as-is; only their translucent
+           DEFAULT states and the lifecycle chips needed lifting. */
+  html[data-skin^="dark"] .plan-card { --card-bg: #14181d; border-color: rgba(160,170,185,0.22); }
+  html[data-skin^="dark"] .plan-card:hover { border-color: var(--accent, #6ee7b7); }
+  html[data-skin^="dark"] .plan-lifecycle-chip-draft { background: rgba(160,170,185,0.14); border-color: rgba(160,170,185,0.4); color: #b8c2d0; }
+  html[data-skin^="dark"] .plan-lifecycle-chip-ready { background: rgba(88,166,255,0.16); border-color: rgba(88,166,255,0.5); color: #58a6ff; }
+  /* Blocked status chip + facet dark overrides (ka-0000005352 iter-55): lift the
+     red-family loud tint + the calm-green cleared marker to the WCAG-AA-clearing
+     hues the dark skin uses elsewhere (#ff8a8a loud red, #6ee7b7 healthy green),
+     meaning preserved (red = open blockers/attention, green = cleared). */
+  html[data-skin^="dark"] .chip-status-blocked { border-color: rgba(255,138,138,0.5); }
+  html[data-skin^="dark"] .chip-status-blocked-open { border-color: #ff8a8a; color: #ff8a8a; }
+  html[data-skin^="dark"] .chip-status-blocked-stale { background: rgba(179,38,30,0.18); border-color: #ff8a8a; color: #ff8a8a; }
+  html[data-skin^="dark"] .chip-status-blocked-cleared { border-color: rgba(110,231,183,0.5); }
+  html[data-skin^="dark"] .chip-status-blocked-cleared-facet { color: #6ee7b7; }
+  /* a11y: drop the age span's 0.85 opacity under the dark skin (ka-0000007487).
+     0.85 over the dark chip composites #58a6ff down to #4f94e3 on the #1f2f41
+     backdrop = 4.33:1, just under the WCAG AA 4.5:1 floor for this 11.5px text,
+     which reds the dark-/plans a11y spec (and with it every MR branched off
+     main). Full opacity is 5.39:1. The light skin keeps 0.85 — there the chip
+     color is the much darker #1e4a72, which stays well clear of the floor. */
+  html[data-skin^="dark"] .plan-lifecycle-chip-age { opacity: 1; }
+  /* Dark override for the loud ready-stale tint (ka-0000005352 iter-47) — the bright
+     #ff8a8a dark tone the freshness stamp's .plan-card-updated-stale + the now/step
+     age's .plan-card-step-now-stale already lift to, so a >7d approval wait reads
+     loud on the dark skin too (the light #a3282a scores far below AA on the dark
+     card). Guards the iter-16 dark-legibility invariant the card was themed under. */
+  html[data-skin^="dark"] .plan-lifecycle-chip-ready-stale { background: rgba(229,57,53,0.18); border-color: #ff8a8a; color: #ff8a8a; }
+  html[data-skin^="dark"] .plan-lifecycle-chip-building { background: rgba(76,175,80,0.18); border-color: rgba(110,231,183,0.5); color: #6ee7b7; }
+  html[data-skin^="dark"] .plan-lifecycle-chip-complete { background: rgba(96,125,139,0.2); border-color: rgba(160,170,185,0.4); color: #b8c2d0; }
+  html[data-skin^="dark"] .plan-lifecycle-chip-abandoned { background: rgba(200,150,90,0.16); border-color: rgba(200,150,90,0.45); color: #d0a06e; }
+  html[data-skin^="dark"] .plan-card-crew { color: #b8c2d0; border-color: rgba(160,170,185,0.35); }
+  html[data-skin^="dark"] .plan-card-crew-live { color: #6ee7b7; border-color: rgba(110,231,183,0.45); background: rgba(76,175,80,0.16); }
+  html[data-skin^="dark"] .plan-card-crew-failed { color: #ff8a8a; }
+  html[data-skin^="dark"] .plan-card-crew-stuck-stale { color: #ff5a5a; }
+  /* Lane / group header aggregate crew tally (ka-0000005352): the working green
+     and stuck red both lift for legibility on the near-black board, mirroring
+     the card crew facets' own dark overrides above. */
+  html[data-skin^="dark"] .plans-lane-crew-working { color: #6ee7b7; }
+  html[data-skin^="dark"] .plans-lane-crew-stuck { color: #ff8a8a; }
+  html[data-skin^="dark"] .plan-card-crew-queued-stale { color: #ff5a5a; }
+  html[data-skin^="dark"] .plan-card-crew-face { color: #6ee7b7; background: rgba(76,175,80,0.22); border-color: rgba(110,231,183,0.6); }
+  html[data-skin^="dark"] .plan-card-crew-face-more { color: #b8c2d0; background: rgba(160,170,185,0.14); border-color: rgba(160,170,185,0.5); }
+  html[data-skin^="dark"] .plan-card-crew-face-stuck { color: #ff8a8a; background: rgba(211,47,47,0.2); border-color: rgba(255,138,138,0.6); }
+  html[data-skin^="dark"] .plan-card-crew-face-queued { color: #c3cdda; background: rgba(148,163,184,0.2); border-color: rgba(148,163,184,0.6); }
+  html[data-skin^="dark"] .plan-card-crew-face-queued.plan-card-crew-face-more { color: #b8c2d0; background: rgba(160,170,185,0.14); border-color: rgba(160,170,185,0.5); }
+  html[data-skin^="dark"] .plan-card-mr { color: #58a6ff; border-color: rgba(88,166,255,0.5); }
+  html[data-skin^="dark"] .plan-card-mr-draft { color: #b8c2d0; border-color: rgba(160,170,185,0.45); }
+  html[data-skin^="dark"] .plan-card-mr-ci-glyph-success  { color: #6ee7b7; }
+  html[data-skin^="dark"] .plan-card-mr-ci-glyph-failed   { color: #ff8a8a; }
+  html[data-skin^="dark"] .plan-card-mr-ci-glyph-canceled { color: #9aa0a6; }
+  /* Dark twin of the iter-40 stale-MR amber tint: a brighter amber legible on the
+     #14181d card. Declared BEFORE the dark .plan-card-mr-ci-failed below so a pill
+     that is both stale AND CI-failed keeps the louder dark-red chrome. */
+  html[data-skin^="dark"] .plan-card-mr-stale { color: #f0a860; border-color: rgba(240,168,96,0.6); background: rgba(180,95,6,0.24); }
+  /* Failed-CI pill chrome on the dark skin (ka-0000000387, iter-20): lift the
+     loud-red per-pill + overflow tint to the dark palette's bright red so a
+     failed MR (inline pill OR the "+N MR · ✕ K" overflow) reads >=AA-legible on
+     the #14181d card instead of the light #c62828 that washes out. Same red
+     vocabulary as the dark stall/escalation badges (#ff8a8a), so all three
+     "needs attention" signals read one color on dark too. */
+  html[data-skin^="dark"] .plan-card-mr-ci-failed { color: #ff8a8a; border-color: rgba(255,138,138,0.6); background: rgba(198,40,40,0.24); }
+  html[data-skin^="dark"] .plan-card-mr-more-ci { color: #ff8a8a; }
+  /* Dark twin of the iter-36 P0/P1 split: P0 a solid red fill (white text,
+     #fff on #d32f2f = 4.98:1 AA), P1 the tinted-red text it had. */
+  html[data-skin^="dark"] .plan-prio-chip-0 { color: #fff; background: #d32f2f; border-color: #ff8a8a; }
+  html[data-skin^="dark"] .plan-prio-chip-1 { color: #ff8a8a; }
+  html[data-skin^="dark"] .plan-prio-chip-2 { color: #f5d578; }
+  html[data-skin^="dark"] .plan-prio-chip-3, html[data-skin^="dark"] .plan-prio-chip-4 { color: #b8c2d0; }
+  html[data-skin^="dark"] .plan-step-tally-inprogress { color: #f5d578; border-color: rgba(245,213,120,0.5); }
+  html[data-skin^="dark"] .plan-step-tally-blocked { color: #ff8a8a; border-color: rgba(255,138,138,0.5); }
+  /* Ghost-done marker (ka-0000005352 iter-41) — calm green in dark, matching the
+     live-crew chip's #6ee7b7 healthy-green family so "✓ steps done" reads as
+     complete-and-healthy, not an alarm. */
+  html[data-skin^="dark"] .plan-steps-done { color: #6ee7b7; background: rgba(76,175,80,0.16); border-color: rgba(110,231,183,0.5); }
+  html[data-skin^="dark"] .plan-step-kind-now { color: #f5d578; background: rgba(255,152,0,0.18); }
+  html[data-skin^="dark"] .plan-step-kind-next { color: #58a6ff; background: rgba(33,150,243,0.18); }
+  html[data-skin^="dark"] .plan-step-kind-blocked { color: #ff8a8a; background: rgba(229,57,53,0.16); }
+  html[data-skin^="dark"] .chip-attention { color: #f5d578; background: rgba(245,213,120,0.12); border-color: rgba(245,213,120,0.5); }
+  html[data-skin^="dark"] .chip-attention-stale { color: #ff8a8a; background: rgba(229,57,53,0.18); border-color: rgba(255,138,138,0.6); }
+  html[data-skin^="dark"] .plan-stall-badge { color: #ff8a8a; border-color: rgba(255,138,138,0.55); background: rgba(179,38,30,0.16); }
+  html[data-skin^="dark"] .plan-esc-badge { color: #ff8a8a; border-color: rgba(255,138,138,0.7); background: rgba(179,38,30,0.26); }
+  html[data-skin^="dark"] .plan-card-dispatch-note { color: #6ee7b7; }
+  html[data-skin^="dark"] .plan-card-dispatch-note-err { color: #ff8a8a; }
+  html[data-skin^="dark"] .plan-cap-toggle-err { color: #ff8a8a; background: rgba(179,38,30,0.18); }
+  /* "+ New plan" affordance + actionable empty state (task 3b, plan
+     ka-0000005794 Surface A). The compose form (goal + project selector) POSTs
+     the 3a create verb (POST /plans) as a native browser form: the server mints
+     the epic + plan/project labels transactionally and 303-redirects to
+     /plans/{id}. Operator-gated (rendered only when .IsOperator). Two entry
+     points share ONE {{`{{template "planNewForm"}}`}} — a <details> disclosure
+     above a populated list, and an always-open form inside the empty hero — so
+     the form markup lives in exactly one place. */
+  .plan-new { margin: 0 0 1.25rem; }
+  .plan-new-btn { display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer;
+                  width: max-content; list-style: none; font: inherit; font-weight: 600;
+                  color: #fff; background: rgb(25,118,210); border: 1px solid rgb(21,101,192);
+                  border-radius: 6px; padding: 0.4rem 0.9rem; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+  /* Hide the default disclosure triangle (list-style:none covers Firefox/Chrome;
+     the ::-webkit-details-marker rule covers Safari) so the summary reads as a
+     solid primary button, not a collapsible row. */
+  .plan-new-btn::-webkit-details-marker { display: none; }
+  .plan-new-btn:hover, .plan-new-btn:focus,
+  .plan-new[open] > .plan-new-btn { background: rgb(21,101,192); border-color: rgb(13,71,161); }
+  html[data-skin^="dark"] .plan-new-btn { background: rgb(56,178,255); border-color: rgb(33,150,243); color: #000; }
+  html[data-skin^="dark"] .plan-new-btn:hover, html[data-skin^="dark"] .plan-new-btn:focus,
+  html[data-skin^="dark"] .plan-new[open] > .plan-new-btn { background: rgb(33,150,243); border-color: rgb(25,118,210); color: #000; }
+  .plan-new-panel { margin-top: 0.75rem; max-width: 34rem; border: 1px solid var(--rule, #d7dbe0);
+                    border-radius: 12px; padding: 1.1rem 1.15rem; background: var(--card-bg, #fff); }
+  .plan-new-lead { font-size: 0.84rem; opacity: 0.8; margin: 0 0 0.9rem; }
+  /* Actionable empty state — replaces the old "go mint an epic elsewhere" copy
+     that pointed OUT of the viewer. */
+  .plan-empty-hero { max-width: 40rem; border: 1px solid var(--rule, #d7dbe0); border-radius: 12px;
+                     padding: 1.4rem 1.35rem; background: var(--card-bg, #fff); }
+  .plan-empty-hero h3 { font-size: 1.15rem; margin: 0 0 0.3rem; }
+  .plan-empty-hero > p { font-size: 0.86rem; opacity: 0.82; margin: 0 0 1rem; }
+  .plan-empty-strike { font-size: 0.75rem; opacity: 0.6; margin: 1rem 0 0; }
+  /* Shared compose-form fields (goal textarea + project selector). Inputs use a
+     fixed light surface + dark text so they stay legible under every skin, the
+     same approach the quick-spawn / create-advice forms take. */
+  .plan-field { display: block; margin: 0 0 0.85rem; }
+  .plan-field-label { display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.3rem; }
+  .plan-field-hint { font-size: 0.72rem; font-weight: 400; opacity: 0.6; }
+  .plan-new-form textarea, .plan-new-form select { width: 100%; font: inherit; font-size: 0.9rem;
+      padding: 0.5rem 0.6rem; border: 1px solid var(--rule, #d7dbe0); border-radius: 8px;
+      background: #fff; color: #1a1a1a; }
+  .plan-new-form textarea { min-height: 4.5rem; resize: vertical; }
+  .plan-new-actions { display: flex; gap: 0.55rem; align-items: center; margin-top: 0.4rem; }
+  .plan-new-submit { font: inherit; font-weight: 600; cursor: pointer; color: #fff;
+      background: rgb(25,118,210); border: 1px solid rgb(21,101,192); border-radius: 6px;
+      padding: 0.45rem 0.95rem; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+  .plan-new-submit:hover, .plan-new-submit:focus { background: rgb(21,101,192); border-color: rgb(13,71,161); }
+  html[data-skin^="dark"] .plan-new-submit { background: rgb(56,178,255); border-color: rgb(33,150,243); color: #000; }
+  html[data-skin^="dark"] .plan-new-submit:hover, html[data-skin^="dark"] .plan-new-submit:focus { background: rgb(33,150,243); border-color: rgb(25,118,210); color: #000; }
+  /* ── Dark-terminal theming for the "+ New plan" compose card (ka-0000007487) ──
+     THE BUG: both the .plan-new-panel and .plan-empty-hero surfaces ink
+     `background: var(--card-bg, #fff)`, but --card-bg is defined ONLY on
+     `.plan-card` for dark (line ~488) — NOT on these two. So under the dark skin
+     they fell back to pure #fff while the dark skin's --text (#d6e0ec) inked the
+     labels/hints/lead ON that white → ~1.2–1.9:1, a serious axe color-contrast
+     violation. Same root cause the .plan-card dark fix above solved: give the
+     surface an ACTUAL dark card bg by defining --card-bg here too, so every
+     var(--card-bg,#fff) fallback inside (panel, hero, textarea placeholder wash)
+     themes for dark and the existing dark --text/--text-muted inks ride a dark
+     surface at ≥5.5:1. The `code` in the hint inks --accent-alt #f0b000 on white
+     (1.5:1) → on the dark card it clears 9.3:1. Color/surface only. The inputs
+     (.plan-new-form textarea/select) intentionally KEEP their fixed light
+     #fff + #1a1a1a per the "fixed light surface" note above — a filled field
+     reads legibly light on every skin (13.6:1) and matches quick-spawn/advice. */
+  html[data-skin^="dark"] .plan-new-panel,
+  html[data-skin^="dark"] .plan-empty-hero { --card-bg: #14181d; border-color: rgba(160,170,185,0.22); }
+  /* The `<code>project:</code>` token inside .plan-field-hint inherits the dark
+     skin's global `code { color: --accent-alt #f0b000 }`, but the hint's own 0.6
+     opacity veil drags that amber to 4.08:1 on the dark card — just under AA.
+     Inside this de-emphasised hint the token reads as prose, so let it inherit
+     the hint's muted --text instead (→ 5.5:1 under the same veil) rather than
+     shouting the loud accent through a veil that dims it below the floor. */
+  html[data-skin^="dark"] .plan-field-hint code { color: inherit; }
+  /* Filter control strip (Matt's "filter plans by user, project, and status;
+     some visual grouping would be nice"). Now renders through the shared
+     `.filter-rows` / `.filter-row` labeled-control component in layout.html
+     (ka-0000006647 / audit F7) — the page's bespoke labeled-row idiom is
+     retired so /plans and /extern read as one component. .chip / .chip-active /
+     .chip-clear come from layout.html. */
+  /* Progressive search box (Matt's "progressive search bar" ask) — a
+     client-side filter over the rendered cards, mirroring /maps' .maps-search.
+     JS toggles .plans-search-hidden on non-matching cards (and on lane /
+     group sections left empty by the filter). */
+  .plans-search { margin: -0.6rem 0 1.1rem; display: flex; align-items: baseline; gap: 0.4rem; flex-wrap: wrap; }
+  .plans-search input {
+    padding: 0.32rem 0.6rem; min-width: 16rem; max-width: 100%; font: inherit;
+    border: 1px solid rgba(128,128,128,0.45); border-radius: 6px;
+    background: var(--bg, #fff); color: inherit;
+  }
+  html[data-skin^="dark"] .plans-search input { background: #14181d; }
+  .plans-search input:focus { outline: 2px solid rgba(33,150,243,0.55); outline-offset: 0; }
+  .plans-search-count { font-size: 0.72rem; color: #777; font-variant-numeric: tabular-nums; }
+  html[data-skin^="dark"] .plans-search-count { color: #9aa0a6; }
+  /* JS hides non-matching cards / emptied lane+group sections with this. */
+  .plans-search-hidden { display: none !important; }
+  .plans-search-empty { font-size: 0.85rem; color: #777; margin: 0.4rem 0; }
+  html[data-skin^="dark"] .plans-search-empty { color: #9aa0a6; }
+  /* Group section headings (?group=). One <section> per group; the heading
+     carries the group label + a count badge, matching /extern's group heads. */
+  .plan-group { margin: 0 0 1.4rem; }
+  .plan-group-head { font-size: 1.02rem; margin: 0.6rem 0 0.5rem; display: flex;
+                     align-items: baseline; gap: 0.4rem; }
+  .plan-group-head .meta { font-size: 0.8rem; opacity: 0.6; font-variant-numeric: tabular-nums; }
+  /* Layer-1 unhomed-forks backstop (ka-0000004983): a distinct global section
+     below the plan grid listing open decisions/escalations that belong to no plan
+     and no operator surface. Rendered only when non-empty (server-gated), so a
+     healthy cockpit shows nothing here. Toned as an attention band (not an error)
+     — these are recoverable forks, not failures. */
+  .plans-unhomed { margin: 1.6rem 0 1.2rem; padding: 0.9rem 1rem; border: 1px solid #e6c96a;
+                   border-radius: 8px; background: rgba(255,243,205,0.5); }
+  html[data-skin^="dark"] .plans-unhomed { border-color: #6b5a24; background: rgba(90,66,0,0.16); }
+  .plans-unhomed-head { font-size: 1.0rem; margin: 0 0 0.25rem; display: flex;
+                        align-items: baseline; gap: 0.45rem; flex-wrap: wrap; }
+  /* ka-0000002181: the unhomed panel muted its meta text with opacity veils on
+     the warm cream wash (#fff9e6) — the .meta #555 ink at 0.7–0.75 composited to
+     ~#7f7e79 = 3.86:1, a serious axe fail the seeded CI daemon renders (open
+     orphan decisions) but an empty-daemon scan never sees. Re-mute via explicit
+     AA colours (a child can't escape the veil). */
+  .plans-unhomed-head .meta { font-size: 0.78rem; color: #5c5c5c; }
+  html[data-skin^="dark"] .plans-unhomed-head .meta { color: #c7b98f; }
+  .plans-unhomed-badge { font-variant-numeric: tabular-nums; }
+  .plans-unhomed-lead { margin: 0 0 0.6rem; font-size: 0.82rem; }
+  .plans-unhomed-list { list-style: none; margin: 0 0 0.4rem; padding: 0; display: flex;
+                        flex-direction: column; gap: 0.3rem; }
+  .plans-unhomed-kind { flex: none; font-size: 0.8rem; color: #5c5c5c; }
+  html[data-skin^="dark"] .plans-unhomed-kind { color: #c7b98f; }
+  .plans-unhomed-kind-esc { color: #a3282a; }
+  html[data-skin^="dark"] .plans-unhomed-kind-esc { color: #ff8a8a; }
+  .plans-unhomed-title { font-weight: 500; word-break: break-word; }
+  .plans-unhomed-project { font-size: 0.72rem; }
+  .plans-unhomed-detail { font-size: 0.78rem; color: #5c5c5c; }
+  html[data-skin^="dark"] .plans-unhomed-detail { color: #c7b98f; }
+  .plans-unhomed-age { margin-left: auto; font-size: 0.78rem; color: #5c5c5c;
+                       font-variant-numeric: tabular-nums; white-space: nowrap; }
+  html[data-skin^="dark"] .plans-unhomed-age { color: #c7b98f; }
+  /* Master switch + global-pause banner (step 4, ka-0000004048). The switch is a
+     page-level pause/resume-ALL-gardeners control; the banner is the persistent
+     storm-guard notice. Scoped under .plans-master so it never leaks. The
+     .banner + .cap-pause-* base styling comes from layout.html; these rules add
+     the layout (banner icon row, control row) and live in the page (not the
+     partial) so they survive the partial's outerHTML swap. */
+  .plans-master { margin: 0.25rem 0 1.1rem; display: flex; flex-direction: column; gap: 0.6rem; }
+  .plans-master-banner { display: flex; align-items: flex-start; gap: 0.55rem; margin: 0; }
+  .plans-master-banner-icon { font-size: 1.05rem; line-height: 1.3; flex: none; }
+  .plans-master-banner-body { min-width: 0; font-size: 0.86rem; line-height: 1.45; }
+  .plans-master-banner-hint { display: block; margin-top: 0.3rem; opacity: 0.8; font-size: 0.8rem; }
+  .plans-master-control { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem 0.75rem; }
+  .plans-master-title { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;
+                        opacity: 0.6; font-weight: 600; }
+  .plans-master-form { display: inline-flex; align-items: center; gap: 0.6rem; margin: 0; padding: 0; }
+  /* The master switch is a bigger affordance than a per-row toggle — it governs
+     the whole fleet — so give its label a touch more weight. */
+  .plans-master-btn .cap-pause-label { font-size: 0.82rem; }
+  .plans-master-static { cursor: default; }
+  .plans-master-hint { font-size: 0.78rem; opacity: 0.7; }
+  .plans-master-error { font-size: 0.78rem; color: #7c1d17; font-weight: 600; }
+  html[data-skin^="dark"] .plans-master-error { color: #ff8a8a; }
+  /* User-scope header chip (Step 2, ka-0000005414). The shared markup carried no
+     CSS, so every scope state rendered as indistinct plain text + a blue link —
+     "mine" vs "everyone's" was a guess. Style it as a labelled pill whose LEFT
+     edge is colour-coded by data-state so the active scope is unmistakable at a
+     glance: a warm accent stripe for the narrowed "your plans" / a person's
+     plans, a cool stripe for the fleet-wide discovery scopes (everyone's /
+     unowned / anonymous). Scoped under .operator-header-chip-row so it never
+     leaks to /active or /search, which keep the unstyled shared chip. */
+  .operator-header-chip-row { margin: 0.25rem 0 0.6rem; }
+  .operator-header-chip-row .operator-header-chip {
+      display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.35rem;
+      font-size: 0.85rem; padding: 0.32rem 0.7rem; border-radius: 8px;
+      border: 1px solid var(--rule, #d7dbe0); border-left-width: 4px;
+      background: var(--card-bg, #fff); }
+  /* Narrowed scopes (your plans / a person's plans) — warm accent stripe. */
+  .operator-header-chip-row .operator-header-chip[data-state="mine"],
+  .operator-header-chip-row .operator-header-chip[data-state="other"] {
+      border-left-color: var(--accent, #b9851b); background: rgba(185,133,27,0.06); }
+  /* Fleet-wide discovery scopes — cool stripe, so "everyone's plans" reads as a
+     different, wider mode than the narrowed default (not a subtle variant). */
+  .operator-header-chip-row .operator-header-chip[data-state="all"],
+  .operator-header-chip-row .operator-header-chip[data-state="anonymous"] {
+      border-left-color: rgb(33,150,243); background: rgba(33,150,243,0.06); }
+  .operator-header-chip-row .operator-header-chip[data-state="unowned"] {
+      border-left-color: #8a8f98; background: rgba(128,128,128,0.07); }
+  .operator-header-chip-row .operator-header-chip-headline { font-weight: 600; }
+  /* Muted helper text via COLOR, not opacity (ka-0000002181). The old
+     `opacity: 0.75` veiled the WHOLE actions run — including the switch-scope
+     LINK nested inside it — so the link's rgb(25,118,210) composited down to
+     ~#5196da and measured 2.9:1 on the chip wash: a serious axe color-contrast
+     fail. A child cannot escape an ancestor's opacity (it composites as a
+     group), so the link could never be lifted while the veil stood. Mute the
+     surrounding prose with an explicit near-AA grey instead (#57606a → ~4.8:1
+     on the chip washes) and give the link its own full-opacity colour below. */
+  .operator-header-chip-row .operator-header-chip-actions { color: #57606a; font-size: 0.8rem; }
+  html[data-skin^="dark"] .operator-header-chip-row .operator-header-chip-actions { color: var(--text-muted, #8b99ac); }
+  /* blue-800 (#1565c0), not the old blue-700 rgb(25,118,210): at full opacity on
+     the three chip washes (warm mine/other, cool all/anonymous, grey unowned)
+     it clears 5.0:1+ AA. rgb(25,118,210) itself only reached ~4.0–4.3:1 even
+     unveiled, so the darker step is what buys the margin. */
+  .operator-header-chip-row .operator-header-chip-link { font-weight: 600; text-decoration: none;
+      color: #1565c0; }
+  .operator-header-chip-row .operator-header-chip-link:hover { text-decoration: underline; }
+  html[data-skin^="dark"] .operator-header-chip-row .operator-header-chip-link { color: rgb(88,166,255); }
+  /* "(auto)" pill — a muted, non-shouting marker that the scope came from the
+     cold-load default, not a peer's link. Tightened from the old "(default)". */
+  .operator-header-chip-row .operator-header-chip-default {
+      font-size: 0.72rem; font-weight: 500; opacity: 0.6; font-variant: normal;
+      padding: 0.02rem 0.3rem; border-radius: 999px; background: rgba(128,128,128,0.14);
+      cursor: help; }
+  /* Browse-by-person discovery strip (Step 5, ka-0000004302). A row of person
+     chips pivoting the index to a teammate's plans via ?operated_by=<peer>, plus
+     a cross-link to the full /people directory. Sits under the user-scope header
+     chip and above the status/project/group filter strip. Chip base styling
+     (.chip / .chip-active) comes from layout.html; these rules lay out the row
+     and add the per-person count badge + (you) tag. */
+  .plan-people-strip { display: flex; align-items: baseline; flex-wrap: wrap;
+                       gap: 0.4rem; margin: 0.1rem 0 0.9rem; }
+  .plan-people-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;
+                       opacity: 0.6; min-width: 3.75rem; }
+  .plan-people-strip .chip { cursor: pointer; }
+  .plan-people-chip-count { font-variant-numeric: tabular-nums; opacity: 0.65;
+                            font-size: 0.78rem; margin-left: 0.28rem; }
+  /* Dark-terminal (ka-0000007487): this count sits inside .chip, whose 0.6
+     opacity veil (layout.html:313) COMPOUNDS with the 0.65 here → 0.39 effective,
+     dropping the phosphor-green #6ee7b7 to ~2.8:1 on the #11161d strip. Reset the
+     count's own veil to 1 on dark so it inherits only the .chip 0.6 veil (→ 5.0:1
+     AA). Same opacity-veil anti-pattern the plan-card chips were reset for. */
+  html[data-skin^="dark"] .plan-people-chip-count { opacity: 1; }
+  .plan-people-self-tag { font-size: 0.72rem; opacity: 0.7; margin-left: 0.22rem; }
+  .plan-people-more { font-size: 0.8rem; }
+  .plan-people-more a { text-decoration: none; }
+  .plan-people-more a:hover { text-decoration: underline; }
+  /* --- Jira-style board (Matt's ask, thread ka-0000005903): one status lane
+     per column, horizontally scrollable when the lanes outgrow the viewport.
+     Cards inside a lane reuse the SAME planCard partial the grid renders —
+     only the container geometry changes. --- */
+  .plans-board { display: grid; grid-auto-flow: column;
+                 grid-auto-columns: minmax(17rem, 22rem); gap: 0.9rem;
+                 align-items: start; overflow-x: auto; padding-bottom: 0.75rem; }
+  .plans-lane { border: 1px solid var(--rule, #d7dbe0); border-radius: 10px;
+                background: rgba(128,128,128,0.045); display: flex;
+                flex-direction: column; min-width: 0; }
+  .plans-lane-head { display: flex; align-items: baseline; gap: 0.4rem;
+                     padding: 0.6rem 0.8rem 0.45rem; font-weight: 600;
+                     font-size: 0.85rem; text-transform: uppercase;
+                     letter-spacing: 0.03em; border-bottom: 1px solid var(--rule, #e2e5e9); }
+  .plans-lane-head .meta { font-size: 0.78rem; font-weight: 400;
+                           font-variant-numeric: tabular-nums; text-transform: none; }
+  /* Lane accent: the same status hues the card chips carry, painted as a top
+     border so a column's state reads at a glance. */
+  .plans-lane-open { border-top: 3px solid rgba(33,150,243,0.55); }
+  .plans-lane-in_progress { border-top: 3px solid rgba(255,152,0,0.6); }
+  /* stalled is the derived Stalled/Blocked lane; blocked is the raw-status
+     column a narrowed ?status=blocked view renders — same alarm hue. */
+  .plans-lane-stalled { border-top: 3px solid rgba(179,38,30,0.55); }
+  .plans-lane-blocked { border-top: 3px solid rgba(179,38,30,0.55); }
+  .plans-lane-deferred { border-top: 3px solid rgba(128,128,128,0.5); }
+  .plans-lane-closed { border-top: 3px solid rgba(76,175,80,0.55); }
+  /* The "Done?" close-out lane (planCloseoutBoardLane, task ka-0000004467) — the
+     exit ramp's column, immediately before Closed. It shares Closed's done-green
+     accent (same work-is-finished family) but DASHED, because unlike Closed these
+     plans are still OPEN: the lane asks "is this one done?" rather than asserting
+     it, matching the dashed/solid confidence tiering the card badges use. */
+  .plans-lane-closeout { border-top: 3px dashed rgba(76,175,80,0.55); }
+  .plans-lane-list { list-style: none; margin: 0; padding: 0.7rem;
+                     display: flex; flex-direction: column; gap: 0.7rem; }
+  .plans-lane-empty { font-size: 0.78rem; opacity: 0.55; padding: 0.9rem 0.8rem 1rem; }
+  .plans-lane-note { font-size: 0.72rem; opacity: 0.6; padding: 0 0.8rem 0.6rem; margin: 0; }
+  /* Aggregate live-crew tally on the lane / ?group= section header
+     (ka-0000005352): the column-level scan signal summed across the section's
+     rows (planLaneCrew). Pushed to the far end of the header row (margin-left:
+     auto) where the count already sits, in the non-uppercase small type the
+     .meta count uses. The working facet reads CALM green with the SAME pulsing
+     live-dot the card crew chip carries (.plan-card-crew-dot vocabulary); the
+     stuck facet reads LOUD red (.plan-card-crew-failed's #a3282a), the reachable
+     "act now" column count. Both self-suppress when zero (template Any gate). */
+  .plans-lane-crew { margin-left: auto; display: inline-flex; align-items: center;
+                     gap: 0.5rem; font-size: 0.74rem; font-weight: 500;
+                     text-transform: none; letter-spacing: 0;
+                     font-variant-numeric: tabular-nums; }
+  .plans-lane-crew-working { display: inline-flex; align-items: center; gap: 0.28rem;
+                             color: #2e7d32; }
+  .plans-lane-crew-dot { width: 0.45rem; height: 0.45rem; border-radius: 50%;
+                         background: #4caf50; flex: 0 0 auto;
+                         animation: plan-crew-pulse 1.6s infinite ease-in-out; }
+  @media (prefers-reduced-motion: reduce) { .plans-lane-crew-dot { animation: none; } }
+  .plans-lane-crew-stuck { color: #a3282a; font-weight: 600; }
+  /* Board cards open the peek drawer on click — cursor signals it. Interactive
+     descendants (links/buttons/inputs) keep their own cursor + behaviour. */
+  .plans-index .plan-card { cursor: pointer; }
+  /* --- Card-peek slide-out drawer (the "pops out from the side" panel).
+     Static shell shipped hidden; plans_board.js opens it and mounts the
+     GET /plans/{id}/peek fragment into #plan-peek-body. --- */
+  .plan-peek-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.35);
+                        z-index: 60; }
+  /* display:flex below would beat the UA's [hidden]{display:none} — restate it
+     so the shipped-hidden shell actually stays hidden until JS opens it. */
+  .plan-peek-drawer[hidden], .plan-peek-backdrop[hidden] { display: none; }
+  .plan-peek-drawer { position: fixed; top: 0; right: 0; bottom: 0; z-index: 61;
+                      width: min(46rem, 94vw); background: var(--card-bg, #fff);
+                      border-left: 1px solid var(--rule, #d7dbe0);
+                      box-shadow: -8px 0 28px rgba(0,0,0,0.18);
+                      display: flex; flex-direction: column;
+                      animation: plan-peek-slide 0.18s ease-out; }
+  /* Dark drawer surface (ka-0000005352 iter-85) — the SAME white-island root bug
+     iter-16 (ka-0000007937) fixed on the /plans INDEX card, one surface over that
+     was NEVER themed. .plan-peek-drawer is a TOP-LEVEL fixed <aside>, NOT a
+     descendant of .plan-card, so the dark --card-bg the card defines never
+     reaches it: on the dark skin the whole card-click peek drawer rendered a
+     pure-#fff rectangle on the near-black page, and the dense crew/step/notice
+     chips inside rode that white fill with light-mode ink. Define --card-bg on
+     the drawer here (same #14181d tone) so the drawer AND every
+     var(--card-bg,#fff) fallback inside it (the peek bead-action buttons) theme
+     for dark; the peek-specific hardcoded-ink chips (.plan-steps-notice,
+     .bead-actions-error, .plan-tl-blocked) are lifted to the bright dark palette
+     just below. The peek is a card-click surface prior iters folded crew facets
+     into (iter-65/71/78/79) but the /plans PACES capture only rendered the LIGHT
+     skin, so this white-island was structurally invisible to the audit. */
+  html[data-skin^="dark"] .plan-peek-drawer { --card-bg: #14181d; border-color: rgba(160,170,185,0.22); }
+  @keyframes plan-peek-slide { from { transform: translateX(2.5rem); opacity: 0.4; }
+                               to { transform: translateX(0); opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .plan-peek-drawer { animation: none; } }
+  .plan-peek-bar { display: flex; align-items: center; gap: 0.5rem;
+                   padding: 0.55rem 0.8rem; border-bottom: 1px solid var(--rule, #e2e5e9); }
+  .plan-peek-bar-label { font-size: 0.72rem; text-transform: uppercase;
+                         letter-spacing: 0.05em; opacity: 0.55; font-weight: 600; }
+  .plan-peek-close { margin-left: auto; cursor: pointer; font: inherit;
+                     font-size: 1.05rem; line-height: 1; padding: 0.25rem 0.55rem;
+                     border: 1px solid var(--rule, #d7dbe0); border-radius: 7px;
+                     background: transparent; color: inherit; }
+  .plan-peek-close:hover, .plan-peek-close:focus { border-color: var(--accent, #b9851b); }
+  #plan-peek-body { overflow-y: auto; padding: 0.9rem 1.1rem 1.4rem; flex: 1; min-width: 0; }
+  .plan-peek-loading { padding: 1rem 0; }
+  .plan-peek-error { color: #7c1d17; padding: 1rem 0; }
+  /* Dark override (ka-0000005352 iter-85): the peek load-error message inks a
+     dark red (#7c1d17, ~2.3:1 on the now-dark drawer) — lift to the bright dark
+     red the drawer's other error signals use. */
+  html[data-skin^="dark"] .plan-peek-error { color: #ff8a8a; }
+  .plan-peek-head { margin-bottom: 1rem; }
+  .plan-peek-title { margin: 0 0 0.4rem; font-size: 1.2rem; line-height: 1.3; }
+  .plan-peek-title a { color: inherit; text-decoration: none; }
+  .plan-peek-title a:hover { text-decoration: underline; }
+  .plan-peek-meta { display: flex; flex-wrap: wrap; align-items: center;
+                    gap: 0.35rem; margin: 0 0 0.45rem; }
+  .plan-peek-id { margin-left: auto; text-decoration: none; }
+  .plan-peek-id code { font-size: 0.72rem; opacity: 0.6; }
+  /* "Last change" freshness stamp in the peek header (ka-0000005352 iter-73) — the
+     peek twin of the index card's .plan-card-updated head stamp. The index rule is
+     scoped under .plan-card-head so it can't reach the peek; this is the one scoped
+     rule + dark override the fold needs, tones byte-matched to the index stamp
+     (muted #5c5c5c / #9aa0a6; loud stale #a3282a / #ff8a8a) so the two surfaces
+     read identically. flex:none + nowrap keeps it a tight tail token. */
+  .plan-peek-meta .meta.plan-peek-updated { flex: none; white-space: nowrap; font-size: 0.7rem;
+                     color: #5c5c5c; }
+  html[data-skin^="dark"] .plan-peek-meta .meta.plan-peek-updated { color: #9aa0a6; }
+  .plan-peek-meta .meta.plan-peek-updated-stale { color: #a3282a; font-weight: 600; }
+  html[data-skin^="dark"] .plan-peek-meta .meta.plan-peek-updated-stale { color: #ff8a8a; }
+  .plan-peek-state { font-size: 0.72rem; text-transform: lowercase; }
+  .plan-peek-state-draft { background: rgba(255,193,7,0.2); border-color: rgba(255,193,7,0.55); }
+  .plan-peek-state-ready { background: rgba(33,150,243,0.14); border-color: rgba(33,150,243,0.5); }
+  .plan-peek-state-building { background: rgba(76,175,80,0.16); border-color: rgba(76,175,80,0.5); }
+  .plan-peek-state-complete { background: rgba(96,125,139,0.16); border-color: rgba(96,125,139,0.5); }
+  /* Live-crew chip in the peek header (ka-0000005352 iter-65): the compact
+     "● N crew · M working" pill folded into .plan-peek-meta beside the gardener
+     chip, so the drawer answers "how many crew / how many working" at a glance
+     without scrolling to the roster. Mirrors the index card's .plan-card-crew
+     green vocabulary (a live crew gets the pulsing dot + green border) so the two
+     surfaces read the same; a crew with none working reads a plain neutral pill.
+     The dot reuses the roster's own plan-crew-pulse keyframe below. */
+  .plan-peek-crew { display: inline-flex; align-items: center; gap: 0.28rem; text-decoration: none;
+                    font-size: 0.72rem; font-variant-numeric: tabular-nums; }
+  .plan-peek-crew:hover, .plan-peek-crew:focus { border-color: rgba(33,150,243,0.55); outline: none; }
+  .plan-peek-crew-live { border-color: rgba(76,175,80,0.5); background: rgba(76,175,80,0.14); color: #256029; }
+  .plan-peek-crew-dot { width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #4caf50; flex: 0 0 auto;
+                        animation: plan-crew-pulse 1.6s infinite ease-in-out; }
+  .plan-peek-crew-working { opacity: 0.9; }
+  /* Working-crew RUNTIME age + "(K starting)" sub-qualifier (ka-0000005352 iter-76):
+     byte-matched to the index card's .plan-card-crew-working-age (plans.html:350) +
+     .plan-card-crew-starting (plans.html:356) — calm muted, tabular so the digits
+     never jitter beside the working count. Only adjust opacity, inheriting the chip's
+     own color, so no dark override is needed (unlike the loud .plan-peek-crew-stuck). */
+  .plan-peek-crew-working-age { opacity: 0.92; font-variant-numeric: tabular-nums; }
+  .plan-peek-crew-starting { opacity: 0.8; font-variant-numeric: tabular-nums; }
+  /* Loud open-stuck facet (ka-0000005352 iter-71): reuses the index card's
+     .plan-card-crew-failed red (plans.html:363) so the "act now" stuck count reads
+     the same on the peek header as on the index chip + cockpit roster. Tabular so
+     the count never jitters beside the working count. */
+  .plan-peek-crew-stuck { color: #a3282a; font-variant-numeric: tabular-nums; }
+  /* Queued + done crew facets (ka-0000005352 iter-79): byte-matched to the index
+     card's .plan-card-crew-idle / .plan-card-crew-queued-age / .plan-card-crew-done
+     (plans.html:362/372/381) — calm muted, tabular so the counts never jitter. The
+     queued facet loud-tints .plan-peek-crew-queued-stale (index .plan-card-crew-
+     queued-stale, plans.html:373) once the oldest queued crew crosses
+     planCrewQueuedStaleThreshold — a pool-starvation alarm, so it takes a dark
+     override like the stuck facet; the calm queued/done/age spans inherit the chip's
+     own color (opacity-only) and need none. */
+  .plan-peek-crew-queued { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  .plan-peek-crew-queued-age { opacity: 0.92; font-variant-numeric: tabular-nums; }
+  .plan-peek-crew-queued-stale { color: #d32f2f; font-weight: 600; opacity: 1; }
+  .plan-peek-crew-done { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  /* Cumulative crew SPEND facet (ka-0000005352): byte-matched to the index card's
+     .plan-card-crew-spend (plans.html:407) + the /deck card's .deck-card-crew-spend
+     — calm muted, tabular so the dollars never jitter. Opacity-only on the chip's
+     own inherited color (like the working age), so no dark override is needed
+     (unlike the loud .plan-peek-crew-stuck). */
+  .plan-peek-crew-spend { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  @media (prefers-reduced-motion: reduce) { .plan-peek-crew-dot { animation: none; } }
+  html[data-skin^="dark"] .plan-peek-crew-live { color: #6ee7b7; border-color: rgba(110,231,183,0.45); background: rgba(76,175,80,0.16); }
+  html[data-skin^="dark"] .plan-peek-crew-stuck { color: #ff8a8a; }
+  /* Pool-starvation loud-tint dark override (ka-0000005352 iter-79): the red queued-
+     stale washes to mud on dark, byte-matched to the index's
+     html[data-skin^="dark"] .plan-card-crew-queued-stale (plans.html:804). The calm
+     queued/done facets inherit the chip color (opacity-only) and need no override. */
+  html[data-skin^="dark"] .plan-peek-crew-queued-stale { color: #ff5a5a; }
+  .plan-peek-lifecycle { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin: 0.4rem 0 0; }
+  .plan-peek-open-full { display: flex; align-items: baseline; gap: 0.5rem;
+                         flex-wrap: wrap; margin: 0; font-size: 0.85rem; }
+  .plan-peek-full-link { font-weight: 600; text-decoration: none; }
+  .plan-peek-full-link:hover { text-decoration: underline; }
+  /* The embedded step timeline reuses the cockpit's markup; give the drawer
+     the minimal timeline styling it needs (a trimmed copy of the cockpit's
+     rules, scoped under the drawer so nothing leaks to the index behind it). */
+  .plan-peek .plan-steps-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+  .plan-peek .plan-steps h3 { display: flex; align-items: baseline; gap: 0.5rem; margin: 0; }
+  .plan-peek .plan-steps h3 .meta { font-size: 0.8rem; opacity: 0.7; font-weight: normal; }
+  .plan-peek .plan-timeline { list-style: none; padding: 0; margin: 0.75rem 0 0; }
+  .plan-peek .plan-tl-step { position: relative; display: flex; gap: 0.75rem; padding: 0 0 1.1rem 0; }
+  .plan-peek .plan-tl-step::before { content: ""; position: absolute; left: 0.85rem; top: 1.75rem; bottom: -0.15rem;
+                                     width: 2px; background: var(--rule, #e2e5e9); }
+  .plan-peek .plan-tl-step:last-child::before { display: none; }
+  .plan-peek .plan-tl-marker { position: relative; z-index: 1; flex: 0 0 1.7rem; width: 1.7rem; height: 1.7rem;
+                               display: flex; align-items: center; justify-content: center; border-radius: 50%;
+                               border: 2px solid var(--rule, #cfd4da); background: var(--card-bg, #fff);
+                               font-size: 0.8rem; font-weight: 600; color: var(--fg, #555); }
+  .plan-peek .plan-tl-step.is-done > .plan-tl-marker { background: #4caf50; border-color: #4caf50; color: #fff; }
+  .plan-peek .plan-tl-step.is-active > .plan-tl-marker { border-color: #ff9800; color: #b06e00; box-shadow: 0 0 0 3px rgba(255,152,0,0.16); }
+  html[data-skin^="dark"] .plan-peek .plan-tl-step.is-active > .plan-tl-marker { color: #f5d578; }
+  .plan-peek .plan-tl-body { flex: 1; min-width: 0; padding-top: 0.1rem; }
+  .plan-peek .plan-tl-line { display: flex; align-items: baseline; gap: 0.5rem; }
+  .plan-peek .plan-tl-title { flex: 1; min-width: 0; overflow-wrap: anywhere; text-decoration: none; color: var(--fg, #1a1a1a); font-weight: 500; }
+  .plan-peek .plan-tl-title:hover { text-decoration: underline; }
+  .plan-peek .plan-tl-step.is-done .plan-tl-title { text-decoration: line-through; opacity: 0.65; font-weight: 400; }
+  .plan-peek .plan-tl-actions { margin-left: auto; }
+  .plan-peek .plan-tl-meta { display: flex; align-items: center; gap: 0.35rem; margin-top: 0.3rem; flex-wrap: wrap; }
+  .plan-peek .plan-tl-assignee { font-size: 0.78rem; }
+  .plan-peek .plan-tl-stamps { margin-left: auto; min-width: 0; font-size: 0.72rem; opacity: 0.6; }
+  .plan-peek .plan-phase { margin: 0.75rem 0 0; }
+  .plan-peek .plan-phase-head { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
+  .plan-peek .plan-step-add { display: flex; gap: 0.5rem; margin-top: 0.7rem; }
+  .plan-peek .plan-step-add-input { flex: 1; padding: 0.4rem 0.6rem; border: 1px solid var(--rule, #cfd4da); border-radius: 7px; }
+  .plan-peek .bead-action { cursor: pointer; padding: 0.3rem 0.7rem; border: 1px solid var(--rule, #cfd4da);
+                            border-radius: 7px; background: var(--card-bg, #fff); font-size: 0.82rem; }
+  .plan-peek .bead-action:hover { border-color: var(--accent, #b9851b); }
+  .plan-peek .bead-actions-error { color: #b3261e; font-size: 0.85rem; }
+  .plan-peek .plan-steps-notice { color: #256029; background: rgba(76,175,80,0.1);
+                                  border: 1px solid rgba(76,175,80,0.4); border-radius: 7px;
+                                  padding: 0.4rem 0.7rem; font-size: 0.85rem; margin: 0.4rem 0; }
+  .plan-peek .chip-mr { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px; font-size: 0.72rem;
+                        border: 1px solid rgba(120,120,120,0.35); text-decoration: none; color: inherit; }
+  .plan-peek .plan-tl-blocked { font-size: 0.72rem; background: rgba(179,38,30,0.08); border-color: rgba(179,38,30,0.45);
+                                color: #7c1d17; text-decoration: none; opacity: 1; }
+  /* Dark overrides for the peek drawer's hardcoded-ink chips (ka-0000005352
+     iter-85). Now that the drawer is a dark surface (above), the light greens/reds
+     these three chips ink would read ~2.3-2.7:1 on it. Lift to the bright dark
+     palette the index card's own success/error signals use (#6ee7b7 green,
+     #ff8a8a red). The calm crew facets (.plan-peek-crew-working/-queued/-done/
+     -spend) inherit the chip color opacity-only and already theme via the chip. */
+  html[data-skin^="dark"] .plan-peek .plan-steps-notice { color: #6ee7b7; background: rgba(76,175,80,0.16); border-color: rgba(110,231,183,0.4); }
+  html[data-skin^="dark"] .plan-peek .bead-actions-error { color: #ff8a8a; }
+  html[data-skin^="dark"] .plan-peek .plan-tl-blocked { color: #ff8a8a; background: rgba(179,38,30,0.16); border-color: rgba(255,138,138,0.45); }
+  /* Crew roster in the peek drawer (Matt's ask, thread ka-0000002125: "show
+     working crew"). The plan_crew partial's own CSS lives on the cockpit
+     (plan_detail.html); the drawer renders it on the /plans page, so the roster
+     styles are duplicated here scoped under .plan-peek — same idiom as the
+     duplicated .plan-peek .plan-tl-* timeline styles above, keeping them out of
+     the index cards' .plan-card-crew rollup chip. */
+  .plan-peek .plan-crew { margin-top: 1.4rem; }
+  .plan-peek .plan-crew-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+  .plan-peek .plan-crew h3 { display: flex; align-items: baseline; gap: 0.5rem; margin: 0; }
+  .plan-peek .plan-crew h3 .meta { font-size: 0.8rem; opacity: 0.7; font-weight: normal; }
+  .plan-peek .plan-crew-tally { display: inline-flex; gap: 0.35rem; flex-wrap: wrap; }
+  .plan-peek .plan-crew-count { font-size: 0.72rem; display: inline-flex; align-items: center; gap: 0.3rem; }
+  .plan-peek .plan-crew-count-working { background: rgba(76,175,80,0.14); border-color: rgba(76,175,80,0.5); color: #256029; }
+  .plan-peek .plan-crew-count-working-age { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  .plan-peek .plan-crew-count-done { background: rgba(120,120,120,0.12); border-color: rgba(120,120,120,0.4); color: #555; }
+  .plan-peek .plan-crew-count-failed { background: rgba(179,38,30,0.1); border-color: rgba(179,38,30,0.55); color: #7c1d17; }
+  .plan-peek .plan-crew-count-spend { background: rgba(120,120,120,0.12); border-color: rgba(120,120,120,0.4); color: #555; font-variant-numeric: tabular-nums; }
+  .plan-peek .plan-crew-dot { width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #4caf50;
+                              animation: plan-crew-pulse 1.6s infinite ease-in-out; }
+  @keyframes plan-crew-pulse { 0%,100% { opacity: 0.45; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .plan-peek .plan-crew-dot, .plan-peek .plan-crew-live-dot { animation: none; } }
+  .plan-peek .plan-crew-list { list-style: none; padding: 0; margin: 0.75rem 0 0; display: flex; flex-direction: column; gap: 0.5rem; }
+  .plan-peek .plan-crew-member { border: 1px solid var(--rule, #e2e5e9); border-radius: 8px; padding: 0.5rem 0.65rem; background: var(--card-bg, #fff); }
+  .plan-peek .plan-crew-member.is-live { border-color: rgba(76,175,80,0.5); }
+  .plan-peek .plan-crew-member.is-failed { border-color: rgba(179,38,30,0.5); background: rgba(179,38,30,0.03); }
+  .plan-peek .plan-crew-line { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+  .plan-peek .plan-crew-live-dot { flex: 0 0 auto; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: #4caf50;
+                                   box-shadow: 0 0 0 0 rgba(76,175,80,0.5); animation: plan-crew-live-pulse 1.8s infinite ease-in-out; }
+  @keyframes plan-crew-live-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(76,175,80,0.5); }
+    70% { box-shadow: 0 0 0 5px rgba(76,175,80,0); }
+    100% { box-shadow: 0 0 0 0 rgba(76,175,80,0); }
+  }
+  .plan-peek .plan-crew-name { font-weight: 500; text-decoration: none; color: var(--fg, #1a1a1a); overflow-wrap: anywhere; }
+  .plan-peek .plan-crew-name:hover { text-decoration: underline; }
+  .plan-peek .plan-crew-role { font-size: 0.68rem; background: rgba(120,120,120,0.1); border-color: rgba(120,120,120,0.35); opacity: 0.85; }
+  .plan-peek .plan-crew-state { font-size: 0.68rem; text-transform: lowercase; }
+  .plan-peek .plan-crew-state-alive { background: rgba(76,175,80,0.14); border-color: rgba(76,175,80,0.5); color: #256029; }
+  .plan-peek .plan-crew-state-idle { background: rgba(120,120,120,0.1); border-color: rgba(120,120,120,0.35); color: #555; }
+  .plan-peek .plan-crew-state-stuck, .plan-peek .plan-crew-state-failed { background: rgba(179,38,30,0.12); border-color: rgba(179,38,30,0.55); color: #7c1d17; }
+  /* The peek's crew chips on both dark skins (Homestead 2.3): the cockpit's
+     dark palette for the same chips (plan_detail.html). */
+  html[data-skin^="dark"] .plan-peek .plan-crew-count-working,
+  html[data-skin^="dark"] .plan-peek .plan-crew-state-alive { color: #6ee7b7; }
+  html[data-skin^="dark"] .plan-peek .plan-crew-count-done,
+  html[data-skin^="dark"] .plan-peek .plan-crew-count-spend,
+  html[data-skin^="dark"] .plan-peek .plan-crew-state-idle { color: #b8c2d0; }
+  html[data-skin^="dark"] .plan-peek .plan-crew-count-failed,
+  html[data-skin^="dark"] .plan-peek .plan-crew-state-stuck,
+  html[data-skin^="dark"] .plan-peek .plan-crew-state-failed { color: #ff8a8a; }
+  .plan-peek .plan-crew-ago { margin-left: auto; font-size: 0.72rem; opacity: 0.6; white-space: nowrap; }
+  .plan-peek .plan-crew-step { margin-top: 0.3rem; }
+  .plan-peek .plan-crew-step-link { display: inline-flex; align-items: baseline; gap: 0.35rem; font-size: 0.78rem;
+                                    text-decoration: none; color: inherit; opacity: 0.85; border-radius: 5px;
+                                    padding: 0.05rem 0.2rem; margin: -0.05rem -0.2rem; }
+  .plan-peek .plan-crew-step-link:hover { background: rgba(33,150,243,0.1); opacity: 1; }
+  .plan-peek .plan-crew-step-link:hover .plan-crew-step-title { text-decoration: underline; }
+  .plan-peek .plan-crew-step-num { opacity: 0.55; font-weight: 600; }
+  .plan-peek .plan-crew-step-title { overflow-wrap: anywhere; }
+  .plan-peek .plan-crew-outcome { margin: 0.35rem 0 0; font-size: 0.78rem; opacity: 0.8; overflow-wrap: anywhere; }
+  .plan-peek .plan-crew-outcome.is-failed { color: #7c1d17; opacity: 0.95; }
+  .plan-peek .plan-crew-more { margin: 0.5rem 0 0; font-size: 0.75rem; }
+  .plan-peek .plan-crew-empty { margin: 0.6rem 0 0; font-size: 0.82rem; }
+
+  /* ============================================================
+     Mobile / small-viewport treatment (Step 1, ka-0000000866).
+     /plans shipped with ZERO width breakpoints: at 390px the Jira-style
+     board kept its horizontally-scrolling lanes so the right column was
+     clipped off-screen, and ~1,274px of nav+filter chrome stacked before
+     the first plan card. These rules — grouped at the END of the style
+     block so they win by source order — collapse the board to one column,
+     tighten the pre-card filter chrome, and (on touch) give the card's
+     controls a comfortable tap target. Nav densification is generalized
+     in layout.html so every surface benefits, not just /plans.
+     ============================================================ */
+
+  /* 1. Board → single stacked column under ~700px. The board's default
+        geometry (grid-auto-flow: column; grid-auto-columns: minmax(17rem,
+        22rem); overflow-x: auto) forces lanes wider than a phone viewport
+        and scrolls them horizontally — the clipped-right-column bug. Below
+        700px, stack the lanes one-per-row at full width with no horizontal
+        scroll, so every lane (and its cards) is reachable by vertical
+        scrolling alone. */
+  @media (max-width: 700px) {
+    .plans-board {
+      grid-auto-flow: row;
+      grid-auto-columns: auto;
+      grid-template-columns: minmax(0, 1fr);
+      overflow-x: visible;
+      padding-bottom: 0;
+    }
+  }
+
+  /* 2. Densify the pre-card chrome at phone widths so the first card sits
+        far closer to the fold. Rendering-only margin/blurb trims — no data
+        or control is removed, and desktop is untouched. Pairs with the
+        generalized nav densification in layout.html. */
+  @media (max-width: 640px) {
+    .plans-blurb { display: none; }
+    /* Deck pill (ka-0000001498): the phone is where /deck earns its place, so on
+       a narrow screen promote it to a full-width primary action right under the
+       title — the first actionable thing a thumb reaches. Width concern (see the
+       pointer:coarse block for the 44px tap floor). box-sizing so the pill's own
+       padding + border stay inside 100% and never push a horizontal scrollbar. */
+    .deck-cta { display: flex; width: 100%; box-sizing: border-box;
+                justify-content: flex-start; font-size: 0.95rem;
+                padding-top: 0.6rem; padding-bottom: 0.6rem; }
+    .deck-cta-count { font-size: 0.85rem; }
+    .plans-master,
+    .operator-header-chip-row,
+    .plan-people-strip,
+    .filter-rows { margin-top: 0.15rem; margin-bottom: 0.5rem; }
+    .filter-rows { gap: 0.2rem; }
+    .filter-row { gap: 0.3rem; }
+    .plans-search { margin: 0 0 0.6rem; }
+    .plans-search input { min-width: 0; flex: 1; }
+    h1 { font-size: 1.25rem; }
+  }
+
+  /* 3. Touch tap targets (ka-0000000866). Mirrors the coarse-pointer
+        precedent at layout.html:586-588 (.project-row-actions .bead-action
+        → 44px), applied to the plan card's own controls. The task-grid
+        squares stay 7px VISUALLY but get a larger transparent hit area via
+        a centered ::after overlay, so a fingertip can land one without the
+        grid growing. The overlay is sized to a square's own cell (square +
+        gap) so neighbours never fight over a tap, and the coarse-pointer
+        gap is widened a touch to give each overlay more room. */
+  @media (pointer: coarse) {
+    /* Deck pill (ka-0000001498): a tap target needs the 44px comfortable floor
+       on a coarse pointer regardless of viewport width — this is the INPUT
+       concern. Its narrow-screen PROMINENCE (full-width, larger face) is a WIDTH
+       concern and lives in the max-width block below, matching this file's
+       existing separation (densification = width, tap sizing = pointer). */
+    .deck-cta { min-height: 44px; }
+    /* Row-level buttons (Dispatch / Approve & build) and the master
+       pause/resume switch reach the 44px comfortable-target floor. */
+    .plan-card-dispatch-btn,
+    .plan-card-approve-btn { min-height: 44px; padding-top: 0.55rem; padding-bottom: 0.55rem; }
+    /* The bulk-select checkbox gets a 44px hit area without a 44px box:
+       an oversized transparent tap surface centered on the 13px control. */
+    .plans-row-select { position: relative; }
+    .plans-row-select::after { content: ""; position: absolute; top: 50%; left: 50%;
+                               width: 44px; height: 44px; transform: translate(-50%, -50%); }
+    /* Task-grid: keep squares 7px, widen the gap so each has breathing room,
+       and extend each square's clickable area over its full cell. */
+    .plan-taskgrid { max-height: 5.5rem; }
+    .plan-taskgrid-row { gap: 0.5rem; }
+    .plan-taskgrid-squares { gap: 6px; }
+    .plan-taskgrid-sq { position: relative; }
+    /* inset:-3px turns each 7px square into a contiguous ~13px tap cell
+       (7 + the 6px gap split either side), so there is no dead zone
+       between adjacent squares and none overlaps its neighbour. */
+    .plan-taskgrid-sq::after { content: ""; position: absolute; inset: -3px; border-radius: 3px; }
+  }
+</style>
+<h1>Plans{{if .ProjectFilter}} · {{.ProjectFilter}}{{end}}
+  {{if .Plans}}<span class="meta">({{len .Plans}})</span>{{end}}
+</h1>
+
+{{/* Deck entry point (ka-0000001498, epic ka-0000000492). /deck — the mobile
+     card-deck triage surface — was built but nothing linked to it, so a phone
+     user on /plans could not discover it. This pill is that door. The count is
+     the plans in the CURRENT view that need a human (server-computed with the
+     same planAttention predicate the deck uses), so it doubles as a "you have N
+     to clear" nudge. A real <a href>, so it works with JS off and carries the
+     active ?project= scope. Prominent on phones (see the pointer:coarse rule),
+     understated on desktop where the full index is already comfortable. */}}
+<a class="deck-cta" href="{{.DeckURL}}"
+   title="Open the mobile card-deck — swipe through plans that need a human, one at a time">
+  <span class="deck-cta-glyph" aria-hidden="true">🃏</span>
+  <span class="deck-cta-label">Deck</span>
+  {{if .DeckAttentionCount}}<span class="deck-cta-count">{{.DeckAttentionCount}} need you</span>{{else}}<span class="deck-cta-count deck-cta-count-clear">all clear</span>{{end}}
+  <span class="deck-cta-arrow" aria-hidden="true">&rarr;</span>
+</a>
+
+<p class="meta plans-blurb">
+  Iterative planning, Cursor-style: research &rarr; clarify one question at a time
+  &rarr; an editable TODO plan &rarr; build step-by-step. A plan is just an epic
+  labelled <code>plan</code> &mdash; its children are the steps, its clarifying
+  questions are decisions, and its narrative is a bundle.
+</p>
+
+{{if .Error}}
+<div class="banner banner-error">{{.Error}}</div>
+{{end}}
+
+{{/* Master switch + global-pause banner (step 4, ka-0000004048). Rendered at
+     the top of the index so the operator can never miss that the global
+     storm-guard is on. The partial owns the swap target (#plans-master-switch)
+     for the POST /plans/master-switch/toggle re-render. */}}
+{{template "plans_master_switch" .}}
+
+{{if .ProjectFilter}}
+<p><a href="{{.BasePath}}/plans">&larr; all projects</a></p>
+{{end}}
+
+<p class="operator-header-chip-row">
+  {{planHeaderChip .OperatedByURLHasKey .EffectiveOperatedBy .OperatedByIsUnowned .OperatedByDisplay .ViewerEmail .ChipBasePath .ChipExtraQuery (len .Plans)}}
+</p>
+
+{{/* Browse-by-person discovery strip (Step 5, ka-0000004302). One chip per
+     person who owns a plan in the current status/project scope; clicking pivots
+     the index to that person's involved plans (?operated_by=<peer>). Derived
+     from the UNSCOPED universe, so it lets a viewer browse to a teammate even
+     while their own list is narrowed. Suppressed when there's no one else to
+     browse to (server sets .PeopleStrip only then). */}}
+{{with .PeopleStrip}}
+<nav class="plan-people-strip" aria-label="Browse plans by person">
+  <span class="plan-people-label">Browse</span>
+  {{range .People}}
+  <a class="chip{{if .IsActive}} chip-active{{end}}" href="{{.Href}}"{{if .IsActive}} aria-current="true"{{end}}
+     title="Show plans {{.Display}} is involved in">{{.Display}}{{if .IsSelf}} <span class="plan-people-self-tag">(you)</span>{{end}}<span class="plan-people-chip-count">{{.Count}}</span></a>
+  {{end}}
+  <span class="plan-people-more">{{if .Truncated}}&hellip; {{end}}<a href="{{.PeopleHref}}" title="Open the full people directory">all people &rarr;</a></span>
+</nav>
+{{end}}
+
+{{/* Filter + grouping control strip (Matt's ask). The USER dimension is the
+     operatorHeaderChip above (mine / all / a peer); STATUS, PROJECT, and GROUP
+     are toggle-chip rows here. Every chip URL preserves the other dimensions +
+     the user scope, so switching one filter never resets the rest. */}}
+<div class="filter-rows" aria-label="Plan filters">
+  {{with .Controls}}
+    {{template "filter_row" (dict "Name" "View" "Items" .Views)}}
+    {{template "filter_row" (dict "Name" "Status" "Items" .Statuses)}}
+    {{template "filter_row" (dict "Name" "Project" "Items" .Projects)}}
+    {{/* Grouping is a grid-only feature, but the row stays visible on the
+         board: a group chip's URL carries group= without view=, which
+         resolvePlanView reads as "switch to the grid, sectioned". */}}
+    {{template "filter_row" (dict "Name" "Group" "Items" .Groups)}}
+  {{end}}
+  {{if .IsFiltered}}
+  <div class="filter-row">
+    <span class="filter-row-label" aria-hidden="true"></span>
+    <a class="chip-clear" href="{{.ClearURL}}" title="Clear status / project / group filters" aria-label="Clear filters">× clear</a>
+  </div>
+  {{end}}
+</div>
+
+{{/* Progressive search (Matt's ask: "the plans page needs a progressive search
+     bar, nothing too fancy"). Mirrors the /maps client-side search box: typing
+     narrows the rendered cards by each card's data-search haystack (title / id /
+     project / status / person / current step, built in plans.go) with no server
+     round-trip, across the board, grouped, and flat-grid layouts alike. Ships
+     hidden and the script at the bottom reveals it, so no-JS clients still see
+     the full unfiltered page. */}}
+{{if or .Plans .Lanes}}
+<div class="plans-search" hidden data-plans-search>
+  <label for="plans-search-input" class="filter-row-label">Search</label>
+  <input id="plans-search-input" type="search" autocomplete="off" spellcheck="false"
+         placeholder="Filter plans by title, project, person…" aria-label="Filter plans">
+  <span class="plans-search-count" data-plans-search-count hidden></span>
+</div>
+<p class="plans-search-empty" data-plans-search-empty hidden>No plans match &ldquo;<span data-plans-search-term></span>&rdquo;.</p>
+{{end}}
+
+{{if .Truncated}}
+<div class="banner banner-warn">Showing the first {{len .Plans}} plans; some are hidden.</div>
+{{end}}
+
+{{/* Stale sweep lead (task ka-0000004351, epic ka-0000007470). The ?status=stale
+     view is a DERIVED "no activity in N days" cut — active plans whose newest
+     activity (epic + steps + crew heartbeats, folded) crossed the 7d freshness
+     bar. It is a DIFFERENT pile from the board's "Done?" lane (zero open children):
+     a plan can idle for a month with every step still open. Tell the operator what
+     they're looking at and how to clear it: Select all → Mark complete (for an
+     approved/legacy plan) or Abandon (the honest exit for a never-approved plan
+     that draft/ready cannot complete). Rendered only on the sweep, only when it
+     surfaced something. */}}
+{{if eq .StatusFilter "stale"}}{{if or .Plans .Lanes}}
+<div class="banner banner-info plans-stale-lead">
+  <strong>Stale sweep</strong> — active plans with no activity in over a week (epic, steps,
+  and crew heartbeats all quiet). Select the ones to retire, then <em>Mark complete</em>
+  (an approved or legacy plan) or <em>Abandon</em> (the honest exit for a never-approved
+  plan that cannot legally complete). Reopen restores any of them later.
+</div>
+{{end}}{{end}}
+
+{{/* "+ New plan" affordance (task 3b). Above a POPULATED list it's a collapsed
+     <details> disclosure so the reading surface stays a list first; on the empty
+     state the same form is rendered always-open inside the hero below. Operator-
+     gated to match the operatorOnly POST /plans route — a read-only viewer sees
+     neither. Native <details> = no JS needed. */}}
+{{if and .IsOperator (or .Plans .Lanes)}}
+<details class="plan-new">
+  <summary class="plan-new-btn">+ New plan</summary>
+  <div class="plan-new-panel">
+    <p class="plan-new-lead">Describe a goal and the plan agent will research it, ask a couple of
+      clarifying questions, and draft an editable plan you approve before any build begins.</p>
+    {{template "planNewForm" $}}
+  </div>
+</details>
+{{end}}
+
+{{if or .Plans .Lanes}}
+{{/* Bulk multi-select scope (step "bulk", ka-0000004771). ONE container carries
+     data-bulk-scope="plans" so project_bulk.js's selectAll()/count/clear operate
+     over every .plans-row-select checkbox on the page — across the flat grid OR
+     every group section — which, because handlePlans renders only the FILTERED
+     rows, is exactly the currently-filtered gardeners. The sticky bar is
+     operator-gated (read-only viewers see no checkboxes and no bar); it stays
+     hidden until ≥1 row is checked. */}}
+<div class="plans-index" data-bulk-scope="plans">
+{{if .IsOperator}}{{template "plans_bulk_toolbar" (dict "BasePath" $.BasePath "ErrMsg" "")}}{{end}}
+{{if .Forest}}
+{{/* ZOOMABLE FOREST (?view=tree, plans_tree.go; Matt's ask in thread
+     ka-0000005850: "yeah, zoomable forest, that's it"). Every plan is ALREADY a
+     tree — epic → phase sub-epics → steps — and every other view flattens it.
+     Here each plan draws as a tree glyph: trunk = the plan, limbs = phases
+     (bottom-first, so reading upward is reading the plan in phase order),
+     leaves = steps colored by the SAME data-status palette the mini task-grid
+     squares use. The crown tint is the plan's attention tier — the one signal
+     that must survive to a 64px canopy glyph.
+
+     ZOOM IS PURE CSS. Every tree is emitted into the same normalized viewBox,
+     so canopy/grove/tree is a tile-size + chrome-visibility class on this
+     container — no re-layout, no re-fetch. The chips are real links carrying
+     ?zoom=, so the control works with JS off; plans_tree.js upgrades them to
+     instant class flips with history sync. */}}
+{{with .Forest}}
+<div class="plans-forest-head">
+  <div class="plans-forest-zoom" role="group" aria-label="Forest zoom">
+    <span class="filter-row-label">Zoom</span>
+    {{range .ZoomControls}}<a class="chip{{if .Active}} chip-active{{end}}" href="{{.URL}}" data-forest-zoom="{{.Label}}"{{if .Active}} aria-current="true"{{end}}>{{.Label}}</a>{{end}}
+  </div>
+  {{/* The shape shows you WHERE the work is; these numbers keep it honest.
+       Summed from the same per-tree counts the tiles render (advice
+       ka-0000005924 — two derivations of one truth). */}}
+  <p class="plans-forest-tally meta">{{.Trees}} tree{{if ne .Trees 1}}s{{end}} ·
+    {{.StepsClosed}}/{{.Steps}} steps ({{.Pct}}%){{if .NeedsHuman}} ·
+    <span class="plans-forest-needs">{{.NeedsHuman}} need{{if eq .NeedsHuman 1}}s{{end}} you</span>{{end}}</p>
+</div>
+<div class="plans-forest plans-forest-{{.Zoom}}" data-forest-zoom-level="{{.Zoom}}">
+  {{range .Stands}}
+  <section class="plans-stand" data-stand="{{.Key}}">
+    <header class="plans-stand-head">{{.Label}} <span class="meta">({{len .Trees}})</span></header>
+    <div class="plans-stand-trees">
+      {{range .Trees}}{{template "planTree" (dict "Root" $ "Tree" .)}}{{end}}
+    </div>
+    {{if .Truncated}}<p class="plans-lane-note">recent closed plans only &mdash; use the Closed status filter for all</p>{{end}}
+  </section>
+  {{end}}
+</div>
+{{end}}
+{{else if .Lanes}}
+{{/* Jira-style board (the ?view= default; Matt's lanes ask): one status column
+     per lane, cards via the SAME planCard partial the grid uses. The Done lane
+     on the default active scope is fed by a bounded recent-closed fetch — its
+     footer says so when clipped. */}}
+<div class="plans-board" role="list" aria-label="Plans by status">
+  {{range .Lanes}}
+  <div class="plans-lane plans-lane-{{.Key}}" data-lane="{{.Key}}" role="listitem">
+    {{/* Aggregate live-crew tally on the lane header (ka-0000005352): the SCAN
+         signal the 86 per-card facet iterations never lifted to the section
+         level. planLaneCrew sums working + open-stuck across THIS lane's rows,
+         reading the SAME per-row .Crew rollup the card facets render — so the
+         header can never disagree with the cards beneath it (zero extra daemon
+         call, two derivations of one crew truth, advice ka-0000005924). Calm
+         green "● N working", loud red "⚠ N" stuck; the whole facet
+         self-suppresses when the lane has no live/stuck crew (Any false). Group
+         header below folds the SAME helper, so the two surfaces agree. */}}
+    <header class="plans-lane-head">{{.Label}} <span class="meta">({{len .Rows}})</span>{{with planLaneCrew .Rows}}{{if .Any}}<span class="plans-lane-crew" role="group" aria-label="Live crew across this lane">{{if .HasWorking}}<span class="plans-lane-crew-working" title="{{.Working}} crew working now across this lane"><span class="plans-lane-crew-dot" aria-hidden="true"></span>{{.Working}} working</span>{{end}}{{if .HasOpenStuck}}<span class="plans-lane-crew-stuck" title="{{.OpenStuck}} stuck crew still reachable across this lane — open a card to jump to a terminal and unstick">&#x26A0; {{.OpenStuck}}</span>{{end}}</span>{{end}}{{end}}</header>
+    {{if .Rows}}
+    <ul class="plans-lane-list">
+      {{range .Rows}}{{template "planCard" (dict "Root" $ "Row" .)}}{{end}}
+    </ul>
+    {{if .Truncated}}<p class="plans-lane-note">recent closed plans only &mdash; use the Closed status filter for all</p>{{end}}
+    {{else}}
+    <p class="plans-lane-empty">Nothing here</p>
+    {{end}}
+  </div>
+  {{end}}
+</div>
+{{else if .Groups}}
+{{/* Visual grouping (?group=project|status|user). One <section> per group,
+     each a heading + count over its own .plans-list grid. Groups are ordered
+     largest-first (server-side). Falls through to the flat grid when ?group=
+     is absent. */}}
+{{range .Groups}}
+<section class="plan-group" id="plan-group-{{.Key}}">
+  {{/* Aggregate live-crew tally on the ?group= section header (ka-0000005352) —
+       the SAME planLaneCrew helper the board lane header folds, so a project /
+       status / user group's header carries the identical column-level "N
+       working · ⚠ M stuck" scan signal, and the two surfaces agree by
+       construction. Zero extra daemon call (reads each row's already-hydrated
+       .Crew rollup); self-suppresses when the section has no live/stuck crew. */}}
+  <h2 class="plan-group-head">{{.Label}} <span class="meta">({{len .Rows}})</span>{{with planLaneCrew .Rows}}{{if .Any}}<span class="plans-lane-crew" role="group" aria-label="Live crew across this group">{{if .HasWorking}}<span class="plans-lane-crew-working" title="{{.Working}} crew working now across this group"><span class="plans-lane-crew-dot" aria-hidden="true"></span>{{.Working}} working</span>{{end}}{{if .HasOpenStuck}}<span class="plans-lane-crew-stuck" title="{{.OpenStuck}} stuck crew still reachable across this group — open a card to jump to a terminal and unstick">&#x26A0; {{.OpenStuck}}</span>{{end}}</span>{{end}}{{end}}</h2>
+  <ul class="plans-list">
+    {{range .Rows}}{{template "planCard" (dict "Root" $ "Row" .)}}{{end}}
+  </ul>
+</section>
+{{end}}
+{{else}}
+<ul class="plans-list">
+  {{range .Plans}}{{template "planCard" (dict "Root" $ "Row" .)}}{{end}}
+</ul>
+{{end}}
+</div>{{/* /.plans-index */}}
+{{else if not .Error}}
+{{if .IsFiltered}}
+{{/* Filter-driven empty state: a status/project/group filter is active and
+     matched nothing. Point the user at the RIGHT remedy (widen/clear the
+     filter) instead of the cold-start "you have no plans, create one" copy —
+     telling someone who filtered to Closed with none to mint a new plan is the
+     wrong nudge. The control strip + × clear stay rendered above; this
+     reinforces it. An operator still keeps the create affordance below the
+     honest heading (a new plan in the active project scope IS a valid action,
+     and the selector pre-selects the ?project= scope). */}}
+{{if .IsOperator}}
+<div class="plan-empty-hero">
+  <h3>No plans match these filters</h3>
+  <p>Nothing in scope matches the current status / project / group filter.
+    <a href="{{.ClearURL}}">Clear filters</a> to widen the view{{if .EffectiveOperatedBy}}, or
+    <a href="{{.BasePath}}/plans?operated_by=">show everyone's plans</a>{{end}}.
+    You can also start a new plan:</p>
+  {{template "planNewForm" $}}
+</div>
+{{else}}
+<p class="empty">
+  No plans match the current filters.
+  <a href="{{.ClearURL}}">Clear filters</a> to widen the view{{if .EffectiveOperatedBy}}, or
+  <a href="{{.BasePath}}/plans?operated_by=">show everyone's plans</a>{{end}}.
+</p>
+{{end}}
+{{else if .IsOperator}}
+<div class="plan-empty-hero">
+  <h3>Start a plan from a one-line goal</h3>
+  <p>{{if .OperatedByMe}}You have no plans yet.{{else if and .EffectiveOperatedBy (not .OperatedByURLHasKey)}}No plans for you yet &mdash;
+    <a href="{{.BasePath}}/plans?operated_by=">show everyone's plans</a>.{{else}}No plan yet.{{end}}
+    Describe what you want to build and the plan agent will research it, ask a couple of
+    clarifying questions, and draft an editable plan you approve before any build begins.</p>
+  {{template "planNewForm" $}}
+  <p class="plan-empty-strike"><s>Mark any epic as a plan from its <em>/plans/&lt;id&gt;</em> page, or spawn the
+    planner gardener (<code>gardener-planner</code>) on a seed epic.</s>
+    &mdash; the old empty state pushed you out of the viewer to mint an epic by hand; this cold-start replaces it.</p>
+</div>
+{{else}}
+<p class="empty">
+  {{if .OperatedByMe}}You have no plans yet.{{else if and .EffectiveOperatedBy (not .OperatedByURLHasKey)}}No plans for you yet &mdash;
+    <a href="{{.BasePath}}/plans?operated_by=">show everyone's plans</a>.{{else}}No plans yet.{{end}}
+  An operator can start one with the <strong>+ New plan</strong> button, or mark any epic as a plan from its
+  <em>/plans/&lt;id&gt;</em> page.
+</p>
+{{end}}
+{{end}}
+
+{{/* Layer 1 unhomed-forks backstop (design ka-0000006833 §3, closes ka-0000003246).
+     Every open decision + escalation in scope that belongs to NO rendered plan and
+     has NO live operator surface pointing at it — the forks that would otherwise
+     orphan off /plans the moment their ephemeral origin bead closed. The server
+     sets .UnhomedForks only when the set is non-empty (gate-on-non-empty), so a
+     healthy cockpit renders nothing here. A distinct global section, below the plan
+     grid, with a header badge count. */}}
+{{with .UnhomedForks}}
+<section class="plans-unhomed" id="plans-unhomed" aria-label="Unhomed open decisions and escalations">
+  <h2 class="plans-unhomed-head">
+    Unhomed open decisions &amp; escalations
+    <span class="chip chip-attention plans-unhomed-badge" title="Open forks with no plan and no operator surface">{{.Count}}</span>
+    {{if .Truncated}}<span class="meta">(showing the first page; more exist)</span>{{end}}
+  </h2>
+  <p class="plans-unhomed-lead meta">These belong to no plan and no operator surface points here &mdash; answer or dismiss them so they don&rsquo;t rot unseen.</p>
+  {{if .Decisions}}
+  <ul class="plans-unhomed-list" aria-label="Unhomed decisions">
+    {{range .Decisions}}
+    <li class="plans-unhomed-row" data-kind="decision">
+      <span class="plans-unhomed-kind" title="Decision">◆</span>
+      <a class="plans-unhomed-title" href="{{.URL}}">{{.Title}}</a>
+      {{if .Project}}<span class="chip plans-unhomed-project">{{.Project}}</span>{{end}}
+      {{if .Detail}}<span class="meta plans-unhomed-detail">{{.Detail}}</span>{{end}}
+      <span class="meta plans-unhomed-age">{{.Ago}}</span>
+    </li>
+    {{end}}
+  </ul>
+  {{end}}
+  {{if .Escalations}}
+  <ul class="plans-unhomed-list" aria-label="Unhomed escalations">
+    {{range .Escalations}}
+    <li class="plans-unhomed-row" data-kind="escalation">
+      <span class="plans-unhomed-kind plans-unhomed-kind-esc" title="Escalation">⛔</span>
+      <a class="plans-unhomed-title" href="{{.URL}}">{{.Title}}</a>
+      {{if .Project}}<span class="chip plans-unhomed-project">{{.Project}}</span>{{end}}
+      {{if .Detail}}<span class="meta plans-unhomed-detail">{{.Detail}}</span>{{end}}
+      <span class="meta plans-unhomed-age">{{.Ago}}</span>
+    </li>
+    {{end}}
+  </ul>
+  {{end}}
+</section>
+{{end}}
+
+{{/* Card-peek slide-out drawer shell (Matt's "pops out from the side" ask).
+     Shipped hidden; plans_board.js opens it on card click, mounts the
+     GET /plans/{id}/peek fragment into #plan-peek-body, and mirrors the open
+     plan in ?peek= so deep links and back/forward restore it. data-base-path
+     is the JS's URL root. */}}
+<div class="plan-peek-backdrop" id="plan-peek-backdrop" hidden></div>
+<aside class="plan-peek-drawer" id="plan-peek-drawer" role="dialog" aria-modal="true"
+       aria-label="Plan preview" data-base-path="{{.BasePath}}" hidden>
+  <div class="plan-peek-bar">
+    <span class="plan-peek-bar-label">Plan preview</span>
+    <button type="button" class="plan-peek-close" title="Close (Esc)" aria-label="Close plan preview">&times;</button>
+  </div>
+  <div id="plan-peek-body"></div>
+</aside>
+<script src="{{.BasePath}}/assets/static/plans_board.js" defer></script>
+{{/* Forest zoom (?view=tree). Loaded only on the forest view — it self-noops
+     when no .plans-forest is on the page, but there is no reason to ship the
+     bytes to a board/grid render. Pure enhancement: the zoom chips are real
+     ?zoom= links the server honors, so this only ever removes a page load. */}}
+{{if .Forest}}<script src="{{.BasePath}}/assets/static/plans_tree.js" defer></script>{{end}}
+
+{{/* Client-side progressive search (Matt's ask). Progressive enhancement: the
+     box ships hidden and this script reveals it, so no-JS clients still see the
+     full page. Filtering is a substring test of the lowercased query against
+     each card's data-search haystack (built in plans.go). A board lane or group
+     section hides entirely when the filter leaves it empty — no stray headings —
+     and reappears as the query relaxes. The query persists in ?q=
+     (history.replaceState, no reload) so a filtered view is a shareable,
+     back-button-safe link, and is restored on load. Gated with the box (like
+     /maps) so the empty page ships no dead script. */}}
+{{if or .Plans .Lanes}}
+<script>
+(function () {
+  var box = document.querySelector('[data-plans-search]');
+  if (!box) return;
+  var input = box.querySelector('#plans-search-input');
+  var count = box.querySelector('[data-plans-search-count]');
+  var empty = document.querySelector('[data-plans-search-empty]');
+  var emptyTerm = empty ? empty.querySelector('[data-plans-search-term]') : null;
+  var cards = Array.prototype.slice.call(document.querySelectorAll('.plan-card[data-search]'));
+  var sections = Array.prototype.slice.call(document.querySelectorAll('.plans-lane, .plan-group'));
+  box.removeAttribute('hidden');
+
+  function apply(q) {
+    q = (q || '').trim().toLowerCase();
+    var shown = 0;
+    cards.forEach(function (card) {
+      var hit = q === '' || (card.getAttribute('data-search') || '').indexOf(q) !== -1;
+      card.classList.toggle('plans-search-hidden', !hit);
+      if (hit) shown++;
+    });
+    // A lane / group section with no matching card hides whole (heading + count
+    // included) so the filtered view carries no empty shells.
+    sections.forEach(function (sec) {
+      var any = sec.querySelector('.plan-card[data-search]:not(.plans-search-hidden)');
+      sec.classList.toggle('plans-search-hidden', q !== '' && !any);
+    });
+    if (count) {
+      if (q === '') { count.setAttribute('hidden', ''); }
+      else { count.removeAttribute('hidden'); count.textContent = shown + (shown === 1 ? ' match' : ' matches'); }
+    }
+    if (empty) {
+      if (q !== '' && shown === 0) {
+        if (emptyTerm) emptyTerm.textContent = input.value;
+        empty.removeAttribute('hidden');
+      } else {
+        empty.setAttribute('hidden', '');
+      }
+    }
+    // Reflect the query in the URL (?q=) without a reload.
+    try {
+      var url = new URL(window.location.href);
+      if (q === '') url.searchParams.delete('q'); else url.searchParams.set('q', input.value);
+      window.history.replaceState(null, '', url.toString());
+    } catch (e) { /* URL unsupported — filtering still works */ }
+  }
+
+  // Restore an initial ?q= from the URL.
+  try {
+    var initial = new URL(window.location.href).searchParams.get('q');
+    if (initial) { input.value = initial; apply(initial); }
+  } catch (e) { /* ignore */ }
+
+  input.addEventListener('input', function () { apply(input.value); });
+  // Escape clears the box.
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && input.value !== '') { input.value = ''; apply(''); }
+  });
+})();
+</script>
+{{end}}
+{{end}}
+
+{{/* planNewForm — the shared goal+project compose form (task 3b). Defined at the
+     top level (a {{define}} can't nest inside {{define "content"}}) and rendered
+     with the page dot ($) so $.BasePath / $.ProjectOptions / $.DefaultProject
+     resolve. A plain native form: the browser POSTs to the operator-gated 3a
+     create verb (POST /plans), which mints the epic + plan/project labels
+     transactionally and 303s to /plans/{id} (POST-redirect-GET, so a refresh
+     never re-submits). No htmx — the full-page redirect lands the operator in
+     the live cockpit. maxlength mirrors the server's maxPlanGoalLen (2000). */}}
+{{define "planNewForm"}}
+<form class="plan-new-form" method="post" action="{{.BasePath}}/plans">
+  <label class="plan-field">
+    <span class="plan-field-label">Goal
+      <span class="plan-field-hint">&mdash; one or two lines; what should this plan accomplish?</span></span>
+    <textarea name="goal" rows="3" required maxlength="2000"
+              aria-label="Plan goal"
+              placeholder="e.g. Let operators create a plan from scratch in the viewer, with a persistent chat and inline editing."></textarea>
+  </label>
+  <label class="plan-field">
+    <span class="plan-field-label">Project
+      <span class="plan-field-hint">&mdash; becomes the <code>project:</code> label, inherited by every step</span></span>
+    <select name="project" required aria-label="Plan project">
+      {{range .ProjectOptions}}<option value="{{.}}"{{if eq . $.DefaultProject}} selected{{end}}>{{.}}</option>{{end}}
+    </select>
+  </label>
+  <div class="plan-new-actions">
+    <button type="submit" class="plan-new-submit">Create plan &amp; open cockpit &rarr;</button>
+  </div>
+</form>
+{{end}}
+

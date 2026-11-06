@@ -1,0 +1,56 @@
+name: lane-tools
+description: >-
+  kubectl + helm + yq for the live-namespace e2e lane (gd-WBz2qt9ADZ), pinned
+  and sha256-verified, plus python3. The actions-runner image ships none of
+  them reliably. lane.sh install packs the chart with
+  scripts/pack-gardenio-chart.sh (yq + python3) before helm (gd-mS5EZeWhZF). Download-to-file
+  then verify, never curl | sh (scripts/check-no-curl-pipe-shell.sh).
+  kubectl is pinned one minor above the cluster's k3s (v1.36.x,
+  gardenio/terraform/composition/gardenio/variables.tf) -- inside the
+  supported +/-1 skew. helm matches the operator's laptop pin.
+runs:
+  using: composite
+  steps:
+    - name: kubectl + helm + yq (pinned, sha256-verified), python3
+      shell: bash
+      run: |
+        set -euo pipefail
+        KUBECTL_VERSION=v1.37.1
+        KUBECTL_SHA256=65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8
+        HELM_VERSION=v3.20.2
+        HELM_SHA256=258e830a9e613c8a7a302d6059b4bb3b9758f2f3e1bb8ea0d707ce10a9a72fea
+        # Same yq as checks.yml's helm job; the sha is the release's own
+        # checksums file entry for yq_linux_amd64.
+        YQ_VERSION=v4.44.3
+        YQ_SHA256=a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7
+        if ! command -v kubectl >/dev/null 2>&1 || [ "$(kubectl version --client -o json 2>/dev/null | jq -r .clientVersion.gitVersion)" != "$KUBECTL_VERSION" ]; then
+          curl -fsSL --retry 5 --retry-delay 2 --max-time 180 -o /tmp/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  /tmp/kubectl" | sha256sum -c --status -
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+        fi
+        if ! command -v helm >/dev/null 2>&1 || [ "$(helm version --template '{{.Version}}' 2>/dev/null)" != "$HELM_VERSION" ]; then
+          curl -fsSL --retry 5 --retry-delay 2 --max-time 180 -o /tmp/helm.tgz \
+            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c --status -
+          tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm
+          sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+        fi
+        if ! command -v yq >/dev/null 2>&1 || [ "$(yq --version 2>/dev/null | awk '{print $NF}')" != "$YQ_VERSION" ]; then
+          curl -fsSL --retry 5 --retry-delay 2 --max-time 180 -o /tmp/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  /tmp/yq" | sha256sum -c --status -
+          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+        fi
+        if ! command -v python3 >/dev/null 2>&1; then
+          sudo apt-get update -q >/dev/null
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends python3
+        fi
+        kubectl version --client
+        helm version --short
+        yq --version
+        python3 --version
+        # The in-cluster identity this runner pod carries. On gardenio-k3s-e2e
+        # it is arc-runners/gardenio-e2e-runner; anything else means the job
+        # landed on the wrong scale set and every namespaced call will 403.
+        kubectl auth whoami 2>/dev/null || echo "(kubectl auth whoami unavailable)"

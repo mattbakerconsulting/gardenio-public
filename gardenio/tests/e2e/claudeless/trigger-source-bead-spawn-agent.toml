@@ -1,0 +1,346 @@
+# trigger-source-bead-spawn-agent.toml
+#
+# Claudeless scenario: a `trigger:bead` source fires the spawn_agent action on
+# a bead lifecycle event (closed), gated by both a label predicate AND a
+# daemon-backed in_subgraph_of subgraph predicate. Asserts fire-once on the
+# matching close, NO fire on a non-matching close, and — crucially — NO double
+# spawn after an engine restart replays the same close through the reconciler.
+#
+# gd-DLMCirbsRl (parent ka-0000004568 §"generic bead-event spawn_agent"):
+#   "Add a claudeless spec for a trigger:bead source firing spawn_agent on a
+#    lifecycle event with label + subgraph condition predicates, asserting
+#    fire-once + dedup on restart. Complements existing gardener-trigger-bead-*
+#    specs by exercising the NON-gardener spawn path."
+#
+# Why this is distinct from the gardener-trigger-bead-* specs:
+#   The gardener-trigger-bead-{created,closed,event-*}.toml scenarios drive the
+#   SCHEDULER-native gardener fire path (type=schedule bead with a triggers[]
+#   array, asserted via runs_spawned / last_agent_id on the schedule bead).
+#   This scenario drives the BRIDGE TriggerEngine non-gardener path: a
+#   type=trigger / kind=data bead labelled trigger:bead with action=spawn_agent
+#   and trig.Gardener == nil. That path runs through:
+#     - BeadStateTriggerSource.Evaluate (trigger_source_bead.go:216) draining
+#       SSE/reconciler events and matching event-type + conditions
+#     - matchConditionsCtx → matchLabelCondition (label predicate) AND
+#       matchSubgraphCondition → SubgraphResolver.IsInSubgraph (subgraph
+#       predicate; trigger_source_bead.go:364)
+#     - TriggerEngine.fireAction → actionSpawnAgent (triggers.go:995): creates
+#       a per-fire task bead (createTaskBead, labelled trigger:<id>, field
+#       bead_event_key) and calls daemon.SpawnAgent, producing a type=agent
+#       bead. trig.Gardener == nil, so the AssignBead-pinning branch is skipped
+#       and the per-fire task semantics are exercised.
+#
+# Engine code covered (0% before this spec per epic ka-0000004568):
+#   - gardenio/controller/internal/bridge/trigger_source_bead.go
+#       Evaluate / matchEventType / matchConditionsCtx / matchSubgraphCondition
+#       / matchLabelCondition / beadEventToMatch / CatchUpKeys
+#   - gardenio/controller/internal/bridge/triggers.go
+#       evalOne new-match filter, fireAction (spawn path + authz recheck),
+#       actionSpawnAgent (non-gardener branch), createTaskBead, catchUpSource
+#       (restart seed of seen[] from CatchUpKeys)
+#   - gardenio/controller/internal/bridge/trigger_source_bead_reconcile.go
+#       BeadStateReconciler.runOnce → InjectBeadEvent("beads.bead.reconciled")
+#       — the missed-event floor whose replay must NOT double-spawn.
+#
+# Why live-flow (not a shape test): a shape test over the trigger bead's
+# fields passes even if the SSE→engine wiring, the subgraph resolver, or the
+# restart-dedup seed regress. Only an end-to-end "close a bead, observe
+# exactly one spawned agent, restart, observe still exactly one" proves the
+# non-gardener spawn path and its dedup invariant hold.
+
+[claude]
+session_id = "e2e00000-000a-4000-a000-000000000005"
+username = "e2e-trigger-bead-spawn-agent"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 300000
+
+[[responses]]
+on = "*"
+say = "Running trigger-source-bead-spawn-agent: bead close → spawn_agent (label + subgraph predicates), fire-once + restart-dedup."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-engine ─────────────────────
+TE_BIN=""
+if command -v trigger-engine >/dev/null 2>&1; then
+  TE_BIN=$(command -v trigger-engine)
+elif [ -x /usr/local/bin/trigger-engine ]; then
+  TE_BIN=/usr/local/bin/trigger-engine
+elif [ -x /tmp/trigger-engine ]; then
+  TE_BIN=/tmp/trigger-engine
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-engine from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-engine ./cmd/trigger-engine/ ) || {
+    echo "SKIP: trigger-engine build failed"; exit 0;
+  }
+  TE_BIN=/tmp/trigger-engine
+else
+  echo "SKIP: trigger-engine binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-engine: $TE_BIN"
+
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if [ -z "${BEADS_HTTP_URL:-}" ]; then echo "SKIP: BEADS_HTTP_URL not set"; exit 0; fi
+if [ -z "${BEADS_TOKEN:-}" ]; then echo "SKIP: BEADS_TOKEN not set"; exit 0; fi
+
+# ── Setup: epic → tagged child subgraph ────────────────────────────
+# The trigger gates on THREE predicates that must ALL match (matchConditionsCtx
+# ANDs the condition list):
+#   1. event type "closed" (+ "reconciled" so the restart replay still matches)
+#   2. label:<MATCH_LABEL> present        — pure in-process label predicate
+#   3. id in_subgraph_of <EPIC_ID>        — daemon-backed subgraph predicate
+# Only the TAGGED child, parented under the epic, satisfies all three.
+TAG="e2e-tbsa-$$-$(date +%s)"
+MATCH_LABEL="e2e-bead-spawn-match-$TAG"
+echo "tag: $TAG  match-label: $MATCH_LABEL"
+
+EPIC_ID=$(kd create "bead-spawn-epic-$TAG" --type=epic -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+
+# TAGGED child: carries MATCH_LABEL and is parented under the epic (so it sits
+# in the epic's connected subgraph). Satisfies all three predicates on close.
+TAGGED_ID=$(kd create "bead-spawn-tagged-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "$MATCH_LABEL" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$TAGGED_ID" ]; then fail "create tagged child"; exit 1; fi
+kd dep add "$TAGGED_ID" "$EPIC_ID" --type parent-child >/dev/null 2>&1 || true
+
+# UNTAGGED-IN-SUBGRAPH child: parented under the epic (in subgraph) but missing
+# MATCH_LABEL. Fails the label predicate → must NOT fire. Isolates the label
+# predicate from the subgraph predicate.
+PLAIN_ID=$(kd create "bead-spawn-plain-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$PLAIN_ID" ]; then fail "create plain child"; exit 1; fi
+kd dep add "$PLAIN_ID" "$EPIC_ID" --type parent-child >/dev/null 2>&1 || true
+
+# OUTSIDE child: carries MATCH_LABEL but is NOT linked to the epic (outside the
+# subgraph). Fails the subgraph predicate → must NOT fire. Isolates the
+# subgraph predicate from the label predicate.
+OUTSIDE_ID=$(kd create "bead-spawn-outside-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "$MATCH_LABEL" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$OUTSIDE_ID" ]; then fail "create outside bead"; exit 1; fi
+echo "subgraph: epic=$EPIC_ID tagged=$TAGGED_ID plain=$PLAIN_ID outside=$OUTSIDE_ID"
+
+# ── Trigger bead: trigger:bead, action=spawn_agent, three predicates ──
+# Built directly (not via `gb trigger create bead`) because the CLI's
+# --condition parser rejects the daemon-backed in_subgraph_of operator, and we
+# want "reconciled" in event_types so the restart replay re-matches. event_types
+# accepts the leaf form; conditions is the JSON array consumed by
+# trigger_source_bead.go's beadCondition.
+#
+# CreatedBy is left to the system actor (no "@" OIDC identity), so
+# recheckSpawnAuthzAtFire takes the "non-OIDC creator bypass" path and the
+# spawn is authorized at fire time without a user bead lookup.
+CONDITIONS=$(cat <<JSON
+[
+  {"field":"label:$MATCH_LABEL","op":"present","value":""},
+  {"field":"id","op":"in_subgraph_of","value":"$EPIC_ID"}
+]
+JSON
+)
+
+TRIG_ID=$(kd create "Bead-state spawn trigger $TAG" --type=trigger \
+  -l "trigger:bead" -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "project:gardenio" \
+  -f "source=bead-state" \
+  -f "action=spawn_agent" \
+  -f "role=crew" \
+  -f "project=gardenio" \
+  -f "enabled=true" \
+  -f "cooldown_minutes=0" \
+  -f "max_concurrent=3" \
+  -f "event_types=closed,reconciled" \
+  -f "prompt=bead {{bead_id}} closed: {{bead_title}}" \
+  -f "conditions=$CONDITIONS" \
+  --json 2>&1 | jq -r '.id // empty')
+if [ -z "$TRIG_ID" ]; then fail "create trigger bead"; exit 1; fi
+echo "trigger: $TRIG_ID"
+
+# Helpers scoped to this trigger.
+list_task_keys() {
+  # Per-fire task beads carry label trigger:<id> and field bead_event_key.
+  kd list --type=task -l "trigger:$TRIG_ID" --json 2>/dev/null | \
+    jq -r '.[] | .fields.bead_event_key // empty' 2>/dev/null
+}
+list_agent_ids() {
+  # Spawned agent beads carry field spawned_by=trigger:<id>.
+  kd list --type=agent -l "e2e-tag:$TAG" --json 2>/dev/null | \
+    jq -r '.[] | select(.fields.spawned_by=="trigger:'"$TRIG_ID"'") | .id' 2>/dev/null
+}
+count_agents() { list_agent_ids | grep -c . | tr -d ' '; }
+
+cleanup() {
+  gb trigger disable "$TRIG_ID" --http-url "$BEADS_HTTP_URL" >/dev/null 2>&1 || \
+    kd update "$TRIG_ID" -f "enabled=false" >/dev/null 2>&1 || true
+  # Close spawned agents + per-fire task beads so they don't accumulate.
+  for aid in $(list_agent_ids); do kd close "$aid" >/dev/null 2>&1 || true; done
+  for bid in $(kd list --type=task -l "trigger:$TRIG_ID" --json 2>/dev/null | jq -r '.[].id' 2>/dev/null); do
+    kd close "$bid" >/dev/null 2>&1 || true
+  done
+  for id in "$TRIG_ID" "$TAGGED_ID" "$PLAIN_ID" "$OUTSIDE_ID" "$EPIC_ID"; do
+    kd close "$id" >/dev/null 2>&1 || true
+  done
+  if [ -n "${TE_PID_A:-}" ]; then kill "$TE_PID_A" 2>/dev/null || true; wait "$TE_PID_A" 2>/dev/null || true; fi
+  if [ -n "${TE_PID_B:-}" ]; then kill "$TE_PID_B" 2>/dev/null || true; wait "$TE_PID_B" 2>/dev/null || true; fi
+  rm -f "${STATE_FILE:-}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# STATE_FILE enables the reconciler in engine B, so the restart can replay the
+# close as a synthetic "reconciled" event and we can prove dedup holds.
+STATE_FILE="/tmp/te-bead-spawn-state-$$.json"
+
+start_engine() {
+  # $1 = log path. Reconciler interval kept short so engine B replays quickly.
+  BEADS_HTTP_ADDR="$BEADS_HTTP_URL" \
+    BEADS_DAEMON_TOKEN="$BEADS_TOKEN" \
+    TRIGGER_POLL_INTERVAL=1s \
+    RECONCILE_INTERVAL=5s \
+    STATE_FILE="$STATE_FILE" \
+    LISTEN_ADDR=":0" \
+    LOG_LEVEL=info \
+    "$TE_BIN" >"$1" 2>&1 &
+  echo $!
+}
+
+# ── Engine A ───────────────────────────────────────────────────────
+TE_LOG_A="/tmp/te-bead-spawn-A-$$.log"
+TE_PID_A=$(start_engine "$TE_LOG_A")
+echo "engine A pid: $TE_PID_A"
+
+# Let engine A connect SSE, LoadTriggers, and bootstrap-seed (the bead source
+# opts out of historical bootstrap, but the trigger is brand-new so the close
+# events below are genuinely fresh).
+sleep 8
+
+# ── NEG 1: close the OUTSIDE bead (label ok, subgraph fails) ───────
+kd close "$OUTSIDE_ID" >/dev/null 2>&1 || { fail "kd close outside"; exit 1; }
+# ── NEG 2: close the PLAIN child (subgraph ok, label fails) ────────
+kd close "$PLAIN_ID" >/dev/null 2>&1 || { fail "kd close plain"; exit 1; }
+echo "closed non-matching beads (outside=$OUTSIDE_ID plain=$PLAIN_ID); waiting 25s to confirm no spawn..."
+sleep 25
+
+NEG_AGENTS=$(count_agents)
+if [ "${NEG_AGENTS:-0}" = "0" ]; then
+  pass "non-matching closes did NOT spawn an agent (predicates correctly AND-gated)"
+else
+  fail "non-matching close unexpectedly spawned" "agent_count=$NEG_AGENTS"
+  list_agent_ids
+fi
+
+# ── POS: close the TAGGED child (all three predicates match) ───────
+kd close "$TAGGED_ID" >/dev/null 2>&1 || { fail "kd close tagged"; exit 1; }
+echo "closed tagged child $TAGGED_ID at $(date -u +%FT%TZ); waiting for spawn..."
+
+DEADLINE=$(( $(date +%s) + 90 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  if [ "$(count_agents)" -ge 1 ] 2>/dev/null; then
+    FIRED=1
+    break
+  fi
+  sleep 3
+done
+
+if [ "$FIRED" = "1" ]; then
+  AID=$(list_agent_ids | head -n1)
+  pass "matching close spawned an agent (agent=$AID)"
+else
+  fail "matching close did NOT spawn an agent within 90s"
+  echo "--- engine A log (tail) ---"; tail -50 "$TE_LOG_A" 2>/dev/null || true
+  exit 1
+fi
+
+# Fire-once: exactly one agent + exactly one per-fire task bead, and the task
+# bead carries a bead_event_key (proves the actionSpawnAgent → createTaskBead
+# non-gardener path ran, not the AssignBead-pinning gardener branch).
+sleep 6
+AGENTS_AFTER_POS=$(count_agents)
+if [ "${AGENTS_AFTER_POS:-0}" = "1" ]; then
+  pass "fire-once: exactly one agent after matching close (count=$AGENTS_AFTER_POS)"
+else
+  fail "expected exactly one agent after matching close" "count=$AGENTS_AFTER_POS"
+fi
+
+POS_KEYS=$(list_task_keys)
+POS_KEY_COUNT=$(echo "$POS_KEYS" | grep -c . | tr -d ' ')
+POS_UNIQUE=$(echo "$POS_KEYS" | sort -u | grep -c . | tr -d ' ')
+if [ "${POS_KEY_COUNT:-0}" = "1" ] && [ "${POS_UNIQUE:-0}" = "1" ]; then
+  pass "exactly one per-fire task bead with a unique bead_event_key (key=$(echo "$POS_KEYS" | head -n1))"
+else
+  fail "expected one per-fire task bead with bead_event_key" "count=$POS_KEY_COUNT unique=$POS_UNIQUE"
+fi
+
+# ── Restart: kill A, start B (cold seen[]), reconciler replays close ──
+kill "$TE_PID_A" 2>/dev/null || true
+wait "$TE_PID_A" 2>/dev/null || true
+TE_PID_A=""
+echo "engine A killed; starting engine B (cold in-memory seen state)..."
+
+TE_LOG_B="/tmp/te-bead-spawn-B-$$.log"
+TE_PID_B=$(start_engine "$TE_LOG_B")
+echo "engine B pid: $TE_PID_B"
+
+# Engine B on startup:
+#   - CatchUp → catchUpSource → CatchUpKeys reads the existing per-fire task
+#     bead's bead_event_key and seeds seen[trig.ID], so a re-delivery of the
+#     same key is suppressed.
+#   - The reconciler (STATE_FILE set, RECONCILE_INTERVAL=5s) re-queries beads
+#     updated since the watermark and InjectBeadEvent("beads.bead.reconciled")
+#     for the just-closed tagged child — re-presenting the SAME close. Because
+#     "reconciled" is in event_types and the predicates still match, this is a
+#     genuine re-fire attempt that the seen[] seed must dedup.
+# Give B enough time for >=2 reconcile cycles plus a couple poll ticks.
+sleep 35
+
+if grep -qE 'triggers: catch-up complete|catch-up' "$TE_LOG_B" 2>/dev/null; then
+  pass "engine B logged catch-up after restart"
+else
+  echo "  (note) engine B did not log catch-up — non-fatal"
+fi
+
+FINAL_AGENTS=$(count_agents)
+FINAL_KEYS=$(list_task_keys)
+FINAL_KEY_COUNT=$(echo "$FINAL_KEYS" | grep -c . | tr -d ' ')
+FINAL_UNIQUE=$(echo "$FINAL_KEYS" | sort -u | grep -c . | tr -d ' ')
+echo "  final: agents=$FINAL_AGENTS task_keys=$FINAL_KEY_COUNT unique=$FINAL_UNIQUE"
+
+if [ "${FINAL_AGENTS:-0}" = "1" ]; then
+  pass "restart-dedup: still exactly one agent after engine restart + reconciler replay (count=$FINAL_AGENTS)"
+else
+  fail "restart caused a double spawn" "agent_count=$FINAL_AGENTS (expected 1)"
+  echo "--- engine B log (tail) ---"; tail -60 "$TE_LOG_B" 2>/dev/null || true
+fi
+
+# Dedup invariant on the per-fire task beads: count == unique bead_event_keys.
+if [ "${FINAL_KEY_COUNT:-0}" = "${FINAL_UNIQUE:-0}" ] && [ "${FINAL_KEY_COUNT:-0}" -ge 1 ] 2>/dev/null; then
+  pass "no duplicate bead_event_keys after restart (count=$FINAL_KEY_COUNT unique=$FINAL_UNIQUE)"
+else
+  fail "duplicate bead_event_keys after restart" "count=$FINAL_KEY_COUNT unique=$FINAL_UNIQUE"
+  echo "$FINAL_KEYS" | sort
+fi
+
+# ── Summary ────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "trigger-source-bead-spawn-agent: bead close → spawn_agent fire-once + restart-dedup OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "trigger-source-bead-spawn-agent scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

@@ -1,0 +1,248 @@
+{{template "layout" .}}
+{{define "title"}}{{.Project}} · Project · Beads Viewer{{end}}
+{{define "content"}}
+{{- $hub := .Hub -}}
+<span class="wide-page" hidden></span>
+{{with .GardenHref}}{{template "garden_banner" .}}{{end}}
+
+<nav class="crumbs" aria-label="Breadcrumb">
+  <a href="{{.BasePath}}/">Projects</a> &rsaquo; <span>{{.Project}}</span>
+</nav>
+
+{{/* ── Project header: name + config-validity badge + config-bead deep link ── */}}
+<header class="project-hub-header">
+  <h1 class="project-hub-title">
+    {{.Project}}
+    {{- with $hub.Validity -}}
+      {{if .OK}}
+      <span class="validity-badge validity-green" title="Config valid — no findings">✓ valid</span>
+      {{else if eq .Badge "red"}}
+      <span class="validity-badge validity-red" title="{{.ErrorCount}} error(s), {{.WarningCount}} warning(s) in this project's config">✕ {{.ErrorCount}} error{{if ne .ErrorCount 1}}s{{end}}{{if gt .WarningCount 0}}, {{.WarningCount}} warn{{end}}</span>
+      {{else}}
+      <span class="validity-badge validity-yellow" title="{{.WarningCount}} warning(s) in this project's config">⚠ {{.WarningCount}} warning{{if ne .WarningCount 1}}s{{end}}</span>
+      {{end}}
+    {{- end -}}
+  </h1>
+  <div class="project-hub-subline">
+    {{if $hub.ConfigBeadID}}
+    <a class="chip chip-link" href="{{.BasePath}}/{{$hub.ConfigBeadID}}" title="The type:project config bead">config: {{$hub.ConfigBeadID}}</a>
+    {{if $hub.ConfigBeadStatus}}<span class="chip chip-status">{{$hub.ConfigBeadStatus}}</span>{{end}}
+    {{else}}
+    <span class="chip chip-raw" title="No type:project config bead — this is a label-only project (beads carry project:{{.Project}})">label-only project</span>
+    {{end}}
+  </div>
+</header>
+
+{{/* ── Tab / section bar ── */}}
+{{template "section_tabs" (dict "Tabs" .Tabs "AriaLabel" "Project sections")}}
+
+<div class="project-hub-overview">
+
+{{/* ── Health panel (reuse projectSummary) ── */}}
+<section class="hub-section hub-health" aria-label="Health">
+  <h2>Health</h2>
+  {{if $hub.Summary}}
+  {{- $sum := $hub.Summary -}}
+  <div class="project-header-band" aria-label="Project summary">
+    <span class="band-group">
+      <span class="band-label">Active</span>
+      <span class="band-count">{{$sum.TotalOpen}}</span>
+    </span>
+    <span class="band-sep"></span>
+    <span class="band-group">
+      <span class="band-label">Open</span>
+      <span class="band-count">{{$sum.Open}}</span>
+    </span>
+    <span class="band-group">
+      <span class="band-label">In progress</span>
+      <span class="band-count">{{$sum.InProgress}}</span>
+    </span>
+    {{if gt $sum.Blocked 0}}
+    <span class="band-sep"></span>
+    <span class="band-group">
+      <span class="band-label">Blocked</span>
+      <span class="band-count badge-warn">{{$sum.Blocked}}</span>
+    </span>
+    {{end}}
+    {{if gt $sum.StaleInProgress 0}}
+    <span class="band-group">
+      <span class="band-label">Stale &gt;24h</span>
+      <span class="band-count badge-warn">{{$sum.StaleInProgress}}</span>
+    </span>
+    {{end}}
+    {{if gt $sum.Created24h 0}}
+    <span class="band-group">
+      <span class="band-label">New 24h</span>
+      <span class="band-count">{{$sum.Created24h}}</span>
+    </span>
+    {{end}}
+  </div>
+  {{if or (gt (index $sum.PriorityCounts 0) 0) (gt (index $sum.PriorityCounts 1) 0) (gt (index $sum.PriorityCounts 2) 0) (gt (index $sum.PriorityCounts 3) 0) (gt (index $sum.PriorityCounts 4) 0)}}
+  <ul class="project-summary-list project-summary-priority hub-priority">
+    {{range $i, $n := $sum.PriorityCounts}}
+    {{if gt $n 0}}
+    <li><span class="label">P{{$i}}</span><span class="count prio-pill prio-pill-{{$i}}">{{$n}}</span></li>
+    {{end}}
+    {{end}}
+  </ul>
+  {{end}}
+  {{if $sum.BlockedBeads}}
+  <div class="hub-attention" aria-label="Blocked beads">
+    <h3>Blocked <span class="project-summary-count badge-warn">{{$sum.Blocked}}</span></h3>
+    <ul class="project-summary-bead-list">
+      {{range $sum.BlockedBeads}}
+      <li class="project-summary-bead">
+        <a class="project-summary-bead-title" href="{{$.BasePath}}/{{.ID}}" title="{{.Title}}">{{.Title}}</a>
+        <span class="project-summary-bead-meta"><span class="project-summary-bead-id">{{.ID}}</span>{{if .Ago}} · <span class="project-summary-bead-ago">{{.Ago}}</span>{{end}}</span>
+      </li>
+      {{end}}
+    </ul>
+  </div>
+  {{end}}
+  {{else}}
+  <p class="empty">Health is unavailable right now.</p>
+  {{end}}
+</section>
+
+{{/* ── Work-breakdown digest (reuse projectTypeChips + TypeCounts) ── */}}
+<section class="hub-section hub-work" aria-label="Work breakdown">
+  <h2>Work <a class="hub-section-more" href="{{.BasePath}}/p/{{.Project}}?view=list">view full list →</a></h2>
+  {{template "filter_strip" (dict "Chips" $hub.Chips "AriaLabel" "Type filter" "Wrapper" "nav" "ChipClass" "chip" "Boost" true "AriaCurrent" "true" "CountMode" "gated")}}
+</section>
+
+{{/* ── Config summary (labeled ProjectInfo render; secrets by NAME only) ── */}}
+<section class="hub-section hub-config" id="config" aria-label="Config summary">
+  <h2>Config{{if and $hub.IsAdmin $hub.ConfigBeadID}}
+    <button type="button" class="hub-config-edit-btn"
+            hx-get="{{.BasePath}}/p/{{.Project}}/edit"
+            hx-target="#project-config-host" hx-swap="innerHTML"
+            title="Edit this project's config (admin-only)">Edit config</button>
+    {{end}}</h2>
+  {{if and $hub.IsAdmin $hub.ConfigBeadID}}<div id="project-config-host"></div>{{end}}
+  {{if $hub.ConfigBeadID}}
+  {{- $c := $hub.Config -}}
+  <dl class="hub-config-grid">
+    {{if $c.Prefix}}<dt>Prefix</dt><dd>{{$c.Prefix}}</dd>{{end}}
+    {{if $c.GitURL}}<dt>Git URL</dt><dd class="hub-config-mono">{{$c.GitURL}}</dd>{{end}}
+    {{if $c.DefaultBranch}}<dt>Default branch</dt><dd>{{$c.DefaultBranch}}</dd>{{end}}
+    {{if $c.Image}}<dt>Image</dt><dd class="hub-config-mono">{{$c.Image}}</dd>{{end}}
+    {{if $c.Account}}<dt>Account</dt><dd>{{$c.Account}}</dd>{{end}}
+    {{if $c.Model}}<dt>Model</dt><dd>{{$c.Model}}</dd>{{end}}
+    {{if or $c.CPURequest $c.CPULimit}}<dt>CPU</dt><dd>{{if $c.CPURequest}}{{$c.CPURequest}}{{else}}—{{end}} / {{if $c.CPULimit}}{{$c.CPULimit}}{{else}}—{{end}} <span class="hub-config-hint">(req / limit)</span></dd>{{end}}
+    {{if or $c.MemoryRequest $c.MemoryLimit}}<dt>Memory</dt><dd>{{if $c.MemoryRequest}}{{$c.MemoryRequest}}{{else}}—{{end}} / {{if $c.MemoryLimit}}{{$c.MemoryLimit}}{{else}}—{{end}} <span class="hub-config-hint">(req / limit)</span></dd>{{end}}
+    {{if $c.StorageClass}}<dt>Storage class</dt><dd>{{$c.StorageClass}}</dd>{{end}}
+    {{if $c.ServiceAccount}}<dt>Service account</dt><dd>{{$c.ServiceAccount}}</dd>{{end}}
+    {{if $c.RuntimeClassName}}<dt>Runtime class</dt><dd>{{$c.RuntimeClassName}}</dd>{{end}}
+    {{if $c.DefaultTimezone}}<dt>Timezone</dt><dd>{{$c.DefaultTimezone}}</dd>{{end}}
+    <dt>Flags</dt>
+    <dd class="hub-config-flags">
+      <span class="hub-flag hub-flag-{{if $c.DockerEnabled}}on{{else}}off{{end}}">docker</span>
+      <span class="hub-flag hub-flag-{{if $c.PostgresEnabled}}on{{else}}off{{end}}">postgres</span>
+      <span class="hub-flag hub-flag-{{if $c.NeedsK8sAPI}}on{{else}}off{{end}}">k8s-api</span>
+      <span class="hub-flag hub-flag-{{if $c.SchedulesEnabled}}on{{else}}off{{end}}">schedules</span>
+      <span class="hub-flag hub-flag-{{if $c.TriggersEnabled}}on{{else}}off{{end}}">triggers</span>
+    </dd>
+    {{if $c.SlackChannels}}<dt>Slack channels</dt><dd>{{range $i, $ch := $c.SlackChannels}}{{if $i}}, {{end}}<span class="hub-config-mono">{{$ch}}</span>{{end}}</dd>{{end}}
+    {{if $c.Repos}}<dt>Repos</dt><dd>{{len $c.Repos}}</dd>{{end}}
+    <dt>Secrets</dt>
+    <dd>
+      {{if $c.Secrets}}
+      <span class="hub-secret-count">{{len $c.Secrets}}</span>
+      <ul class="hub-secret-list">
+        {{/* SECURITY: render env var name + K8s Secret/key REFERENCE only.
+             Never a value — the viewer has no access to secret values and they
+             must never reach the page (design doc §1.1, §3.1). */}}
+        {{range $c.Secrets}}
+        <li class="hub-secret"><code>{{.Env}}</code> <span class="hub-config-hint">← {{.Secret}}/{{.Key}}</span></li>
+        {{end}}
+      </ul>
+      {{else}}
+      <span class="hub-config-hint">none</span>
+      {{end}}
+    </dd>
+  </dl>
+  {{if not $hub.Validity.OK}}
+  <div class="hub-validity-findings" aria-label="Config validity findings">
+    <h3>Config findings</h3>
+    <ul class="hub-finding-list">
+      {{range $hub.Validity.Checks}}
+      <li class="hub-finding hub-finding-{{.Severity}}"><span class="hub-finding-field">{{.Field}}</span> <span class="hub-finding-msg">{{.Message}}</span></li>
+      {{end}}
+    </ul>
+  </div>
+  {{end}}
+  {{else}}
+  <p class="empty">No <code>type:project</code> config bead — this project is defined only by the <code>project:{{.Project}}</code> label on its beads.</p>
+  {{end}}
+</section>
+
+{{/* ── Lazy dependent-object sections (task ka-0000003487, design doc §3.2) ──
+     The eager Overview above paints config + health + the work digest on first
+     byte. The six expensive dependent-object sections load lazily as HTMX
+     fragments, each revealed once its shell scrolls into view, mirroring the
+     gardener-page eager-head + lazy-tail skeleton (gardener_page.go
+     handleGardenerRunsSection; gardener_detail.html).
+
+     Trigger is `intersect once`, NOT `revealed once` (ka-0000003717): htmx's
+     `revealed` is scroll-event driven and never fires for a shell already in the
+     viewport at first paint, leaving a perpetual "Loading…" spinner. `intersect`
+     uses IntersectionObserver and fires as soon as the shell is visible, so each
+     section always resolves to its fragment — or the fragment's own empty-state /
+     inline retry on a daemon error, never a broken page. hx-swap="outerHTML"
+     replaces the whole shell with the <section> the handler renders. */}}
+{{- $p := .Project -}}
+<div class="project-hub-lazy-sections">
+{{range $sec := .LazySections}}
+  <div class="project-hub-lazy" id="{{$sec.Slug}}-shell"
+       hx-get="{{$.BasePath}}/b/project/{{$p}}/{{$sec.Endpoint}}"
+       hx-trigger="intersect once"
+       hx-swap="outerHTML">
+    <h2>{{$sec.Title}}</h2>
+    <p class="empty">Loading {{$sec.Loading}}&hellip;</p>
+  </div>
+{{end}}
+</div>
+
+</div>{{/* /.project-hub-overview */}}
+
+<style>
+.project-hub-header { margin: 0 0 .5rem; }
+.project-hub-title { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-bottom: .25rem; }
+.project-hub-subline { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; }
+.validity-badge { font-size: .72rem; font-weight: 600; padding: .1rem .45rem; border-radius: 999px; white-space: nowrap; }
+.validity-green { background: #e6f4ea; color: #137333; }
+.validity-yellow { background: #fef7e0; color: #b06000; }
+.validity-red { background: #fce8e6; color: #c5221f; }
+.hub-section { margin-bottom: 1.5rem; }
+.hub-section h2 { display: flex; align-items: baseline; gap: .5rem; font-size: 1.05rem; }
+.hub-section-more { font-size: .8rem; font-weight: 400; }
+.hub-config-edit-hint { font-size: .75rem; font-weight: 400; color: var(--muted, #5f6368); }
+.hub-config-edit-btn { font-size: .78rem; font-weight: 500; padding: .2rem .6rem; border-radius: 6px; border: 1px solid var(--accent, #1a73e8); color: var(--accent, #1a73e8); background: transparent; cursor: pointer; }
+.hub-config-edit-btn:hover { background: var(--accent, #1a73e8); color: #fff; }
+.hub-config-grid { display: grid; grid-template-columns: max-content 1fr; gap: .35rem .9rem; margin: .5rem 0; }
+.hub-config-grid dt { font-weight: 600; color: var(--muted, #5f6368); }
+.hub-config-grid dd { margin: 0; }
+.hub-config-mono, .hub-config-grid code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+.hub-config-hint { color: var(--muted, #5f6368); font-size: .85em; }
+.hub-config-flags { display: flex; gap: .35rem; flex-wrap: wrap; }
+.hub-flag { font-size: .72rem; padding: .1rem .4rem; border-radius: 4px; }
+.hub-flag-on { background: #e6f4ea; color: #137333; }
+.hub-flag-off { background: #f1f3f4; color: #5f6368; text-decoration: line-through; }
+.hub-secret-list, .hub-finding-list { list-style: none; padding: 0; margin: .3rem 0 0; }
+.hub-secret { font-size: .85rem; }
+.hub-finding { font-size: .85rem; padding: .15rem 0; }
+.hub-finding-error .hub-finding-field { color: #c5221f; font-weight: 600; }
+.hub-finding-warning .hub-finding-field { color: #b06000; font-weight: 600; }
+.hub-finding-field { font-family: ui-monospace, monospace; margin-right: .4rem; }
+.hub-priority { display: flex; gap: .5rem; list-style: none; padding: 0; margin: .5rem 0; }
+.hub-attention { margin-top: .5rem; }
+.project-hub-lazy-sections { display: flex; flex-direction: column; gap: 1.5rem; margin-top: 1.5rem; }
+.project-hub-lazy h2, .project-hub-section h2 { font-size: 1.05rem; }
+.project-hub-lazy .empty, .project-hub-section .empty { color: var(--muted, #5f6368); }
+.project-hub-section-error button { margin-top: .35rem; cursor: pointer; }
+.project-hub-paused-banner { background: #fef7e0; color: #b06000; padding: .35rem .6rem; border-radius: 6px; font-size: .85rem; }
+.project-hub-cost-rollup { display: grid; grid-template-columns: max-content 1fr; gap: .2rem .8rem; margin: .3rem 0; }
+.project-hub-cost-rollup dt { font-weight: 600; color: var(--muted, #5f6368); }
+.project-hub-cost-rollup dd { margin: 0; }
+</style>
+{{end}}

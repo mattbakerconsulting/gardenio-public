@@ -1,0 +1,180 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.global.securityHeaders.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- /* CSP defaults: all gardenio frontends are Vite SPAs that bundle JS inline in HTML.
+       'unsafe-inline' required for script-src. data: required for font-src (embedded woff2).
+       connect-src is restricted to 'self' + wss://*.<apex> derived from tls.domainName
+       (audit F5: avoid unbounded `wss:`). When tls.domainName is unset, only 'self'
+       is allowed for WebSocket origins. */ -}}
+{{- $apexDomain := "" -}}
+{{- if .Values.tls.domainName -}}
+{{-   $apexDomain = trimPrefix "*." .Values.tls.domainName -}}
+{{- end -}}
+{{- $wssOrigin := "" -}}
+{{- if $apexDomain -}}
+{{-   $wssOrigin = printf " wss://*.%s wss://%s" $apexDomain $apexDomain -}}
+{{- end -}}
+{{- $defaultCSP := printf "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'%s; frame-ancestors 'none'" $wssOrigin -}}
+{{- $defaultIframeCSP := printf "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'%s; worker-src 'self' blob:; frame-ancestors 'self'" $wssOrigin -}}
+{{- /* CSP for htmx server-rendered surfaces — beads-viewer's /beads route (ka-0000006016).
+       Identical to $defaultCSP but ADDS 'unsafe-eval' to script-src. beads-viewer ships
+       htmx, which compiles three attribute families through `new Function()`: hx-on /
+       hx-on:: handlers (htmx's `Nt`), hx-trigger `[…]` event filters, and hx-vals='js:{…}'.
+       The browser blocks `new Function()` under a CSP without 'unsafe-eval', producing the
+       EvalError reported on /plans (plans.html hx-on::after-request; plan_steps.html and
+       plan_assistant.html likewise) and silently breaking the comment/thread poll filters.
+       Kept as a SEPARATE variant (not folded into $defaultCSP) so the eval relaxation is
+       scoped to beads-viewer only — the kd daemon HTTP API (/kd), coopmux (/mux), NATS
+       (/nats), and jira-bridge (/jira) stay on the strict no-eval $defaultCSP, none of them
+       use htmx. Framing posture stays strict (frame-ancestors 'none' + frameDeny); we do
+       NOT reuse the -iframe variant, which would needlessly make beads-viewer framable. */ -}}
+{{- $defaultHtmxEvalCSP := printf "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'%s; frame-ancestors 'none'" $wssOrigin -}}
+{{- /* Strict CSP for free-htmx widget-rendering routes (ka-0000002043, plan
+       ka-0000002149 §3). Drops 'unsafe-inline' from script-src — widgets
+       cannot include <script>, <style>, or style= (sanitizer strips), so
+       the long-standing audit F6 finding is finally closeable on widget
+       routes. report-uri lands on the in-process /htmx/widget/csp-report
+       handler. The header value is duplicated by the Go in-process middleware
+       (gardenio/controller/internal/freehtmx/csp.go) — multiple CSP headers
+       are intersected by browsers, never weakened, so the doubled emission
+       is safe and resilient to a Traefik misconfig. */ -}}
+{{- $defaultStrictHtmxCSP := "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://s3.amazonaws.com https://*.s3.amazonaws.com; font-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; manifest-src 'none'; worker-src 'none'; upgrade-insecure-requests; report-uri /htmx/widget/csp-report" -}}
+{{- $csp := .Values.global.securityHeaders.contentSecurityPolicy | default $defaultCSP -}}
+{{- $iframeCSP := .Values.global.securityHeaders.iframeContentSecurityPolicy | default $defaultIframeCSP -}}
+{{- $strictHtmxCSP := .Values.global.securityHeaders.strictHtmxContentSecurityPolicy | default $defaultStrictHtmxCSP -}}
+{{- $htmxEvalCSP := .Values.global.securityHeaders.htmxEvalContentSecurityPolicy | default $defaultHtmxEvalCSP -}}
+{{- /* Build HSTS header value as a customResponseHeader. Traefik's stsSeconds
+       field only emits Strict-Transport-Security when Traefik observes the
+       request as TLS — which depends on entrypoint config + trusted forwarded
+       headers from the upstream LB. customResponseHeaders is unconditional and
+       reliable (HTTP→HTTPS redirect on entryPoint `web` ensures real responses
+       are only served over HTTPS, so emitting HSTS on the websecure response
+       path is always correct). */ -}}
+{{- $hstsParts := list (printf "max-age=%d" (.Values.global.securityHeaders.stsSeconds | int64)) -}}
+{{- if .Values.global.securityHeaders.stsIncludeSubdomains -}}
+{{-   $hstsParts = append $hstsParts "includeSubDomains" -}}
+{{- end -}}
+{{- if .Values.global.securityHeaders.stsPreload -}}
+{{-   $hstsParts = append $hstsParts "preload" -}}
+{{- end -}}
+{{- $hsts := join "; " $hstsParts -}}
+# ── Security Headers Middleware (strict) ─────────────────────────────────────
+# Applied to all public IngressRoutes. Sets HSTS, X-Content-Type-Options,
+# X-Frame-Options: DENY, CSP, Referrer-Policy, and Permissions-Policy.
+#
+# Note: this middleware does NOT set `trustForwardHeader`, so Traefik uses its
+# own canonical observation of the request scheme/source IP rather than
+# trusting the incoming X-Forwarded-* headers. HSTS is still emitted on every
+# response — its correctness therefore depends on the cluster-Traefik
+# `forwardedHeaders.trustedIPs` being set to the LB CIDR, so that Traefik's
+# scheme detection is not influenced by spoofed X-Forwarded-Proto from
+# untrusted clients. See gardenio/docs/audits/ingress-tls-static.md F9 and
+# gardenio/docs/runbooks/ingress-trusted-ips.md.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-security-headers
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: security-headers
+spec:
+  headers:
+    stsSeconds: {{ .Values.global.securityHeaders.stsSeconds | int64 }}
+    stsIncludeSubdomains: {{ .Values.global.securityHeaders.stsIncludeSubdomains }}
+    stsPreload: {{ .Values.global.securityHeaders.stsPreload }}
+    contentTypeNosniff: true
+    frameDeny: true
+    browserXssFilter: true
+    referrerPolicy: {{ .Values.global.securityHeaders.referrerPolicy | quote }}
+    permissionsPolicy: {{ .Values.global.securityHeaders.permissionsPolicy | quote }}
+    contentSecurityPolicy: {{ $csp | quote }}
+    customResponseHeaders:
+      Strict-Transport-Security: {{ $hsts | quote }}
+---
+# ── Security Headers Middleware (iframe-allowed) ─────────────────────────────
+# Variant for services that need to be embedded in iframes.
+# Uses SAMEORIGIN instead of DENY and a relaxed CSP with frame-ancestors 'self'.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-security-headers-iframe
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: security-headers
+spec:
+  headers:
+    stsSeconds: {{ .Values.global.securityHeaders.stsSeconds | int64 }}
+    stsIncludeSubdomains: {{ .Values.global.securityHeaders.stsIncludeSubdomains }}
+    stsPreload: {{ .Values.global.securityHeaders.stsPreload }}
+    contentTypeNosniff: true
+    customFrameOptionsValue: "SAMEORIGIN"
+    browserXssFilter: true
+    referrerPolicy: {{ .Values.global.securityHeaders.referrerPolicy | quote }}
+    permissionsPolicy: {{ .Values.global.securityHeaders.permissionsPolicy | quote }}
+    contentSecurityPolicy: {{ $iframeCSP | quote }}
+    customResponseHeaders:
+      Strict-Transport-Security: {{ $hsts | quote }}
+---
+# ── Security Headers Middleware (strict htmx) ────────────────────────────────
+# Variant for routes that render free-form htmx widgets (ka-0000002043, plan
+# ka-0000002149). Drops `'unsafe-inline'` from `script-src` and adds
+# `report-uri /htmx/widget/csp-report`. Widgets cannot author `<script>` /
+# `<style>` / inline event handlers (sanitizer strips), so the strict
+# directive is finally tightenable on widget routes without breaking the
+# rest of beads-viewer. Apply this middleware on bead-show / rich-report
+# IngressRoute paths once free-htmx renders inline; until then, the default
+# `security-headers` middleware remains the active one.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-security-headers-strict-htmx
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: security-headers
+spec:
+  headers:
+    stsSeconds: {{ .Values.global.securityHeaders.stsSeconds | int64 }}
+    stsIncludeSubdomains: {{ .Values.global.securityHeaders.stsIncludeSubdomains }}
+    stsPreload: {{ .Values.global.securityHeaders.stsPreload }}
+    contentTypeNosniff: true
+    frameDeny: true
+    browserXssFilter: true
+    referrerPolicy: {{ .Values.global.securityHeaders.referrerPolicy | quote }}
+    permissionsPolicy: {{ .Values.global.securityHeaders.permissionsPolicy | quote }}
+    contentSecurityPolicy: {{ $strictHtmxCSP | quote }}
+    customResponseHeaders:
+      Strict-Transport-Security: {{ $hsts | quote }}
+---
+# ── Security Headers Middleware (htmx-eval) ──────────────────────────────────
+# Variant for beads-viewer's server-rendered htmx pages (ka-0000006016). Same
+# as the default `security-headers` middleware but its CSP adds `'unsafe-eval'`
+# to `script-src`, because htmx compiles `hx-on` / `hx-trigger [filter]` /
+# `hx-vals='js:{…}'` attributes via `new Function()`, which the browser blocks
+# under the default no-eval CSP (EvalError on /plans). Attached ONLY to the
+# `/beads` route in unified-host/ingressroute.yaml — the kd API, coopmux, nats,
+# and jira-bridge stay on the strict default. Framing posture is kept strict
+# (frameDeny + frame-ancestors 'none'), unlike the -iframe variant.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-security-headers-htmx-eval
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: security-headers
+spec:
+  headers:
+    stsSeconds: {{ .Values.global.securityHeaders.stsSeconds | int64 }}
+    stsIncludeSubdomains: {{ .Values.global.securityHeaders.stsIncludeSubdomains }}
+    stsPreload: {{ .Values.global.securityHeaders.stsPreload }}
+    contentTypeNosniff: true
+    frameDeny: true
+    browserXssFilter: true
+    referrerPolicy: {{ .Values.global.securityHeaders.referrerPolicy | quote }}
+    permissionsPolicy: {{ .Values.global.securityHeaders.permissionsPolicy | quote }}
+    contentSecurityPolicy: {{ $htmxEvalCSP | quote }}
+    customResponseHeaders:
+      Strict-Transport-Security: {{ $hsts | quote }}
+{{- end }}

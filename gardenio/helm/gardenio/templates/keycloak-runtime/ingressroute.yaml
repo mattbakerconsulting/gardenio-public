@@ -1,0 +1,92 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.keycloak.enabled .Values.keycloak.runtime.enabled .Values.keycloak.runtime.ingress.enabled }}
+{{- $runtime := .Values.keycloak.runtime -}}
+{{- $name := include "gardenio.keycloakRuntime.fullname" . -}}
+{{- $rateLimit := $runtime.ingress.rateLimit | default dict -}}
+{{- if $rateLimit.enabled }}
+# ── Keycloak auth-host rate-limit Middleware (research ka-0000004895 §5) ──────
+# Per-source-IP rate limit fronting the public Keycloak login endpoint. The EDP
+# KeycloakRealm CRD exposes no brute-force/failureFactor field (verified live
+# against the v1.32.0 operator schema, spike ka-0000006878), so realm-level
+# brute-force protection is not a CR field; the first-admin hook sets it with
+# kcadm when keycloak.runtime.realmHardening.bruteForce.enabled (gd-DAy1iWvO4y).
+# This edge
+# rateLimit is the front-line guard against credential-stuffing: it throttles a
+# single source IP before requests ever reach Keycloak.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $name }}-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.keycloakRuntime.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ $rateLimit.average | default 50 | int }}
+    burst: {{ $rateLimit.burst | default 100 | int }}
+    period: {{ $rateLimit.period | default "1m" | quote }}
+    sourceCriterion:
+      ipStrategy:
+        depth: {{ $rateLimit.ipStrategyDepth | default 1 | int }}
+---
+{{- end }}
+# ── Keycloak runtime IngressRoute ────────────────────────────────────────────
+# Public-facing Traefik route for the in-cluster Keycloak server.
+# TLS uses the cluster wildcard secret managed elsewhere; the cert for the
+# auth host is provisioned by a separate cert-manager / Route53 task.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.keycloakRuntime.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $runtime.host }}`)
+      kind: Rule
+      services:
+        - name: {{ $name }}
+          port: {{ $runtime.service.httpPort | default 8080 }}
+      {{- /* Order matters: edge caps (buffering 413, inFlightReq 429) and
+             rate-limit first (cheapest rejects at the edge), then security
+             headers on the response path (ka-0000006519). */ -}}
+      {{- $mws := list -}}
+      {{- if and .Values.edge .Values.edge.buffering .Values.edge.buffering.enabled -}}
+      {{-   $mws = append $mws (printf "%s-edge-buffering" (include "gardenio.fullname" .)) -}}
+      {{- end -}}
+      {{- if and .Values.edge .Values.edge.inFlightReq .Values.edge.inFlightReq.enabled -}}
+      {{-   $mws = append $mws (printf "%s-edge-inflightreq" (include "gardenio.fullname" .)) -}}
+      {{- end -}}
+      {{- if $rateLimit.enabled -}}
+      {{-   $mws = append $mws (printf "%s-ratelimit" $name) -}}
+      {{- end -}}
+      {{- /* Keycloak's admin & account consoles load a same-origin
+             login-status-iframe (silent SSO check) + 3p-cookie probe iframes.
+             The strict `-security-headers` middleware (frame-ancestors 'none',
+             X-Frame-Options: DENY) blocks even those same-origin frames, so the
+             keycloak-js adapter never resolves and the console spins forever
+             ("somethingWentWrong"). Use the `-security-headers-iframe` variant
+             (frame-ancestors 'self', SAMEORIGIN, + 'unsafe-eval'/worker blob:
+             the console needs) on the auth host. */ -}}
+      {{- if .Values.global.securityHeaders.enabled -}}
+      {{-   $mws = append $mws (printf "%s-security-headers-iframe" (include "gardenio.fullname" .)) -}}
+      {{- end -}}
+      {{- if $mws }}
+      middlewares:
+        {{- range $mws }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,340 @@
+{{template "layout" .}}
+{{define "title"}}Charts · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+<h1>Observability Hub
+  <span class="bead-row-spacer"></span>
+  {{if .GrafanaBaseURL}}
+  <a class="charts-grafana-link" href="{{.GrafanaBaseURL}}" target="_blank" rel="noopener"
+     title="Open Grafana — reuses your current session, no second login">Open in Grafana ↗</a>
+  {{end}}
+  {{/* The garden's Costs panel draws the costs dashboards (gd-0WYDQUDLFf).
+       This hub stays; the link is a cross-reference, not a retirement. */}}
+  {{if .GardenCostsHref}}
+  <a class="charts-grafana-link" href="{{.GardenCostsHref}}"
+     title="The costs dashboards, drawn in the garden's Costs panel">Costs in the garden</a>
+  {{end}}
+  <a class="meta" href="{{.BasePath}}/charts">refresh ↻</a>
+</h1>
+
+<p class="meta">
+  Every Grafana dashboard the fleet has filed as a <code>type=dashboard</code> bead,
+  grouped by project. Each card embeds a live hero panel that reuses your current
+  viewer session via the unified host's <code>/grafana</code> — no second login —
+  links out to the full board, and lists every panel the board contains. New
+  dashboards appear here automatically once they carry a dashboard uid + model.
+  {{with .Hub}}
+  <br><span class="charts-hub-summary">{{.TotalDashboards}} dashboards · {{.TotalPanels}} panels · {{.SectionCount}} section{{if ne .SectionCount 1}}s{{end}}</span>
+  {{end}}
+</p>
+
+{{with .Hub}}
+{{if .Sections}}
+{{/* Sticky controls bar (design §3 landing fold): free-text search over
+     title+uid + project filter chips. Filtering is entirely client-side over
+     the already-rendered cards — no new endpoint, no re-enumeration. The chips
+     are derived from the sections actually present (data-driven, G3), so a new
+     project's chip appears with no code change. */}}
+<div class="charts-hub-controls" role="search">
+  <input type="search" id="charts-hub-search" class="charts-hub-search"
+         placeholder="Filter dashboards by title or uid…" autocomplete="off"
+         aria-label="Filter dashboards by title or uid">
+  <div class="charts-hub-chips" role="group" aria-label="Filter by project">
+    <button type="button" class="charts-hub-chip is-active" data-project="" aria-pressed="true">All</button>
+    {{range .Sections}}
+    <button type="button" class="charts-hub-chip" data-project="{{if .Project}}{{.Project}}{{else}}(no project){{end}}" aria-pressed="false">{{if .Project}}{{.Project}}{{else}}(no project){{end}}</button>
+    {{end}}
+  </div>
+  <span class="charts-hub-count meta" id="charts-hub-count" aria-live="polite"></span>
+</div>
+
+{{range .Sections}}
+{{$sectionProject := .Project}}
+<section class="charts-hub-section" data-project="{{if .Project}}{{.Project}}{{else}}(no project){{end}}"
+         aria-label="Dashboards for {{if .Project}}{{.Project}}{{else}}unlabeled{{end}}">
+  <h2 class="charts-hub-section-title">{{if .Project}}{{.Project}}{{else}}(no project){{end}}
+    <span class="charts-hub-section-count meta">{{len .Dashboards}}</span>
+  </h2>
+  <div class="charts-grid">
+    {{range .Dashboards}}
+    <div class="charts-panel charts-hub-card"
+         data-title="{{.Title}}" data-uid="{{.UID}}"
+         data-project="{{if $sectionProject}}{{$sectionProject}}{{else}}(no project){{end}}">
+      <div class="charts-panel-head">
+        <h3 class="charts-panel-title">{{.Title}}</h3>
+        <p class="meta charts-panel-desc">
+          <code>{{.UID}}</code>
+          · {{.PanelCount}} panel{{if ne .PanelCount 1}}s{{end}}
+          {{if .ModelErr}}<span class="charts-hub-modelerr">· {{.ModelErr}}</span>{{end}}
+        </p>
+      </div>
+      {{.HeroEmbed}}
+      {{/* JSON-model panel-list fallback (design §3 "everywhere, incl. when
+           GRAFANA_BASE_URL=''"). Always present so a reader sees the board's
+           shape; auto-expanded when there is no live hero embed (no Grafana),
+           collapsed when the hero already shows live data. Mirrors the bead
+           view's type_dashboard panel list. */}}
+      <details class="charts-hub-panels"{{if not $.GrafanaBaseURL}} open{{end}}>
+        <summary>Panels{{if .Panels}} ({{.PanelCount}}){{end}}</summary>
+        {{if .Panels}}
+          <ul class="charts-hub-panel-list">
+            {{range .Panels}}
+            <li class="charts-hub-panel-row charts-hub-panel-row--{{.Type}}">
+              {{if eq .Type "row"}}
+                <span class="charts-hub-panel-rowlabel">▸ {{if .Title}}{{.Title}}{{else}}(row){{end}}</span>
+              {{else}}
+                <span class="charts-hub-panel-name">{{if .Title}}{{.Title}}{{else}}<span class="empty">(untitled)</span>{{end}}</span>
+                <span class="charts-hub-panel-type">{{.Type}}</span>
+              {{end}}
+            </li>
+            {{end}}
+          </ul>
+        {{else}}
+          <p class="empty charts-hub-panels-empty">Panel list unavailable{{if .ModelErr}} ({{.ModelErr}}){{end}}.</p>
+        {{end}}
+      </details>
+      <div class="charts-hub-card-foot meta">
+        {{if .OpenURL}}<a href="{{.OpenURL}}" target="_blank" rel="noopener">Open in Grafana ↗</a> · {{end}}
+        <a href="{{$.BasePath}}/{{.BeadID}}">View bead</a>
+      </div>
+    </div>
+    {{end}}
+  </div>
+</section>
+{{end}}
+
+{{/* Shown by the client filter when a query/chip matches nothing. */}}
+<p class="meta charts-hub-noresults" id="charts-hub-noresults" hidden>No dashboards match the current filter.</p>
+{{else}}
+<p class="meta charts-hub-empty">No dashboards filed yet. Use <code>gb grafana put</code> to file a dashboard as a <code>type=dashboard</code> bead.</p>
+{{end}}
+{{end}}
+
+<style>
+  /* "Open in Grafana ↗" — a quiet pill in the page header. Reuses the AVA
+     session (same host /grafana), so it opens authenticated in a new tab. */
+  .charts-grafana-link {
+    font-size: 0.8em;
+    font-weight: 600;
+    padding: 0.2rem 0.7rem;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    border-radius: 4px;
+    background: rgba(128, 128, 128, 0.06);
+    color: inherit;
+    text-decoration: none;
+    margin-right: 0.6rem;
+    white-space: nowrap;
+  }
+  .charts-grafana-link:hover,
+  .charts-grafana-link:focus {
+    border-color: rgb(25, 118, 210);
+    text-decoration: none;
+  }
+  html[data-skin="dark-terminal"] .charts-grafana-link:hover,
+  html[data-skin="dark-terminal"] .charts-grafana-link:focus {
+    border-color: rgb(56, 178, 255);
+  }
+  .charts-hub-summary { font-size: 0.85em; }
+
+  /* Sticky controls bar — search + project chips, pinned to the top of the
+     scroll so the filter is always reachable while scanning long lists. */
+  .charts-hub-controls {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 0.75rem;
+    margin: 1rem 0 0.4rem;
+    padding: 0.55rem 0.65rem;
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    border-radius: 6px;
+    background: var(--bg, #fff);
+    /* opaque-ish backdrop so cards scrolling under the sticky bar don't bleed */
+    background: color-mix(in srgb, var(--bg, #ffffff) 92%, transparent);
+    backdrop-filter: blur(2px);
+  }
+  html[data-skin="dark-terminal"] .charts-hub-controls {
+    background: color-mix(in srgb, var(--bg, #0e1117) 92%, transparent);
+  }
+  .charts-hub-search {
+    flex: 1 1 16rem;
+    min-width: 11rem;
+    padding: 0.32rem 0.55rem;
+    font: inherit;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    border-radius: 4px;
+    background: rgba(128, 128, 128, 0.06);
+    color: inherit;
+  }
+  .charts-hub-search:focus {
+    outline: none;
+    border-color: rgb(25, 118, 210);
+  }
+  html[data-skin="dark-terminal"] .charts-hub-search:focus { border-color: rgb(56, 178, 255); }
+  .charts-hub-chips { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+  .charts-hub-chip {
+    font: inherit;
+    font-size: 0.8em;
+    padding: 0.18rem 0.6rem;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    border-radius: 999px;
+    background: rgba(128, 128, 128, 0.06);
+    color: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .charts-hub-chip:hover { border-color: rgb(25, 118, 210); }
+  .charts-hub-chip.is-active {
+    border-color: rgb(25, 118, 210);
+    background: rgba(25, 118, 210, 0.14);
+    font-weight: 600;
+  }
+  html[data-skin="dark-terminal"] .charts-hub-chip:hover,
+  html[data-skin="dark-terminal"] .charts-hub-chip.is-active {
+    border-color: rgb(56, 178, 255);
+  }
+  html[data-skin="dark-terminal"] .charts-hub-chip.is-active { background: rgba(56, 178, 255, 0.16); }
+  .charts-hub-count { font-size: 0.8em; margin-left: auto; white-space: nowrap; }
+
+  .charts-hub-section { margin-top: 1.4rem; }
+  .charts-hub-section-title {
+    font-size: 1.05rem;
+    margin: 0 0 0.4rem;
+    padding-bottom: 0.2rem;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+  }
+  .charts-hub-section-count {
+    font-size: 0.72em;
+    margin-left: 0.4rem;
+    padding: 0.02rem 0.4rem;
+    border-radius: 999px;
+    background: rgba(128, 128, 128, 0.15);
+  }
+  .charts-grid {
+    display: grid;
+    /* minmax(0, 1fr), not 1fr: a bare 1fr track floors at min-content, and a
+       card's min-content is its longest white-space:nowrap panel name (the
+       monorepo boards carry ~400px titles). On a narrow viewport that floor
+       refuses to shrink, so the card overflows the screen and the panel-name
+       ellipsis never engages (bug ka-0000004897 — 633px>390px on mobile the
+       instant a panel list expands). minmax(0,…) lets the track shrink below
+       min-content so the names ellipsis-truncate and the grid stays in-frame. */
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1rem;
+    margin-top: 0.6rem;
+  }
+  @media (min-width: 60rem) {
+    .charts-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  }
+  .charts-panel {
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    border-radius: 6px;
+    padding: 0.6rem 0.8rem 0.8rem;
+    background: rgba(128, 128, 128, 0.04);
+  }
+  .charts-panel-head { margin-bottom: 0.4rem; }
+  .charts-panel-title { font-size: 1rem; margin: 0; }
+  .charts-panel-desc { margin: 0.15rem 0 0; }
+  .charts-hub-modelerr { color: var(--text-muted, #8a6d3b); }
+  .charts-hub-card-foot { margin-top: 0.4rem; }
+
+  /* Per-card panel-list fallback. */
+  .charts-hub-panels { margin-top: 0.5rem; font-size: 0.85em; }
+  .charts-hub-panels > summary {
+    cursor: pointer;
+    color: var(--text-muted, #595959);
+    user-select: none;
+  }
+  .charts-hub-panel-list {
+    list-style: none;
+    margin: 0.35rem 0 0;
+    padding: 0;
+    max-height: 13rem;
+    overflow-y: auto;
+  }
+  .charts-hub-panel-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.12rem 0.1rem;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.12);
+  }
+  .charts-hub-panel-row:last-child { border-bottom: none; }
+  .charts-hub-panel-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .charts-hub-panel-type {
+    flex: 0 0 auto;
+    font-size: 0.85em;
+    color: var(--text-muted, #595959);
+    font-family: var(--mono, ui-monospace, monospace);
+  }
+  .charts-hub-panel-row--row .charts-hub-panel-rowlabel {
+    font-weight: 600;
+    color: var(--text-muted, #595959);
+  }
+  .charts-hub-panels-empty { margin: 0.35rem 0 0; }
+
+  /* The embedded Grafana iframe sits flush in the panel card — drop the
+     grafana-embed helper's own outer margin so it doesn't double the card
+     padding. */
+  .charts-panel .grafana-embed { margin: 0; }
+</style>
+
+<script>
+(function () {
+  // Client-side filter over the already-rendered hub cards (design §3): a
+  // free-text search (title + uid substring, case-insensitive) AND a project
+  // chip. No endpoint, no re-render — we only toggle hidden on cards/sections.
+  var search = document.getElementById("charts-hub-search");
+  if (!search) return; // empty hub: no controls rendered
+  var chips = Array.prototype.slice.call(document.querySelectorAll(".charts-hub-chip"));
+  var cards = Array.prototype.slice.call(document.querySelectorAll(".charts-hub-card"));
+  var sections = Array.prototype.slice.call(document.querySelectorAll(".charts-hub-section"));
+  var noResults = document.getElementById("charts-hub-noresults");
+  var countEl = document.getElementById("charts-hub-count");
+  var total = cards.length;
+  var activeProject = ""; // "" = All
+
+  function apply() {
+    var q = (search.value || "").trim().toLowerCase();
+    var shown = 0;
+    cards.forEach(function (card) {
+      var title = (card.getAttribute("data-title") || "").toLowerCase();
+      var uid = (card.getAttribute("data-uid") || "").toLowerCase();
+      var project = card.getAttribute("data-project") || "";
+      var matchesText = !q || title.indexOf(q) !== -1 || uid.indexOf(q) !== -1;
+      var matchesProject = !activeProject || project === activeProject;
+      var visible = matchesText && matchesProject;
+      card.hidden = !visible;
+      if (visible) shown++;
+    });
+    // Hide a section whose visible cards are all filtered out.
+    sections.forEach(function (sec) {
+      var visibleCards = sec.querySelectorAll(".charts-hub-card:not([hidden])").length;
+      sec.hidden = visibleCards === 0;
+    });
+    if (noResults) noResults.hidden = shown !== 0;
+    if (countEl) {
+      countEl.textContent = (q || activeProject)
+        ? "Showing " + shown + " of " + total
+        : "";
+    }
+  }
+
+  search.addEventListener("input", apply);
+  chips.forEach(function (chip) {
+    chip.addEventListener("click", function () {
+      activeProject = chip.getAttribute("data-project") || "";
+      chips.forEach(function (c) {
+        var on = c === chip;
+        c.classList.toggle("is-active", on);
+        c.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      apply();
+    });
+  });
+  apply();
+})();
+</script>
+{{end}}

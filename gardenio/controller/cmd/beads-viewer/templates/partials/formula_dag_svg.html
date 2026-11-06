@@ -1,0 +1,101 @@
+{{define "formula_dag_svg"}}
+{{/* The layered formula-step DAG, shared by the recipe view (type_formula.html)
+     and the molecule execution view (type_molecule.html) so the instance
+     renders the SAME structure graph as its formula (plan ka-0000007376:
+     S2 ka-0000005735 drew the recipe, S3 ka-0000007739 overlays execution).
+     Server-laid-out SVG (formula_dag.go); this file only paints it. Called
+     with a dict: DAG (required, non-nil) + BasePath. */}}
+<style>
+  /* Shrink-to-fit the box to the graph's rendered width so a narrow/linear DAG
+     (e.g. a 6-step chain laid out vertically at ~204px wide) doesn't sit in a
+     full-pane-width bordered box with a large right-side void (ka-0000002500).
+     width:max-content hugs the SVG; max-width:100% still lets a wide/branching
+     DAG fill the pane and scroll inside its own overflow-x container (so 375px
+     page-level overflow stays 0). */
+  /* box-sizing:border-box so the 0.5rem padding + 1px border are absorbed
+     INSIDE max-width:100% rather than added on top of it. Without this, a graph
+     wide enough to hit the max-width clamp (e.g. a wrapped multi-column linear
+     chain, ka-0000001826) overflows its column by the padding+border at narrow
+     widths — the thin single-column ribbon never reached the clamp, so this was
+     latent until the chain wrapped wide. */
+  .formula-dag-scroll { box-sizing: border-box; overflow-x: auto; width: max-content; max-width: 100%; border: 1px solid var(--border, #ddd); border-radius: 8px; padding: 0.5rem; background: var(--bg-raised, rgba(127,127,127,0.04)); }
+  .formula-dag-svg { display: block; }
+  .formula-dag-svg .fdag-edge { fill: none; stroke: var(--text-subtle, #888); stroke-width: 1.6; stroke-opacity: 0.55; }
+  .formula-dag-svg .fdag-node rect { fill: var(--bg, #fff); stroke: var(--border, #bbb); stroke-width: 1.4; }
+  .formula-dag-svg .fdag-node text { fill: currentColor; }
+  .formula-dag-svg .fdag-node .fdag-id { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 10px; opacity: 0.65; }
+  .formula-dag-svg .fdag-node .fdag-title { font-size: 12px; }
+  .formula-dag-svg .fdag-node .fdag-glyph { font-size: 15px; }
+  .formula-dag-svg a.fdag-node { cursor: pointer; text-decoration: none; }
+  .formula-dag-svg a.fdag-node:hover rect { stroke-width: 2.2; }
+  /* Status tints — one palette across recipe (step_status_* fields) and
+     molecule execution (live bead statuses) so both surfaces read alike. */
+  .formula-dag-svg .fdag-node.step-completed rect,
+  .formula-dag-svg .fdag-node.step-done rect { stroke: #43a047; fill: rgba(67,160,71,0.10); }
+  .formula-dag-svg .fdag-node.step-in_progress rect,
+  .formula-dag-svg .fdag-node.step-running rect { stroke: #f9a825; fill: rgba(249,168,37,0.12); }
+  .formula-dag-svg .fdag-node.step-failed rect,
+  .formula-dag-svg .fdag-node.step-partial rect { stroke: #e53935; fill: rgba(229,57,53,0.10); }
+  .formula-dag-svg .fdag-node.step-ready rect { stroke: #1e88e5; fill: rgba(30,136,229,0.08); }
+  .formula-dag-svg .fdag-node.step-blocked rect,
+  .formula-dag-svg .fdag-node.step-deferred rect { stroke: #8e24aa; fill: rgba(142,36,170,0.08); }
+  .formula-dag-svg .fdag-node.fdag-current rect { stroke: #1976d2; stroke-width: 2.4; }
+  .formula-dag-svg .fdag-node.fdag-external rect { stroke-dasharray: 5 4; fill: rgba(127,127,127,0.06); }
+  .formula-dag-svg .fdag-node.fdag-external text { opacity: 0.7; }
+  .formula-dag-legend { display: flex; flex-wrap: wrap; gap: 0.35rem 1rem; margin-top: 0.4rem; font-size: 0.78em; color: var(--text-subtle, #666); }
+  .formula-dag-legend .fdag-legend-glyph { font-size: 1.1em; margin-right: 0.25rem; }
+  .formula-dag-note { font-size: 0.8em; color: var(--text-subtle, #666); margin-top: 0.3rem; }
+</style>
+{{with .DAG}}
+{{if .Cyclic}}
+<div class="banner banner-warn">This formula's <code>depends_on</code> graph contains a cycle &mdash; layout is best-effort.</div>
+{{end}}
+<div class="formula-dag-scroll">
+  <svg class="formula-dag-svg"
+       viewBox="0 0 {{.Width}} {{.Height}}"
+       width="{{.Width}}" height="{{.Height}}"
+       role="img"
+       aria-label="Formula step graph: {{len .Nodes}} steps in {{.Layers}} stage{{if ne .Layers 1}}s{{end}}, dependencies flow {{if .Vertical}}top to bottom{{else}}left to right{{end}}"
+       xmlns="http://www.w3.org/2000/svg">
+    <g class="fdag-edges">
+      {{range .Edges}}
+      <path class="fdag-edge" d="{{.Path}}" data-from="{{.From}}" data-to="{{.To}}"/>
+      {{end}}
+    </g>
+    <g class="fdag-nodes">
+      {{range .Nodes}}
+        {{if .Step.BeadID}}
+        <a class="fdag-node step-{{.Step.Status}}{{if .IsCurrent}} fdag-current{{end}}{{if .External}} fdag-external{{end}}"
+           href="{{$.BasePath}}/{{.Step.BeadID}}" aria-label="{{.TitleAttr}}">
+          <title>{{.TitleAttr}}</title>
+          <rect x="{{printf "%.1f" .X}}" y="{{printf "%.1f" .Y}}" width="176" height="46" rx="8"/>
+          <text class="fdag-glyph" x="{{printf "%.1f" .GlyphX}}" y="{{printf "%.1f" .GlyphY}}" text-anchor="middle">{{.Glyph}}</text>
+          <text class="fdag-id" x="{{printf "%.1f" .IDTextX}}" y="{{printf "%.1f" .IDTextY}}">{{.IDLabel}}</text>
+          <text class="fdag-title" x="{{printf "%.1f" .TitleTextX}}" y="{{printf "%.1f" .TitleTextY}}">{{.Label}}</text>
+        </a>
+        {{else}}
+        <g class="fdag-node step-{{.Step.Status}}{{if .IsCurrent}} fdag-current{{end}}{{if .External}} fdag-external{{end}}">
+          <title>{{.TitleAttr}}</title>
+          <rect x="{{printf "%.1f" .X}}" y="{{printf "%.1f" .Y}}" width="176" height="46" rx="8"/>
+          <text class="fdag-glyph" x="{{printf "%.1f" .GlyphX}}" y="{{printf "%.1f" .GlyphY}}" text-anchor="middle">{{.Glyph}}</text>
+          <text class="fdag-id" x="{{printf "%.1f" .IDTextX}}" y="{{printf "%.1f" .IDTextY}}">{{.IDLabel}}</text>
+          <text class="fdag-title" x="{{printf "%.1f" .TitleTextX}}" y="{{printf "%.1f" .TitleTextY}}">{{.Label}}</text>
+        </g>
+        {{end}}
+      {{end}}
+    </g>
+  </svg>
+</div>
+{{if .Legend}}
+<div class="formula-dag-legend" aria-label="Step shape legend">
+  {{range .Legend}}<span><span class="fdag-legend-glyph">{{.Glyph}}</span>{{.Label}}</span>{{end}}
+</div>
+{{end}}
+{{if not .HasEdges}}
+<p class="formula-dag-note">No <code>depends_on</code> between steps &mdash; all steps can run in parallel.</p>
+{{end}}
+{{if .ExternalCount}}
+<p class="formula-dag-note">{{.ExternalCount}} dashed step{{if ne .ExternalCount 1}}s are{{else}} is{{end}} inherited via <code>extends</code> and defined in the parent formula.</p>
+{{end}}
+{{end}}
+{{end}}

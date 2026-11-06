@@ -1,0 +1,133 @@
+{{- if .Values.agents.metrics.prometheusRule.tagCostValidation.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.tagCostValidation }}
+# PrometheusRule that cross-validates the two REAL-BILL accounting methods
+# (ka-0000000478, requested by Matt as "a good test of alerting"):
+#
+#   A) gardenio_account_cost_usd  — real bill sliced by {account}, polled from
+#      LiteLLM /key/info every ~5m (spend_sync.go).
+#   B) gardenio_tag_cost_usd      — real bill sliced by {dim,value} for
+#      dim ∈ {role,project,model}, polled from LiteLLM /spend/tags every ~5m
+#      (tag_spend_sync.go).
+#
+# Both are the SAME underlying LiteLLM bill, just sliced differently, so at the
+# FLEET TOTAL each tag dimension must reconcile with the account total:
+#   sum(role:*) == sum(project:*) == sum(model:*) == sum(account:*).
+# This alert fires when any tag dimension's fleet 1h spend diverges from the
+# account-gauge fleet 1h spend by more than `driftThreshold`, gated on the fleet
+# spending more than `minSpendUSD` in the window. A sustained divergence means
+# the tag-attribution pipeline has drifted from the per-account truth — e.g. the
+# producer stopped tagging a dimension, a proxy dropped out of the tag poller, or
+# /spend/tags indexing diverged from /key/info.
+#
+# A vanished dimension can't show up in the per-dim DRIFT vector (it has no
+# series to be "below" the account total), so a companion TagCostDimensionAbsent
+# rule uses absent() to catch "the producer stopped tagging role/project/model
+# entirely" or "the tag poller is wedged". During the expected post-deploy
+# backfill window the tag gauge is legitimately empty, so keep BOTH alerts
+# disabled until the gauge has warmed (per-env overlays opt in).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-tag-cost-validation
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.tag_cost_validation
+      interval: 1m
+      rules:
+        - alert: TagCostDriftFromAccountGauge
+          # Per tag dimension: |tag_dim_1h - account_1h| / account_1h > threshold,
+          # gated on the fleet having meaningful 1h account spend. The account fleet
+          # total is broadcast as a scalar() in the ARITHMETIC (subtract/divide) so
+          # it matches the per-dim tag vector without group_left juggling. The
+          # minSpend GATE, however, is a label-less VECTOR (`and on() (sum(...) >
+          # N)`) — `and` is a vector-matching operator, so a bare `scalar > N` on its
+          # RHS does NOT gate (verified live on vmsingle: it suppresses everything).
+          # Both sides use the same dedup + aligned-subquery shape as the headline so
+          # they are numerically comparable (ka-0000004779 / ka-0000000170).
+          expr: |
+            (
+              abs(
+                sum by (dim) (increase((max by (dim, value, env) (gardenio_tag_cost_usd))[1h:5m]))
+                -
+                scalar(sum(increase((max by (account, env) (gardenio_account_cost_usd))[1h:5m])))
+              )
+              /
+              scalar(clamp_min(sum(increase((max by (account, env) (gardenio_account_cost_usd))[1h:5m])), {{ $cfg.minSpendUSD }}))
+            ) > {{ $cfg.driftThreshold }}
+            and on()
+            (sum(increase((max by (account, env) (gardenio_account_cost_usd))[1h:5m])) > {{ $cfg.minSpendUSD }})
+          for: {{ $cfg.for | default "30m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gardenio
+            subsystem: spend
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Real-bill tag dimension {{`{{ $labels.dim }}`}} drifts >{{ $cfg.driftThreshold }} from the account-gauge fleet total"
+            description: |
+              The fleet 1h spend attributed by the real-bill tag gauge for
+              dimension {{`{{ $labels.dim }}`}}
+              (sum(increase(gardenio_tag_cost_usd[1h]))) diverges by more than
+              {{ $cfg.driftThreshold }} from the account-cost gauge fleet total
+              (sum(increase(gardenio_account_cost_usd[1h]))).
+
+              Both are the SAME LiteLLM bill sliced differently, so they should
+              match. A tag dimension well BELOW the account total means the
+              tag-attribution pipeline broke for some requests: the producer stopped
+              emitting the {{`{{ $labels.dim }}`}}: tag (podspec.go x-litellm-tags),
+              or the tag_spend_sync poller lost a LiteLLM proxy. A tag total ABOVE
+              the account total suggests a proxy double-counted or an account-gauge
+              read went stale.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/research/timeseries-metrics-catalog.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        - alert: TagCostDimensionAbsent
+          # A whole attribution dimension stopped reporting while the fleet is
+          # actively spending — the drift alert above can't see a dimension that has
+          # NO series, so this absence check catches "the producer stopped tagging
+          # role/project/model entirely" or "the tag poller is wedged". One rule per
+          # dim so the firing alert names which dimension vanished.
+          # Same gate caveat as the drift rule: the minSpend gate is a label-less
+          # VECTOR via `and on() (sum(...) > N)`, not a bare scalar comparison.
+          expr: |
+            (
+              absent(gardenio_tag_cost_usd{dim="role"})
+              or absent(gardenio_tag_cost_usd{dim="project"})
+              or absent(gardenio_tag_cost_usd{dim="model"})
+            )
+            and on()
+            (sum(increase((max by (account, env) (gardenio_account_cost_usd))[1h:5m])) > {{ $cfg.minSpendUSD }})
+          for: {{ $cfg.absentFor | default "1h" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gardenio
+            subsystem: spend
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "A real-bill tag dimension (role/project/model) has no series while the fleet is spending"
+            description: |
+              gardenio_tag_cost_usd is missing one of the {role,project,model}
+              dimensions entirely while the account-cost gauge shows the fleet is
+              actively spending. Either the producer stopped emitting that
+              x-litellm-tags dimension (podspec.go) or the tag_spend_sync poller is
+              wedged / lost every LiteLLM proxy. The cost-rollup by-{dim} view will
+              be silently falling back to the settled at-close counter
+              (costs_rollup.go backfill fallback). Note: this is EXPECTED during the
+              post-deploy backfill window — keep this alert disabled until the gauge
+              has warmed.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/research/timeseries-metrics-catalog.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

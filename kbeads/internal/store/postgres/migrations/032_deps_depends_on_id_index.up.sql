@@ -1,0 +1,22 @@
+-- idx_deps_depends_on_id_type: covers the "what depends on bead X via type T"
+-- lookup pattern. The deps PK is (bead_id, depends_on_id, type), which only
+-- supports prefix lookups starting with bead_id and is useless when filtering
+-- by depends_on_id alone.
+--
+-- Hot path that exposed the gap: queryListBeads' has_report and
+-- blocked_on_decision_bead_id projections (queries.go:51 / :104) both run
+-- correlated EXISTS subqueries keyed on `deps.depends_on_id = beads.id`. Per
+-- output row, postgres sequentially scanned the full deps table. On the
+-- gardenio-e2e dataset (53k deps rows, 315k beads) pg_stat_user_tables showed
+-- 1.04M sequential scans of deps reading 52.5B tuples; /v1/beads requests
+-- consistently hit the 30s context-deadline cap and slack-bridge couldn't
+-- pass its readiness probe.
+--
+-- type is included as the second column so the planner can satisfy both the
+-- depends_on_id equality and the dep-type equality from the index alone
+-- (parent-child is the dominant filter today, but the index is generic).
+--
+-- Idempotent so a partial-apply or a hand-applied hotfix on the live RDS
+-- (where this was created via CREATE INDEX CONCURRENTLY) is a no-op.
+CREATE INDEX IF NOT EXISTS idx_deps_depends_on_id_type
+    ON deps (depends_on_id, type);

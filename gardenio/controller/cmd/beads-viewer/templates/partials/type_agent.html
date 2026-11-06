@@ -1,0 +1,367 @@
+{{define "type_agent"}}
+{{$f := .Bead.Fields}}
+<section class="agent-card agent-font-{{or .TermFontSize "medium"}}"
+         data-bead-id="{{.Bead.ID}}"
+         data-session-id="{{index $f "last_session_id"}}"
+         data-coarse-pointer="{{if .CoarsePointer}}1{{else}}0{{end}}">
+  <h3>Agent</h3>
+
+  {{/* Featured wrap-up TLDR banner (bead ka-0000006621): the one-line "what
+       actually happened" surfaced at the very TOP of the card — above the
+       state pills, terminal, and detail — so an operator reads the outcome
+       first. Rendered only for terminal runs that carry a headline (empty
+       .Text suppresses the whole banner). Outcome-classed so light/dark skins
+       tint the border per ok/blocked/handoff/platform. */}}
+  {{with .WrapUpTLDR}}{{if .Text}}
+  <div class="agent-tldr agent-tldr-{{.Outcome}}" role="note" aria-label="Wrap-up summary">
+    <span class="agent-tldr-glyph" aria-hidden="true">{{.Glyph}}</span>
+    <span class="agent-tldr-text">{{.Text}}</span>
+  </div>
+  {{end}}{{end}}
+
+  {{/* Restart-condition line (parity task ka-0000008218): when/why the
+       controller will bring this identity back — respawn, wake-trigger
+       (restart_when), or gardener refire — mirroring the Slack card's
+       "↻ Restart:" line. Empty .Text suppresses it, so a truly terminal run
+       renders nothing. Gardener-run beads are type=agent, so this also covers
+       gardener cards. */}}
+  {{with .WrapUpRestart}}{{if .Text}}
+  <div class="agent-restart" role="note" aria-label="Restart condition">
+    <span class="agent-restart-glyph" aria-hidden="true">↻</span>
+    <span class="agent-restart-label">Restart:</span>
+    <span class="agent-restart-text">{{.Text}}</span>
+  </div>
+  {{end}}{{end}}
+
+  <header class="agent-header">
+    <div class="agent-header-row">
+      {{with index $f "agent_state"}}
+        <span class="agent-state-pill agent-state-{{.}}">{{.}}</span>
+      {{end}}
+      {{with index $f "pod_phase"}}
+        <span class="agent-pod-phase">{{.}}</span>
+      {{end}}
+      {{with index $f "agent"}}
+        <span class="agent-name"><code>{{.}}</code></span>
+      {{end}}
+      {{with index $f "role"}}
+        <span class="agent-role">{{.}}</span>
+      {{end}}
+      {{with index $f "project"}}
+        <span class="agent-project">{{.}}</span>
+      {{end}}
+      {{/* Context-window size + cost so far, surfaced prominently in the
+           agent card header. Empty (no usage reported yet) renders nothing.
+           ka-0000007210. */}}
+      {{with $.Usage}}{{template "agent_usage_chips" .}}{{end}}
+      {{/*
+        Phase 4 per-transport health dots. Initial state is "unknown" so
+        the dots render even before the JS modules attach; agent_terminal.js
+        and agent_events.js update them as the WS / SSE state changes.
+      */}}
+      <span class="agent-health" role="group" aria-label="Transport health">
+        <span id="term-health-pty" class="agent-health-dot" data-state="unknown"
+              title="PTY transport status">PTY</span>
+        <span id="term-health-events" class="agent-health-dot" data-state="unknown"
+              title="Events transport status">events</span>
+      </span>
+    </div>
+    <div class="agent-header-row agent-header-meta">
+      {{with index $f "task_id"}}
+        <span class="agent-task">task {{with $.TaskArms}}<span class="heraldry-slot">{{heraldry .Heraldry 24}}</span>{{end}}<a href="{{$.BasePath}}/{{.}}"><code>{{.}}</code></a></span>
+      {{end}}
+      {{with index $f "spawned_by"}}
+        <span class="agent-spawned-by">spawned by <code>{{.}}</code></span>
+      {{end}}
+      {{/* Spawn-provenance badge (gd-jbY5UiWlN4): "policy-approved" /
+           "human-approved" / a red "unreviewed" call-out for a privileged
+           role with neither field recorded. Empty .Label suppresses it. */}}
+      {{with $.SpawnBadge}}{{if .Label}}
+        <span class="agent-spawn-badge agent-spawn-badge-{{.Class}}">{{.Label}}</span>
+      {{end}}{{end}}
+      {{/* Harness badge (ADR 0004): the agent CLI this pod resolved to. The
+           controller stamps resolved_harness at spawn; beads that predate it
+           fall back to the per-spawn harness override, else show nothing. */}}
+      {{with $.Harness}}
+        <span class="agent-harness agent-harness-{{.}}" title="Agent CLI this pod runs">harness {{.}}</span>
+      {{end}}
+      {{with index $f "mode"}}
+        <span class="agent-mode">mode {{.}}</span>
+      {{end}}
+      {{with index $f "last_session_id"}}
+        <span class="agent-session">session <code>{{.}}</code></span>
+      {{end}}
+      {{with index $f "last_checked_agent"}}
+        <span class="agent-last-checked">last checked {{.}}</span>
+      {{end}}
+      {{with index $f "cwd"}}
+        {{/* hover-only cwd: full path on hover, truncated on the chip itself
+             so the header row stays compact. */}}
+        <span class="agent-cwd" title="{{.}}"><code>{{.}}</code></span>
+      {{end}}
+    </div>
+
+    {{/* Always-visible context-window gauge (ka-0000006399). Operator asked to
+         "front it in an obvious way", so the small chip is promoted to a
+         labeled progress bar spanning the header. Renders nothing until the run
+         reports context_tokens. Paired again next to the Compact button below
+         so the operator sees "how full" right where they act on it. */}}
+    {{with $.Usage}}{{template "agent_ctx_gauge" .}}{{end}}
+    {{/* ka-0000002654: promote the coopmux terminal link to a large, primary
+         CTA so operators can't miss the live-terminal handle. Gated on
+         CoopmuxTerminalURL (only set when the agent has a pod). The small
+         inline prime/Slack/gardener links stay in the .agent-actions row
+         below. */}}
+    {{with .CoopmuxTerminalURL}}
+    <a class="agent-watch-terminal" href="{{.}}" target="_blank" rel="noopener">
+      <span class="agent-watch-terminal-glyph" aria-hidden="true">▶</span>
+      <span class="agent-watch-terminal-label">Watch live terminal</span>
+    </a>
+    {{end}}
+    <p class="agent-actions">
+      <a href="{{$.BasePath}}/agents/{{.Bead.ID}}/prime">View rendered <code>gb prime</code></a>
+      <span class="meta">· live render, not a historical snapshot</span>
+      {{with .SlackThreadURL}}
+      <span class="agent-actions-sep" aria-hidden="true">·</span>
+      <a href="{{.}}" target="_blank" rel="noopener">Open Slack thread</a>
+      {{end}}
+      {{/* Gardener-spawned agents carry schedule_id = the gardener trigger bead's
+           ID (design doc §9). Link to that gardener's life-thread. One-off
+           agents have no schedule_id and render nothing extra. */}}
+      {{with index $f "schedule_id"}}
+      <span class="agent-actions-sep" aria-hidden="true">·</span>
+      <a class="agent-gardener-link" href="{{$.BasePath}}/gardener/{{.}}">View gardener life-thread</a>
+      {{end}}
+    </p>
+  </header>
+
+  <section id="agent-decisions" class="agent-decisions" aria-label="Pending decisions">
+    {{/* Phase 2 wires the open-decisions list here. Empty in phase 1. */}}
+  </section>
+
+  <section id="agent-terminal" class="agent-terminal" aria-label="Agent terminal" tabindex="0">
+    {{if .TerminalAvailable}}
+    <div class="agent-terminal-toolbar" role="toolbar" aria-label="Terminal toolbar">
+      <label class="agent-terminal-fontsize-label">
+        <span class="meta">font</span>
+        <select id="term-fontsize" class="agent-terminal-fontsize" aria-label="Terminal font size">
+          <option value="small">small</option>
+          <option value="medium">medium</option>
+          <option value="large">large</option>
+        </select>
+      </label>
+      <span id="term-catching-up" class="agent-terminal-catching-up" hidden
+            role="status" aria-live="polite">catching up…</span>
+    </div>
+    <pre id="term-fallback" class="agent-terminal-fallback">{{.ScreenAnsiText}}</pre>
+    <div id="term" class="agent-terminal-live" role="application" aria-label="Live agent terminal" hidden></div>
+    <div id="term-status" class="agent-terminal-status" aria-live="polite"></div>
+    {{/*
+      Phase 4 a11y: sibling polite live region that mirrors xterm scrollback so
+      screen readers announce new lines. The visually-hidden class keeps the
+      DOM accessible without occupying layout. agent_terminal.js writes the
+      last N lines into this region on every line feed.
+    */}}
+    <div id="term-aria-live" class="visually-hidden" aria-live="polite" aria-atomic="false"></div>
+    <div id="agent-control" class="agent-control" data-bead-id="{{.Bead.ID}}">
+      <button type="button"
+              class="agent-control-claim"
+              hx-post="{{.BasePath}}/agents/{{.Bead.ID}}/control/claim"
+              hx-target="#agent-control"
+              hx-swap="outerHTML">
+        Take control
+      </button>
+      <p class="agent-control-hint meta">operator-only · routes keystrokes to the live PTY</p>
+    </div>
+
+    {{/*
+      Phase 3 write surface. The keys toolbar, nudge form, and respond
+      modal are operator-only by route gate; presence in the DOM doesn't
+      grant access — RequireRole(RoleOperator) on the POSTs does.
+      The respond <details open> is gated on agent_state=ask_user via the
+      data-* attribute; agent_terminal.js toggles `open` from SSE events.
+    */}}
+    <div id="agent-keys" class="agent-keys" data-bead-id="{{.Bead.ID}}" aria-label="Send named keys">
+      <p class="agent-keys-label meta">Send key</p>
+      <div class="agent-keys-row">
+        {{$base := .BasePath}}{{$id := .Bead.ID}}
+        <button type="button" class="agent-keys-btn"
+                hx-post="{{$base}}/agents/{{$id}}/keys" hx-vals='{"keys": "Esc"}'
+                hx-target="#agent-keys-confirm" hx-swap="outerHTML">Esc</button>
+        <button type="button" class="agent-keys-btn"
+                hx-post="{{$base}}/agents/{{$id}}/keys" hx-vals='{"keys": "Tab"}'
+                hx-target="#agent-keys-confirm" hx-swap="outerHTML">Tab</button>
+        <button type="button" class="agent-keys-btn"
+                hx-post="{{$base}}/agents/{{$id}}/keys" hx-vals='{"keys": "Up"}'
+                hx-target="#agent-keys-confirm" hx-swap="outerHTML">↑</button>
+        <button type="button" class="agent-keys-btn"
+                hx-post="{{$base}}/agents/{{$id}}/keys" hx-vals='{"keys": "Down"}'
+                hx-target="#agent-keys-confirm" hx-swap="outerHTML">↓</button>
+        <button type="button" class="agent-keys-btn"
+                hx-post="{{$base}}/agents/{{$id}}/keys" hx-vals='{"keys": "Enter"}'
+                hx-target="#agent-keys-confirm" hx-swap="outerHTML">Enter</button>
+        <button type="button" class="agent-keys-btn agent-keys-btn-destructive"
+                hx-post="{{$base}}/agents/{{$id}}/keys" hx-vals='{"keys": "Ctrl-C"}'
+                hx-target="#agent-keys-confirm" hx-swap="outerHTML"
+                title="Destructive — confirmation required">Ctrl-C ⚠</button>
+        <button type="button" class="agent-keys-btn agent-keys-btn-destructive"
+                hx-post="{{$base}}/agents/{{$id}}/keys" hx-vals='{"keys": "Ctrl-D"}'
+                hx-target="#agent-keys-confirm" hx-swap="outerHTML"
+                title="Destructive — confirmation required">Ctrl-D ⚠</button>
+      </div>
+      <form class="agent-keys-custom"
+            hx-post="{{.BasePath}}/agents/{{.Bead.ID}}/keys"
+            hx-target="#agent-keys-confirm"
+            hx-swap="outerHTML">
+        <label for="agent-keys-custom-input" class="agent-keys-label">Custom keys (CSV)</label>
+        <input id="agent-keys-custom-input" type="text" name="keys"
+               placeholder="Esc,Tab,Enter"
+               autocomplete="off" spellcheck="false">
+        <button type="submit" class="agent-keys-send">Send keys</button>
+      </form>
+      <div id="agent-keys-confirm"></div>
+    </div>
+
+    <form id="agent-nudge"
+          class="agent-nudge"
+          hx-post="{{.BasePath}}/agents/{{.Bead.ID}}/nudge"
+          hx-swap="none"
+          aria-label="Nudge agent">
+      <label for="agent-nudge-message" class="agent-nudge-label">Nudge message</label>
+      <input id="agent-nudge-message" type="text" name="message"
+             placeholder="catch up and continue"
+             autocomplete="off" required>
+      <button type="submit" class="agent-nudge-send">Nudge</button>
+    </form>
+
+    {{/*
+      Compact: sends Claude Code's "/compact" slash command to the live
+      session, initiating a context-window compaction. Operator-only by route
+      gate. The first click swaps in a confirmation fragment (compaction
+      rewrites the transcript); the confirmed POST forwards the command.
+    */}}
+    <div id="agent-compact" class="agent-compact" data-bead-id="{{.Bead.ID}}" aria-label="Compact context window">
+      {{/* The gauge sits directly beside the Compact button so the operator
+           reads current occupancy and the action on it together (ka-0000006399). */}}
+      {{with $.Usage}}{{template "agent_ctx_gauge" .}}{{end}}
+      <button type="button" class="agent-compact-btn"
+              hx-post="{{.BasePath}}/agents/{{.Bead.ID}}/compact"
+              hx-target="#agent-compact-confirm" hx-swap="outerHTML"
+              title="Send /compact to compact the agent's context window">Compact context</button>
+      <div id="agent-compact-confirm"></div>
+    </div>
+
+    <details id="agent-respond"
+             class="agent-respond"
+             data-bead-id="{{.Bead.ID}}"
+             data-agent-state="{{index $f "agent_state"}}"
+             {{if eq (index $f "agent_state") "ask_user"}}open{{end}}>
+      <summary>Respond to ask_user prompt</summary>
+      <p class="agent-respond-hint meta">
+        Agent terminal write — answers the agent's pending ask_user prompt.
+        Modal auto-opens when <code>agent_state=ask_user</code>.
+      </p>
+      <form class="agent-respond-form"
+            hx-post="{{.BasePath}}/agents/{{.Bead.ID}}/respond"
+            hx-swap="none">
+        <fieldset class="agent-respond-fieldset">
+          <legend>Yes / no</legend>
+          <button type="submit" name="accept" value="yes" class="agent-respond-yes">Accept (yes)</button>
+          <button type="submit" name="accept" value="no" class="agent-respond-no">Decline (no)</button>
+        </fieldset>
+        <fieldset class="agent-respond-fieldset">
+          <legend>Free-text answer</legend>
+          <label for="agent-respond-text" class="visually-hidden">Free-text answer</label>
+          <textarea id="agent-respond-text" name="text" rows="3"
+                    placeholder="Type a free-text answer for the prompt"></textarea>
+          <button type="submit" class="agent-respond-send">Send text</button>
+        </fieldset>
+        <fieldset class="agent-respond-fieldset">
+          <legend>Numbered option</legend>
+          <label for="agent-respond-option" class="visually-hidden">Option number</label>
+          <input id="agent-respond-option" type="number" name="option" min="0" max="99" placeholder="0">
+          <button type="submit" class="agent-respond-option-send">Send option</button>
+        </fieldset>
+      </form>
+    </details>
+    {{else}}
+    <p class="agent-terminal-unavailable">agent terminal unavailable in this deployment</p>
+    {{end}}
+  </section>
+
+  <aside id="agent-events"
+         class="agent-events"
+         aria-label="Agent events"
+         data-bead-id="{{.Bead.ID}}"
+         data-events-url="{{.BasePath}}/agents/{{.Bead.ID}}/events">
+    <p class="agent-events-empty meta">waiting for activity…</p>
+  </aside>
+
+  {{if .ProducedMRs}}
+    <section class="agent-mrs" aria-label="Produced merge requests">
+      <h4 class="agent-mrs-label">Produced MRs</h4>
+      <div class="agent-mrs-pills">
+        {{range .ProducedMRs}}{{template "mr_pill" .}}{{end}}
+      </div>
+    </section>
+  {{end}}
+
+  {{/* Succession lineage strip (task ka-0000007852, design memo ka-0000001420
+       §3.4): a LINEAR, paginated strip anchored on the live head — the opaque
+       current run — with the last K predecessors as chips newest-first and the
+       rest folded into a "+N earlier" pill. Rendered only when the agent has a
+       resolved predecessor chain (nil view suppresses the section). Pruned/
+       capped chains carry the EngineCount "older runs pruned" framing so a gap
+       reads as explained, not lost data. */}}
+  {{with .Lineage}}{{if .Head}}
+    <section class="agent-lineage" aria-label="Succession lineage">
+      <h4 class="agent-lineage-label">Lineage
+        <span class="agent-lineage-count meta">{{.TotalKnown}} run{{if ne .TotalKnown 1}}s{{end}} in view{{if .Pruned}} · older runs pruned{{end}}</span>
+      </h4>
+      <ol class="agent-lineage-strip" role="list">
+        <li class="agent-lineage-item agent-lineage-head">
+          {{template "lineage_chip" .Head}}
+        </li>
+        {{range .Shown}}
+        <li class="agent-lineage-item">
+          <span class="agent-lineage-arrow" aria-hidden="true">←</span>
+          {{template "lineage_chip" .}}
+        </li>
+        {{end}}
+        {{if .HasEarlier}}
+        <li class="agent-lineage-item agent-lineage-earlier">
+          <span class="agent-lineage-arrow" aria-hidden="true">←</span>
+          {{if .RootID}}
+          <a class="agent-lineage-more" href="{{$.BasePath}}/{{.RootID}}"
+             title="Jump to the lineage root — {{.EarlierCount}} earlier run{{if ne .EarlierCount 1}}s{{end}}">+{{.EarlierCount}} earlier</a>
+          {{else}}
+          <span class="agent-lineage-more agent-lineage-more-plain"
+                title="{{.EarlierCount}} earlier run{{if ne .EarlierCount 1}}s{{end}} beyond the shown window">+{{.EarlierCount}} earlier</span>
+          {{end}}
+        </li>
+        {{end}}
+      </ol>
+    </section>
+  {{end}}{{end}}
+
+  {{/* Live-vs-approved ServiceAccount permissions (gd-SyEYkqe601) for an
+       agent replayed from a privileged spawn escalation. The shell loads the
+       diff after the page, since the daemon probes RBAC live for it. */}}
+  {{with $.PermissionDiffEscalation}}
+    <section id="agent-permission-diff" class="agent-permission-diff" data-bead-id="{{$.Bead.ID}}"
+      hx-get="{{$.BasePath}}/b/{{$.Bead.ID}}/permission-diff"
+      hx-trigger="load"
+      hx-swap="outerHTML">
+      <h2>ServiceAccount permissions</h2>
+      <p class="permission-diff-meta">Checking live permissions&hellip;</p>
+    </section>
+  {{end}}
+
+  {{with index $f "prompt"}}
+    <details class="agent-prompt">
+      <summary>Prompt</summary>
+      <pre>{{.}}</pre>
+    </details>
+  {{end}}
+</section>
+{{end}}

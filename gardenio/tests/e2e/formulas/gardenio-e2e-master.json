@@ -1,0 +1,67 @@
+{
+  "title": "Gardenio E2E: Create, Prove, Fix",
+  "description": "Master formula for gardenio's own e2e test ecosystem using a gardenio-e2e namespace as testbed. Three modes: author (create new test modules), fixer (fix flaky modules), claudeless (expand session simulation scenarios).",
+  "vars": [
+    {
+      "name": "MODE",
+      "description": "Sub-workflow to run: author (new module), fixer (fix flaky module), claudeless (session scenario)"
+    },
+    {
+      "name": "TARGET",
+      "description": "Module or feature name (e.g. webhook-retry, slack-cards, formula-pour-lifecycle)"
+    },
+    {
+      "name": "BRANCH",
+      "description": "Git branch to work on (e.g. agent/e2e/add-webhook-retry)"
+    }
+  ],
+  "steps": [
+    {
+      "id": "analyze",
+      "type": "task",
+      "title": "{{TARGET}}: Analyze and plan test scenarios (mode={{MODE}})",
+      "labels": ["project:gardenio"],
+      "description": "## Step 1: Analyze\n\nAnalyze the target and plan what to test.\n\n### If MODE=author (new module)\n\n1. Read code paths for {{TARGET}} in gardenio/controller/, kbeads/, or coop/\n2. Identify kd/gb commands and API endpoints involved\n3. List testable scenarios: happy path, error cases, edge cases\n4. Check existing tests for overlap: `grep -r '{{TARGET}}' gardenio/tests/e2e/scripts/`\n5. Read gardenio/tests/e2e/README.md for conventions\n\n### If MODE=fixer (fix flaky module)\n\n1. Check recent e2e.yml runs for test-{{TARGET}}.sh pass/fail history\n2. Run the module 3x locally to reproduce the failure:\n   ```bash\n   cd gardenio && NAMESPACE=gardenio-e2e ./tests/e2e/scripts/test-{{TARGET}}.sh\n   ```\n3. Classify: deterministic failure, timing flake, env flake, CI-only\n4. Read the test script to understand what it tests\n\n### If MODE=claudeless (session scenario)\n\n1. Map the {{TARGET}} workflow: user prompts, tool calls, hook invocations\n2. Read existing scenarios: gardenio/tests/e2e/claudeless/*.toml\n3. Identify session config, response sequences, tool mocks\n4. Check if claudeless binary is available: `which claudeless`\n\n### Deliverables\n\nPost a comment on this bead with:\n- Mode: {{MODE}}\n- Target: {{TARGET}}\n- Scenario list (author) / failure classification (fixer) / workflow map (claudeless)\n- Code references (file:line)\n- Dependencies and prerequisites\n\nThen close this step."
+    },
+    {
+      "id": "write-or-baseline",
+      "type": "task",
+      "title": "{{TARGET}}: Write test / establish baseline (mode={{MODE}})",
+      "labels": ["project:gardenio"],
+      "depends_on": ["analyze"],
+      "description": "## Step 2: Write or Baseline\n\n### If MODE=author — Write the test module\n\nCreate `gardenio/tests/e2e/scripts/test-{{TARGET}}.sh` following the standard pattern:\n\n```bash\n#!/usr/bin/env bash\n# test-{{TARGET}}.sh — {{TARGET}} E2E tests\nset -euo pipefail\n\nNAMESPACE=\"${NAMESPACE:-gardenio-e2e}\"\nBEADS_SVC=\"${BEADS_SVC:-${NAMESPACE}-beads}\"\nKD_BIN=\"${KD_BIN:-kd}\"\nGB_BIN=\"${GB_BIN:-gb}\"\nPASS=0; FAIL=0; ERRORS=()\nPF_PID=\"\"; CREATED_BEADS=()\nexport KD_ACTOR=\"${KD_ACTOR:-e2e-test}\"\n\n# Standard helpers: red/green/blue/dim, pass/fail, assert_exit, assert_contains\n# Standard setup: setup_portforward, setup_token, cleanup trap\n# Scenarios: blue \"Scenario N: ...\" + assertions\n# Summary: pass/fail count, error list, exit code\n```\n\nConventions:\n- Use unique test tags: `TEST_TAG=\"e2e-{{TARGET}}-$$-$(date +%s)\"`\n- Clean up ALL created beads in the trap\n- Each scenario is self-contained (creates its own test data)\n- Use `$KD_BIN` and `$GB_BIN` for commands, never hardcode paths\n- Test both success AND error paths\n\nCommit the test script.\n\n### If MODE=fixer — Pre-fix baseline (20 runs)\n\nRun `test-{{TARGET}}.sh` 20x against gardenio-e2e:\n\n```bash\nPASSES=0; FAILS=0; TOTAL=20\nfor i in $(seq 1 $TOTAL); do\n  echo \"=== PRE-FIX BASELINE Run $i/$TOTAL ===\"\n  NAMESPACE=gardenio-e2e bash gardenio/tests/e2e/scripts/test-{{TARGET}}.sh 2>&1 | tee /tmp/baseline-$i.txt\n  if [ $? -eq 0 ]; then PASSES=$((PASSES+1)); else FAILS=$((FAILS+1)); fi\ndone\necho \"PRE-FIX: $PASSES/$TOTAL passed, $FAILS/$TOTAL failed\"\n```\n\n**FLAKINESS GATE**: If 20/20 pass, STOP — module is not flaky. Close all remaining steps.\n\nPost baseline as comment.\n\n### If MODE=claudeless — Write TOML scenario\n\nCreate `gardenio/tests/e2e/claudeless/{{TARGET}}.toml`:\n\n```toml\n[claude]\nsession_id = \"e2e-{{TARGET}}-0001\"\nusername = \"e2e-test\"\npermission_mode = \"accept-edits\"\ntrusted = true\nlogged_in = true\n\n[claude.timeouts]\nhook_timeout_ms = 10000\n\n[[responses]]\non = { contains = \"trigger phrase\" }\nsay = \"Agent response text\"\n[[responses.tools]]\ncall = \"Bash\"\n[responses.tools.input]\ncommand = \"kd create 'test' --type task\"\n[responses.tools.result]\nstdout = \"Created: gd-test-001\"\nexit_code = 0\n\n[default]\nsay = \"I'm an E2E test agent.\"\n\n[tools]\nmode = \"live\"\n[tools.Bash]\napprove = true\n```\n\nCommit the scenario.\n\n### Deliverables\n- author: committed test-{{TARGET}}.sh\n- fixer: baseline posted (X/20 pass) or STOP if 20/20\n- claudeless: committed {{TARGET}}.toml\n\nClose this step."
+    },
+    {
+      "id": "run-and-fix",
+      "type": "task",
+      "title": "{{TARGET}}: Run, diagnose, fix (mode={{MODE}})",
+      "labels": ["project:gardenio"],
+      "depends_on": ["write-or-baseline"],
+      "description": "## Step 3: Run and Fix\n\n### If MODE=author — Run against gardenio-e2e\n\n1. Run the new module 5x:\n   ```bash\n   for i in $(seq 1 5); do\n     NAMESPACE=gardenio-e2e bash gardenio/tests/e2e/scripts/test-{{TARGET}}.sh 2>&1 | tee /tmp/author-run-$i.txt\n   done\n   ```\n2. Fix any failures found during runs\n3. Iterate until 5/5 pass consistently\n4. Post pass evidence as comment\n\n### If MODE=fixer — Diagnose and fix\n\n**EMPIRICAL EVIDENCE RULE**: Every fix MUST target a specifically observed failure from the baseline.\n\nProhibited fixes (unless baseline demonstrates the exact failure):\n- Adding generic waits or sleeps\n- Changing selectors that aren't failing\n- Refactoring test structure when structure isn't causing failures\n\nDiagnosis categories:\n- (A) Test bug — fix the test\n- (B) Gardenio code bug — file bug bead, close remaining steps with BLOCKED\n- (C) Infra/env issue — file bug bead, close remaining steps with BLOCKED\n- (D) Test rewrite needed — rewrite targeting observed failures\n\nApply fix and commit.\n\n### If MODE=claudeless — Run scenario\n\n1. Run with claudeless:\n   ```bash\n   claudeless run gardenio/tests/e2e/claudeless/{{TARGET}}.toml --settings .claude/settings.json\n   ```\n2. Verify hooks fire correctly\n3. Fix scenario issues and re-run\n4. Post pass evidence\n\n### Deliverables\n- author: 5/5 pass evidence\n- fixer: committed fix with root cause explanation\n- claudeless: passing run evidence\n\nClose this step."
+    },
+    {
+      "id": "stability-proof",
+      "type": "task",
+      "title": "{{TARGET}}: Stability proof (mode={{MODE}})",
+      "labels": ["project:gardenio"],
+      "depends_on": ["run-and-fix"],
+      "description": "## Step 4: Stability Proof\n\n### If MODE=author — 20-run stability proof\n\n```bash\nPASSES=0; FAILS=0; TOTAL=20\nfor i in $(seq 1 $TOTAL); do\n  echo \"=== STABILITY Run $i/$TOTAL ===\"\n  NAMESPACE=gardenio-e2e bash gardenio/tests/e2e/scripts/test-{{TARGET}}.sh 2>&1 | tee /tmp/stability-$i.txt\n  if [ $? -eq 0 ]; then PASSES=$((PASSES+1)); else FAILS=$((FAILS+1)); fi\ndone\necho \"STABILITY: $PASSES/$TOTAL passed, $FAILS/$TOTAL failed\"\n```\n\nMust achieve 20/20. If not, go back to step 3.\n\n### If MODE=fixer — Post-fix stability (20 runs)\n\nSame 20-run loop as author mode.\n\nPost complete flakiness proof:\n```\n## Flakiness Proof\nPre-fix: X/20 passed (Y% failure rate)\nPost-fix: 20/20 passed (0% failure rate)\nDelta: Y% → 0%\n```\n\nIf < 19/20: iterate back to step 3.\n\n### If MODE=claudeless — 10-run stability\n\nClaudeless scenarios are deterministic, so 10 runs suffices:\n```bash\nfor i in $(seq 1 10); do\n  claudeless run gardenio/tests/e2e/claudeless/{{TARGET}}.toml --settings .claude/settings.json\ndone\n```\n\nAll 10 must pass.\n\n### Deliverables\n- author: 20/20 stability proof\n- fixer: complete flakiness proof (pre + post)\n- claudeless: 10/10 proof\n\nClose this step."
+    },
+    {
+      "id": "wire-pipeline",
+      "type": "task",
+      "title": "{{TARGET}}: Wire into the E2E pipeline (mode={{MODE}})",
+      "labels": ["project:gardenio"],
+      "depends_on": ["stability-proof"],
+      "description": "## Step 5: Wire Into Pipeline\n\n### If MODE=author — Add to run-shard.sh\n\n1. Add the `should_run` + `run_module` block to `gardenio/tests/e2e/scripts/run-shard.sh`:\n   ```bash\n   if should_run \"{{TARGET}}\"; then\n     run_module \"{{TARGET}}\" \"./gardenio/tests/e2e/scripts/test-{{TARGET}}.sh\" || MODULE_RC=1\n   fi\n   ```\n   Place it in alphabetical order among the existing modules.\n\n2. Add JUnit XML entry:\n   ```xml\n   <testcase name=\"{{TARGET}}\" classname=\"gardenio.e2e\" />\n   ```\n\n3. Update `gardenio/tests/e2e/README.md` with:\n   - Module name and description\n   - Scenarios covered\n   - Prerequisites\n\n4. Commit all changes.\n\n### If MODE=fixer — No pipeline changes needed\n\nThe module is already in the pipeline. Just commit the fix.\n\n### If MODE=claudeless — Wire scenario into runner\n\nOption A: Add to existing test-gate-system.sh as a sub-scenario\nOption B: Create a new test-claudeless.sh module that runs all TOML scenarios\n\nIf Option B:\n```bash\n#!/usr/bin/env bash\nset -euo pipefail\nfor toml in gardenio/tests/e2e/claudeless/*.toml; do\n  name=$(basename \"$toml\" .toml)\n  echo \"Running claudeless scenario: $name\"\n  claudeless run \"$toml\" --settings .claude/settings.json || { echo \"FAILED: $name\"; exit 1; }\n  echo \"PASSED: $name\"\ndone\n```\n\nThen add to run-shard.sh like the author mode.\n\n### Deliverables\n- Pipeline updated (author/claudeless) or confirmed no changes needed (fixer)\n- README updated if applicable\n\nClose this step."
+    },
+    {
+      "id": "pr-and-cleanup",
+      "type": "task",
+      "title": "{{TARGET}}: PR with evidence (mode={{MODE}})",
+      "labels": ["project:gardenio"],
+      "depends_on": ["wire-pipeline"],
+      "description": "## Step 6: PR and Cleanup\n\n1. Push branch:\n   ```bash\n   git push -u origin {{BRANCH}}\n   ```\n\n2. Create PR:\n   - Title: depends on mode:\n     - author: `test(gardenio/e2e): add {{TARGET}} test module`\n     - fixer: `fix(gardenio/e2e): fix flaky {{TARGET}} module`\n     - claudeless: `test(gardenio/e2e): add {{TARGET}} claudeless scenario`\n   - Description includes:\n     - What was done\n     - Stability proof (20/20 or 10/10)\n     - For fixer: full flakiness proof with pre/post comparison\n     - Scenarios covered\n     - Example output\n\n3. Link MR to bead: `gb mr link <bead-id> <mr-url>`\n\n4. Verify CI passes on the PR\n\n### Deliverables\n- PR URL posted as comment\n- PR linked to bead\n- CI green\n\nClose this step and the parent molecule."
+    }
+  ]
+}

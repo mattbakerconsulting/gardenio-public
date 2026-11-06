@@ -1,0 +1,68 @@
+# local-runner-mail.toml
+#
+# Claudeless scenario: a local runner agent that works from its mail
+# (local-agents spec §11 b and e; plan gd-fwFefkDP4H Task 18, gd-jW7KJ7ZdNy).
+#
+# Driven by gardenio/tests/e2e/scripts/test-local-runner-lifecycle.sh, which
+# runs it through `gb runner join --command "claudeless --scenario <this>"`.
+# The agent's mail subscriber nudges coop with interrupt mail as
+# "Mail from <sender> [<id>]: <subject>\n\n<body>", so each response keys on a
+# marker the script puts in the subject:
+#
+#   E2E-CLAIM  check that `gb ready` on this runner lists the task named in
+#              $GARDENIO_HOME/e2e-claim-task, claim it, squawk, read the mail
+#   E2E-READ   read and close every open, non-control mail in the inbox
+#
+# Mail stays open after `gb mail read`; closing it is the agent's ack, and the
+# script's proof that the nudge reached the session. control: mail never
+# reaches the model (the subscriber hands it to gb), so it is skipped here.
+#
+# GARDENIO_HOME is the runner registration dir the script exported for
+# `gb runner join`; the session inherits it, which is also what makes
+# `gb ready` narrow to this runner.
+
+[claude]
+session_id = "e2e00000-0007-4000-a000-000000000001"
+username = "e2e-local-runner"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+[[responses]]
+on = { contains = "E2E-CLAIM" }
+say = "Claim request. Checking gb ready on this runner."
+tools = [
+  { call = "Bash", input = { command = """set -u
+TASK="$(cat "$GARDENIO_HOME/e2e-claim-task" 2>/dev/null || true)"
+if [ -n "$TASK" ] && gb ready --json 2>/dev/null | jq -e --arg id "$TASK" 'any(.[]; .id == $id)' >/dev/null; then
+  kd claim "$TASK" && gb squawk "E2E-SQUAWK $TASK claimed on the local runner" && echo "CLAIM-OK $TASK"
+else
+  echo "CLAIM-SKIPPED: $TASK not in gb ready on this runner"
+fi
+for id in $(gb mail inbox --json 2>/dev/null | jq -r '.[] | select([.labels[]? | startswith("control:")] | any | not) | .id'); do
+  gb mail read "$id" >/dev/null && kd close "$id" >/dev/null && echo "MAIL-READ-OK $id"
+done""" } }
+]
+
+[[responses]]
+on = { contains = "E2E-READ" }
+say = "I have mail. Reading it."
+tools = [
+  { call = "Bash", input = { command = """set -u
+for id in $(gb mail inbox --json 2>/dev/null | jq -r '.[] | select([.labels[]? | startswith("control:")] | any | not) | .id'); do
+  gb mail read "$id" >/dev/null && kd close "$id" >/dev/null && echo "MAIL-READ-OK $id"
+done""" } }
+]
+
+# Startup prompt, prime output and anything else: wait for mail.
+[default]
+say = "Local runner mail scenario idle. Waiting for mail."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

@@ -1,0 +1,292 @@
+{{- /*
+  Stage 3 / W-B-12 (ka-0000007194): gardenio-edge-auth Deployment.
+
+  Non-AVA edge proxy that fronts in-cluster Services (kbeads, coopmux)
+  with GitLab-PAT-rooted auth so CLI tools (kd, coop) can drive the
+  daemons from outside the cluster. See:
+    - gardenio/plans/stage3-ava-cli-eb-rollout.md (Workstream B)
+    - gardenio/controller/cmd/edge-auth/ (scaffold, PAT validator,
+      reverse-proxy + HMAC, OCSF audit — W-B-7..W-B-10)
+    - parent epic ka-0000003384
+
+  Gated by .Values.edgeAuth.enabled (default false). The safe-deploy
+  knob .Values.edgeAuth.dryRun (ka-0000002544) skips rendering the
+  Deployment entirely so chart rollouts can land the edge-auth surface
+  bits (Service / IngressRoute / ExternalSecret) without requiring an
+  edge-auth image or HMAC secret to exist yet. Flip dryRun=false once
+  the image is published and the HMAC secret is provisioned.
+*/}}
+{{- if and .Values.edgeAuth.enabled (not .Values.edgeAuth.dryRun) }}
+{{- if not .Values.edgeAuth.host }}
+{{- fail "edgeAuth.enabled is true but edgeAuth.host is empty: set the public hostname (e.g. cli.gardenio.example.com) or set edgeAuth.enabled=false." }}
+{{- end }}
+{{- $entra := .Values.edgeAuth.entra | default dict -}}
+{{- if $entra.enabled }}
+{{- if not (hasPrefix "https://" ($entra.issuerURL | default "")) }}
+{{- fail "edgeAuth.entra.enabled is true but edgeAuth.entra.issuerURL is not an https:// URL" }}
+{{- end }}
+{{- if not $entra.audience }}
+{{- fail "edgeAuth.entra.enabled is true but edgeAuth.entra.audience is empty" }}
+{{- end }}
+{{- if not $entra.tenantID }}
+{{- fail "edgeAuth.entra.enabled is true but edgeAuth.entra.tenantID is empty" }}
+{{- end }}
+{{- if not $entra.requiredScope }}
+{{- fail "edgeAuth.entra.enabled is true but edgeAuth.entra.requiredScope is empty" }}
+{{- end }}
+{{- if not (has ($entra.requiredRole | default "") (list "gardenio-viewer" "gardenio-operator" "gardenio-admin")) }}
+{{- fail "edgeAuth.entra.requiredRole must be one of gardenio-viewer, gardenio-operator, or gardenio-admin" }}
+{{- end }}
+{{- if eq (len ($entra.allowedClientIDs | default list)) 0 }}
+{{- fail "edgeAuth.entra.enabled is true but edgeAuth.entra.allowedClientIDs is empty" }}
+{{- end }}
+{{- end }}
+{{- /* ka-0000001247: with dryRun=false the shared HMAC secret is load-bearing —
+       beads/coopmux mount DAEMON_HMAC_KEY with optional:false (see
+       templates/beads/deployment.yaml). If no source for the secret is wired,
+       those pods CreateContainerConfigError at pod-start and the rollout stalls
+       (regression ka-0000006697). Fail loudly at template time instead. Two
+       valid sources: an ESO remoteRef (externalSecrets.edgeAuthHMACKey.remoteRef,
+       prod path) or an operator-supplied K8s Secret (edgeAuth.hmacKey.secretName,
+       dev/e2e path). */}}
+{{- if not (or .Values.edgeAuth.hmacKey.secretName (and .Values.externalSecrets.enabled .Values.externalSecrets.edgeAuthHMACKey.remoteRef)) }}
+{{- fail "edgeAuth.enabled is true with dryRun=false but no HMAC key source is configured: set externalSecrets.edgeAuthHMACKey.remoteRef (ESO from secret store) or edgeAuth.hmacKey.secretName (pre-provisioned K8s Secret), else beads/coopmux hit CreateContainerConfigError on rollout. Set edgeAuth.dryRun=true to ship the surface dark without a key." }}
+{{- end }}
+{{- /* gd-h2tQrOwjGJ: same contract for the split v2 key. On the ESO path the
+       ExternalSecret owns the Secret, so without a v2 remoteRef the key never
+       lands and the DAEMON_HMAC_KEY_V2 mounts stall the rollout. */}}
+{{- if and .Values.edgeAuth.hmacKey.secretKeyV2 (not .Values.edgeAuth.hmacKey.secretName) .Values.externalSecrets.enabled (not .Values.externalSecrets.edgeAuthHMACKeyV2.remoteRef) }}
+{{- fail "edgeAuth.hmacKey.secretKeyV2 is set on the ExternalSecrets path but externalSecrets.edgeAuthHMACKeyV2.remoteRef is empty: the v2 key would never land in the edge-auth HMAC Secret and beads/coopmux/slack-bridge hit CreateContainerConfigError on rollout." }}
+{{- end }}
+{{- /* gd-9ZGh01W5ub: same contract for the Glass relay key. */}}
+{{- if and .Values.edgeAuth.hmacKey.secretKeyRelay (not .Values.edgeAuth.hmacKey.secretName) .Values.externalSecrets.enabled (not .Values.externalSecrets.edgeAuthHMACKeyRelay.remoteRef) }}
+{{- fail "edgeAuth.hmacKey.secretKeyRelay is set on the ExternalSecrets path but externalSecrets.edgeAuthHMACKeyRelay.remoteRef is empty: the relay key would never land in the edge-auth HMAC Secret and beads-viewer/coopmux hit CreateContainerConfigError on rollout." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.edgeAuth.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.edgeAuth.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.edgeAuth.replicaCount | default 1 }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "gardenio.edgeAuth.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.edgeAuth.selectorLabels" . | nindent 8 }}
+      {{- /*
+        Prometheus scrape annotations (ka-0000006312). Prod's gardenio-vmagent
+        discovers targets via these prometheus.io/scrape annotations, so the
+        shim's /metrics (gardenio_forwardauth_403_total) must advertise them —
+        served on the internal metrics port, never the public auth port. Any
+        operator-supplied podAnnotations are merged on top.
+      */}}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.edgeAuth.metrics.port | default 9092 }}"
+        prometheus.io/path: "/metrics"
+        {{- with .Values.edgeAuth.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.name }}
+      {{- end }}
+      containers:
+        - name: edge-auth
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.edgeAuth.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.edgeAuth.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: {{ .Values.edgeAuth.service.port | default 8096 }}
+              protocol: TCP
+            # Internal-only Prometheus metrics port (ka-0000006312). Serves
+            # /metrics on a separate listener from the public auth surface.
+            - name: metrics
+              containerPort: {{ .Values.edgeAuth.metrics.port | default 9092 }}
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: ":{{ .Values.edgeAuth.service.port | default 8096 }}"
+            - name: METRICS_LISTEN_ADDR
+              value: ":{{ .Values.edgeAuth.metrics.port | default 9092 }}"
+            {{- if .Values.edgeAuth.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.edgeAuth.logLevel | quote }}
+            {{- end }}
+            # GitLab PAT validation (W-B-8). gitlabBaseURL stays a values
+            # field — it is configuration, not a secret. The HMAC key is
+            # the only real secret and rides on the ExternalSecret below.
+            {{- if .Values.edgeAuth.patDisabled }}
+            # Box auth profile (ka-0000006087 §6): GitLab-PAT path OFF. The shim
+            # makes no gitlab.com calls and rejects PAT-bearing requests, so a
+            # stale-membership PAT cannot authenticate even with egress. Cookie
+            # auth (the in-box Keycloak via oauth2-proxy) is the identity source.
+            # GITLAB_BASE_URL / EDGE_AUTH_GITLAB_GROUP are intentionally omitted.
+            - name: EDGE_AUTH_PAT_DISABLED
+              value: "true"
+            {{- else }}
+            - name: GITLAB_BASE_URL
+              value: {{ .Values.edgeAuth.gitlabBaseURL | default "https://gitlab.com" | quote }}
+            - name: EDGE_AUTH_GITLAB_GROUP
+              value: {{ .Values.edgeAuth.gitlabGroup | default "gardenio" | quote }}
+            {{- end }}
+            # HMAC signing key (W-B-9). Required for the proxy surface to
+            # stamp X-Edge-Auth-Sig; daemons (W-B-11) verify before
+            # trusting X-Operator. Sourced from a K8s Secret; the
+            # ExternalSecret below populates it when externalSecrets is
+            # enabled.
+            {{- $hmacSecret := include "gardenio.edgeAuth.hmacSecretName" . }}
+            - name: EDGE_AUTH_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $hmacSecret }}
+                  key: {{ .Values.edgeAuth.hmacKey.secretKey | default "hmac-key" }}
+                  optional: true
+            {{- /* Split v2 envelope key (gd-h2tQrOwjGJ): signs the role-bearing
+                   v2 envelope. Unset falls back to EDGE_AUTH_HMAC_KEY. */}}
+            {{- with .Values.edgeAuth.hmacKey.secretKeyV2 }}
+            - name: EDGE_AUTH_HMAC_KEY_V2
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $hmacSecret }}
+                  key: {{ . }}
+                  optional: true
+            {{- end }}
+            # Upstreams the proxy dispatches to by path prefix. Resolved
+            # from in-chart Service helpers so chart-internal renames flow
+            # through; operators may override with explicit URLs (useful
+            # when running against an out-of-chart kbeads or coopmux).
+            - name: EDGE_AUTH_UPSTREAM_KBEADS
+              value: {{ include "gardenio.edgeAuth.upstreamKbeads" . | quote }}
+            - name: EDGE_AUTH_UPSTREAM_COOPMUX
+              value: {{ include "gardenio.edgeAuth.upstreamCoopmux" . | quote }}
+            # NATS WebSocket channel (/kd/nats/). Registered before /kd/ in
+            # the shim so `gb agent start --local`'s realtime bridge reaches
+            # NATS instead of the kbeads daemon (ka-0000006000).
+            - name: EDGE_AUTH_UPSTREAM_NATS
+              value: {{ include "gardenio.edgeAuth.upstreamNats" . | quote }}
+            # Optional defense-in-depth email-domain allowlist (ka-0000000533).
+            # OFF by default: group membership (EDGE_AUTH_GITLAB_GROUP) is the
+            # sole authority. When edgeAuth.allowedEmailDomains is set, a
+            # resolved identity (PAT / AVA / Entra / cookie) whose email domain is not
+            # in the comma-separated list is denied 403 (deny:email-domain) even
+            # if it passes the group gate — bringing the CLI edge to parity with
+            # the web front door's oauth2-proxy --email-domain restriction.
+            {{- with .Values.edgeAuth.allowedEmailDomains }}
+            - name: EDGE_AUTH_ALLOWED_EMAIL_DOMAINS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            # Safe-deploy kill switch (ka-0000002544). When true the proxy
+            # validates PAT + group + emits audit, then short-circuits with
+            # a synthetic 200 and X-Edge-Auth-Dry-Run: true instead of
+            # proxying. Flip per env in the rollout sequence.
+            {{- if .Values.edgeAuth.dryRun }}
+            - name: EDGE_AUTH_DRY_RUN
+              value: "true"
+            {{- end }}
+            # AWS Verified Access auth-path opt-in (epic ka-0000005862).
+            # When trustSigner is set, requests carrying
+            # X-Amzn-Ava-User-Context are authenticated against the pinned
+            # AVA instance and stamped into the SAME HMAC envelope PAT-mode
+            # produces — daemon-side validator (kbeads
+            # internal/edgeauth/verify.go, ka-0000001678) is unchanged.
+            # Empty -> AVA mode OFF; the shim is PAT-only as before.
+            {{- with .Values.edgeAuth.ava }}
+            {{- if .trustSigner }}
+            - name: EDGE_AUTH_AVA_TRUST_SIGNER
+              value: {{ .trustSigner | quote }}
+            {{- if .region }}
+            - name: EDGE_AUTH_AVA_REGION
+              value: {{ .region | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            # Microsoft Entra delegated-token path. All fields are non-secret
+            # validation policy; the verifier discovers Microsoft JWKS over
+            # HTTPS and stamps the existing HMAC envelope only after the token
+            # clears issuer/aud/tid/scp/azp/role/email checks.
+            {{- if $entra.enabled }}
+            - name: EDGE_AUTH_ENTRA_ISSUER_URL
+              value: {{ $entra.issuerURL | quote }}
+            - name: EDGE_AUTH_ENTRA_AUDIENCE
+              value: {{ $entra.audience | quote }}
+            - name: EDGE_AUTH_ENTRA_TENANT_ID
+              value: {{ $entra.tenantID | quote }}
+            - name: EDGE_AUTH_ENTRA_REQUIRED_SCOPE
+              value: {{ $entra.requiredScope | quote }}
+            - name: EDGE_AUTH_ENTRA_REQUIRED_ROLE
+              value: {{ $entra.requiredRole | quote }}
+            - name: EDGE_AUTH_ENTRA_ALLOWED_CLIENT_IDS
+              value: {{ join "," $entra.allowedClientIDs | quote }}
+            {{- end }}
+            # gb-login browser-session-cookie auth-path opt-in (ka-0000000080).
+            # When enabled, a proxy request carrying the oauth2-proxy session
+            # cookie but no Bearer PAT / AVA header is validated by forwarding
+            # the cookie to oauth2-proxy's /oauth2/auth; the attested email is
+            # stamped into the SAME HMAC envelope PAT/AVA produce, so the
+            # daemon is unchanged. Lets `gb login` drive gardenio.app/kd with no
+            # PAT. Empty authURL -> cookie mode OFF (default). Requires the
+            # forwardauth (oauth2-proxy) Service to be deployed.
+            {{- with .Values.edgeAuth.cookieAuth }}
+            {{- if .enabled }}
+            {{- $roleSource := .roleSource | default "provider-groups" }}
+            {{- if and (ne $roleSource "provider-groups") (ne $roleSource "entra-app-roles") }}
+            {{- fail "edgeAuth.cookieAuth.roleSource must be provider-groups or entra-app-roles" }}
+            {{- end }}
+            - name: EDGE_AUTH_OAUTH2_PROXY_AUTH_URL
+              value: {{ .authURL | default (printf "http://%s-forwardauth:4180/oauth2/auth" (include "gardenio.fullname" $)) | quote }}
+            {{- if .cookieName }}
+            - name: EDGE_AUTH_OAUTH2_PROXY_COOKIE_NAME
+              value: {{ .cookieName | quote }}
+            {{- end }}
+            - name: EDGE_AUTH_OAUTH2_PROXY_ROLE_SOURCE
+              value: {{ $roleSource | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.edgeAuth.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.edgeAuth.resources | nindent 12 }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.edgeAuth.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.edgeAuth.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.edgeAuth.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,42 @@
+-- Bug ka-0000002762: duplicate canonical type=merge-request beads per mr_url.
+--
+-- The gitlab-bridge upserts one type=merge-request bead per canonical MR URL,
+-- keyed on fields->>'mr_url'. Its find-then-create was serialised only by an
+-- IN-PROCESS client mutex (gardenio beadsapi/client_mr.go mrUpsertLock), so two
+-- bridge replicas — or one replica across a restart — each miss the client-side
+-- find and each CreateBead a duplicate. The store enforced no uniqueness, so
+-- every insert landed: a full census (2026-08-18) measured 396 mr_urls carrying
+-- >1 canonical MR bead (up to 7 each), 282 disagreeing on mr_state.
+--
+-- The daemon-side fix (server/beads_mr_dedup.go) makes createBead a
+-- lookup-or-return keyed on fields->>'mr_url' for type='merge-request',
+-- serialised by a per-URL mutex. That lookup is a single-key equality filter
+-- (fields ? 'mr_url' AND fields->>'mr_url' = $1) — the textbook B-tree fit — so
+-- this migration adds the supporting index.
+--
+-- NON-UNIQUE, deliberately. A partial UNIQUE index cannot be built while the
+-- existing 396 duplicate sets live: CREATE UNIQUE INDEX would raise 23505 and
+-- hard-fail the prod `kd migrate` Job. Promotion to a partial UNIQUE index is
+-- HALF-2 (a follow-up child of ka-0000002762), gated behind reconciling those
+-- 396 sets into one surviving bead each. This non-unique index is useful on its
+-- own (it makes the new dedup lookup indexed instead of a sequential scan over
+-- the ~8400 merge-request beads) and stages that promotion.
+--
+-- TYPE-SCOPED predicate is required: task beads ALSO carry a legacy
+-- fields->>'mr_url' (the pre-epic dual-write). Scoping the index — and the
+-- daemon lookup — to type='merge-request' keeps a producing task bead that
+-- mirrors the same URL out of the dedup set.
+--
+-- PARTIAL B-tree expression index (WHERE type = 'merge-request' AND
+-- fields ? 'mr_url') keeps the index small and single-key equality fast — same
+-- rationale as migrations 025 / 031 / 034.
+--
+-- Migration policy (kbeads/CLAUDE.md): idempotent DDL only
+-- (CREATE INDEX IF NOT EXISTS), no table backfill. Built inline (not
+-- CONCURRENTLY) because golang-migrate wraps each migration in a transaction;
+-- over the small partial set this is a sub-second build. Runs via `kd migrate`
+-- with no daemon-startup deadline.
+
+CREATE INDEX IF NOT EXISTS idx_beads_fields_mr_url
+    ON beads ((fields->>'mr_url'))
+    WHERE type = 'merge-request' AND fields ? 'mr_url';

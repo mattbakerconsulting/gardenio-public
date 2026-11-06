@@ -1,0 +1,205 @@
+# rule_files is rewritten at runtime by TestLandsCredits_Rules
+# (lands_credits_test.go): the placeholder is replaced with the path to the
+# helm-rendered lands-credits.yaml key of the vmalert ConfigMap. By hand:
+#   helm template test gardenio/helm/gardenio --show-only templates/vmalert/configmap.yaml \
+#     --set vmalert.enabled=true | yq '.data."lands-credits.yaml"' > /tmp/credits_rules.yaml
+#   sed 's#__RULES_FILE__#/tmp/credits_rules.yaml#' this-file > /tmp/credits_test.yaml
+#   promtool test rules /tmp/credits_test.yaml
+#
+# Tenant land credit series (plan step 3.2). Money is exact here: every input
+# is a multiple of 0.25, so each figure is exact in binary and promtool's exact
+# comparison holds.
+rule_files:
+  - __RULES_FILE__
+
+evaluation_interval: 1m
+
+tests:
+  # tomato spends $0.25 a minute from $10 at 1.5 credits per dollar, with 500
+  # credits granted. The fleet account and bean-row (no rate in force) never
+  # get a credit series.
+  - name: spent_remaining_windows_and_operator_lands
+    interval: 1m
+    input_series:
+      - series: 'gardenio_account_cost_usd{account="lands-tomato",env="prod",pod="controller-a"}'
+        values: '10+0.25x600'
+      # A second controller pod reporting the same bead is not double-counted.
+      - series: 'gardenio_account_cost_usd{account="lands-tomato",env="prod",pod="controller-b"}'
+        values: '10+0.25x600'
+      - series: 'gardenio_lands_credit_rate{land="tomato"}'
+        values: '1.5x600'
+      - series: 'gardenio_lands_credits_granted{land="tomato"}'
+        values: '500x600'
+      - series: 'gardenio_account_cost_usd{account="fleet",env="prod"}'
+        values: '100+1x600'
+      - series: 'gardenio_account_cost_usd{account="lands-bean-row",env="prod"}'
+        values: '3+1x600'
+      - series: 'gardenio_lands_credits_granted{land="bean-row"}'
+        values: '20x600'
+      - series: 'gardenio_agent_spend_logs_usd{agent="crew-a",project="tomato",role="crew",model="opus",account="lands-tomato"}'
+        values: '4x600'
+      - series: 'gardenio_agent_spend_logs_usd{agent="crew-a",project="tomato",role="crew",model="sonnet",account="lands-tomato"}'
+        values: '0.5x600'
+      - series: 'gardenio_agent_spend_logs_usd{agent="steward",project="tomato",role="steward",model="opus",account="lands-tomato"}'
+        values: '2x600'
+      - series: 'gardenio_agent_spend_logs_usd{agent="crew-z",project="gardenio",role="crew",model="opus",account="fleet"}'
+        values: '9x600'
+    promql_expr_test:
+      # $10 + 600 x $0.25 = $160, x1.5.
+      - expr: gardenio:land_spend_credits:total
+        eval_time: 600m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:total{land="tomato"}'
+            value: 240
+      - expr: gardenio:land_credits:granted
+        eval_time: 600m
+        exp_samples:
+          - labels: 'gardenio:land_credits:granted{land="tomato"}'
+            value: 500
+          - labels: 'gardenio:land_credits:granted{land="bean-row"}'
+            value: 20
+      - expr: gardenio:land_credits:remaining
+        eval_time: 600m
+        exp_samples:
+          - labels: 'gardenio:land_credits:remaining{land="tomato"}'
+            value: 260
+      # Since 00:00 UTC (t=0): 120 steps of $1.25. The $10 already on the
+      # account at the first sample was spent before today.
+      - expr: gardenio:land_spend_credits:today
+        eval_time: 600m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:today{land="tomato"}'
+            value: 225
+      # 12 steps of $1.25 in the trailing hour, x1.5.
+      - expr: gardenio:land_spend_credits:rate1h
+        eval_time: 600m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:rate1h{land="tomato"}'
+            value: 22.5
+      # The day so far ($150 x 1.5 = 225 credits) over 24 hours.
+      - expr: gardenio:land_spend_credits:rate1d
+        eval_time: 600m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:rate1d{land="tomato"}'
+            value: 9.375
+      # The 7d and 30d windows share the window define rate1h and rate1d
+      # prove the cut on; with ten hours of history both hold all of it.
+      - expr: gardenio:land_spend_credits:increase7d
+        eval_time: 600m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:increase7d{land="tomato"}'
+            value: 225
+      - expr: gardenio:land_spend_credits:increase30d
+        eval_time: 600m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:increase30d{land="tomato"}'
+            value: 225
+      # Per agent across models: crew-a $4.5, steward $2, x1.5. The fleet's
+      # agent is not a land's.
+      - expr: gardenio:land_spend_credits:by_agent
+        eval_time: 600m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:by_agent{land="tomato",agent="crew-a"}'
+            value: 6.75
+          - labels: 'gardenio:land_spend_credits:by_agent{land="tomato",agent="steward"}'
+            value: 3
+      # Nothing for a land with no rate in force, or for an operator account.
+      - expr: gardenio:land_spend_credits:total{land!="tomato"}
+        eval_time: 600m
+        exp_samples: []
+      - expr: gardenio:land_spend_credits:today{land!="tomato"}
+        eval_time: 600m
+        exp_samples: []
+      - expr: gardenio:land_credits:remaining{land!="tomato"}
+        eval_time: 600m
+        exp_samples: []
+
+  # "today" across the first midnight (t=1440m). With the first case (d0 = 0)
+  # this fixes both terms of W - (d0 - 1) x S. $0.25 a minute, x2.
+  - name: today_resets_at_midnight_utc
+    interval: 1m
+    input_series:
+      - series: 'gardenio_account_cost_usd{account="lands-tomato",env="prod"}'
+        values: '0+0.25x1500'
+      - series: 'gardenio_lands_credit_rate{land="tomato"}'
+        values: '2x1500'
+    promql_expr_test:
+      # Day 0, 23:50: 286 steps of $1.25.
+      - expr: gardenio:land_spend_credits:today
+        eval_time: 1430m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:today{land="tomato"}'
+            value: 715
+      # Day 1, 00:00: the step that ends at midnight is yesterday's.
+      - expr: gardenio:land_spend_credits:today
+        eval_time: 1440m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:today{land="tomato"}'
+            value: 0
+      # Day 1, 01:00: 12 steps of $1.25.
+      - expr: gardenio:land_spend_credits:today
+        eval_time: 1500m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:today{land="tomato"}'
+            value: 30
+      # The trailing day still holds yesterday evening: $360 x2 over 24 hours.
+      - expr: gardenio:land_spend_credits:rate1d
+        eval_time: 1500m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:rate1d{land="tomato"}'
+            value: 30
+
+  # A 20-minute scrape gap loses nothing; a re-minted key (the gauge drops to
+  # 0) is a reset, not negative spend, and loses only the step it falls in.
+  # $1 a minute, x1.
+  - name: gap_and_reset
+    interval: 1m
+    input_series:
+      - series: 'gardenio_account_cost_usd{account="lands-tomato",env="prod"}'
+        values: '0+1x30 _x20 51+1x9 0+1x29'
+      - series: 'gardenio_lands_credit_rate{land="tomato"}'
+        values: '1x90'
+    promql_expr_test:
+      # t=0..30 ($30), across the gap to t=55 ($25), t=60 ($5); the step with
+      # the reset at t=61 counts 0, the new key's $4 to t=65 is the one loss;
+      # t=65..90 ($25). $85 in all.
+      - expr: gardenio:land_spend_credits:today
+        eval_time: 90m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:today{land="tomato"}'
+            value: 85
+      # Spent to date is what the purse reads: the new key's total.
+      - expr: gardenio:land_spend_credits:total
+        eval_time: 90m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:total{land="tomato"}'
+            value: 29
+
+  # A rate change reprices the whole history, as the purse does: windows take
+  # the USD first and the rate now, so moving from x1.5 to x2 neither jumps
+  # nor reads as a reset.
+  - name: rate_change_reprices
+    interval: 1m
+    input_series:
+      - series: 'gardenio_account_cost_usd{account="lands-tomato",env="prod"}'
+        values: '0+1x120'
+      - series: 'gardenio_lands_credit_rate{land="tomato"}'
+        values: '1.5x60 2x60'
+      - series: 'gardenio_lands_credits_granted{land="tomato"}'
+        values: '1000x120'
+    promql_expr_test:
+      - expr: gardenio:land_spend_credits:total
+        eval_time: 120m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:total{land="tomato"}'
+            value: 240
+      - expr: gardenio:land_credits:remaining
+        eval_time: 120m
+        exp_samples:
+          - labels: 'gardenio:land_credits:remaining{land="tomato"}'
+            value: 760
+      - expr: gardenio:land_spend_credits:rate1h
+        eval_time: 120m
+        exp_samples:
+          - labels: 'gardenio:land_spend_credits:rate1h{land="tomato"}'
+            value: 120

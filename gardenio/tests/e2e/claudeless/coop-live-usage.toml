@@ -1,0 +1,67 @@
+# coop-live-usage.toml
+#
+# Claudeless scenario for gardenio/tests/e2e/scripts/test-coop-live-usage.sh
+# (ka-0000005996). Fed directly to a bare
+# `coop --port-metrics N -- claudeless --scenario=...` invocation.
+#
+# PURPOSE: drive coop's live-usage seam with a DETERMINISTIC number of tool
+# calls, so the e2e can assert an exact tool-call histogram count rather than
+# a vague "> 0". Block 2 issues three tool calls in one turn (Claude can emit
+# parallel tool_use blocks, and coop's ToolTimer keys pending starts by tool
+# NAME in a FIFO — two same-named calls in one turn is the case that exercises
+# that queue); block 3 issues one more. Total 4.
+#
+# `[tools] mode = "live"` plus a per-tool `approve = true` is load-bearing: an
+# unapproved tool never produces the PostToolUse hook event, so coop sees a
+# ToolBefore with no matching ToolAfter and records NO latency observation.
+#
+# `usage = { input_tokens, output_tokens }` is what makes the
+# gardenio_session_*_tokens counters non-zero. NOTE: in interactive PTY mode
+# (what coop drives) claudeless writes hardcoded token values into the session
+# log and ignores these numbers, so the e2e asserts "> 0", never a magnitude.
+#
+# Response blocks are matched in order, one per prompt-like input claudeless
+# sees. The shell test feeds inputs in the same order:
+#   Block 1: initial prompt at coop startup   → idle ack, no tools
+#   Block 2: first HTTP nudge                 → 3 tool calls (Read/Bash/Read)
+#   Block 3: second HTTP nudge                → 1 tool call  (Bash)
+
+[[responses]]
+on = "*"
+say = "Live-usage scenario online."
+max = 1
+usage = { input_tokens = 1000, output_tokens = 50 }
+
+[[responses]]
+on = "*"
+say = "Running three tools."
+max = 1
+usage = { input_tokens = 2500, output_tokens = 120 }
+[[responses.tools]]
+call = "Read"
+input = { file_path = "/tmp/coop-live-usage-a" }
+[[responses.tools]]
+call = "Bash"
+input = { command = "echo one" }
+[[responses.tools]]
+call = "Read"
+input = { file_path = "/tmp/coop-live-usage-b" }
+
+[[responses]]
+on = "*"
+say = "Running one more tool."
+usage = { input_tokens = 3000, output_tokens = 60 }
+[[responses.tools]]
+call = "Bash"
+input = { command = "echo two" }
+
+[tools]
+mode = "live"
+
+[tools.Read]
+approve = true
+result = "coop-live-usage fixture content"
+
+[tools.Bash]
+approve = true
+result = "ok"

@@ -1,0 +1,136 @@
+{
+  "_comment": [
+    "Seed fixture for the fix-available-pending-branch-htmx widget-type bead.",
+    "Created for ka-0000005506 (Phase 4 free-htmx port — sixth port after",
+    "activity-log-htmx (MR !2334 / ka-0000004584), related-tickets-htmx",
+    "(MR !2346 / ka-0000005540), header-incident-summary-htmx",
+    "(MR !2347 / ka-0000005304), reporter-info-htmx (ka-0000004065), and",
+    "event-timeline-htmx (ka-0000000243)). Strategy A — port-then-soak:",
+    "lives alongside the Go-coded `fix-available-pending-branch` slug",
+    "(widgets_phase6.go) rather than replacing it. Authoring path:",
+    "",
+    "  kd create 'Free-htmx widget: fix-available-pending-branch-htmx' \\",
+    "    --type=widget-type \\",
+    "    -F gardenio/controller/cmd/beads-viewer/fixtures/fix-available-pending-branch-htmx.json",
+    "",
+    "Pre-write hooks (kbeads/internal/server/widget_validation.go) parse",
+    "template_source under html/template and reject malformed inputs at",
+    "createBead/updateBead time, so a bad fixture surfaces immediately.",
+    "Schema validation runs against widget-instance writes per the same",
+    "pre-write hook; the schema below is the wire contract.",
+    "",
+    "Unlike the previous five ports, the wire contract here does NOT mirror",
+    "the Go renderer 1:1. The Go path takes a raw unified `diff` string and",
+    "parses + chroma-highlights it server-side; the htmx template has no",
+    "diff parser or syntax-highlighter in scope, so the contract requires",
+    "producers to ship pre-structured `files[]` (path / language / adds /",
+    "dels / hunks → header / context / lines → kind / old_num / new_num /",
+    "text). Five intentional parity gaps documented in the port doc and in",
+    "TestFixAvailablePendingBranchParity:",
+    "  1. Diff parsing — Go runs parseUnifiedDiff; htmx requires structured",
+    "     files[]. Producers parse upstream (the gardener that emits the",
+    "     widget-instance bead is best-placed to do this).",
+    "  2. Syntax highlighting — Go runs chroma per line; htmx emits text",
+    "     verbatim (auto-escaped). The diff CSS classes still apply, just",
+    "     without the per-token spans.",
+    "  3. Markdown summary — Go renders summary_markdown via goldmark; htmx",
+    "     drops the field. Producers can pre-render and ship plain text.",
+    "  4. Action buttons — Go emits Fast-track-merge + Open MR via",
+    "     FastTrackMergeAction / OpenMRAction; htmx omits both. The",
+    "     ii-w-pending-actions footer is present but empty.",
+    "  5. CI status sanitization + commit_short — Go normalises CI status",
+    "     and computes commit_sha[:7]; htmx emits both verbatim. Producers",
+    "     should pre-normalize ci_status to {passed,failed,running,pending}",
+    "     and pre-truncate to the desired short SHA length."
+  ],
+  "fields": {
+    "slug": "fix-available-pending-branch-htmx",
+    "widget_version": "1",
+    "renderer_kind": "htmx",
+    "template_engine": "go-html-template-v1",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title":        {"type": "string"},
+        "branch":       {"type": "string"},
+        "base_branch":  {"type": "string"},
+        "commit_sha":   {"type": "string"},
+        "commit_short": {"type": "string"},
+        "author":       {"type": "string"},
+        "ci_status":    {"type": "string"},
+        "adds":         {"type": "number"},
+        "dels":         {"type": "number"},
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "path":     {"type": "string"},
+              "language": {"type": "string"},
+              "adds":     {"type": "number"},
+              "dels":     {"type": "number"},
+              "hunks": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "header":  {"type": "string"},
+                    "context": {"type": "string"},
+                    "lines": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind":    {"type": "string", "enum": ["ctx", "add", "del"]},
+                          "old_num": {"type": "number"},
+                          "new_num": {"type": "number"},
+                          "text":    {"type": "string"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "template_source": "<div class=\"ii-w-pending-branch\">\n{{- $title := index .Payload \"title\" -}}\n{{- $branch := index .Payload \"branch\" -}}\n{{- $baseBranch := index .Payload \"base_branch\" -}}\n{{- $commitSHA := index .Payload \"commit_sha\" -}}\n{{- $commitShort := index .Payload \"commit_short\" -}}\n{{- $author := index .Payload \"author\" -}}\n{{- $ciStatus := index .Payload \"ci_status\" -}}\n{{- $adds := index .Payload \"adds\" -}}\n{{- $dels := index .Payload \"dels\" -}}\n{{- $files := index .Payload \"files\" -}}\n  <header class=\"ii-w-pending-head\">\n    {{if $title}}<h4 class=\"ii-w-pending-title\">{{$title}}</h4>{{end}}\n    <div class=\"ii-w-pending-meta\">\n      {{if $branch}}<code class=\"ii-w-pending-branch-name\">{{$branch}}</code>{{end}}\n      {{if $baseBranch}}<span class=\"ii-w-pending-base\">→ {{$baseBranch}}</span>{{end}}\n      {{if $commitShort}}<code class=\"ii-w-pending-sha\" title=\"{{$commitSHA}}\">{{$commitShort}}</code>{{end}}\n      {{if $author}}<span class=\"ii-w-pending-author\">by {{$author}}</span>{{end}}\n    </div>\n    <div class=\"ii-w-pending-status\">\n      {{if $ciStatus}}<span class=\"ii-pill\" data-state=\"{{$ciStatus}}\">CI {{$ciStatus}}</span>{{end}}\n      {{if $files}}<span class=\"ii-w-pending-count\">{{len $files}} file{{if ne (len $files) 1}}s{{end}}</span>{{end}}\n      {{if or $adds $dels}}\n        <span class=\"ii-w-pending-adds\">+{{$adds}}</span>\n        <span class=\"ii-w-pending-dels\">−{{$dels}}</span>\n      {{end}}\n    </div>\n  </header>\n  {{if $files}}\n    <ol class=\"ii-w-pending-files\">\n      {{range $files}}\n        <li class=\"ii-w-diff-file\" data-language=\"{{.language}}\">\n          <header class=\"ii-w-diff-file-head\">\n            <code class=\"ii-w-diff-path\">{{.path}}</code>\n            <span class=\"ii-w-diff-counts\">\n              <span class=\"ii-w-diff-add-count\">+{{.adds}}</span>\n              <span class=\"ii-w-diff-del-count\">−{{.dels}}</span>\n            </span>\n          </header>\n          {{range .hunks}}\n            <div class=\"ii-w-diff-hunk\">\n              <div class=\"ii-w-diff-hunk-head\">\n                <code class=\"ii-w-diff-hunk-header\">{{.header}}</code>\n                {{if .context}}<span class=\"ii-w-diff-hunk-ctx\">{{.context}}</span>{{end}}\n              </div>\n              <table class=\"ii-w-diff-table\">\n                <tbody>\n                  {{range .lines}}\n                    <tr class=\"ii-w-diff-line ii-w-diff-{{.kind}}\">\n                      <td class=\"ii-w-diff-gutter ii-w-diff-gutter-old\">{{if .old_num}}{{.old_num}}{{end}}</td>\n                      <td class=\"ii-w-diff-gutter ii-w-diff-gutter-new\">{{if .new_num}}{{.new_num}}{{end}}</td>\n                      <td class=\"ii-w-diff-marker\">{{if eq .kind \"add\"}}+{{else if eq .kind \"del\"}}−{{else}}&nbsp;{{end}}</td>\n                      <td class=\"ii-w-diff-code\">{{.text}}</td>\n                    </tr>\n                  {{end}}\n                </tbody>\n              </table>\n            </div>\n          {{end}}\n        </li>\n      {{end}}\n    </ol>\n  {{else}}\n    <p class=\"empty\">No diff available.</p>\n  {{end}}\n  <footer class=\"ii-w-pending-actions\"></footer>\n</div>",
+    "sample_payload": {
+      "title": "Fix available",
+      "branch": "agent/fix-stale-cookies",
+      "base_branch": "main",
+      "commit_sha": "9c2a3b7e1f4d8c0a5b6e9f2d4c1a3e5b7d9c0a2f",
+      "commit_short": "9c2a3b7",
+      "author": "gardenio",
+      "ci_status": "passed",
+      "adds": 2,
+      "dels": 1,
+      "files": [
+        {
+          "path": "auth/session.go",
+          "language": "go",
+          "adds": 2,
+          "dels": 1,
+          "hunks": [
+            {
+              "header": "@@ -42,7 +42,8 @@",
+              "context": "func rotateSession",
+              "lines": [
+                {"kind": "ctx", "old_num": 42, "new_num": 42, "text": "\tcookie := r.Cookies()"},
+                {"kind": "del", "old_num": 43, "new_num": 0,  "text": "-\tif cookie.Stale() { return cookie }"},
+                {"kind": "add", "old_num": 0,  "new_num": 43, "text": "+\tif cookie.Stale() {"},
+                {"kind": "add", "old_num": 0,  "new_num": 44, "text": "+\t\treturn nil"}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

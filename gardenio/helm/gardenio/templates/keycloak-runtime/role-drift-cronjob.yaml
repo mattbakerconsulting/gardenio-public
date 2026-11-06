@@ -1,0 +1,145 @@
+{{- /*
+Keycloak role-drift probe (gd-L2MyfEe9lL): checks hourly that
+default-roles-<realm> composes no gardenio-* role. A fresh user holding
+gardenio-viewer is an unrestricted reader in kbeads and the viewer. The script
+is files/keycloak/role-drift-probe.sh; a failed run means drift or a probe that
+cannot look, and vmalert's KeycloakRoleDriftProbeFailing fires on the CronJob's
+stale last success.
+
+It signs in as its own confidential client (keycloak/clients.yaml renders it
+from gardenio.keycloakRuntime.roleDriftProbe.client): its service account holds
+realm-management view-realm and nothing else, so the probe only reads (operator
+decision gd-TgsaQWJPQ3). The client secret, in the Secret below, is generated
+once and kept across upgrades; the EDP operator imports it from there.
+*/ -}}
+{{- if include "gardenio.keycloakRuntime.roleDriftProbe.on" . }}
+{{- $clientSecret := include "gardenio.keycloakRuntime.roleDriftProbe.clientSecretName" . -}}
+{{- $runtime := .Values.keycloak.runtime -}}
+{{- $probe := $runtime.roleDriftProbe -}}
+{{- $realm := .Values.keycloak.realm.name | default .Release.Name -}}
+{{- $svc := include "gardenio.keycloakRuntime.fullname" . -}}
+{{- $path := $runtime.httpRelativePath | default "/auth" -}}
+{{- $tls := include "gardenio.keycloakRuntime.clientsTLS" . -}}
+{{- $serverURL := "" -}}
+{{- if $tls -}}
+{{- $serverURL = printf "https://%s.%s.svc.cluster.local:%v%s" $svc .Release.Namespace (($runtime.service.httpsPort | default 8443) | toString) $path -}}
+{{- else -}}
+{{- $serverURL = printf "http://%s.%s.svc.cluster.local:%v%s" $svc .Release.Namespace (($runtime.service.httpPort | default 8080) | toString) $path -}}
+{{- end -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $clientSecret }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-runtime-role-drift
+  annotations:
+    "helm.sh/resource-policy": keep
+type: Opaque
+data:
+  clientSecret: {{ include "gardenio.keycloakRuntime.roleDriftProbe.clientSecret" . | b64enc | quote }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "gardenio.keycloakRuntime.roleDriftProbe.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-runtime-role-drift
+spec:
+  schedule: {{ $probe.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ $probe.activeDeadlineSeconds }}
+      # One try per slot: a retry would only repeat the same answer.
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "gardenio.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: keycloak-runtime-role-drift
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          {{- if $.Values.global.systemPriorityClass.create }}
+          priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+          {{- end }}
+          containers:
+            - name: probe
+              image: {{ include "gardenio.mirroredImage" (dict "image" $runtime.image "global" .Values.global) | quote }}
+              imagePullPolicy: {{ $runtime.image.pullPolicy | default "IfNotPresent" }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: KC_SERVER
+                  value: {{ $serverURL | quote }}
+                - name: KC_REALM
+                  value: {{ $realm | quote }}
+                {{- if $tls }}
+                - name: TRUSTSTORE_FILE
+                  value: /etc/keycloak-runtime-ca/truststore.p12
+                - name: TRUSTSTORE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ printf "%s-truststore-password" $svc | quote }}
+                      key: password
+                {{- end }}
+                - name: KC_CLIENT_ID
+                  value: {{ $probe.clientId | quote }}
+                - name: KC_CLIENT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $clientSecret | quote }}
+                      key: clientSecret
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  {{- .Files.Get "files/keycloak/role-drift-probe.sh" | nindent 18 }}
+              resources:
+                {{- toYaml $probe.resources | nindent 16 }}
+              volumeMounts:
+                - name: home
+                  mountPath: /tmp
+                {{- if $tls }}
+                - name: keycloak-runtime-ca
+                  mountPath: /etc/keycloak-runtime-ca
+                  readOnly: true
+                {{- end }}
+          volumes:
+            - name: home
+              emptyDir: {}
+            {{- if $tls }}
+            - name: keycloak-runtime-ca
+              secret:
+                secretName: {{ include "gardenio.keycloakRuntime.tlsSecretName" . | quote }}
+                defaultMode: 0444
+                items:
+                  - key: truststore.p12
+                    path: truststore.p12
+            {{- end }}
+          {{- include "gardenio.nodeSelector" (dict "local" $runtime.nodeSelector "global" .Values.global.nodeSelector) | nindent 10 }}
+          {{- include "gardenio.tolerations" (dict "local" $runtime.tolerations "global" .Values.global.tolerations) | nindent 10 }}
+{{- end }}

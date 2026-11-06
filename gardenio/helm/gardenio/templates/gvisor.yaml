@@ -1,0 +1,177 @@
+{{- /*
+gVisor (runsc) sandboxed runtime — Phase 4 freeze/thaw productionization
+(epic ka-0000007417, task ka-0000007200).
+
+Flag-gated, DEFAULT OFF. Nothing here is templated unless `.Values.gvisor.enabled`
+is true, and even then no agent runs under runsc until a role/project/agent
+explicitly opts in via `runtime_class: runsc` (podspec.go RuntimeClassName
+plumbing, lines 165-169/417). This template only makes the RuntimeClass exist
+and (optionally) the Karpenter node pool — it does NOT route any workload onto
+runsc by itself.
+
+The `runsc` RuntimeClass pins every pod that sets `runtimeClassName: runsc`
+onto the gVisor node pool via scheduling.nodeSelector + tolerations
+(label/taint `gvisor=enabled`), so callers only carry the runtimeClassName —
+they don't have to also repeat the nodeSelector/toleration.
+
+The node pool itself (Karpenter NodePool `gvisor-poc` + EC2NodeClass
+`gvisor-runsc`, AL2023, runsc containerd handler registered via nodeadm
+NodeConfig userdata) was provisioned out-of-band by the operator on
+america-e2e-eks and VERIFIED end-to-end (escalation ka-0000004674). It is the
+prod target. By default this chart does NOT manage it — see
+`.Values.gvisor.nodePool.create` and gardenio/docs/gvisor-runsc-prod.md.
+
+ROLLBACK: set `gvisor.enabled=false`. The RuntimeClass (and any chart-managed
+node pool) is removed and agents fall back to the cluster default runtime's
+cold-start lifecycle. Keep any role/agent `runtime_class: runsc` opt-in in sync
+with this flag — a runsc pod cannot schedule once the RuntimeClass is gone.
+*/ -}}
+{{- if .Values.gvisor.enabled }}
+{{- $rc := .Values.gvisor.runtimeClass }}
+{{- /*
+runtimeClass.create gates whether THIS chart renders the RuntimeClass object.
+Mirrors nodePool.create: on america-e2e-eks the `runsc` RuntimeClass was applied
+out-of-band by the operator (escalation ka-0000004674) and is NOT Helm-owned, so
+a release that also rendered it hits an "exists and cannot be imported" upgrade
+collision. Set runtimeClass.create=false to REFERENCE that pre-existing object
+(substrate-only step 1, plan ka-0000006865): gvisor.enabled=true still gates the
+controller env + node-pool block, but the RuntimeClass itself is left to whoever
+owns it. Default true preserves the original single-release behaviour.
+*/ -}}
+{{- if $rc.create }}
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: {{ $rc.name | default "runsc" }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    # Cluster-scoped, potentially shared by other releases referencing the same
+    # sandboxed runtime. `keep` prevents an uninstall (or a flip to
+    # gvisor.enabled=false on one release) from yanking the RuntimeClass out
+    # from under pods/releases that still reference it.
+    "helm.sh/resource-policy": keep
+# containerd runtime handler registered on the gVisor nodes. runsc is wired in
+# via nodeadm NodeConfig.spec.containerd.config
+# ([plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]
+#  runtime_type='io.containerd.runsc.v1') so it survives nodeadm regenerating
+# /etc/containerd/config.toml — the naive post-boot `runsc install` does NOT
+# survive (escalation ka-0000004674 durability note).
+handler: {{ $rc.handler | default "runsc" }}
+{{- /*
+On k3s (gvisor.k3sInstaller.enabled) runsc exists only where the installer
+DaemonSet runs, so the RuntimeClass pins to exactly the installer's
+nodeSelector + tolerations and runtimeClass.scheduling is not used.
+*/ -}}
+{{- $sched := $rc.scheduling }}
+{{- if .Values.gvisor.k3sInstaller.enabled }}
+{{- $sched = dict "nodeSelector" .Values.gvisor.k3sInstaller.nodeSelector "tolerations" .Values.gvisor.k3sInstaller.tolerations }}
+{{- end }}
+{{- with $sched }}
+# Auto-pin every runsc pod onto the nodes that have runsc: the gVisor pool
+# (gvisor=enabled) on EKS, the installer's platform nodes on k3s.
+scheduling:
+  {{- with .nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- with $rc.overhead }}
+overhead:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}{{/* end if $rc.create */}}
+{{- end }}{{/* end if gvisor.enabled */}}
+{{- /*
+Optional chart-managed Karpenter node pool. DEFAULT OFF — the operator already
+provisioned `gvisor-poc` / `gvisor-runsc` out-of-band (escalation
+ka-0000004674) and the runsc containerd handler MUST be registered via nodeadm
+NodeConfig userdata (post-boot `runsc install` does not survive). Enabling this
+requires the Karpenter CRDs (karpenter.sh NodePool, karpenter.k8s.aws
+EC2NodeClass) installed on the cluster, plus cluster-specific selectors
+(subnets, security groups, node IAM role) filled in under
+`.Values.gvisor.nodePool`. Leave create=false to reference the existing pool.
+*/ -}}
+{{- if and .Values.gvisor.enabled .Values.gvisor.nodePool.create }}
+{{- $np := .Values.gvisor.nodePool }}
+{{- if not $np.nodeClass.role }}
+{{- fail "gvisor.nodePool.create=true requires gvisor.nodePool.nodeClass.role (the node IAM role name)" }}
+{{- end }}
+{{- if not $np.nodeClass.subnetSelectorTerms }}
+{{- fail "gvisor.nodePool.create=true requires gvisor.nodePool.nodeClass.subnetSelectorTerms" }}
+{{- end }}
+{{- if not $np.nodeClass.securityGroupSelectorTerms }}
+{{- fail "gvisor.nodePool.create=true requires gvisor.nodePool.nodeClass.securityGroupSelectorTerms" }}
+{{- end }}
+---
+apiVersion: {{ $np.apiVersion | default "karpenter.k8s.aws/v1" }}
+kind: EC2NodeClass
+metadata:
+  name: {{ $np.nodeClassName | default "gvisor-runsc" }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  amiFamily: {{ $np.nodeClass.amiFamily | default "AL2023" }}
+  role: {{ $np.nodeClass.role | quote }}
+  subnetSelectorTerms:
+    {{- toYaml $np.nodeClass.subnetSelectorTerms | nindent 4 }}
+  securityGroupSelectorTerms:
+    {{- toYaml $np.nodeClass.securityGroupSelectorTerms | nindent 4 }}
+  {{- with $np.nodeClass.amiSelectorTerms }}
+  amiSelectorTerms:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $np.nodeClass.tags }}
+  tags:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $np.nodeClass.userData }}
+  # runsc + containerd-shim-runsc-v1 install and containerd runtime
+  # registration. MUST register runsc in nodeadm NodeConfig.spec.containerd
+  # so it survives config.toml regeneration (escalation ka-0000004674). For
+  # freeze/thaw, the same NodeConfig must add the runtime `options` (TypeUrl +
+  # ConfigPath -> /etc/containerd/runsc.toml) and the shim's [runsc_config]
+  # overlay2 = "root:dir=/var/lib/gardenio/overlay", relocating the rootfs-overlay
+  # upper filestore to a host-visible path so the freeze strip no longer destroys
+  # it (plan gvisor-thaw-overlay-dir-medium.md, bug ka-0000008217). See the
+  # values.yaml userData example.
+  userData: |
+    {{- . | nindent 4 }}
+  {{- end }}
+---
+apiVersion: {{ $np.nodePoolApiVersion | default "karpenter.sh/v1" }}
+kind: NodePool
+metadata:
+  name: {{ $np.name | default "gvisor-poc" }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  template:
+    metadata:
+      labels:
+        {{- toYaml ($np.nodeLabels | default (dict "gvisor" "enabled")) | nindent 8 }}
+    spec:
+      # Taint so NOTHING lands here unless it tolerates gvisor=enabled — i.e.
+      # only pods that go through the runsc RuntimeClass (which carries the
+      # matching toleration). Zero blast radius on the general node pool.
+      taints:
+        {{- toYaml ($np.taints | default (list (dict "key" "gvisor" "value" "enabled" "effect" "NoSchedule"))) | nindent 8 }}
+      nodeClassRef:
+        group: {{ $np.nodeClassRef.group | default "karpenter.k8s.aws" }}
+        kind: {{ $np.nodeClassRef.kind | default "EC2NodeClass" }}
+        name: {{ $np.nodeClassName | default "gvisor-runsc" }}
+      requirements:
+        {{- toYaml $np.requirements | nindent 8 }}
+  {{- with $np.limits }}
+  limits:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $np.disruption }}
+  disruption:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

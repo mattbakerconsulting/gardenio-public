@@ -1,0 +1,485 @@
+# Promote RC images + helm chart to final calver tag.
+#
+# Dispatched by GitLab CI's `promote` job after `rwx-e2e` succeeds. Splits
+# image and chart promotion out of docker.yml's event-triggered flow so
+# rwx-deploy-prod can hard-depend on promotion completing — previously
+# promote-images was event-triggered on tag push and ran in parallel with
+# the prod-deploy job, which could (and did) helm-upgrade prod with -rc-only
+# images (ka-0000008209).
+#
+# Dispatch:
+#   rwx dispatch gardenio-promote --ref $TAG --param version=$TAG
+#
+# Tasks:
+#   promote-images       — crane retag <version>-rc → <version> (mutable :latest
+#                          retired, F7 ka-0000006416); export release-digests.txt
+#                          (image@sha256:…) so the release can deploy/pin by digest
+#   promote-helm-chart   — helm package + push plain {version} chart
+#
+# Both run in parallel; the dispatch succeeds only if both succeed.
+
+on:
+  dispatch:
+    - key: gardenio-promote
+      init:
+        commit-sha: ${{ event.git.sha }}
+        version: ${{ event.dispatch.params.version }}
+      params:
+        - key: version
+          name: Version
+          description: "Calver tag (e.g. 2026.119.3) — promotes <version>-rc images + chart to <version>."
+          required: true
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      version: ""
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  # ── Clone monorepo (for helm chart source) ─────────────────────────
+  - key: code
+    # ── Retry-wrapped shallow clone (ka-0000004454) ─────────────────────
+    # Hand-rolled shallow clone with a bounded retry loop instead of
+    # `call: git/clone` — the same pattern proven in docker.yml (ka-0000007550).
+    # The stock package (through 2.0.8) has NO retry and RWX has no task-level
+    # auto-retry, so a single transient gitlab.com blip during fetch-pack
+    # (`Connection to gitlab.com closed by remote host`, exit 128) fails the whole
+    # run — and in a release-DAG task that reds a calver release outright.
+    #
+    # Parity with `git/clone` DEFAULTS (all this task used): shallow `--depth=1`
+    # fetch of the exact SHA (init.commit-sha is a 40-hex commit — no ls-remote
+    # ref resolution), detached checkout at that SHA, `.git` stripped afterwards
+    # (cleanup-git-dir default) for identical downstream cache keys, no submodules,
+    # no LFS. This task consumes only the checked-out working tree — no downstream
+    # `git` ops and no RWX_GIT_COMMIT_SHA — so, unlike docker.yml, it emits no sha.
+    run: |
+      set -eu
+      : "${GITLAB_CLONE_TOKEN:?GITLAB_CLONE_TOKEN is required}"
+      REPO="https://oauth2:${GITLAB_CLONE_TOKEN}@gitlab.com/Acme/Platform/gardenio.git"
+      SHA="${COMMIT_SHA}"
+      MAX_ATTEMPTS=5
+
+      # Redact the token from any tracing/output; never echo $REPO.
+      git init -q -b main
+      git remote add origin "$REPO"
+      git config --local maintenance.auto false
+      git config --local gc.auto 0
+
+      attempt=1
+      while :; do
+        echo "git-clone attempt ${attempt}/${MAX_ATTEMPTS} for ${SHA}"
+        if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch --no-auto-gc --depth=1 origin "+${SHA}:refs/rwx/git-clone/checkout"; then
+          echo "git-clone: fetch succeeded on attempt ${attempt}"
+          break
+        else
+          rc=$?
+          if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+            echo "git-clone: fetch FAILED after ${MAX_ATTEMPTS} attempts (last exit ${rc})" >&2
+            exit "$rc"
+          fi
+          # Exponential backoff: 5s, 10s, 20s, 40s.
+          sleep_s=$((5 * (1 << (attempt - 1))))
+          echo "git-clone: fetch failed (exit ${rc}); retrying in ${sleep_s}s" >&2
+          sleep "$sleep_s"
+          attempt=$((attempt + 1))
+        fi
+      done
+
+      git checkout -q --detach "$(git rev-parse refs/rwx/git-clone/checkout^{commit})"
+      git clean -fdq
+      echo "Checked out git repository at $(git rev-parse HEAD)"
+
+      # Strip .git for cache-key parity with git/clone's cleanup-git-dir default.
+      rm -rf .git
+    env:
+      GITLAB_CLONE_TOKEN:
+        value: ${{ secrets.GITLAB_CLONE_TOKEN }}
+        cache-key: excluded
+      COMMIT_SHA: ${{ init.commit-sha }}
+
+  # ── Install crane + auth to GitLab registry ─────────────────────────
+  - key: install-crane
+    cache: false
+    run: |
+      set -ex
+      curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+        | tar xz -C /tmp crane
+      sudo mv /tmp/crane /usr/local/bin/
+      IMAGE_REGISTRY="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}"
+      REGISTRY_HOST="${IMAGE_REGISTRY%%/*}"
+      set +x  # never xtrace the token into the log (ka-0000002171)
+      echo "$REGISTRY_TOKEN" | crane auth login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin
+      set -x
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+
+  # ── Install helm + python3 (for chart promotion + image entrypoint check) ─
+  - key: install-helm
+    cache: false
+    run: |
+      set -ex
+      sudo apt-get update && sudo apt-get install -y -q curl jq python3
+      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      helm version --short
+      # yq (mikefarah) — used by scripts/pack-gardenio-chart.sh to strip
+      # values.yaml comments at package time (defense-in-depth). The strip that
+      # actually keeps the Helm release-history Secret under the K8s 1 MiB limit
+      # is the Go-template comment strip in templates/ (python3, installed above)
+      # — Helm stores values as a parsed map, so only template text lands in the
+      # Secret verbatim (ka-0000007585). Pinned to match .rwx/ci.yml.
+      YQ_VERSION=4.53.2
+      ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; esac
+      sudo curl -fsSL -o /usr/local/bin/yq \
+        "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${ARCH}"
+      sudo chmod +x /usr/local/bin/yq
+      yq --version
+
+  # ── Promote RC images: <version>-rc → <version> (mutable :latest retired) ──
+  - key: promote-images
+    use: [code, install-crane, install-helm]
+    if: ${{ init.version != '' }}
+    cache: false
+    timeout: 20m
+    run: |
+      set -ex
+      CALVER="${VERSION}"
+      REGISTRY="${IMAGE_REGISTRY:-registry.gitlab.com/acme/platform/gardenio}"
+
+      # IMAGES is derived from the single source of truth scripts/release-images.txt
+      # (ka-0000005178) — do NOT re-hardcode a copy here. The sign-release-images
+      # job (.gitlab-ci.yml) reads the SAME file, and scripts/check-release-images-manifest.sh
+      # reds CI if that file drifts from the .rwx/docker.yml build matrix — which
+      # is how a service (ava-log-shipper, geo-table, traefik-log-shipper) once
+      # ended up promoted-but-unsigned. microvm-agent{,-context} are built by
+      # .rwx/microvm-image.yml (native arm64 DAG, same tag-push trigger) — ka-0000001041.
+      IMAGES="$(grep -vE '^[[:space:]]*(#|$)' scripts/release-images.txt | tr '\n' ' ')"
+
+      # ── Pre-flight: poll every -rc image until present (or timeout) ──
+      # docker.yml's push-* tasks finish at different times — push-agent
+      # depends on push-agent-base (~1.8 GB upload) and routinely finishes
+      # 5-10 min after the lighter push-controller/-bridge images. The
+      # GitLab CI dispatch chain (deploy-rwx -> e2e -> promote) probes
+      # only `controller` before deploying (.rwx/deploy-rwx.yml), so
+      # promote can be reached while push-agent is still uploading
+      # (ka-0000007611: tag 2026.135.14 — agent:rc pushed at +26 min,
+      # promote-images ran at +19 min and FATALed on a missing tag that
+      # appeared ~7 min later). Mirror the deploy-rwx self-heal pattern:
+      # poll for the full set with a generous cap so transient lag does
+      # not burn a calver tag, but a genuine build failure still surfaces.
+      WAIT_TIMEOUT_SEC="${PROMOTE_WAIT_TIMEOUT_SEC:-900}"   # 15 min cap
+      WAIT_INTERVAL_SEC="${PROMOTE_WAIT_INTERVAL_SEC:-30}"
+      # IMAGES is a space-separated string; count tokens for log clarity.
+      IMAGE_COUNT=$(echo $IMAGES | wc -w)
+      echo "=== Pre-promotion validation: polling ${IMAGE_COUNT} ${CALVER}-rc images (timeout ${WAIT_TIMEOUT_SEC}s) ==="
+      DEADLINE=$(( $(date +%s) + WAIT_TIMEOUT_SEC ))
+      ATTEMPT=0
+      while true; do
+        ATTEMPT=$((ATTEMPT + 1))
+        MISSING=()
+        for image in $IMAGES; do
+          if ! crane manifest "${REGISTRY}/${image}:${CALVER}-rc" >/dev/null 2>&1; then
+            MISSING+=("$image")
+          fi
+        done
+        if [ ${#MISSING[@]} -eq 0 ]; then
+          echo "OK: all ${IMAGE_COUNT} -rc images present (attempt ${ATTEMPT})"
+          break
+        fi
+        NOW=$(date +%s)
+        if [ "$NOW" -ge "$DEADLINE" ]; then
+          echo "FATAL: ${#MISSING[@]} -rc image(s) still missing after ${WAIT_TIMEOUT_SEC}s (${ATTEMPT} attempts). Missing: ${MISSING[*]}"
+          echo "       The .rwx/docker.yml push-* tasks for this commit must complete before promote can run."
+          echo "       Inspect docker.yml run at https://cloud.rwx.com/mint/acme (filter on commit ${COMMIT_SHA:-unknown})."
+          exit 1
+        fi
+        REMAINING=$((DEADLINE - NOW))
+        echo "Attempt ${ATTEMPT}: ${#MISSING[@]} missing (${MISSING[*]}); retrying in ${WAIT_INTERVAL_SEC}s (${REMAINING}s remaining)..."
+        sleep "$WAIT_INTERVAL_SEC"
+      done
+
+      # Log the verified set once so the success path is auditable.
+      for image in $IMAGES; do
+        echo "  OK: ${image}:${CALVER}-rc"
+      done
+
+      # Verify the agent -rc image has expected metadata before promoting.
+      # The 2026.101.6 incident showed that a concurrent build can overwrite
+      # the -rc tag with an un-mutated image (no entrypoint).
+      EP=$(crane config "${REGISTRY}/agent:${CALVER}-rc" 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('config',{}).get('Entrypoint') or '')" 2>/dev/null)
+      if [ -z "$EP" ]; then
+        echo "FATAL: agent:${CALVER}-rc has no Entrypoint — refusing to promote a broken image"
+        exit 1
+      fi
+      echo "  Verified: agent:${CALVER}-rc has Entrypoint=${EP}"
+
+      # ── Build-provenance gate: -rc image revision MUST match the tag SHA ──
+      #
+      # Root cause of the 2026.167.5 gasbox incident (ka-0000004203): the
+      # promoted controller:2026.167.5 binary behaved as if it predated a
+      # fix (038daa2c2) that the 2026.167.5 SOURCE TAG demonstrably
+      # contains. The clone in docker.yml is pinned to event.git.sha, so a
+      # correct tag-triggered build is content-accurate — but nothing
+      # asserted that the image actually PROMOTED was built from the tag's
+      # commit. The -rc tags are mutable: a stale or parallel build (an
+      # older pipeline re-run, a main-branch build racing the tag build,
+      # the 2026.101.6 / 2026.135.14 overwrite incidents documented above)
+      # can leave ${CALVER}-rc pointing at the wrong source. Promotion then
+      # blindly retags that wrong image as the golden ${CALVER}.
+      #
+      # docker.yml now stamps every app image with an OCI standard label
+      # org.opencontainers.image.revision=<commit-sha> at push time (crane
+      # mutate --label). Here we read it back from each -rc image and refuse
+      # to promote on a MISMATCH against this tag's commit — turning the
+      # silent build-vs-tag divergence into a loud, blocking failure that
+      # burns no calver tag. Missing label is tolerated (warn-only) so the
+      # gate rolls out incrementally: images built before this change, or
+      # the cache/base layers, won't carry it yet. Set
+      # PROMOTE_REQUIRE_REVISION=1 to harden missing→fatal once all images
+      # are known to carry the label.
+      EXPECTED_SHA="${COMMIT_SHA}"
+      REQUIRE_REVISION="${PROMOTE_REQUIRE_REVISION:-0}"
+      REVISION_LABEL="org.opencontainers.image.revision"
+      if [ -z "$EXPECTED_SHA" ]; then
+        echo "WARN: COMMIT_SHA unset — skipping build-provenance gate (cannot determine expected tag SHA)"
+      else
+        echo "=== Build-provenance gate: asserting -rc image revision == ${EXPECTED_SHA} (require_label=${REQUIRE_REVISION}) ==="
+        PROV_FAILED=()
+        for image in $IMAGES; do
+          GOT=$(crane config "${REGISTRY}/${image}:${CALVER}-rc" 2>/dev/null \
+            | python3 -c "import sys,json; print((json.load(sys.stdin).get('config',{}).get('Labels') or {}).get('${REVISION_LABEL}',''))" 2>/dev/null)
+          if [ -z "$GOT" ]; then
+            if [ "$REQUIRE_REVISION" = "1" ]; then
+              echo "  FAIL: ${image}:${CALVER}-rc has no ${REVISION_LABEL} label (PROMOTE_REQUIRE_REVISION=1)"
+              PROV_FAILED+=("$image(no-label)")
+            else
+              echo "  WARN: ${image}:${CALVER}-rc has no ${REVISION_LABEL} label — skipping provenance check for this image"
+            fi
+            continue
+          fi
+          if [ "$GOT" != "$EXPECTED_SHA" ]; then
+            echo "  FAIL: ${image}:${CALVER}-rc built from ${GOT}, expected tag commit ${EXPECTED_SHA}"
+            PROV_FAILED+=("$image(${GOT:0:9})")
+          else
+            echo "  OK: ${image}:${CALVER}-rc revision=${GOT:0:9} matches tag"
+          fi
+        done
+        if [ ${#PROV_FAILED[@]} -gt 0 ]; then
+          echo "FATAL: ${#PROV_FAILED[@]} -rc image(s) do NOT match the release tag commit ${EXPECTED_SHA}."
+          echo "       Refusing to promote a build-vs-tag mismatch (release-integrity gate, ka-0000004203)."
+          echo "       Mismatched: ${PROV_FAILED[*]}"
+          echo "       Re-run the docker.yml build for this exact tag, then re-dispatch gardenio-promote."
+          exit 1
+        fi
+        echo "  All labelled -rc images built from the release tag commit ${EXPECTED_SHA}."
+      fi
+
+      # ── Coverage-image refusal gate (W2 §6.2, ka-0000001728) ──────────────
+      #
+      # Coverage-instrumented image variants (<binary>-cover:<tag>) are built
+      # by .rwx/docker.yml's push-*-cover tasks for E2E runtime coverage
+      # collection. They carry instrumentation overhead, write counters to a
+      # host volume, and MUST NEVER reach a final calver/latest tag or run in
+      # production. docker.yml stamps every such image with the OCI label
+      # org.gardenio.cover=1 (crane mutate --label). This gate is the promote-
+      # time enforcement: it hard-fails if ANY image being promoted is a
+      # coverage variant, detected two independent ways —
+      #   1. the image NAME carries a -cover repo suffix, or
+      #   2. the -rc image carries the org.gardenio.cover=1 OCI label.
+      # The tag scheme already keeps cover variants off the promote path
+      # (main -> <bin>-cover:main-<sha7>; tag -> <bin>-cover:<calver>-rc, never
+      # promoted), and the IMAGES list below excludes every -cover repo — so in
+      # a correct pipeline this gate is a no-op. It exists to turn a future
+      # mistake (a -cover repo added to IMAGES, or a mislabelled image
+      # overwriting a plain -rc tag) into a loud, blocking failure instead of a
+      # coverage-instrumented production release. The Kyverno
+      # disallow-cover-images ClusterPolicy is the third line of defense at
+      # admission time.
+      COVER_LABEL="org.gardenio.cover"
+      echo "=== Coverage-image refusal gate: refusing to promote any -cover variant to ${CALVER} ==="
+      COVER_FAILED=()
+      for image in $IMAGES; do
+        # (1) name-based: a -cover repo suffix must never be promoted.
+        case "$image" in
+          *-cover)
+            echo "  FAIL: ${image} is a coverage-image repo (-cover suffix) — must never be promoted"
+            COVER_FAILED+=("$image(name)")
+            continue
+            ;;
+        esac
+        # (2) label-based: read org.gardenio.cover back from the -rc image.
+        COVER=$(crane config "${REGISTRY}/${image}:${CALVER}-rc" 2>/dev/null \
+          | python3 -c "import sys,json; print((json.load(sys.stdin).get('config',{}).get('Labels') or {}).get('${COVER_LABEL}',''))" 2>/dev/null)
+        if [ -n "$COVER" ]; then
+          echo "  FAIL: ${image}:${CALVER}-rc carries ${COVER_LABEL}=${COVER} — coverage-instrumented image, refusing to promote"
+          COVER_FAILED+=("$image(${COVER_LABEL}=${COVER})")
+        fi
+      done
+      if [ ${#COVER_FAILED[@]} -gt 0 ]; then
+        echo "FATAL: ${#COVER_FAILED[@]} coverage-instrumented image(s) reached the promote path — refusing to tag them ${CALVER}/latest."
+        echo "       Coverage variants (${COVER_LABEL}=1 / -cover suffix) are E2E-only and MUST NEVER run in production (W2 §6.2, ka-0000001728)."
+        echo "       Offending: ${COVER_FAILED[*]}"
+        echo "       Remove the -cover image from the promote IMAGES set, or fix the mislabelled -rc image, then re-dispatch gardenio-promote."
+        exit 1
+      fi
+      echo "  OK: no coverage-instrumented images on the promote path."
+
+      # ── Promote: tag -rc → final calver ONLY (mutable :latest retired) ──
+      #
+      # F7 (ka-0000006416): the per-release `crane tag <rc> latest` is GONE.
+      # A floating `:latest` is a registry-write attack surface — a compromised
+      # push token can silently repoint latest to swapped bytes — and NOTHING on
+      # the deploy path consumes a first-party `:latest`: prod deploys
+      # <image>:<calver> via global.imageTag (terraform gardenio_image_tag) and
+      # staging deploys <image>:<calver>-rc; `latestMode` (the only chart switch
+      # that would render `:latest`) is default-off and set in no deploy path.
+      #
+      # Each promoted image is instead recorded BY IMMUTABLE DIGEST below. Because
+      # `crane tag` preserves the manifest digest, digest(<calver>) == digest(-rc)
+      # == the digest the sign-release-images job signed keyless — so this record
+      # is the exact content that admission binds. The digest → tag binding at
+      # admission is enforced by the Kyverno verify-image-signatures ClusterPolicy
+      # (mutateDigest: true; gardenio/helm/gardenio/templates/kyverno/), which
+      # rewrites an admitted tag to its resolved digest and requires digest
+      # pinning (TOCTOU-safe). See gardenio/docs/image-signing.md.
+      DIGESTS_FILE="release-digests.txt"
+      : > "$DIGESTS_FILE"
+      for image in $IMAGES; do
+        echo "Promoting ${image}:${CALVER}-rc → ${CALVER}"
+        crane tag "${REGISTRY}/${image}:${CALVER}-rc" "${CALVER}"
+      done
+
+      # ── Post-promotion: verify final tags exist + record immutable digests ──
+      echo "=== Post-promotion verification + digest capture ==="
+      FAILED=()
+      for image in $IMAGES; do
+        DIGEST=$(crane digest "${REGISTRY}/${image}:${CALVER}" 2>/dev/null || true)
+        if [ -z "$DIGEST" ]; then
+          echo "FAIL: ${image}:${CALVER} not found after promotion"
+          FAILED+=("$image")
+          continue
+        fi
+        # Immutable, content-addressed record of exactly what was promoted.
+        echo "${REGISTRY}/${image}:${CALVER}@${DIGEST}" >> "$DIGESTS_FILE"
+        echo "  OK: ${image}:${CALVER} @ ${DIGEST}"
+      done
+      if [ ${#FAILED[@]} -gt 0 ]; then
+        echo "FATAL: ${#FAILED[@]} image(s) missing after promotion — only -rc tags exist. Failed: ${FAILED[*]}"
+        exit 1
+      fi
+
+      echo "=== Release ${CALVER} digest manifest (deploy/pin by these, not by mutable tag) ==="
+      cat "$DIGESTS_FILE"
+      echo "All images promoted and verified by digest: ${CALVER}-rc → ${CALVER} (no :latest)"
+    env:
+      IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+      VERSION: ${{ init.version }}
+      # The release tag's commit SHA. The `promote` GitLab job dispatches
+      # gardenio-promote with --ref $CI_COMMIT_TAG, so init.commit-sha
+      # (= event.git.sha) resolves to the exact commit the tag points at.
+      # Used by the build-provenance gate below to assert the -rc images
+      # were built from this tag's source, not a stale/parallel build.
+      COMMIT_SHA: ${{ init.commit-sha }}
+    outputs:
+      # Skip the filesystem layer; export only the immutable digest manifest
+      # (image@sha256:… per promoted image) so a downstream step / operator can
+      # deploy or pin the release BY DIGEST rather than the mutable calver tag.
+      filesystem: false
+      artifacts:
+        - key: release-digests
+          path: release-digests.txt
+
+  # ── Promote helm chart: {version}-rc → {version} ───────────────────
+  #
+  # Re-packages from the source tree (same Chart.yaml as helm.yml's plain
+  # path) rather than pulling the -rc chart from OCI and mutating it —
+  # simpler, same bytes. MUST override version+appVersion at package time
+  # because deploy-rwx mutates Chart.yaml to set appVersion=${TAG}-rc for
+  # staging; without override, the plain chart ships with appVersion=-rc
+  # (advice ka-0000001114).
+  - key: promote-helm-chart
+    use: [code, install-helm]
+    if: ${{ init.version != '' }}
+    cache: false
+    timeout: 5m
+    run: |
+      set -ex
+      # Chart registry parameterized (ka-0000000040): defaults to the GitLab
+      # OCI charts path; override the CHART_REGISTRY vault var (bare host/path,
+      # no oci:// prefix) to point at a LOL-owned target such as
+      # ghcr.io/liveoaklabs/gardenio/charts.
+      CHART_REGISTRY="${CHART_REGISTRY:-registry.gitlab.com/acme/platform/gardenio/charts}"
+      CHART_REGISTRY="${CHART_REGISTRY#oci://}"   # tolerate an oci:// prefix in the vault value
+      CHART_HOST="${CHART_REGISTRY%%/*}"
+      set +x  # never xtrace the token into the log (ka-0000002171)
+      echo "$REGISTRY_TOKEN" | helm registry login "$CHART_HOST" \
+        -u "$REGISTRY_USER" --password-stdin
+      set -x
+      TAG_VERSION="${VERSION}"
+
+      # Retry shim for `helm push`. The GitLab OCI registry occasionally
+      # closes the HTTP/2 stream mid-push with REFUSED_STREAM; helm cannot
+      # retry internally because the SDK does not set Request.GetBody
+      # (ka-0000007048). Re-running `helm push` re-opens a fresh request
+      # with the file body, which works.
+      helm_push_with_retry() {
+        local tgz="$1"
+        local dest="$2"
+        local max_attempts=5
+        local attempt=1
+        local delay=5
+        while :; do
+          if helm push "$tgz" "$dest"; then
+            return 0
+          fi
+          if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "helm push failed after ${max_attempts} attempts: $tgz → $dest" >&2
+            return 1
+          fi
+          echo "helm push attempt ${attempt}/${max_attempts} failed; retrying in ${delay}s..." >&2
+          sleep "$delay"
+          attempt=$((attempt + 1))
+          delay=$((delay * 2))
+        done
+      }
+
+      for chart in gardenio/helm/*/; do
+        if [ -f "$chart/Chart.yaml" ]; then
+          name=$(basename "$chart")
+          echo "Promoting $name v${TAG_VERSION}-rc → ${TAG_VERSION}"
+          # Package via the shared helper, which strips values.yaml comments so
+          # the tarball stays under the K8s 1 MiB Secret limit (ka-0000007585).
+          # It prints the produced .tgz path on its last stdout line.
+          tgz=$(scripts/pack-gardenio-chart.sh "$chart" /tmp/helm-packages \
+            --version "$TAG_VERSION" --app-version "$TAG_VERSION" | tail -1)
+          helm_push_with_retry "$tgz" "oci://${CHART_REGISTRY}"
+          echo "Published plain: ${name}:${TAG_VERSION}"
+        fi
+      done
+
+      # ── Post-publish verification: ensure published appVersion is plain ──
+      VERIFY_DIR=$(mktemp -d)
+      cd "$VERIFY_DIR"
+      for chart in /tmp/helm-packages/*.tgz; do
+        name=$(basename "$chart" .tgz | sed "s/-${TAG_VERSION}$//")
+        helm pull "oci://${CHART_REGISTRY}/${name}" \
+          --version "$TAG_VERSION" --destination "$VERIFY_DIR" >/dev/null
+        pulled_app_version=$(tar -xzOf "$VERIFY_DIR/${name}-${TAG_VERSION}.tgz" "${name}/Chart.yaml" | grep '^appVersion:' | awk '{print $2}')
+        if [ "$pulled_app_version" != "$TAG_VERSION" ]; then
+          echo "FATAL: published plain chart ${name}:${TAG_VERSION} has appVersion=${pulled_app_version}, expected ${TAG_VERSION}"
+          echo "       Templates would render image:${pulled_app_version} instead of image:${TAG_VERSION}"
+          exit 1
+        fi
+        echo "  Verified: ${name}:${TAG_VERSION} has appVersion=${TAG_VERSION}"
+      done
+      cd - >/dev/null
+    env:
+      CHART_REGISTRY: ${{ secrets.CHART_REGISTRY }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      VERSION: ${{ init.version }}

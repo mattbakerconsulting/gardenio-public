@@ -1,0 +1,297 @@
+# Keeps an ECR imagePullSecret alive from the node's own IAM role.
+#
+# WHY THIS EXISTS
+# k3s ships no AWS credential provider: there is no ecr-credential-provider
+# binary on the nodes and no --image-credential-provider-config on the kubelet
+# (verified 2026-09-18 on i-0123456789abcdef0). So granting the node role ECR
+# permissions is NOT by itself enough to pull from ECR — containerd never
+# consults IMDS for registry auth. A docker-registry Secret is still required.
+#
+# What the node-role grant DOES buy us is that the token can be minted from
+# INSIDE the cluster, so no long-lived registry credential exists anywhere:
+# this CronJob calls `aws ecr get-login-password` against IMDS (node role
+# gardenio-k3s, Sid EcrAuth) and rewrites the Secret in place. Verified: a pod
+# on the platform pool resolves as
+# arn:aws:sts::360190250083:assumed-role/gardenio-k3s/<instance-id> and the call
+# succeeds.
+#
+# ECR authorization tokens last 12 hours. This runs every 8 to leave a margin
+# for a failed run, and on startup (the Secret is created out-of-band once so
+# the first pull does not wait for the first tick).
+#
+# THE ALTERNATIVE, and why not: installing the ECR credential provider on the
+# nodes would remove the Secret entirely, but it is a node-image change (a
+# binary plus kubelet flags in user-data) and therefore terraform's lane. If
+# that ever lands, delete this CronJob and drop `ecr` from imagePullSecrets.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ecr-token-refresh
+  namespace: gardenio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ecr-token-refresh
+  namespace: gardenio
+rules:
+  # Scoped to the one Secret it rewrites. resourceNames cannot be used with
+  # `create`, so create is granted at the type level and every other verb is
+  # pinned to the single object.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["ecr"]
+    verbs: ["get", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ecr-token-refresh
+  namespace: gardenio
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ecr-token-refresh
+subjects:
+  - kind: ServiceAccount
+    name: ecr-token-refresh
+    namespace: gardenio
+---
+# Same narrow rights again in ns claimlayer-demo: the ClaimLayer demo
+# (mattbakerconsulting/ClaimLayer deploy/demo, escalation gd-NoOR0riqwi) pulls
+# its private ghcr image through the ECR pull-through cache, so it needs the
+# self-refreshing `ecr` secret too. Apply AFTER the namespace exists.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ecr-token-refresh
+  namespace: claimlayer-demo
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["ecr"]
+    verbs: ["get", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ecr-token-refresh
+  namespace: claimlayer-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ecr-token-refresh
+subjects:
+  - kind: ServiceAccount
+    name: ecr-token-refresh
+    namespace: gardenio
+---
+# Same narrow rights again in the two live-namespace e2e pool namespaces
+# (gardenio-e2e-0 / gardenio-e2e-1, task gd-WBz2qt9ADZ). The e2e lane installs
+# the gardenio chart there with a namespaced Role only, so it cannot mint its
+# own pull credential; every pod it starts pulls through the ECR cache with this
+# self-refreshing `ecr` secret. The pool namespaces are created by
+# gardenio/tests/e2e/lane/rbac/namespace-pool.yaml; apply that first.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ecr-token-refresh
+  namespace: gardenio-e2e-0
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["ecr"]
+    verbs: ["get", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ecr-token-refresh
+  namespace: gardenio-e2e-0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ecr-token-refresh
+subjects:
+  - kind: ServiceAccount
+    name: ecr-token-refresh
+    namespace: gardenio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ecr-token-refresh
+  namespace: gardenio-e2e-1
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["ecr"]
+    verbs: ["get", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ecr-token-refresh
+  namespace: gardenio-e2e-1
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ecr-token-refresh
+subjects:
+  - kind: ServiceAccount
+    name: ecr-token-refresh
+    namespace: gardenio
+---
+# Same narrow rights again in ns gardenio-audit, where the k3s-audit-shipper
+# DaemonSet runs (task gd-ZrPUxj8wyU). It needs its
+# own namespace because it mounts a hostPath, which the gardenio namespace's PSA
+# baseline forbids; imagePullSecrets are namespaced, so it needs its own `ecr`.
+# The namespace and DaemonSet are operator-applied (helm/k3s-audit-shipper/), NOT
+# part of the gardenio chart, so apply this Role/RoleBinding AFTER that namespace
+# exists. The refresh loop below skips gardenio-audit while the namespace does not
+# exist, so the CronJob can be applied first without failing the other
+# namespaces' refresh.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ecr-token-refresh
+  namespace: gardenio-audit
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["ecr"]
+    verbs: ["get", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ecr-token-refresh
+  namespace: gardenio-audit
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ecr-token-refresh
+subjects:
+  - kind: ServiceAccount
+    name: ecr-token-refresh
+    namespace: gardenio
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ecr-token-refresh
+  namespace: gardenio
+  labels:
+    app: ecr-token-refresh
+    app.kubernetes.io/part-of: gardenio
+spec:
+  schedule: "0 */8 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: ecr-token-refresh
+            # P7 Task 6: mints the ECR pull token with the node role over IMDS.
+            gardenio.io/imds: allow
+        spec:
+          serviceAccountName: ecr-token-refresh
+          restartPolicy: OnFailure
+          tolerations:
+            - key: "gardenio.agent"
+              operator: "Equal"
+              value: "true"
+              effect: "NoSchedule"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          # Class from the gardenio chart (global.systemPriorityClass): image pulls depend on it,
+          # so a crew burst cannot leave it Pending (gd-2qjxTVMBkC).
+          priorityClassName: gardenio-infra
+          containers:
+            - name: refresh
+              image: docker.io/amazon/aws-cli:2.22.0
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                readOnlyRootFilesystem: true
+              env:
+                - name: AWS_DEFAULT_REGION
+                  value: us-east-1
+                - name: REGISTRY
+                  value: "360190250083.dkr.ecr.us-east-1.amazonaws.com"
+                - name: HOME
+                  value: /tmp
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  # Token comes from the node role via IMDS; nothing is stored.
+                  PASS="$(aws ecr get-login-password)"
+                  AUTH="$(printf 'AWS:%s' "$PASS" | base64 -w0)"
+                  printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$AUTH" > /tmp/dockerconfig.json
+                  API=https://kubernetes.default.svc
+                  SA=/var/run/secrets/kubernetes.io/serviceaccount
+                  TOKEN="$(cat $SA/token)"
+                  B64="$(base64 -w0 < /tmp/dockerconfig.json)"
+                  BODY="$(printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"ecr"},"type":"kubernetes.io/dockerconfigjson","data":{".dockerconfigjson":"%s"}}' "$B64")"
+                  # Every namespace that pulls from the ECR cache; imagePullSecrets
+                  # are namespaced. claimlayer-demo pulls the ClaimLayer demo image
+                  # (gd-NoOR0riqwi). ns ziti was here until S9c deleted it
+                  # (2026-10-21): the PUT then 403'd, the job failed every run, and
+                  # every namespace after it kept a dead token. A
+                  # failure in ANY namespace fails the job — a half-written
+                  # credential expires in 12h and surfaces as an
+                  # ImagePullBackOff on a restart nobody connects to this job.
+                  for NS in "$(cat $SA/namespace)" claimlayer-demo gardenio-e2e-0 gardenio-e2e-1 gardenio-audit; do
+                    code=$(curl -sS -o /tmp/out -w '%{http_code}' --cacert $SA/ca.crt \
+                      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+                      -X PUT "$API/api/v1/namespaces/$NS/secrets/ecr" -d "$BODY")
+                    if [ "$code" = "404" ]; then
+                      code=$(curl -sS -o /tmp/out -w '%{http_code}' --cacert $SA/ca.crt \
+                        -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+                        -X POST "$API/api/v1/namespaces/$NS/secrets" -d "$BODY")
+                    fi
+                    case "$code" in
+                      200|201) echo "ecr pull secret refreshed in ns $NS (HTTP $code)";;
+                      # gardenio-audit exists only once the operator has applied
+                      # helm/k3s-audit-shipper/namespace.yaml. Until then both the PUT and the POST 404 on the missing
+                      # namespace; skip rather than fail the other namespaces.
+                      404) if [ "$NS" = "gardenio-audit" ]; then echo "ns $NS not found; skipping"; else echo "FAILED in ns $NS: HTTP $code"; head -c 400 /tmp/out; exit 1; fi;;
+                      *) echo "FAILED in ns $NS: HTTP $code"; head -c 400 /tmp/out; exit 1;;
+                    esac
+                  done
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                requests: { cpu: 20m, memory: 64Mi }
+                limits:   { cpu: 500m, memory: 256Mi }
+          volumes:
+            - name: tmp
+              emptyDir: {}

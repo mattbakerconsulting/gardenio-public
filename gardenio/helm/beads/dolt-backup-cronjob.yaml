@@ -1,0 +1,111 @@
+# Daily online backup of every database on the server, mirrored to S3.
+# Mirrors the HQ host's /usr/local/bin/gc-dolt-backup (DOLT_BACKUP sync per
+# db, then `aws s3 sync --delete`); the HQ writes dolt/, this writes k3s-dolt/.
+# S3 access is the node instance role (terraform k3s backup_bucket_arn).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dolt-backup
+  namespace: beads
+  labels:
+    app: dolt-backup
+    app.kubernetes.io/part-of: gas-city
+spec:
+  schedule: "45 2 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            app: dolt-backup
+            # P7 Task 6: uploads to S3 with the node role over IMDS.
+            gardenio.io/imds: allow
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+          - name: dolt-backup
+            image: dolthub/dolt:2.3.5
+            env:
+            - name: HOME
+              value: /tmp
+            - name: DOLT_CLI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dolt-root
+                  key: password
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+              readOnlyRootFilesystem: true
+            command:
+            - sh
+            - -ec
+            - |
+              dolt config --global --add metrics.disabled true >/dev/null
+              q() { dolt --host=dolt --port=3306 --user=root --no-tls sql -r csv -q "$1"; }
+              dbs=$(q "SHOW DATABASES" | tail -n +2 | grep -vxE 'information_schema|mysql|performance_schema|dolt_cluster' || true)
+              for db in $dbs; do
+                echo "backup $db -> /backups/$db"
+                q "USE \`$db\`; CALL DOLT_BACKUP('sync-url', 'file:///backups/$db')"
+              done
+              echo "$(date -u +%FT%TZ) $(echo $dbs | tr ' ' ',')" > /backups/.last-dolt-sync
+              [ -n "$dbs" ] || echo "no databases to back up"
+            volumeMounts:
+            - name: dolt-backups
+              mountPath: /backups
+            - name: tmp
+              mountPath: /tmp
+            resources:
+              requests: { cpu: 50m, memory: 64Mi }
+              limits: { cpu: 500m, memory: 512Mi }
+          containers:
+          - name: s3-sync
+            image: amazon/aws-cli:2.36.48
+            env:
+            - name: HOME
+              value: /tmp
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "false"
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+              readOnlyRootFilesystem: true
+            command:
+            - sh
+            - -ec
+            - |
+              aws s3 sync /backups s3://gardenio-hq-backups-360190250083/k3s-dolt/ --delete --no-progress --only-show-errors
+              echo "synced $(date -u +%FT%TZ):"
+              aws s3 ls s3://gardenio-hq-backups-360190250083/k3s-dolt/
+            volumeMounts:
+            - name: dolt-backups
+              mountPath: /backups
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            resources:
+              requests: { cpu: 50m, memory: 64Mi }
+              limits: { cpu: 500m, memory: 512Mi }
+          volumes:
+          - name: tmp
+            emptyDir: {}
+          - name: dolt-backups
+            persistentVolumeClaim:
+              claimName: dolt-backups

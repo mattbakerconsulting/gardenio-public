@@ -1,0 +1,76 @@
+{{- /*
+  PodDisruptionBudgets for the persistent gardenio-system spine singletons.
+
+  WHY (ka-0000001453): these are the PVC-backed, single-replica StatefulSet
+  singletons — nats, postgres, keycloak-runtime, vmsingle, vtsingle. Their
+  EBS/local PVC is zone-bound, so an eviction that lands them on a node in the
+  wrong AZ (or a full one) leaves them Pending until an in-AZ node with
+  headroom exists — exactly the nats-0 stall seen during the EKS 1.31->1.32
+  hop-2 node roll.
+
+  These pods already carry the `karpenter.sh/do-not-disrupt` annotation (see
+  the `gardenio.doNotDisrupt` helper), but that only defers *Karpenter
+  consolidation*. A **managed-nodegroup node roll** (every EKS version hop)
+  drains nodes through the **eviction API**, which honors PodDisruptionBudgets
+  and ignores the Karpenter annotation entirely. Without a PDB the drain evicts
+  these singletons immediately and in any order; with one it must respect the
+  budget, so it evicts them gracefully / last and waits for them to come back
+  Ready before disrupting the next node.
+
+  WHY maxUnavailable: 1 (NOT minAvailable: 1):
+  On a 1-replica workload `minAvailable: 1` == `maxUnavailable: 0`, which makes
+  the eviction API refuse the pod forever — a managed-nodegroup roll then hits
+  PodEvictionFailure and WEDGES (this chart already skips single-replica PDBs
+  elsewhere for exactly this reason — see the alertmanager PDB comment).
+  `maxUnavailable: 1` instead permits eviction only while the pod is currently
+  Ready, so the drain waits for a healthy singleton before disrupting it and can
+  never block the roll — and it upgrades to real quorum protection the moment
+  the workload is scaled to HA (replicas > 1). Universally safe at any replica
+  count, which is why it is applied unconditionally rather than replica-gated.
+
+  Opt out with `platformPdb.enabled: false`. Each singleton's PDB renders only
+  when that component is itself enabled.
+*/}}
+{{- if .Values.platformPdb.enabled }}
+{{- $root := . }}
+{{- $maxUnavailable := .Values.platformPdb.maxUnavailable | default 1 }}
+{{- $singletons := list
+    (dict "enabled" .Values.nats.enabled
+          "nameTpl" "gardenio.nats.fullname"
+          "labelsTpl" "gardenio.nats.labels"
+          "selectorTpl" "gardenio.nats.selectorLabels")
+    (dict "enabled" .Values.postgres.enabled
+          "nameTpl" "gardenio.postgres.fullname"
+          "labelsTpl" "gardenio.postgres.labels"
+          "selectorTpl" "gardenio.postgres.selectorLabels")
+    (dict "enabled" (and .Values.keycloak.enabled .Values.keycloak.runtime.enabled)
+          "nameTpl" "gardenio.keycloakRuntime.fullname"
+          "labelsTpl" "gardenio.keycloakRuntime.labels"
+          "selectorTpl" "gardenio.keycloakRuntime.selectorLabels")
+    (dict "enabled" .Values.vmsingle.enabled
+          "nameTpl" "gardenio.vmsingle.fullname"
+          "labelsTpl" "gardenio.vmsingle.labels"
+          "selectorTpl" "gardenio.vmsingle.selectorLabels")
+    (dict "enabled" .Values.vtsingle.enabled
+          "nameTpl" "gardenio.vtsingle.fullname"
+          "labelsTpl" "gardenio.vtsingle.labels"
+          "selectorTpl" "gardenio.vtsingle.selectorLabels")
+}}
+{{- range $s := $singletons }}
+{{- if $s.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include $s.nameTpl $root }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include $s.labelsTpl $root | nindent 4 }}
+spec:
+  maxUnavailable: {{ $maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include $s.selectorTpl $root | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}

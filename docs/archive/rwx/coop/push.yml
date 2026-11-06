@@ -1,0 +1,71 @@
+# Push OCI images to GitLab Container Registry via rwx image push.
+# Called by docker.yml via embedded run (uses rwx/base for CLI access).
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  - key: rwx-cli
+    call: rwx/install-cli 4.0.1
+
+  # ── Registry auth ─────────────────────────────────────────────────────
+  - key: registry-auth
+    use: rwx-cli
+    run: |
+      mkdir -p ~/.docker
+      REG_USER="${REGISTRY_USER:-$GITHUB_USER}"
+      REG_TOKEN="${REGISTRY_TOKEN:-$GHCR_TOKEN}"
+      REG_HOST="${REGISTRY_HOST:-registry.gitlab.com}"
+      AUTH=$(printf '%s:%s' "$REG_USER" "$REG_TOKEN" | base64 -w0)
+      printf '{"auths":{"%s":{"auth":"%s"}}}' "$REG_HOST" "$AUTH" > ~/.docker/config.json
+    env:
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      REGISTRY_HOST: ${{ secrets.REGISTRY_HOST }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      GITHUB_USER: ${{ secrets.GITHUB_USER }}
+
+  # ── push-claude ───────────────────────────────────────────────────────
+  - key: push-claude
+    use: registry-auth
+    run: |
+      REF_NAME="${REF_NAME#refs/tags/}"; REF_NAME="${REF_NAME#refs/heads/}"
+      SHORT_SHA="${COMMIT_SHA:0:7}"
+
+      rwx image push $IMAGE_TASK_ID \
+        --to registry.gitlab.com/acme/platform/gardenio/coop:claude-sha-${SHORT_SHA} \
+        --to registry.gitlab.com/acme/platform/gardenio/coop:claude
+
+      if [[ "$REF_NAME" == v* ]]; then
+        VERSION="${REF_NAME#v}"
+        rwx image push $IMAGE_TASK_ID --to registry.gitlab.com/acme/platform/gardenio/coop:claude-${VERSION}
+      elif [[ "$REF_NAME" == 20* ]]; then
+        rwx image push $IMAGE_TASK_ID --to registry.gitlab.com/acme/platform/gardenio/coop:claude-${REF_NAME}
+      fi
+    env:
+      COMMIT_SHA: ${{ init.commit-sha }}
+      REF_NAME: ${{ init.ref-name }}
+      IMAGE_TASK_ID: ${{ init.image-claude-task-id }}
+
+  # ── push-coopmux ─────────────────────────────────────────────────────
+  # Coopmux uses calver only (tagged from gardenio release path).
+  # The bare calver tag (e.g. :2026.63.6) is what gardenio Helm uses.
+  - key: push-coopmux
+    use: registry-auth
+    run: |
+      REF_NAME="${REF_NAME#refs/tags/}"; REF_NAME="${REF_NAME#refs/heads/}"
+
+      if [[ "$REF_NAME" == 20* ]]; then
+        rwx image push $IMAGE_TASK_ID \
+          --to registry.gitlab.com/acme/platform/gardenio/coop:${REF_NAME}
+      else
+        # Non-calver builds (main branch) get a sha tag for debugging
+        SHORT_SHA="${COMMIT_SHA:0:7}"
+        rwx image push $IMAGE_TASK_ID \
+          --to registry.gitlab.com/acme/platform/gardenio/coop:coopmux-sha-${SHORT_SHA}
+      fi
+    env:
+      COMMIT_SHA: ${{ init.commit-sha }}
+      REF_NAME: ${{ init.ref-name }}
+      IMAGE_TASK_ID: ${{ init.image-coopmux-task-id }}

@@ -1,0 +1,58 @@
+{{/*
+Fleet Manager ClusterRole + ClusterRoleBinding.
+Grants the controller SA and cluster-admin agent SA permission to
+provision fleet namespaces, RBAC, and token secrets — i.e. everything
+that `gb fleet create` needs.
+
+Gated behind agents.fleetManager.enabled (requires agents.enabled too).
+*/}}
+{{- if and .Values.agents.enabled .Values.agents.fleetManager.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-fleet-manager
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  # Namespace provisioning for fleets.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "delete"]
+  # RBAC primitives per fleet namespace — create-only (operator must helm-
+  # uninstall the fleet to rotate). Widen via a values flag if a `gb fleet
+  # update` flow lands.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create"]
+  # Fleet token secrets.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create"]
+  # Fleet ExternalSecrets.
+  - apiGroups: ["external-secrets.io"]
+    resources: ["externalsecrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-fleet-manager
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.agents.fullname" . }}-fleet-manager
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.agents.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.agents.clusterAdmin.enabled }}
+  - kind: ServiceAccount
+    name: {{ include "gardenio.coop.clusterAdminServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

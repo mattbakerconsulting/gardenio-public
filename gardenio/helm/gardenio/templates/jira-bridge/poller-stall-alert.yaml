@@ -1,0 +1,142 @@
+{{- if .Values.jiraBridge.metrics.prometheusRule.pollerStall.enabled }}
+{{- $cfg := .Values.jiraBridge.metrics.prometheusRule.pollerStall }}
+# PrometheusRule for the jira-bridge INGESTION-POLLER stall prevention alert
+# (epic ka-0000005107 deliverable #4 / task ka-0000001629).
+#
+# Sibling of the trigger cooldown-starvation detector (trigger-starved-alert.yaml,
+# gardenio_trigger_starved). That one guards the TRIGGER path — the cooldown-skip
+# on last_checked that WAS the 2026-07-01 outage. This one guards the INGESTION
+# poll() path: the loop that turns matching JIRA issues into source beads. The
+# ingestion poller has no last_checked/cooldown gate, so the outage's exact
+# mechanism cannot recur here; this is the residual DETECTION net so any FUTURE
+# 0-new-beads ingestion stall pages instead of being noticed only via missing
+# downstream activity.
+#
+# FIDELITY TO THE BEAD SIGNAL. The bead asks to fire when the bridge "polled AND
+# 0 new beads created for N > threshold minutes WHILE JQL ApproximateCount >
+# tracked count." The literal comparison (ApproximateCount > tracked) is
+# UNFIREABLE: the ingestion JQL is open-status-only but the poller's tracked map
+# is seeded with closed/deferred/blocked beads, so tracked >> open-upstream in
+# any mature project (the AssistantPaneSilent unfireable-alert lesson,
+# ka-0000000664). So the poller Go-computes the faithful, fireable rendering of
+# the same intent — "matter exists upstream but none is being materialized" — as
+# a single 0/1 gauge on the jira-bridge :9093 /metrics endpoint
+# (jira_poller_stall.go):
+#   gardenio_jira_poller_stalled — 1 while a poll cycle's ingestion JQL search
+#     returned ZERO rows AND an independent approximate-count of the SAME
+#     ingestion JQL still reports matching issues upstream (i.e. polled, 0 new
+#     beads, yet matches exist). 0 in every healthy state.
+#   gardenio_jira_poller_polls_total{result} — completed poll cycles by terminal
+#     result (ok|search_error|not_caught_up); the deadman signal for the loop.
+#   gardenio_jira_poller_beads_created_total / gardenio_jira_poller_upstream_matches
+#     — context/observability, not paged on.
+#
+# The verdict is folded entirely into the gauge (not a multi-term PromQL join)
+# so the stall expr is a trivial ==1 — a set-per-cycle gauge cannot silently
+# suppress the page via an absent series inside an `and`, the failure mode the
+# sibling trigger-starved Helm test explicitly guards against. A companion
+# deadman leg catches the OTHER failure shape — the poll loop not ticking at all
+# (hung goroutine, crash-loop, never-caught-up) — which the stall gauge alone
+# cannot see. Both OFF by default; per-env overlays opt in. Requires the
+# monitoring.coreos.com/v1 PrometheusRule CRD.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-jira-bridge-poller-stall
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jira-bridge
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.jira_poller_stall
+      interval: 1m
+      rules:
+        - alert: JiraPollerStalled
+          # The poller Go-computes the full verdict (zero-row search + upstream
+          # approximate-count > 0) into the gauge, so the expr is a plain ==1
+          # with a max_over_time window so a single flapping scrape does not
+          # clear it prematurely; the `for:` hold rides out scrape gaps. window
+          # and for map the bead's "N > threshold minutes" onto the rule and are
+          # configurable via values.
+          expr: |
+            max_over_time(gardenio_jira_poller_stalled[{{ $cfg.window | default "15m" }}]) == 1
+          for: {{ $cfg.for | default "10m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: jira-bridge
+            subsystem: ingestion_poller
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "JIRA ingestion poller is stalled — polling but materializing 0 new beads while matching issues exist upstream"
+            description: |
+              The jira-bridge ingestion poller ran a poll cycle whose JQL search
+              returned ZERO rows while an independent approximate-count of the
+              same ingestion JQL still reports matching issues upstream
+              (gardenio_jira_poller_upstream_matches). Matter is sitting in JIRA
+              that the poller is no longer materializing into source beads —
+              polled, healthy-looking, but 0 new beads. This is the residual
+              prevention net for the 2026-07-01-style silent stall (epic
+              ka-0000005107): the structural root cause was fixed, but any FUTURE
+              0-new-beads ingestion stall (a JQL/field regression, a search-API
+              drift, a scoping mistake) now pages here instead of being noticed
+              only via missing downstream activity.
+
+              Triage: check the poller's "jira-poller STALLED" WARN log for the
+              probed JQL + count; confirm JIRA_PROJECTS / JIRA_STATUSES /
+              JIRA_METRICS scoping did not narrow the ingestion query to nothing;
+              verify the /search/jql endpoint is returning rows for that JQL
+              (the approximate-count endpoint clearly thinks matches exist);
+              check for a JIRA field/enum rename that the search rejects. Full
+              runbook on the epic.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000005107)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        - alert: JiraPollerDeadman
+          # The stall gauge only speaks when the loop is RUNNING. This leg
+          # catches the opposite shape — the poll loop not ticking at all (hung
+          # goroutine, crash-loop, or wedged before its first cycle) — which
+          # would otherwise silently suppress the stall page. polls_total is
+          # incremented on every terminal poll path (ok|search_error|
+          # not_caught_up), and the series is baselined to 0 at startup, so a
+          # live-but-erroring loop keeps this quiet while a dead/absent loop
+          # fires. absent() covers the never-scraped / crash-before-first-scrape
+          # case an increase() alone would miss.
+          expr: |
+            increase(gardenio_jira_poller_polls_total[{{ $cfg.deadmanWindow | default "15m" }}]) == 0
+            or absent(gardenio_jira_poller_polls_total)
+          for: {{ $cfg.deadmanFor | default "10m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: jira-bridge
+            subsystem: ingestion_poller
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "JIRA ingestion poll loop is not ticking — no poll cycle completed in the deadman window"
+            description: |
+              gardenio_jira_poller_polls_total has not increased over the deadman
+              window (or the series is absent) — the jira-bridge ingestion poll
+              loop is not completing cycles. This is the dead/hung-loop shape the
+              stall gauge cannot see (the gauge only updates while the loop
+              runs): a hung goroutine, a crash-loop, or a poller wedged before it
+              ever caught up. New JIRA issues are NOT being ingested while this
+              fires.
+
+              Triage: check the jira-bridge pod is Running and not crash-looping
+              (kubectl get pods -l app.kubernetes.io/component=jira-bridge);
+              check its logs for a panic or a stuck catch-up ("JIRA poll skipped:
+              catch-up has not succeeded yet"); confirm the beads daemon is
+              reachable. Full runbook on the epic.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000005107)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

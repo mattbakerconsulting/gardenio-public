@@ -1,0 +1,296 @@
+{{/* plan_peek — the slide-out drawer body a /plans board/grid card click opens
+     (Matt's ask, thread ka-0000005903: "when you click on a card the plan pops
+     out from the side instead of being a whole new page"). Rendered ONLY as a
+     standalone fragment by GET /plans/{id}/peek into the #plan-peek-body mount
+     that plans.html ships statically; plans_board.js owns opening/closing the
+     drawer and the ?peek= URL state.
+
+     Deliberately a LIGHTER cut of the /plans/{id} cockpit: header signals +
+     the SAME plan_steps timeline partial the cockpit renders. Because the
+     drawer contains a real #plan-steps section, every existing step verb
+     (Done / Reopen / Add / dispatch / reorder) works in place — their HTMX
+     POSTs already target #plan-steps and re-render the fragment.
+
+     Matt's follow-up (thread ka-0000002125: "the plans preview window should
+     show working crew and whether the gardener is live; showing chat at the
+     bottom wouldn't hurt either") added three read-only signals from the
+     cockpit: the unified plan-agent CHIP in the header (gardener running/idle/
+     paused + a live-iteration dot), the CREW roster below the steps
+     (plan_crew), and the plan-agent CHAT transcript at the bottom (bead_chat).
+     They render through the SAME partials the cockpit uses, so the preview can
+     never disagree with the page. They stay READ-ONLY here — the gardener levers
+     (Pause/Resume/Wake), the compose box, and the critique cockpit stay on the
+     full page; the header links out for those.
+
+     Data bag: PlanID, Title, Project, Status, PlanState, IsOperator,
+     Steps/Phases/HasPhases, StepsTotal/Closed/Open, PctDone, OpenDecisions,
+     Chip (planAgentChipView), Crew (planCrewInfo), Transcript (mapChatView),
+     BasePath. */}}
+{{define "plan_peek"}}
+<article class="plan-peek" data-plan-id="{{.PlanID}}">
+  <header class="plan-peek-head">
+    <h2 class="plan-peek-title">{{- with .Heraldry}}<span class="heraldry-slot">{{heraldry . 40}}</span>{{end -}}
+      <a href="{{.BasePath}}/plans/{{.PlanID}}" title="Open the full plan cockpit">{{.Title}}</a></h2>
+    <p class="plan-peek-meta">
+      <span class="chip chip-status chip-status-{{.Status}}">{{.Status}}</span>
+      {{if .PlanState}}<span class="chip plan-peek-state plan-peek-state-{{.PlanState}}">{{.PlanState}}</span>{{end}}
+      {{/* Priority pill on the peek header (ka-0000005352 iter-72): the LAST index
+           card FACE triage signal the peek header still dropped. The index card
+           carries the plan epic's 0-4 priority (plan_card.html), but the peek —
+           which an operator opens precisely to TRIAGE — showed status/state/gardener/
+           crew/project/decision yet never whether the plan is P0-urgent or
+           P3-shelved. Fold the SAME "P{N}" pill, reading .Priority (bead.Priority,
+           already in hand in renderPlanPeek — zero extra daemon call) and gated on
+           `ne .Priority 2` exactly like the index face: a routine P2 plan adds no
+           ink, an urgent P0/P1 pops loud-red, a shelved P3/P4 reads quiet-gray. The
+           .plan-prio-chip-* CSS (light + dark) already lives in plans.html, which
+           hosts the #plan-peek-body mount, so this needs no new rule and no dark
+           override — pure index-face→peek-header parity for the plan's own
+           metadata, the metadata twin of the crew-signal fold (iter-65/71). */}}
+      {{if ne .Priority 2}}<span class="plan-prio-chip plan-prio-chip-{{.Priority}}" title="Priority {{.Priority}} (0 = highest)">P{{.Priority}}</span>{{end}}
+      {{/* The gardener-live chip (Matt's ask): the SAME unified plan-agent chip
+           the /plans index card + cockpit header render — loop-primary tone with
+           a pulsing liveness dot, so "is this plan being driven, and is an agent
+           live right now" reads at a glance. .Chip.Label is empty only if the
+           builder produced no chip; guard so a bare pill never renders. */}}
+      {{with .Chip}}{{if .Label}}{{template "plan_agent_chip" .}}{{end}}{{end}}
+      {{/* Live-crew chip in the peek HEADER (ka-0000005352 iter-65). Matt's ask
+           (thread ka-0000002125, quoted above) was "the plans preview window
+           should show WORKING CREW and whether the gardener is LIVE" — the
+           gardener-live half rides the plan_agent_chip just above, but the
+           working-crew half lived ONLY in the plan_crew roster BELOW the whole
+           steps timeline, out of the header's at-a-glance scan. Fold the same
+           compact "● N crew · M working" chip the index card face carries into
+           the header beside the gardener chip, so opening the drawer answers
+           "is this being driven, and by how many crew" without scrolling past
+           the timeline — completing the mission's "surface live crew on EVERY
+           card surface (not just the cockpit)". Reads the SAME .Crew
+           (planCrewInfo) the roster below renders (already in the peek data bag,
+           terminal-reconciled in renderPlanChart), so the header count and the
+           roster header can never disagree — zero extra daemon call. The green
+           live-dot + "· M working" facet render only when a crew is working now
+           (HasLive), so a plan with only finished crew reads a plain "N crew";
+           gated on .Crew.Total so a crew-less plan adds no chip (the roster's own
+           empty state carries "no crew yet"). Links to the #plan-crew roster in
+           this same drawer, matching the index card's own crew-chip target. */}}
+      {{/* Stuck-crew facet on the peek header chip (ka-0000005352 iter-71). iter-65
+           folded the HEALTHY half of the crew signal — "● N crew · M working" —
+           into this header, but the LOUD act-now half (a stuck OPEN, reachable crew
+           needing a human) still lived ONLY in the plan_crew roster BELOW the whole
+           embedded steps timeline. An operator opening a peek to TRIAGE saw healthy
+           working crew up top but had to scroll past the entire timeline to learn a
+           crew is wedged — the single highest-value crew signal buried furthest from
+           the scan. Fold the SAME "· ⚠ N" open-stuck facet the index card face
+           (plan_card.html) and the cockpit roster header (plan_crew.html) already
+           carry onto the header chip: loud red, reachability-scoped to OPEN stuck
+           (.HasOpenStuck / .OpenStuck — a closed-failed crew has no terminal to jump
+           to), so the two-tier open/closed split (iter-29/33) reads the same on every
+           surface. Reads the SAME .Crew (planCrewInfo) already in the peek data bag,
+           terminal-reconciled in renderPlanPeek — zero extra daemon call, and the
+           header count can never disagree with the roster header below (both project
+           off the SAME classifyCrewBead bucket). Gated on .HasOpenStuck so a healthy
+           plan adds no ink; reconcileTerminal cannot manufacture a false stuck (Failed
+           is untouched by the terminal fold). Completes the crew-ATTENTION-signal-on-
+           every-surface parity: index chip · cockpit roster · /deck card all carry the
+           stuck facet; the peek header was the last surface with the working half but
+           not the stuck half. */}}
+      {{/* Working-crew RUNTIME age + "(K starting)" sub-qualifier on the peek
+           header chip (ka-0000005352 iter-76). iter-65 folded the healthy
+           "● N crew · M working" chip into this header, but its "· M working"
+           facet stayed COUNT-ONLY while the index card face (plan_card.html), the
+           /deck card (deck.html), and the cockpit roster header (plan_crew.html,
+           MR !7217) all fold BOTH the longest-running live crew's elapsed RUNTIME
+           ("· 4h") and the "(K starting)" booting sub-qualifier onto the same "·
+           M working" facet. So the peek header was the LAST plan-card surface whose
+           working facet read count-only: a crew grinding a step for 4h read
+           identically to one that had just been dispatched, and a still-booting pod
+           read identical to one actually working. Fold the SAME two facets the
+           index card renders (plan_card.html:657), reading the SAME .Crew
+           (planCrewInfo) already in the peek data bag: WorkingOldestAge() is the
+           longest-running live crew's RUNTIME (aged on CreatedAt, not last-activity,
+           so a heartbeating crew does not read ~0s), and HasStarting()/Starting is
+           the 0<K<M booting subset. Both are the cockpit-side twins of the index
+           rollup's fields (planCrewInfo.WorkingOldestAge / .HasStarting mirror
+           planCrewRollup's) — so the peek chip and the index/deck/cockpit facets
+           agree by construction (advice ka-0000005924), zero extra daemon call. Calm
+           muted (context, not an alarm — a genuinely wedged crew is re-bucketed to
+           the loud ⚠ stuck facet beside it); each sub-span renders only when
+           derivable, so a plain grinding crew / an undatable working set reads
+           "· M working" exactly as before. Order matches the index: "(K starting)"
+           BEFORE the runtime age. */}}
+      {{/* Cumulative crew SPEND facet on the peek header chip (ka-0000005352): fold
+           the "· $N" the peek header chip was the LAST plan-card surface still
+           dropping on-face. The index card face (plan_card.html, iter-12), the
+           /deck card face (deck.html, iter-77), AND the cockpit roster header
+           (plan_crew.html) all render it, and spend is the mission's #1 first-class
+           operator concern (a plan accretes crew that each cost real budget). So an
+           operator opening a peek to TRIAGE saw who/how-many/working/stuck but had
+           to open the whole cockpit to learn how much the plan had burned. Reads
+           the SAME .Crew (planCrewInfo) already in the peek data bag:
+           HasSpend()/SpendLabel() are the cockpit-side twins the index rollup +
+           roster read (summed over the SAME crew agent beads via agentSpendUSD) —
+           so peek↔index↔deck↔cockpit agree by construction (advice ka-0000005924),
+           zero extra daemon call. Calm muted (context, like the runtime age — not
+           a red alarm); rendered only when spend is known (HasSpend), so a plan
+           whose crew have not yet reported cost adds no ink. Ordered LAST, after
+           stuck — matching the index + deck face ordering. */}}
+      {{with .Crew}}{{if .Total -}}
+      <a class="chip plan-peek-crew{{if .HasLive}} plan-peek-crew-live{{end}}" href="{{$.BasePath}}/plans/{{$.PlanID}}#plan-crew"
+         title="{{.Total}} crew agent{{if ne .Total 1}}s{{end}} dispatched onto this plan's steps{{if .Working}} — {{.Working}} working now{{if .HasStarting}} ({{.Starting}} still starting up){{end}}{{if .WorkingOldestAge}} (longest running {{.WorkingOldestAge}}){{end}}{{end}}{{if .Idle}}, {{.Idle}} queued{{end}}{{if .Done}}, {{.Done}} done{{end}}{{if .HasOpenStuck}}, {{.OpenStuck}} stuck (reachable — jump to a terminal to unstick){{end}}{{if .HasSpend}}. {{.SpendLabel}} spent so far{{end}}. Jump to the crew roster below.">
+        {{- if .HasLive}}<span class="plan-peek-crew-dot" aria-hidden="true"></span>{{end -}}
+        <span class="plan-peek-crew-total">{{.Total}} crew</span>
+        {{- if .Working}}<span class="plan-peek-crew-working">· {{.Working}} working{{if .HasStarting}} <span class="plan-peek-crew-starting" aria-label="{{.Starting}} still starting up">({{.Starting}} starting)</span>{{end}}{{if .WorkingOldestAge}} <span class="plan-peek-crew-working-age">{{.WorkingOldestAge}}</span>{{end}}</span>{{end -}}
+        {{/* Queued + done crew facets on the peek header chip (ka-0000005352 iter-79).
+             iter-65/71/76 folded the working half, iter-71 the stuck half, and the
+             iter-77-family the spend facet — but the peek chip still DROPPED the
+             QUEUED ("· N queued") and DONE ("· N done") facets that BOTH the index
+             card face (plan_card.html) AND the cockpit roster header (plan_crew.html)
+             carry. So an operator opening a peek to triage saw working/stuck/spend but
+             not how many crew are dispatched-but-pod-starved (queued) or already
+             finished (done) — two dispositions the index face has surfaced since
+             iter-32/64. Fold the SAME facets, reading the SAME .Crew (planCrewInfo)
+             already terminal-reconciled in the peek data bag: .Idle / .QueuedOldestAge
+             / .QueuedOldestStale for queued (the pool-starvation loud-tint the index
+             carries), and .HasDoneFacet() — the cockpit-side twin just added mirroring
+             planCrewRollup.HasDoneFacet (0 < Done < Total, so the redundant "N crew ·
+             N done" self-suppresses and a terminal plan whose Working+Idle fold into
+             Done reads calm). Zero extra daemon call; peek↔index↔cockpit agree by
+             construction (advice ka-0000005924). Order matches the index face exactly:
+             working → queued → done → stuck → spend. */}}
+        {{- if .Idle}}<span class="plan-peek-crew-queued{{if .QueuedOldestStale}} plan-peek-crew-queued-stale{{end}}">· {{.Idle}} queued{{if .QueuedOldestAge}} <span class="plan-peek-crew-queued-age">{{.QueuedOldestAge}}</span>{{end}}</span>{{end -}}
+        {{- if .HasDoneFacet}}<span class="plan-peek-crew-done">· {{.Done}} done</span>{{end -}}
+        {{- if .HasOpenStuck}}<span class="plan-peek-crew-stuck">· &#x26A0; {{.OpenStuck}}</span>{{end -}}
+        {{- if .HasSpend}}<span class="plan-peek-crew-spend">· {{.SpendLabel}}</span>{{end -}}
+      </a>
+      {{- end}}{{end}}
+      {{if .Project}}<a class="chip chip-type" href="{{.BasePath}}/plans?project={{.Project}}">{{.Project}}</a>{{end}}
+      {{if .OpenDecisions}}<a class="chip chip-attention" href="{{.BasePath}}/plans/{{.PlanID}}#decisions" title="Open clarifying questions waiting on you">{{.OpenDecisions}} to answer</a>{{end}}
+      {{/* Blocked-by-escalation badge on the peek header (ka-0000005352 iter-74).
+           The peek header folded nearly every index-card FACE triage signal —
+           status · lifecycle · priority (iter-72) · gardener · crew+stuck
+           (iter-65/71) · project · open-decision chip · freshness (iter-73) — but
+           dropped the ⛔ "blocked by escalation" badge, the #2 attention tier
+           (planAttentionEscalation): a HARDER operator stop than a ⚠ stall or an
+           open decision — a privileged operator must act before ANY of the blocked
+           work can move. The index card FACE (plan_card.html) and the cockpit
+           banner both carry it, but the peek — opened precisely to TRIAGE — showed
+           the open-decision chip yet nothing about a work-blocking escalation. Fold
+           the SAME badge markup the index face renders: loud-red ⛔, the oldest
+           open escalation's op-label ("· merge MR") + wait-age ("· 3d") + >7d
+           stale-tint (.plan-esc-badge-stale), reading the SAME planEscalationInfo
+           the cockpit banner derives (one planEscalationsBulk over the peek's own
+           steps/phases in renderPlanPeek — header badge and cockpit banner agree by
+           construction, advice ka-0000005924). Gated on .ShowEscalationBadge
+           (Count>0 AND not terminal — the iter-39 reconcile), so a finished plan
+           whose leftover open steps still carry an escalation adds no false "act
+           now" and a healthy plan adds no ink. Links to the #plan-escalations
+           section of the full cockpit (the peek is read-only; the approve/reject
+           levers live there), matching the index badge's target. The .plan-esc-badge
+           CSS (+ -op/-age/-stale + its dark override) already lives in plans.html,
+           which hosts this #plan-peek-body mount, so no new rule and no dark
+           override — pure index-face→peek-header parity for the escalation signal. */}}
+      {{- if .ShowEscalationBadge}}<a class="plan-esc-badge{{if .EscalationStale}} plan-esc-badge-stale{{end}}" href="{{.BasePath}}/plans/{{.PlanID}}#plan-escalations" title="Blocked by {{if eq .Escalations.Count 1}}an open escalation{{else}}{{.Escalations.Count}} open escalations{{end}}{{if .EscalationOldestAge}} — oldest waiting {{.EscalationOldestAge}}{{if .EscalationStale}} (stale){{end}}{{end}}:{{range .Escalations.Escalations}}
+{{.Title}}{{if .OperationType}} ({{.OperationType}}){{end}}{{end}}"><span class="plan-esc-badge-label">⛔ blocked by escalation{{if gt .Escalations.Count 1}} ×{{.Escalations.Count}}{{end}}</span>{{if .EscalationOldestOp}}<span class="plan-esc-badge-op">· {{.EscalationOldestOp}}</span>{{end}}{{if .EscalationOldestAge}}<span class="plan-esc-badge-age">· {{.EscalationOldestAge}}</span>{{end}}</a>{{end}}
+      {{/* ⚠ stall badge on the peek header (ka-0000005352 iter-75). The peek header
+           folds the #1 open-decision chip and the #2 ⛔ escalation badge (iter-74)
+           but dropped the #3 ⚠ stall badge (planAttentionStalled) — the LAST
+           attention-tier signal both the index card FACE (plan_card.html) and the
+           cockpit header (plan_detail.html) carry that the peek still missed. An
+           operator opens a peek to TRIAGE and saw the decision + escalation signals
+           but nothing about a stalled plan (a dead-agent orphan, a paused gardener, or
+           no gardener bound to watch open work). Fold the SAME badge markup both
+           surfaces render, reading the SAME planStallInfo the cockpit derives +
+           reconciles (renderPlanPeek: planStallForDetail then the
+           reconcileStallWith{Crew,Escalation,Lifecycle} chain, so the peek badge and
+           the cockpit badge agree by construction). Gated on .Stall.ShowBadge exactly
+           like the index card + cockpit — a healthy plan adds no ink, and deriveStall's
+           terminal guard means a finished plan never fires. Projects the same facets:
+           the Orphaned re-scope softens the headline to "⚠ N orphaned" when live crew
+           coexist (iter-23), the FaceLabel reason names WHAT to fix ("· no gardener" /
+           "· gardener paused" / "· N dead steps", iter-10), and the AgeLabel folds the
+           oldest dead-agent orphan's frozen duration (iter-11) with a >24h loud tint
+           (.plan-stall-badge-stale). The .plan-stall-badge CSS (+ -reason/-age/-stale +
+           its dark override) already lives in plans.html, which hosts this
+           #plan-peek-body mount — so no new rule and no dark override, pure
+           index-face/cockpit-header → peek-header parity, completing the
+           attention-tier trio (decision · escalation · stall) on the peek. */}}
+      {{- if .Stall.ShowBadge}}<span class="plan-stall-badge{{if .Stall.AgeStale}} plan-stall-badge-stale{{end}}" title="{{if .Stall.Orphaned}}{{.Stall.DeadSteps}} step{{if ne .Stall.DeadSteps 1}}s{{end}} orphaned under a dead agent (other crew still working the plan): {{end}}Stalled: {{.Stall.Reason}}{{if .Stall.AgeLabel}} — oldest dead-agent step frozen {{.Stall.AgeLabel}}{{if .Stall.AgeStale}} (stale){{end}}{{end}}">⚠ {{with .Stall.HeadlineCount}}{{.}} {{end}}{{.Stall.HeadlineLabel}}{{with .Stall.FaceLabel}} <span class="plan-stall-badge-reason">· {{.}}</span>{{end}}{{with .Stall.AgeLabel}} <span class="plan-stall-badge-age">· {{.}}</span>{{end}}</span>{{end}}
+      <a class="plan-peek-id" href="{{.BasePath}}/plans/{{.PlanID}}"><code>{{.PlanID}}</code></a>
+      {{/* "Last change" freshness stamp (ka-0000005352 iter-73). The peek header
+           folded nearly every index-card FACE triage signal — status · lifecycle ·
+           gardener · crew+stuck (iter-65/71) · project · decisions · priority
+           (iter-72) — but dropped the ONE temporal signal both the index card head
+           (.plan-card-updated, plan_card.html) AND the cockpit header
+           (.plan-header-updated, plan_detail.html) carry, so an operator opening a
+           peek to TRIAGE could not tell whether the plan moved 5m ago or has been
+           dead 3 weeks. Fold the SAME "last change" stamp both surfaces render:
+           FreshAgo is the compact "7h"/"21d" instant (fmtTimeAgo) over the epic +
+           steps/phases + crew heartbeats (ka-0000004310 false-freshness fold, so a
+           step claimed a month ago whose crew heartbeats now reads fresh); the
+           precise "Last change <RFC>" + the stale reason live in the tooltip. When
+           an ACTIVE plan has gone stale (>7d no activity, FreshStale) the stamp
+           tints loud — the SAME 7d bar + tone the index card's freshness stamp uses
+           (planFreshnessStale), so a dead plan pops out of the drawer. A terminal
+           plan's honest "3 weeks ago" history stays calm (FreshStale gates on the
+           plan's own status). Gated on FreshAgo so an undatable plan renders no
+           stamp, exactly like the index card. Sits at the tail beside the id where
+           "when" metadata belongs. Zero extra daemon call — every input was already
+           in renderPlanPeek's hand (bead.UpdatedAt, steps/phases, the crew roster). */}}
+      {{- if .FreshAgo}}<span class="meta plan-peek-updated{{if .FreshStale}} plan-peek-updated-stale{{end}}"{{if .FreshRFC}} title="Last change {{.FreshRFC}}{{if .FreshStale}} — this plan has not moved in over a week (stale){{end}}"{{end}} aria-label="last change {{.FreshAgo}} ago">{{.FreshAgo}}</span>{{end}}
+    </p>
+    <p class="plan-peek-open-full">
+      <a class="plan-peek-full-link" href="{{.BasePath}}/plans/{{.PlanID}}">Open full cockpit &rarr;</a>
+      <span class="meta">narrative, gardener levers &amp; critique live there</span>
+    </p>
+    {{- /* Terminal completion levers (task ka-0000000616 + ka-0000001377): the
+           same Mark complete / Abandon / Reopen the cockpit carries, offered from
+           the drawer. Operator-only; they POST peek=1 so the handler re-renders
+           #plan-peek-body in place. */ -}}
+    {{if and .IsOperator (or .ShowMarkComplete .ShowAbandon .ShowReopen)}}
+    <p class="plan-peek-lifecycle" role="group" aria-label="Plan completion">
+      {{if .ShowMarkComplete}}
+      <button type="button"
+              class="bead-action plan-lifecycle-ctl plan-lifecycle-complete"
+              hx-post="{{.BasePath}}/plans/{{.PlanID}}/complete"
+              hx-vals='{"peek":"1"}'
+              hx-target="#plan-peek-body" hx-swap="innerHTML"
+              hx-disabled-elt="this"
+              hx-confirm="{{if .OpenStepsRemaining}}{{.OpenStepsRemaining}} step{{if ne .OpenStepsRemaining 1}}s{{end}} still open — mark this plan complete anyway? It closes the plan and stops the gardener (you can Reopen later).{{else}}Mark this plan complete? It closes the plan and stops the gardener (you can Reopen later).{{end}}"
+              title="Mark this plan complete — closes the plan and disables the bound gardener">Mark complete</button>
+      {{end}}
+      {{if .ShowAbandon}}
+      <button type="button"
+              class="bead-action plan-lifecycle-ctl plan-lifecycle-abandon"
+              hx-post="{{.BasePath}}/plans/{{.PlanID}}/abandon"
+              hx-vals='{"peek":"1"}'
+              hx-target="#plan-peek-body" hx-swap="innerHTML"
+              hx-disabled-elt="this"
+              hx-confirm="Abandon this plan? It closes the plan and stops the gardener without marking it done — the leftover work is given up on (you can Reopen later)."
+              title="Abandon this plan — the cheap exit: closes the plan and disables the gardener, recording it as given up on rather than done">Abandon</button>
+      {{end}}
+      {{if .ShowReopen}}
+      <button type="button"
+              class="bead-action plan-lifecycle-ctl plan-lifecycle-reopen"
+              hx-post="{{.BasePath}}/plans/{{.PlanID}}/reopen"
+              hx-vals='{"peek":"1"}'
+              hx-target="#plan-peek-body" hx-swap="innerHTML"
+              hx-disabled-elt="this"
+              hx-confirm="Reopen this {{if eq .PlanState "abandoned"}}abandoned{{else}}completed{{end}} plan? It moves back to building; resume the gardener to restart the loop."
+              title="Reopen this {{if eq .PlanState "abandoned"}}abandoned{{else}}completed{{end}} plan — moves it back to building (the gardener stays paused until you resume it)">Reopen</button>
+      {{end}}
+    </p>
+    {{end}}
+  </header>
+  {{template "plan_steps" .}}
+  {{/* Working crew (Matt's ask): the agents the gardener dispatched onto the
+       steps above + how each is going. The SAME plan_crew partial the cockpit
+       renders under its timeline; read-only in the drawer (no dispatch levers),
+       so a crew-less plan shows the "no crew yet" empty state. */}}
+  {{template "plan_crew" (dict "PlanID" .PlanID "Crew" .Crew "IsOperator" .IsOperator "BasePath" .BasePath "InPeek" true)}}
+  {{/* Chat at the bottom (Matt's ask): the plan-agent conversation — operator +
+       agent turns — rendered read-only through the shared bead_chat direction-
+       bubble partial. Self-gates on .Chat.HasMessages, so a plan with no turns
+       paints nothing. To SEND a message, open the full cockpit (link above). */}}
+  {{template "bead_chat" (dict "Chat" .Transcript)}}
+</article>
+{{end}}

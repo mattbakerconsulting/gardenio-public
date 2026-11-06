@@ -1,0 +1,120 @@
+{{- if and .Values.tls.enabled (not .Values.tls.existingSecretName) .Values.tls.clusterIssuer.create }}
+# ── cert-manager ClusterIssuer (HTTP-01) — Gardenio-in-a-Box ──────────────────
+# ka-0000002443 follow-up; DNS/TLS doc §3.1 + §5 (ka-0000004570).
+#
+# The chart's Certificate (templates/tls.yaml) references a ClusterIssuer BY
+# NAME via `tls.issuer`. In a cloud path that issuer (e.g. a Route53 DNS-01
+# issuer) is created out-of-band, outside the chart — so this template stays
+# gated OFF by default (`tls.clusterIssuer.create: false`) and the cloud path
+# is untouched.
+#
+# In-box there is no terraform and no DNS-provider credential, so the box must
+# render its own issuer. This is an HTTP-01 ACME ClusterIssuer: cert-manager
+# solves the `/.well-known/acme-challenge/` challenge over the `:80` Traefik
+# entrypoint (no DNS API, no secret), which is exactly what the sslip.io +
+# perHost default needs to mint publicly-trusted certs on a fresh single EC2.
+#
+# Solver name == `tls.issuer` so the issuer this renders is the one the
+# Certificate's issuerRef resolves to — set tls.issuer + tls.clusterIssuer.create
+# together (perHost wants e.g. tls.issuer=letsencrypt-http01).
+#
+# CRD ORDERING: cert-manager's CRDs (ClusterIssuer, Certificate) must already
+# be installed in the cluster before this renders/applies, same prerequisite
+# the wildcard Certificate has always had (DNS/TLS doc §4).
+#
+# ACME-challenge reachability (DNS/TLS doc §5 gotcha #1): the chart's catch-all
+# :80→:443 redirect (templates/https-redirect.yaml) must NOT swallow the
+# challenge path. cert-manager's solver creates a higher-priority Ingress for
+# `/.well-known/acme-challenge/`, so the HTTP-01 handshake wins over the
+# low-priority (priority:1) redirect IngressRoute — verified ordering on k3s
+# Traefik.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.tls.issuer | quote }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tls-cluster-issuer
+spec:
+  acme:
+    server: {{ .Values.tls.clusterIssuer.acmeServer | quote }}
+    {{- with .Values.tls.clusterIssuer.email }}
+    email: {{ . | quote }}
+    {{- end }}
+    privateKeySecretRef:
+      # ACME account key. cert-manager creates this Secret in its own namespace
+      # the first time the issuer registers; pinning the name keeps the account
+      # stable across chart upgrades.
+      name: {{ printf "%s-account-key" .Values.tls.issuer | quote }}
+    solvers:
+      - http01:
+          ingress:
+            class: {{ .Values.tls.clusterIssuer.solverIngressClass | quote }}
+{{- end }}
+{{- if and .Values.tls.enabled (not .Values.tls.existingSecretName) (eq (.Values.tls.mode | default "wildcard") "localCA") }}
+---
+# ── Local-CA issuer chain (Tarboat G1.4, ka-0000003591) — TRUE air-gap TLS ───
+# Q2 = true air-gap: there is NO inbound/outbound internet, so Let's Encrypt
+# HTTP-01 (needs LE to reach :80) is unusable. Instead of asking the operator to
+# hand-craft a static cert secret (the old `existingSecretName` escape — manual,
+# error-prone, undocumented), the box mints its own chain IN-CLUSTER with
+# cert-manager: a SelfSigned issuer bootstraps a long-lived CA, and a CA
+# ClusterIssuer signs the leaf the chart's Certificate (templates/tls.yaml)
+# requests. Cost vs sslip.io+LE: the CA is not publicly trusted, so every client
+# (browser/CLI/iOS) must import the CA once — the trust-import runbook is in
+# gardenio/docs/tarboat-local-ca-tls.md. Set tls.mode=localCA + tls.issuer to the
+# CA issuer name (default below) + tls.hosts to every served hostname.
+#
+# CRDs: cert-manager (Issuer/ClusterIssuer/Certificate) must be installed first
+# — bootstrap-ec2.sh stage 4c stages cert-manager offline (G1.1), so this works
+# with zero internet.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ printf "%s-selfsigned" (include "gardenio.fullname" .) | quote }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tls-local-ca-bootstrap
+spec:
+  selfSigned: {}
+---
+# The CA certificate: a self-signed root the SelfSigned issuer above mints once,
+# stored in a Secret cert-manager's CA issuer then signs leaves from. Long-lived
+# (10y) so the one-time client trust import does not have to be repeated.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ printf "%s-local-ca" (include "gardenio.fullname" .) | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tls-local-ca
+spec:
+  isCA: true
+  commonName: {{ printf "Gardenio-in-a-Box Local CA (%s)" .Release.Name | quote }}
+  secretName: {{ printf "%s-local-ca" (include "gardenio.fullname" .) | quote }}
+  duration: 87600h    # 10y — avoid forcing a repeat trust-import
+  renewBefore: 8760h  # 1y
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never   # rotating the CA invalidates every client's import
+  issuerRef:
+    name: {{ printf "%s-selfsigned" (include "gardenio.fullname" .) | quote }}
+    kind: ClusterIssuer
+---
+# The CA ClusterIssuer the chart's leaf Certificate references via tls.issuer.
+# It signs leaves from the CA secret above. Its name MUST equal the leaf's
+# issuerRef in templates/tls.yaml — both default to "<fullname>-local-ca-issuer"
+# when tls.issuer is unset, so they stay in lockstep.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.tls.issuer | default (printf "%s-local-ca-issuer" (include "gardenio.fullname" .)) | quote }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tls-local-ca-issuer
+spec:
+  ca:
+    secretName: {{ printf "%s-local-ca" (include "gardenio.fullname" .) | quote }}
+{{- end }}

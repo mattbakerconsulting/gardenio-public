@@ -1,0 +1,122 @@
+{{define "gardener_beads"}}
+{{- /* Transitive "connected beads" view for one gardener. Dot: {
+         GardenerID, GardenerHref string, Degree, MaxDegree int,
+         View string, DenseView bool,
+         Groups []gardenerBeadGroupView, Lanes []gardenerBeadLaneView,
+         Total, Invocations int, Truncated bool, MaxNodes int,
+         DegreeURLs []degreeURL, ViewURLs []gardenerBeadsViewView, Error string,
+       }. Walks the dependency graph (both directions) from the gardener's
+       invocations out to Degree hops and lists every reachable bead. Loaded
+       into #cap-beads-host on the gardener detail page; the degree + view pills
+       re-request in place.
+
+       Two renders of the SAME node set (Slack thread ka-0000008021):
+         · Grouped (default) — by-type lists + the constellation star map.
+         · Dense (opt-in)    — info-dense status lanes (In progress · Blocked ·
+           Open · Done), one line per bead, so "what it's working on / what
+           it's done" reads at a glance. */ -}}
+<div class="cap-beads-inner">
+  {{if .Error}}
+  <p class="empty">{{.Error}}</p>
+  {{else}}
+  <div class="cap-beads-head">
+    <span class="cap-beads-summary">
+      <strong>{{.Total}}</strong> bead{{if ne .Total 1}}s{{end}} connected within
+      {{.Degree}} hop{{if ne .Degree 1}}s{{end}} of this gardener's {{.Invocations}} invocation{{if ne .Invocations 1}}s{{end}}
+    </span>
+    <span class="cap-beads-spacer"></span>
+    {{if .ViewURLs}}
+    <span class="cap-beads-views" role="group" aria-label="Connected-beads view">
+      {{range .ViewURLs}}
+      <a class="cap-beads-view{{if .Active}} active{{end}}"
+         hx-get="{{.URL}}" hx-target="#cap-beads-host" hx-swap="innerHTML"
+         href="{{.URL}}" aria-pressed="{{if .Active}}true{{else}}false{{end}}">{{.Label}}</a>
+      {{end}}
+    </span>
+    {{end}}
+    <span class="cap-beads-degrees" role="group" aria-label="Transitive degree">
+      <span class="cap-beads-degrees-label">degrees:</span>
+      {{range .DegreeURLs}}
+      <a class="cap-beads-degree{{if .Active}} active{{end}}"
+         hx-get="{{.URL}}" hx-target="#cap-beads-host" hx-swap="innerHTML"
+         href="{{.URL}}">{{.Degree}}</a>
+      {{end}}
+    </span>
+  </div>
+
+  {{if .Truncated}}
+  <p class="meta cap-beads-trunc">Graph capped at {{.MaxNodes}} beads — reduce the degree to see a complete picture.</p>
+  {{end}}
+
+  {{if .DenseView}}
+  {{- /* Dense status-lane view: info-dense, one line per bead, bucketed by
+         status. Empty lanes are hidden so the grid only shows live buckets. */ -}}
+  {{if .Total}}
+  <div class="cap-beads-lanes">
+    {{range .Lanes}}{{if .Count}}
+    <section class="cap-beads-lane" data-lane="{{.Lane}}">
+      <h3 class="cap-beads-lane-head">{{.Label}} <span class="cap-beads-lane-count">{{.Count}}</span></h3>
+      <ul class="cap-beads-lane-list">
+        {{range .Nodes}}
+        <li class="cap-beads-dnode{{if .IsClosed}} cap-beads-dnode-closed{{end}}">
+          <span class="cap-beads-dnode-type" title="{{.Type}}">{{.Type}}</span>
+          <a class="cap-beads-dnode-link" href="{{.Href}}" title="{{.ID}}{{if .Title}} — {{.Title}}{{end}}">{{if .Title}}{{.Title}}{{else}}{{.ID}}{{end}}</a>
+          <span class="cap-beads-dnode-degree" title="hops from the gardener">·{{.Degree}}</span>
+        </li>
+        {{end}}
+      </ul>
+    </section>
+    {{end}}{{end}}
+  </div>
+  {{else}}
+  <p class="empty">No connected beads found within {{.Degree}} hop{{if ne .Degree 1}}s{{end}}.</p>
+  {{end}}
+
+  {{else}}
+  {{/* Constellation: the gardener's transitive graph as a star map. The gardener
+       is the golden center; connected beads orbit on rings by hop-degree. The
+       grouped lists below remain the complete, accessible record. */}}
+  {{template "gardener_constellation" .}}
+
+  {{if .Groups}}
+  {{- /* The by-type grouped LIST is collapsed behind a single disclosure by
+         default (bug ka-0000007518). Rendered inline-expanded, it dumped every
+         connected-bead title (~477 rows / 2807 links) as a low-signal wall that
+         pushed the page to 33k-39k px and scored CDQR Density 6/10 for three
+         iterations. The constellation star map + the "<N> beads connected
+         within <D> hops" summary above stay visible as the at-a-glance signal;
+         the full title list reveals on demand. The inner per-type <details>
+         stay open so ONE click surfaces the complete record — the wall is
+         opt-in, not double-gated. */ -}}
+  <details class="cap-beads-disclosure">
+    <summary class="cap-beads-disclosure-head">
+      <span class="cap-beads-disclosure-label">Show all {{.Total}} connected bead{{if ne .Total 1}}s{{end}} grouped by type</span>
+    </summary>
+    <div class="cap-beads-groups">
+      {{range .Groups}}
+      <details class="cap-beads-group" open>
+        <summary class="cap-beads-group-head">
+          <span class="cap-beads-group-type">{{.Type}}</span>
+          <span class="cap-beads-group-count">{{.Count}}</span>
+        </summary>
+        <ul class="cap-beads-group-list">
+          {{range .Nodes}}
+          <li class="cap-beads-node{{if .IsClosed}} cap-beads-node-closed{{end}}">
+            <span class="cap-beads-node-degree" title="hops from the gardener">·{{.Degree}}</span>
+            <a class="cap-beads-node-link" href="{{.Href}}">{{if .Title}}{{.Title}}{{else}}{{.ID}}{{end}}</a>
+            <span class="cap-beads-node-id">{{.ID}}</span>
+            {{if .Status}}<span class="cap-beads-node-status">{{.Status}}</span>{{end}}
+          </li>
+          {{end}}
+        </ul>
+      </details>
+      {{end}}
+    </div>
+  </details>
+  {{else}}
+  <p class="empty">No connected beads found within {{.Degree}} hop{{if ne .Degree 1}}s{{end}}.</p>
+  {{end}}
+  {{end}}
+  {{end}}
+</div>
+{{end}}

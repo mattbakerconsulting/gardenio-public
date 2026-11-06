@@ -1,0 +1,161 @@
+{{- if .Values.releaseDeployer.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "gardenio.fullname" . }}-release-deployer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+spec:
+  schedule: {{ .Values.releaseDeployer.schedule | quote }}
+  suspend: {{ .Values.releaseDeployer.suspend }}
+  # Forbid: a release rollout must never overlap another. A run stuck mid
+  # --atomic upgrade or mid rollback --wait must finish (or hit
+  # activeDeadlineSeconds) before the next tick can start a second one.
+  concurrencyPolicy: Forbid
+  # If a scheduled tick is missed (control-plane blip), still start the run
+  # if within this window.
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # 3600s (>= release-deploy.sh's worst case: a 20m --atomic upgrade +
+      # rollback, then verify, then a rollback --wait). Never let a kill land
+      # mid-rollback.
+      activeDeadlineSeconds: 3600
+      # A retry must wait for the next schedule tick, never re-run
+      # immediately -- concurrencyPolicy: Forbid depends on that being true.
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            {{- include "gardenio.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: release-deployer
+        spec:
+          serviceAccountName: {{ include "gardenio.fullname" . }}-release-deployer
+          # Pod-level only -- see rbac.yaml for why this is not set on the
+          # ServiceAccount itself.
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          {{- include "gardenio.nodeSelector" (dict "local" .Values.releaseDeployer.nodeSelector "global" .Values.global.nodeSelector) | nindent 10 }}
+          {{- include "gardenio.tolerations" (dict "local" .Values.releaseDeployer.tolerations "global" .Values.global.tolerations) | nindent 10 }}
+          {{- with $.Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          {{- if $.Values.global.systemPriorityClass.create }}
+          priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+          {{- end }}
+          containers:
+            - name: release-deployer
+              {{- if .Values.releaseDeployer.image }}
+              image: {{ .Values.releaseDeployer.image | quote }}
+              {{- else }}
+              image: {{ include "gardenio.imageRef" (dict "image" .Values.agents.agentImage "global" .Values.global "Chart" .Chart) | quote }}
+              {{- end }}
+              imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" "IfNotPresent" "global" .Values.global) }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              command: ["bash", "/scripts/entrypoint.sh"]
+              env:
+                # readOnlyRootFilesystem is true, so uid 1000's default HOME
+                # (/home/agent) is not writable. git/helm/kubectl all write
+                # caches/config under HOME -- point it at the tmp emptyDir.
+                - name: HOME
+                  value: /tmp
+                - name: REPO
+                  value: {{ .Values.releaseDeployer.repo | quote }}
+                - name: NAMESPACE
+                  value: {{ .Release.Namespace | quote }}
+                - name: RELEASE_NAME
+                  value: {{ .Release.Name | quote }}
+                - name: KD_URL
+                  value: {{ printf "http://%s:%v" (include "gardenio.beads.fullname" .) (.Values.beads.service.httpPort | default 8080) | quote }}
+                {{- /* Machine principal (gd-5QYwXtV7IA): release-deploy.sh reports
+                     as the Keycloak service account of
+                     releaseDeployer.machinePrincipal.clientId, so neither the
+                     shared KD_TOKEN nor a self-declared X-Operated-By is sent.
+                     The secret is a file; its Secret is operator-created and
+                     optional (reporting is best-effort and never changes the
+                     deploy's exit code). Off = the legacy KD_TOKEN path. */}}
+                {{- if .Values.releaseDeployer.machinePrincipal.enabled }}
+                - name: KD_OIDC_TOKEN_URL
+                  value: {{ include "gardenio.keycloak.tokenURL" . | quote }}
+                - name: KD_OIDC_CLIENT_ID
+                  value: {{ .Values.releaseDeployer.machinePrincipal.clientId | quote }}
+                - name: KD_OIDC_CLIENT_SECRET_FILE
+                  value: /var/run/secrets/gardenio-machine/clientSecret
+                {{- if include "gardenio.keycloak.inClusterCA" . }}
+                # The token URL is the keycloak-runtime https port: curl
+                # --cacert this file (gd-lYPZlslOM7).
+                - name: KD_OIDC_CA_FILE
+                  value: {{ include "gardenio.keycloakRuntime.caFile" . | quote }}
+                {{- end }}
+                {{- else }}
+                - name: KD_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.releaseDeployer.kdTokenSecret | quote }}
+                      key: token
+                - name: KD_OPERATED_BY
+                  value: {{ .Values.releaseDeployer.operatedBy | quote }}
+                {{- end }}
+              volumeMounts:
+                - name: entrypoint
+                  mountPath: /scripts
+                  readOnly: true
+                - name: git-creds
+                  mountPath: /etc/git-creds
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+                {{- if .Values.releaseDeployer.machinePrincipal.enabled }}
+                - name: machine-client-secret
+                  mountPath: /var/run/secrets/gardenio-machine
+                  readOnly: true
+                {{- if include "gardenio.keycloak.inClusterCA" . }}
+                {{- include "gardenio.keycloakRuntime.caVolumeMount" . | nindent 16 }}
+                {{- end }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.releaseDeployer.resources | nindent 16 }}
+          volumes:
+            - name: entrypoint
+              configMap:
+                name: {{ include "gardenio.fullname" . }}-release-deployer-entrypoint
+                defaultMode: 0555
+            - name: git-creds
+              projected:
+                sources:
+                  - secret:
+                      name: {{ include "gardenio.releaseDeployer.gitSecret" . | quote }}
+                      items:
+                        - key: username
+                          path: username
+                        - key: token
+                          path: token
+                defaultMode: 0400
+            - name: tmp
+              emptyDir: {}
+            {{- if .Values.releaseDeployer.machinePrincipal.enabled }}
+            - name: machine-client-secret
+              secret:
+                secretName: {{ .Values.releaseDeployer.machinePrincipal.secretName | quote }}
+                optional: true
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            {{- include "gardenio.keycloakRuntime.caVolume" . | nindent 12 }}
+            {{- end }}
+            {{- end }}
+{{- end }}

@@ -1,0 +1,33 @@
+-- idx_events_created_at_id: covers the global event-log scan that backs the
+-- beads-viewer activity feed (GET /v1/events -> queryGetEventsByTimeRange).
+--
+-- Hot path that exposed the gap: the /feed first-paint seeds from the durable
+-- event log, paging up to 20x1000 events over a 72h window. The query is
+--
+--   SELECT ... FROM events
+--   WHERE created_at >= $1 AND created_at <= $2
+--     AND ($3 = 0 OR id > $3)
+--   ORDER BY created_at ASC, id ASC
+--   LIMIT $4
+--
+-- The events table (migration 001) only indexes bead_id, topic, fleet, and
+-- operated_by_id -- nothing on created_at. So every feed load (every viewer,
+-- every refresh) did a full sequential scan of events plus an explicit sort to
+-- satisfy the ORDER BY. On a busy fleet the events table is large and this is
+-- the dominant cost of feed first-paint (operator report, 2026-06-17).
+--
+-- (created_at, id) matches the WHERE range + ORDER BY exactly: the planner can
+-- range-scan the created_at window and walk it already ordered by (created_at,
+-- id), so both the time filter and the cursor tiebreak are satisfied from the
+-- index with no sort. Mirrors the deps perf fix in migration 032.
+--
+-- The same index also backs queryGetEventsByTimeRangeDesc (ORDER BY created_at
+-- DESC, id DESC; cursor `id < $3`), which the /feed first-paint seed now uses
+-- to page NEWEST-first so a busy fleet paints recent activity instead of the
+-- oldest slice of the window (bug ka-0000004135). Postgres scans this same
+-- B-tree backward to satisfy the DESC order with no sort and no extra index.
+--
+-- Idempotent so a partial-apply or a hand-applied hotfix on the live RDS
+-- (where this would be created via CREATE INDEX CONCURRENTLY) is a no-op.
+CREATE INDEX IF NOT EXISTS idx_events_created_at_id
+    ON events (created_at, id);

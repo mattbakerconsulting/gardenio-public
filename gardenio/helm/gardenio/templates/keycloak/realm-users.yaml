@@ -1,0 +1,75 @@
+{{- /*
+Declarative realm users (KeycloakRealmUser CRs), one per keycloak.realmUsers[]
+entry. Default list is empty, so the base render emits nothing.
+
+WHY: admin authority in kbeads comes only from the OIDC token's
+realm_access.roles, i.e. from Keycloak group membership. A user created by hand
+(kcadm / console) is lost when Keycloak restores or rebuilds, and this
+deployment's Keycloak runs on an emptyDir (see deploy-values/gardenio-k3s.yaml).
+A CR is re-reconciled by the EDP operator from git, so the user survives. The
+first-admin hook (keycloak.runtime.firstAdmin) only runs on `helm upgrade` and
+only for ONE user; this is the general mechanism (gd-MBsUUXpJZB).
+
+NO CREDENTIAL IS RENDERED. spec.password is never exposed: a person's user is
+created without a credential and they set their own (admin-issued temporary
+password or reset-credentials flow), so nothing secret lives in git. A machine
+test identity (the land-door verifier, gd-Hq1PnUVOUC) may name passwordSecret
+{name, key}: a reference to a Secret in the release namespace, never its value.
+
+NAMES: the operator's UpdateUser writes firstName/lastName on every reconcile,
+as "" when unset, so a name left off the CR is blanked on an adopted user. Set
+firstName/lastName per entry to keep them; they render only when set. Only the schema-stable core fields are rendered; this operator's
+CRDs have rejected otherwise-valid fields before (see the `groups` override in
+deploy-values/gardenio-k3s.yaml).
+*/ -}}
+{{- if .Values.keycloak.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- range .Values.keycloak.realmUsers }}
+# ── KeycloakRealmUser: {{ .username }} ────────────────────────────────────────
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakRealmUser
+metadata:
+  name: {{ printf "%s-user-%s" $fullname (.username | lower | replace "@" "-at-" | replace "." "-" | replace "_" "-" | replace "+" "-") | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  username: {{ .username | quote }}
+  email: {{ .email | default .username | quote }}
+  enabled: {{ if kindIs "invalid" .enabled }}true{{ else }}{{ .enabled }}{{ end }}
+  emailVerified: {{ if kindIs "invalid" .emailVerified }}true{{ else }}{{ .emailVerified }}{{ end }}
+  {{- with .firstName }}
+  firstName: {{ . | quote }}
+  {{- end }}
+  {{- with .lastName }}
+  lastName: {{ . | quote }}
+  {{- end }}
+  {{- /* Operator default is `full`: it removes every group and direct realm-role
+  mapping the CR does not list (default-roles-*, hand-assigned roles) on every
+  reconcile. Default to addOnly so the CR only ever adds what it names. */}}
+  reconciliationStrategy: {{ .reconciliationStrategy | default "addOnly" | quote }}
+  {{- with .passwordSecret }}
+  {{- if not (and .name .key) }}
+  {{- fail "keycloak.realmUsers[].passwordSecret needs both name and key" }}
+  {{- end }}
+  passwordSecret:
+    name: {{ .name | quote }}
+    key: {{ .key | quote }}
+    temporary: false
+  {{- end }}
+  {{- if .groups }}
+  groups:
+    {{- toYaml .groups | nindent 4 }}
+  {{- end }}
+  {{- if .roles }}
+  roles:
+    {{- toYaml .roles | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+{{- end }}

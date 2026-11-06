@@ -1,0 +1,124 @@
+{{- if and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled (eq .Values.keycloak.forwardAuth.sessionStore.type "redis") .Values.keycloak.forwardAuth.sessionStore.redis.deploy.enabled }}
+{{- /*
+In-chart Redis holding oauth2-proxy sessions (gd-C2Sl6ClxAY).
+
+With the default cookie session store the whole session (access + id + refresh
+token) lives in the browser cookie, split into ~4KB chunks. When two requests
+refresh the session at once (the viewer polls every ~15s), each response
+Set-Cookies its own chunks, the browser keeps a mix, the signature no longer
+verifies and every request 401s until the user signs in again. With a server
+side store the cookie is a tiny ticket and refresh is one atomic write, so
+concurrent refreshes cannot corrupt anything.
+
+NO persistence: losing it only forces a (silent, SSO-backed) re-sign-in, and an
+emptyDir keeps the pod PSA-restricted with a read-only rootfs. Sessions are
+encrypted with the oauth2-proxy cookie secret before they are stored. Auth-less
+by default: the NetworkPolicy (only oauth2-proxy pods may connect) is the
+isolation boundary; set sessionStore.redis.passwordSecret to add AUTH.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.forwardAuth.redis.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.forwardAuth.redis.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Single node on an emptyDir: Recreate avoids two pods racing during rollout.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.forwardAuth.redis.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.forwardAuth.redis.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.name }}
+      {{- end }}
+      containers:
+        - name: redis
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.keycloak.forwardAuth.sessionStore.redis.deploy.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.keycloak.forwardAuth.sessionStore.redis.deploy.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            - redis-server
+            # No RDB/AOF persistence (see the header); nothing written to /data.
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --dir
+            - /tmp
+            # Sessions are bounded by their own TTL; never evict a live one
+            # silently under memory pressure, fail the write instead.
+            - --maxmemory-policy
+            - noeviction
+            {{- if .Values.keycloak.forwardAuth.sessionStore.redis.passwordSecret }}
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            {{- end }}
+          {{- if .Values.keycloak.forwardAuth.sessionStore.redis.passwordSecret }}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.keycloak.forwardAuth.sessionStore.redis.passwordSecret }}
+                  key: {{ .Values.keycloak.forwardAuth.sessionStore.redis.passwordKey | default "password" }}
+          {{- end }}
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 20
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.keycloak.forwardAuth.sessionStore.redis.deploy.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.keycloak.forwardAuth.sessionStore.redis.deploy.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.keycloak.forwardAuth.sessionStore.redis.deploy.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.keycloak.forwardAuth.sessionStore.redis.deploy.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

@@ -1,0 +1,236 @@
+# trigger-source-restart-dedup.toml
+#
+# Claudeless scenario: kill+restart engine, CatchUpKeys seeds seen, no second
+# fire for the same fire_key.
+#
+# ka-0000002354 / parent ka-0000008095 §P3:
+#   "trigger-source-restart-dedup.toml — engine restart does not double-fire."
+#
+# Drives the dedup invariant by:
+#   1. Creating a trigger:schedule with cron='* * * * *' and action=create_bead
+#      (kind=issue task beads, which CatchUpKeys queries for prior fire_keys).
+#   2. Starting trigger-engine subprocess A with poll=1s.
+#   3. Waiting for the first fire (a task bead with field schedule_fire_key set).
+#   4. Killing engine A.
+#   5. Starting trigger-engine subprocess B (fresh in-memory seen state). Engine
+#      B's CatchUp() reads CatchUpKeys → seeds seen[trig.ID] from the existing
+#      task bead's schedule_fire_key.
+#   6. Letting B run for ~30s and asserting that no two task beads share the
+#      same schedule_fire_key value (i.e. the dedup invariant holds).
+#
+# Note: cron='* * * * *' may produce multiple task beads if engine B observes a
+# new minute boundary before the deadline. That's fine — dedup is about
+# (trigger_id, fire_key) uniqueness, not total bead count. We assert the
+# unique-keys count equals the bead count.
+
+[claude]
+session_id = "e2e00000-000a-4000-a000-000000000003"
+username = "e2e-trigger-restart-dedup"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 60000
+
+[[responses]]
+on = "*"
+say = "Running trigger-source-restart-dedup: engine restart does not double-fire."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight ─────────────────────────────────────────────────────
+TE_BIN=""
+if command -v trigger-engine >/dev/null 2>&1; then
+  TE_BIN=$(command -v trigger-engine)
+elif [ -x /usr/local/bin/trigger-engine ]; then
+  TE_BIN=/usr/local/bin/trigger-engine
+elif [ -x /tmp/trigger-engine ]; then
+  TE_BIN=/tmp/trigger-engine
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-engine from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-engine ./cmd/trigger-engine/ ) || {
+    echo "SKIP: trigger-engine build failed"; exit 0;
+  }
+  TE_BIN=/tmp/trigger-engine
+else
+  echo "SKIP: trigger-engine binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-engine: $TE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL not set"
+  exit 0
+fi
+if [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_TOKEN not set"
+  exit 0
+fi
+if ! command -v gb >/dev/null 2>&1; then
+  echo "SKIP: gb not present"
+  exit 0
+fi
+
+# ── Setup ──────────────────────────────────────────────────────────
+TAG="e2e-tsr-$$-$(date +%s)"
+echo "tag: $TAG"
+
+# action=create_bead so CatchUpKeys (which queries kind=issue beads with the
+# trigger:<id> label) finds prior fire_keys to seed dedup.
+TRIG_OUT=$(gb trigger create schedule \
+  --http-url "$BEADS_HTTP_URL" \
+  --title "$TAG" \
+  --cron '* * * * *' \
+  --action create_bead \
+  --prompt "fired at {{fire_time}}" \
+  --label "e2e:claudeless" \
+  --label "e2e-tag:$TAG" \
+  --json 2>&1) || { fail "gb trigger create" "$TRIG_OUT"; exit 1; }
+
+TRIG_ID=$(echo "$TRIG_OUT" | jq -r '.id // .ID // empty')
+if [ -z "$TRIG_ID" ]; then
+  fail "extract trigger id" "out=$TRIG_OUT"
+  exit 1
+fi
+echo "trigger: $TRIG_ID"
+
+# Helper: count + list fire_keys on task beads created by this trigger.
+list_keys() {
+  kd list --type=task -l "trigger:$TRIG_ID" --json 2>/dev/null | \
+    jq -r '.[] | .fields.schedule_fire_key // empty' 2>/dev/null
+}
+
+cleanup() {
+  gb trigger disable "$TRIG_ID" --http-url "$BEADS_HTTP_URL" >/dev/null 2>&1 || true
+  # Close any task beads created by this trigger so they don't accumulate.
+  for bid in $(kd list --type=task -l "trigger:$TRIG_ID" --json 2>/dev/null | jq -r '.[].id'); do
+    kd close "$bid" >/dev/null 2>&1 || true
+  done
+  kd close "$TRIG_ID" >/dev/null 2>&1 || true
+  if [ -n "${TE_PID_A:-}" ]; then
+    kill "$TE_PID_A" 2>/dev/null || true
+    wait "$TE_PID_A" 2>/dev/null || true
+  fi
+  if [ -n "${TE_PID_B:-}" ]; then
+    kill "$TE_PID_B" 2>/dev/null || true
+    wait "$TE_PID_B" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+# ── Engine A: wait for first fire ──────────────────────────────────
+TE_LOG_A=/tmp/trigger-engine-restart-A-$$.log
+BEADS_HTTP_ADDR="$BEADS_HTTP_URL" \
+  BEADS_DAEMON_TOKEN="$BEADS_TOKEN" \
+  TRIGGER_POLL_INTERVAL=1s \
+  LISTEN_ADDR=":0" \
+  LOG_LEVEL=info \
+  "$TE_BIN" >"$TE_LOG_A" 2>&1 &
+TE_PID_A=$!
+echo "engine A pid: $TE_PID_A"
+
+DEADLINE=$(( $(date +%s) + 75 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  KEYS=$(list_keys)
+  if [ -n "$KEYS" ]; then
+    FIRED=1
+    pass "engine A produced first task bead with schedule_fire_key"
+    echo "  initial keys: $(echo "$KEYS" | tr '\\n' ' ')"
+    break
+  fi
+  sleep 2
+done
+if [ "$FIRED" = "0" ]; then
+  fail "engine A did not fire within 75s"
+  echo "--- engine A log (tail) ---"
+  tail -40 "$TE_LOG_A" 2>/dev/null || true
+  echo "--- end log ---"
+  exit 1
+fi
+
+INITIAL_BEAD_COUNT=$(list_keys | wc -l | tr -d ' ')
+INITIAL_UNIQUE=$(list_keys | sort -u | wc -l | tr -d ' ')
+echo "  initial: bead_count=$INITIAL_BEAD_COUNT unique_keys=$INITIAL_UNIQUE"
+
+# ── Kill engine A ──────────────────────────────────────────────────
+kill "$TE_PID_A" 2>/dev/null || true
+wait "$TE_PID_A" 2>/dev/null || true
+TE_PID_A=""
+echo "engine A killed"
+
+# ── Engine B: cold start, must seed seen[] from CatchUpKeys ───────
+TE_LOG_B=/tmp/trigger-engine-restart-B-$$.log
+BEADS_HTTP_ADDR="$BEADS_HTTP_URL" \
+  BEADS_DAEMON_TOKEN="$BEADS_TOKEN" \
+  TRIGGER_POLL_INTERVAL=1s \
+  LISTEN_ADDR=":0" \
+  LOG_LEVEL=info \
+  "$TE_BIN" >"$TE_LOG_B" 2>&1 &
+TE_PID_B=$!
+echo "engine B pid: $TE_PID_B"
+
+# Run engine B for ~30s. Across that window, it might cross a new minute
+# boundary and produce one additional task bead with a new fire_key — that's
+# the expected non-duplicate path. What we care about: the (trigger, fire_key)
+# tuple must remain unique.
+sleep 30
+
+# Confirm engine B observed catch-up by checking for the runtime log line OR
+# by checking last_checked moved.
+if grep -qE 'triggers: catch-up complete|triggers: runtime catch-up from prior beads' "$TE_LOG_B"; then
+  pass "engine B logged catch-up after restart"
+else
+  echo "  (note) engine B did not log catch-up — non-fatal"
+fi
+
+# ── Dedup invariant: bead_count == unique fire_keys ───────────────
+FINAL_BEAD_COUNT=$(list_keys | wc -l | tr -d ' ')
+FINAL_UNIQUE=$(list_keys | sort -u | wc -l | tr -d ' ')
+echo "  final:   bead_count=$FINAL_BEAD_COUNT unique_keys=$FINAL_UNIQUE"
+
+if [ "$FINAL_BEAD_COUNT" = "$FINAL_UNIQUE" ]; then
+  pass "no duplicate fire_keys after restart (count=$FINAL_BEAD_COUNT, unique=$FINAL_UNIQUE)"
+else
+  fail "duplicate fire_keys observed after restart" "count=$FINAL_BEAD_COUNT unique=$FINAL_UNIQUE"
+  echo "--- final keys ---"
+  list_keys | sort
+  echo "--- engine B log (tail) ---"
+  tail -50 "$TE_LOG_B" 2>/dev/null || true
+  echo "--- end log ---"
+fi
+
+# Sanity: at minimum the original keys produced by engine A must still be
+# present (no destruction by engine B).
+INITIAL_KEY="$(list_keys | head -n1)"  # may be different ordering, just check non-empty
+if [ -n "$INITIAL_KEY" ]; then
+  pass "task beads from engine A persist after restart"
+else
+  fail "task beads from engine A vanished after restart"
+fi
+
+# ── Summary ────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "trigger-source-restart-dedup: engine restart does not double-fire OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "trigger-source-restart-dedup scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

@@ -1,0 +1,52 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.tls.redirect.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+# ── HTTP → HTTPS redirect (audit F3) ─────────────────────────────────────────
+# Single web-only IngressRoute that catches every Host on the `web` (HTTP/80)
+# entrypoint and returns 308 → https://. App IngressRoutes only list the
+# `websecure` entrypoint, so plain HTTP no longer reaches any real backend.
+#
+# This unblocks safe HSTS preload submission (F4): with `web` returning a
+# permanent redirect, a misconfigured client speaking HTTP first cannot leak
+# cookies/tokens before HSTS pins the host.
+#
+# Independent of `tls.enabled`: the redirect just rewrites scheme. Even when
+# TLS is terminated upstream (e.g. ALB) and Traefik does not own the certs,
+# the redirect must still deploy so plain-HTTP requests get a 308 instead of
+# a 403 from Traefik (ka-0000004710).
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-https-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: https-redirect
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-https-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: https-redirect
+spec:
+  entryPoints:
+    - web
+  routes:
+    # Catch every host on the web entrypoint. The redirectScheme middleware
+    # short-circuits before the noop@internal service is invoked.
+    - match: HostRegexp(`^.+$`)
+      kind: Rule
+      priority: 1
+      services:
+        - name: noop@internal
+          kind: TraefikService
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        - name: {{ $fullname }}-https-redirect
+{{- end }}

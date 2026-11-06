@@ -1,0 +1,162 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.beads.ingress.runnerRoute.enabled (not .Values.fleet.enabled) }}
+{{- $rr := .Values.beads.ingress.runnerRoute -}}
+{{- if empty $rr.host }}
+{{- fail "beads.ingress.runnerRoute.enabled is true but beads.ingress.runnerRoute.host is empty: set the public runner hostname or disable the route." }}
+{{- end }}
+{{- $fullname := include "gardenio.beads.fullname" . -}}
+{{- $host := $rr.host -}}
+{{- $httpPort := .Values.beads.service.httpPort | default 8080 -}}
+{{- /*
+  The runner route allowlist, one "METHOD /path" per entry in the Go 1.22 mux
+  pattern form. It MUST equal runnerAllowedPatterns in
+  kbeads/internal/server/runner_auth.go, which is the source of truth: the
+  daemon refuses a runner token on any other route whatever this rule says.
+  tests/runner_ingress_test.go reads that map and fails on any drift. A
+  {name} wildcard becomes [^/]+, as the mux matches one non-empty segment,
+  and a {name...} wildcard .+, the rest of the path.
+*/ -}}
+{{- $allowed := list
+  "POST /v1/runners/{id}/heartbeat"
+  "GET /v1/runners/{id}"
+  "GET /v1/events/stream"
+  "GET /v1/beads"
+  "GET /v1/beads/{id}"
+  "GET /v1/beads/{id}/comments"
+  "GET /v1/beads/{id}/dependencies"
+  "GET /v1/beads/{id}/dependents"
+  "POST /v1/beads"
+  "PATCH /v1/beads/{id}"
+  "POST /v1/beads/{id}/close"
+  "POST /v1/beads/{id}/comments"
+  "POST /v1/hooks/emit"
+  "POST /v1/escalations/{id}/result"
+  "GET /v1/configs"
+  "GET /v1/configs/{key...}"
+  "GET /v1/me"
+  "GET /v1/agents-by-name/{name}"
+  "POST /v1/beads/{id}/dependencies"
+  "DELETE /v1/beads/{id}/dependencies"
+  "POST /v1/search/semantic"
+  "GET /v1/escalations"
+  "GET /v1/batch/beads"
+  "POST /v1/beads/{id}/labels"
+  "DELETE /v1/beads/{id}/labels/{label}"
+  "POST /v1/agents/{id}/gates/{gate_id}/satisfy"
+-}}
+{{- $clauses := list -}}
+{{- range $allowed }}
+{{- $method := index (splitList " " .) 0 -}}
+{{- $path := index (splitList " " .) 1 -}}
+{{- if contains "{" $path }}
+{{- $re := regexReplaceAll "\\{[^}]+\\.\\.\\.\\}" $path ".+" -}}
+{{- $re = regexReplaceAll "\\{[^}]+\\}" $re "[^/]+" -}}
+{{- $clauses = append $clauses (printf "(Method(`%s`) && PathRegexp(`^%s$`))" $method $re) -}}
+{{- else }}
+{{- $clauses = append $clauses (printf "(Method(`%s`) && Path(`%s`))" $method $path) -}}
+{{- end }}
+{{- end }}
+---
+# Public runner listener (local-agents spec §4.3). Only runner tokens, only
+# the runner routes. Everything else on this host has no route, so Traefik
+# answers 404.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-runner
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    {{- toYaml $rr.entryPoints | nindent 4 }}
+  routes:
+    - match: Host(`{{ $host }}`) && HeaderRegexp(`Authorization`, `^Bearer gr_`) && ({{ join " || " $clauses }})
+      kind: Rule
+      services:
+        - name: {{ $fullname }}
+          port: {{ $httpPort }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        - name: {{ $fullname }}-runner-headers
+        - name: {{ $fullname }}-runner-ratelimit
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+---
+# Runner registration: an invite code, no bearer yet. Its own tight per-IP
+# limit (spec §10: 10 per hour).
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-runner-register
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    {{- toYaml $rr.entryPoints | nindent 4 }}
+  routes:
+    - match: Host(`{{ $host }}`) && Method(`POST`) && Path(`/v1/runners/register`)
+      kind: Rule
+      services:
+        - name: {{ $fullname }}
+          port: {{ $httpPort }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        - name: {{ $fullname }}-runner-headers
+        - name: {{ $fullname }}-runner-register-ratelimit
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+---
+# Overwrites any client-sent value. The daemon refuses a non-runner bearer
+# (or an edge access token) on a request carrying it (runnerAuthMiddleware).
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-runner-headers
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  headers:
+    customRequestHeaders:
+      X-Gardenio-Listener: runner
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-runner-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ $rr.rateLimit.average }}
+    burst: {{ $rr.rateLimit.burst }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-runner-register-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ $rr.registerRateLimit.average }}
+    period: {{ $rr.registerRateLimit.period }}
+    burst: {{ $rr.registerRateLimit.burst }}
+{{- end }}

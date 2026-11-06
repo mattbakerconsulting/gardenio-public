@@ -1,0 +1,54 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-agent-runtimeclass
+  annotations:
+    policies.kyverno.io/title: Require the gVisor (runsc) RuntimeClass on agent pods
+    policies.kyverno.io/category: gardenio-admission-starter
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Agent pods run untrusted, LLM-generated workloads directly on shared
+      kernels. gVisor (runsc) puts each agent behind a user-space kernel,
+      containing a container-escape / kernel-exploit to the sandbox (attacker
+      path A3, audit finding F5, ka-0000002606). The controller already supports
+      pinning an agent to runsc (runtime_class: runsc -> spec.runtimeClassName),
+      but it is opt-in per role/project/agent and gated behind gvisor.enabled +
+      the gVisor node pool. This ClusterPolicy is the admission-time backstop
+      that flags (Audit) or denies (Enforce) any agent pod (selected by the
+      gardenio.io/agent label) NOT pinned to runsc.
+      IMPORTANT ROLLOUT ORDER: this policy MUST stay in Audit until gVisor is
+      fully rolled out (gvisor.enabled=true, the gVisor node pool exists, and
+      every agent role/project sets runtime_class: runsc). Flipping to Enforce
+      before that would DENY every agent pod that has not yet been migrated onto
+      runsc. Part of the admission starter set: default OFF, and Audit-only
+      until the gVisor substrate is universal. The Helm chart renders a
+      values-parameterized copy at
+      templates/kyverno/require-agent-runtimeclass.yaml (gated behind
+      global.admissionPolicies.requireRunsc.enabled). See
+      gardenio/docs/admission-policies.md and gardenio/docs/gvisor-runsc-prod.md.
+spec:
+  # Audit ONLY for the starter posture. Do NOT flip to Enforce until gVisor is
+  # universal (see the rollout-order warning above) — otherwise every
+  # not-yet-migrated agent pod is denied.
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: agent-pods-use-runsc
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              selector:
+                matchExpressions:
+                  - key: gardenio.io/agent
+                    operator: Exists
+      validate:
+        message: >-
+          Agent pods must run under the gVisor (runsc) RuntimeClass
+          (spec.runtimeClassName=runsc). See
+          policy/kyverno/require-agent-runtimeclass.yaml.
+        pattern:
+          spec:
+            runtimeClassName: runsc

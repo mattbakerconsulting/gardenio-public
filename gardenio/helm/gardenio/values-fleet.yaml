@@ -1,0 +1,70 @@
+# Lightweight fleet child deployment.
+#
+# This values overlay deploys a fleet child that shares the parent's beads
+# daemon, PostgreSQL, and NATS. Only the controller, coopmux, and optionally
+# the slack bridge are deployed locally. ExternalName services route traffic
+# to the parent's shared infrastructure.
+#
+# Prerequisites:
+#   1. Parent fleet deployed (e.g., `helm install gardenio gardenio/ -n gardenio`)
+#   2. Fleet token registered in parent's BEADS_FLEET_MAP env var
+#   3. K8s Secret with the fleet's beads auth token in the target namespace
+#
+# Usage:
+#   kubectl create namespace gardenio-qa
+#   kubectl create secret generic kd-beads-token -n gardenio-qa --from-literal=token=<fleet-token>
+#   helm install qa-fleet gardenio/ -n gardenio-qa -f values-fleet.yaml \
+#     --set fleet.name=qa-fleet \
+#     --set fleet.parentNamespace=gardenio \
+#     --set fleet.parentRelease=gardenio
+
+# Fleet child mode — creates ExternalName services for parent's beads + NATS.
+fleet:
+  enabled: true
+  name: ""              # REQUIRED: fleet name (must match parent's BEADS_FLEET_MAP)
+  parentNamespace: ""   # REQUIRED: parent fleet K8s namespace
+  parentRelease: ""     # REQUIRED: parent fleet Helm release name
+
+# TLS — disabled for fleet children (parent fleet handles TLS termination).
+tls:
+  enabled: false
+
+# Shared infrastructure — disabled (provided by parent fleet).
+postgres:
+  enabled: false
+nats:
+  enabled: false
+
+# Beads daemon — shared with parent (ExternalName service routes to parent).
+# The token secret must contain a fleet-scoped token that maps to this fleet
+# in the parent daemon's BEADS_FLEET_MAP.
+beads:
+  tokenSecret: kd-beads-token
+
+# Agent controller — deployed locally to manage fleet agent pods.
+agents:
+  enabled: true
+  replicaCount: 1
+  serviceAccount:
+    create: true
+  agentServiceAccount:
+    create: true
+  coopMaxPods: 2
+  coopBurstLimit: 2
+
+# Coopmux — deployed locally for fleet agent session management.
+coopmux:
+  enabled: true
+  replicaCount: 1
+
+# Slack bridge — optional for fleet-specific notifications.
+slackBridge:
+  enabled: false
+
+# Other components — disabled for fleet children.
+landing:
+  enabled: false
+jiraBridge:
+  enabled: false
+gitlabBridge:
+  enabled: false

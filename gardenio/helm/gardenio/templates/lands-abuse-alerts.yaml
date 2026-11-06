@@ -1,0 +1,173 @@
+{{- if .Values.agents.metrics.prometheusRule.landsAbuse.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.landsAbuse }}
+# PrometheusRule for the Lands abuse controls (Track B spec §5.4, step 10.4,
+# gd-l8ltROhREx). Five alerts, one per tenant land, routed like every other
+# alert by severity. Abuse handling follows the AUP: freeze first
+# (gb lands freeze <land>), then ask.
+#
+#   LandSpendVelocityHigh  the land's LLM spend in the last hour is more than
+#                          `spendVelocity.multiple` times its 7-day hourly mean,
+#                          and above a dollar floor. Reads the account gauge
+#                          gardenio_account_cost_usd for the land's own account
+#                          lands-<land> (B-D7), so it is the LiteLLM bill.
+#   LandPurseWallHit       a spawn into the land was refused at the purse wall
+#                          (gardenio_lands_spawn_refusals_total{code="purse_wall"},
+#                          the controller's spawn wall): the land ran dry.
+#   LandEgressHigh         the land namespace land-<land> sent more than
+#                          `egress.bytesPerHour` in the last hour. Needs the
+#                          kubelet cadvisor scrape
+#                          (monitoring.clusterMetrics.kubeletCadvisor)
+#                          on, keeping container_network_transmit_bytes_total.
+#   LandSpawnRefusalsHigh  the land had more than `spawnRefusals.perHour` spawns
+#                          refused in the last hour, any code (frozen, spawns off,
+#                          purse, spawn_rate): something keeps asking for agents
+#                          it cannot have.
+#   LandUntrustedInputUnusable
+#                          the beads daemon refused a tenant-land write because
+#                          the untrusted-input taint is unregistered or not
+#                          restrict-only
+#                          (gardenio_lands_untrusted_input_unusable_total,
+#                          gd-Ms3cmrdW49): the land takes no new beads until
+#                          the operator fixes the taint.
+#
+# Off by default, like the other rules; per-env overlays opt in.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-lands-abuse
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.lands_abuse
+      interval: 1m
+      rules:
+        - alert: LandSpendVelocityHigh
+          expr: |
+            (
+              max by (land) (label_replace(delta(gardenio_account_cost_usd{account=~"lands-.+"}[1h]), "land", "$1", "account", "lands-(.+)"))
+              >
+              {{ $cfg.spendVelocity.multiple }} * max by (land) (label_replace(delta(gardenio_account_cost_usd{account=~"lands-.+"}[7d]), "land", "$1", "account", "lands-(.+)")) / 168
+            )
+            and
+            max by (land) (label_replace(delta(gardenio_account_cost_usd{account=~"lands-.+"}[1h]), "land", "$1", "account", "lands-(.+)")) > {{ $cfg.spendVelocity.minUSDPerHour }}
+          for: {{ $cfg.spendVelocity.for | default "10m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gardenio
+            subsystem: lands
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Land {{`{{ $labels.land }}`}} is spending more than {{ $cfg.spendVelocity.multiple }}x its 7-day hourly mean"
+            description: |
+              Land {{`{{ $labels.land }}`}} spent ${{`{{ $value | printf "%.2f" }}`}} of LLM
+              spend in the last hour (account lands-{{`{{ $labels.land }}`}}), more than
+              {{ $cfg.spendVelocity.multiple }} times its 7-day hourly mean and above
+              ${{ $cfg.spendVelocity.minUSDPerHour }}/h. Look at the land's running agents
+              (gb lands purse {{`{{ $labels.land }}`}}); if it looks like abuse, freeze first
+              (gb lands freeze {{`{{ $labels.land }}`}} --reason ...), then ask the owner.
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: LandPurseWallHit
+          # The second arm catches a land's first refusal: the counter is born
+          # at 1, which increase() alone does not see.
+          expr: |
+            sum by (land) (increase(gardenio_lands_spawn_refusals_total{code="purse_wall"}[15m])) > 0
+            or
+            sum by (land) (gardenio_lands_spawn_refusals_total{code="purse_wall"} unless gardenio_lands_spawn_refusals_total{code="purse_wall"} offset 15m)
+          labels:
+            severity: {{ $cfg.purseWall.severity | default $cfg.severity | quote }}
+            component: gardenio
+            subsystem: lands
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Land {{`{{ $labels.land }}`}} hit its purse wall"
+            description: |
+              A spawn into land {{`{{ $labels.land }}`}} was refused because its purse is at
+              the wall (code purse_wall). The land's agents are being parked; the steward
+              asks the owner. Grant credits with gb lands credit add {{`{{ $labels.land }}`}}
+              if that is the plan.
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: LandEgressHigh
+          expr: |
+            sum by (land) (label_replace(increase(container_network_transmit_bytes_total{namespace=~"land-.+"}[1h]), "land", "$1", "namespace", "land-(.+)")) > {{ $cfg.egress.bytesPerHour | int64 }}
+          for: {{ $cfg.egress.for | default "5m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gardenio
+            subsystem: lands
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Land {{`{{ $labels.land }}`}} sent {{`{{ $value | humanize1024 }}`}}B out in an hour"
+            description: |
+              The pods in namespace land-{{`{{ $labels.land }}`}} sent
+              {{`{{ $value | humanize1024 }}`}}B in the last hour, over the
+              {{ $cfg.egress.bytesPerHour | int64 }}-byte limit. Package installs are
+              normal; a sustained stream is not. Freeze first if it looks like abuse.
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: LandSpawnRefusalsHigh
+          expr: |
+            sum by (land) (increase(gardenio_lands_spawn_refusals_total[1h])) > {{ $cfg.spawnRefusals.perHour }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gardenio
+            subsystem: lands
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Land {{`{{ $labels.land }}`}} had {{`{{ $value | printf \"%.0f\" }}`}} spawns refused in an hour"
+            description: |
+              The Lands spawn wall refused more than {{ $cfg.spawnRefusals.perHour }} spawns
+              into land {{`{{ $labels.land }}`}} in the last hour. Break it down with
+              sum by (code) (increase(gardenio_lands_spawn_refusals_total{land="{{`{{ $labels.land }}`}}"}[1h]));
+              spawn_rate means it is starting agents faster than LANDS_SPAWNS_PER_HOUR.
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: LandUntrustedInputUnusable
+          # The second arm catches a land's first refusal: the counter is born
+          # at 1, which increase() alone does not see.
+          expr: |
+            sum by (land, reason) (increase(gardenio_lands_untrusted_input_unusable_total[15m])) > 0
+            or
+            sum by (land, reason) (gardenio_lands_untrusted_input_unusable_total unless gardenio_lands_untrusted_input_unusable_total offset 15m)
+          labels:
+            severity: {{ $cfg.untrustedInput.severity | default $cfg.severity | quote }}
+            component: gardenio
+            subsystem: lands
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Land {{`{{ $labels.land }}`}} is refusing writes: the untrusted-input taint is unusable ({{`{{ $labels.reason }}`}})"
+            description: |
+              The beads daemon refused a write in tenant land {{`{{ $labels.land }}`}}
+              ({{`{{ $labels.reason }}`}}): it will not create a tenant bead without the
+              untrusted-input taint, nor provision a tenant land while that taint is
+              unusable. Check kd taint show untrusted-input; it must be registered with
+              the restrict effect only (kd taint create untrusted-input --owner <team>
+              --effect restrict).
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

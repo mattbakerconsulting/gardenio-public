@@ -1,0 +1,131 @@
+{{- if .Values.vmalert.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.vmalert.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmalert.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.vmalert.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.vmalert.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "gardenio.contentChecksum" (include (print .Template.BasePath "/vmalert/configmap.yaml") .) }}
+        {{- if .Values.vmalert.selfScrape }}
+        # Expose vmalert's own /metrics to the in-chart vmagent so a
+        # up{component="vmalert"} series exists in vmsingle — the target the
+        # VMAlertDown dead-man's-switch alert selects on (ka-0000001461, GAP-6).
+        # vmalert already serves /metrics on its :8880 http port.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8880"
+        prometheus.io/path: "/metrics"
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: vmalert
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.vmalert.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.vmalert.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            # Glob over the mounted rules ConfigMap so every *.yaml data key
+            # loads: the chart-shipped recording.yaml plus any extra rules key
+            # written into the same ConfigMap. (The bead-authored
+            # beads-rules.yaml writer, alertmanager-bridge, was deleted
+            # 2026-10-31, gd-Y4ZCGr2m2t.)
+            - "-rule=/config/*.yaml"
+            # Auto-reload rules at runtime: re-read the mounted files on this
+            # interval (the kubelet projects ConfigMap updates into the mount
+            # within ~1m), so a rules change needs no pod restart.
+            - "-configCheckInterval={{ .Values.vmalert.configCheckInterval | default "30s" }}"
+            # Evaluate rules against vmsingle and write the recorded series
+            # back to the SAME vmsingle. A recording rule's output is a new
+            # series, so -remoteWrite.url is mandatory (without it vmalert
+            # evaluates but discards results).
+            - "-datasource.url={{ .Values.vmalert.datasourceURL | default (include "gardenio.vmalert.datasourceURL" .) }}"
+            - "-remoteWrite.url={{ .Values.vmalert.remoteWriteURL | default (include "gardenio.vmalert.datasourceURL" .) }}"
+            - "-evaluationInterval={{ .Values.vmalert.evaluationInterval }}"
+            {{- $notifierURL := include "gardenio.vmalert.effectiveNotifierURL" . }}
+            {{- if $notifierURL }}
+            # ALERTING rules need a notifier. Precedence
+            # (gardenio.vmalert.effectiveNotifierURL): an explicit
+            # vmalert.notifierURL always wins; otherwise, when the in-chart
+            # Alertmanager is enabled (alertmanager.enabled), auto-wire to its
+            # ClusterIP Service — the alert → Slack delivery path (epic
+            # ka-0000000770, decision ka-0000006149 option (a)). Leave both unset
+            # for a recording-rules-only deployment; vmalert then starts cleanly
+            # with no Alertmanager dependency.
+            - "-notifier.url={{ $notifierURL }}"
+            {{- else if .Values.vmalert.notifierBlackhole }}
+            # No-Alertmanager fallback: alerting rules are present but no
+            # Alertmanager is wired. -notifier.blackhole lets vmalert evaluate
+            # those rules (firing state visible via /api/v1/alerts) and discard
+            # the notifications, instead of refusing to start. notifierURL
+            # takes precedence above; this is the no-notifier escape hatch.
+            - "-notifier.blackhole=true"
+            {{- end }}
+            - "-httpListenAddr=:8880"
+          ports:
+            - name: http
+              containerPort: 8880
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.vmalert.resources | nindent 12 }}
+          volumeMounts:
+            - name: rules
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: rules
+          configMap:
+            name: {{ include "gardenio.vmalert.rulesConfigMapName" . }}
+        - name: tmp
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.vmalert.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.vmalert.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.vmalert.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

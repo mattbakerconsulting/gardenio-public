@@ -1,0 +1,97 @@
+{{/*
+ValidatingAdmissionPolicy that constrains the controller SA's PersistentVolume
+mutations (DELETE, UPDATE) to PVs whose `spec.claimRef.namespace` is in the
+configured managed-namespace allow-list.
+
+Mitigates F7 from gardenio/docs/audits/namespace-isolation-static.md
+(ka-0000004901). PersistentVolume is cluster-scoped, so the agents-pv-gc
+ClusterRole still grants `list/patch/delete` cluster-wide (unavoidable for
+PV). The controller's PV-GC code already filters client-side
+(gardenio/controller/internal/pvgc/collector.go isManaged); this VAP enforces
+the same boundary at admission time as defense-in-depth, so a compromised
+controller pod cannot use the SA token to patch or delete PVs claimed by
+namespaces outside the gardenio fleet (e.g. `monitoring`, `kube-system`).
+
+The allow-list is built at chart-render time from
+`agents.pvGCNamespaces` (CSV) plus the release namespace. Operators must
+match this with the runtime `PV_GC_NAMESPACES` env (deployment.yaml) to
+avoid the controller logging admission rejections during normal GC sweeps.
+
+CREATE is intentionally NOT covered: PV creation is performed by the CSI
+provisioner SA, not the controller SA, and dynamic provisioning races with
+the namespace-label check at admission time.
+
+Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA). Operators on
+older clusters can disable via `agents.pvGc.admissionPolicy.enabled`.
+*/}}
+{{- if and .Values.agents.enabled (((.Values.agents.pvGc).admissionPolicy).enabled) }}
+{{- $allowed := list .Release.Namespace -}}
+{{- if .Values.agents.pvGCNamespaces -}}
+{{- range (splitList "," .Values.agents.pvGCNamespaces) -}}
+{{- $ns := trim . -}}
+{{- if $ns -}}{{- $allowed = append $allowed $ns -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-pv-gc
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE", "UPDATE"]
+        resources: ["persistentvolumes"]
+  matchConditions:
+    # Only apply this policy to the controller SA. The CSI provisioner,
+    # cluster admins, and other SAs are unaffected — they should be governed
+    # by their own RBAC/policies.
+    - name: only-controller-sa
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:{{ .Release.Namespace }}:{{ include "gardenio.agents.serviceAccountName" . }}'
+  variables:
+    - name: allowedNamespaces
+      expression: >-
+        [{{- range $i, $ns := ($allowed | uniq) }}{{ if $i }}, {{ end }}'{{ $ns }}'{{- end }}]
+  validations:
+    # DELETE: the PV being deleted must have a claimRef whose namespace is
+    # in the allow-list. PVs with no claimRef (never bound) are allowed —
+    # the GC code does not touch them, but the CSI provisioner may.
+    - expression: >-
+        request.operation != 'DELETE' ||
+        oldObject.spec.claimRef == null ||
+        oldObject.spec.claimRef.namespace in variables.allowedNamespaces
+      message: >-
+        gardenio controller SA may only delete PVs whose claimRef.namespace
+        is in agents.pvGCNamespaces (or the release namespace). Cluster-wide
+        PV mutation is blocked at admission time (F7, ka-0000004901).
+    # UPDATE: both the prior and the proposed claimRef.namespace must be
+    # in the allow-list. This blocks the F7 cross-namespace re-bind attack
+    # (patching claimRef to redirect a fleet-A PV to fleet-B).
+    - expression: >-
+        request.operation != 'UPDATE' ||
+        ((oldObject.spec.claimRef == null ||
+          oldObject.spec.claimRef.namespace in variables.allowedNamespaces) &&
+         (object.spec.claimRef == null ||
+          object.spec.claimRef.namespace in variables.allowedNamespaces))
+      message: >-
+        gardenio controller SA may only patch/update PVs whose old and new
+        claimRef.namespace are in agents.pvGCNamespaces (or the release
+        namespace). Cross-namespace PV re-bind is blocked at admission time
+        (F7, ka-0000004901).
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-pv-gc
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "gardenio.agents.fullname" . }}-pv-gc
+  validationActions: ["Deny"]
+{{- end }}

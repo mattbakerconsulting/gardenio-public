@@ -1,0 +1,37 @@
+{{- if and .Values.traefikLogShipper.enabled .Values.traefikLogShipper.geoTable.data }}
+{{- /*
+traefik-log-shipper geo table ConfigMap (edge IDP L1 geo enrichment, task
+ka-0000001136; geo mechanism ka-0000000583).
+
+Holds the operator-provided-per-env CIDR->{ASN,country} table (the offline
+ip2asn+ip2country form) the shipper resolves each edge row's X-Forwarded-For
+client IP against to emit the scalar sourceASN AND sourceCountry fields — the
+group keys the edge geomap console (request choropleth, ka-0000003019) and the L2
+novel-geo detections need. A geo table is a SUPERSET of the ASN table (it also
+emits sourceASN), so it is mutually exclusive with asnTable.data (the deployment
+fails render if both are set).
+
+Rendered ONLY when traefikLogShipper.geoTable.data is non-empty, so the default
+deploy carries no geo config and the shipper runs in its byte-identical RAW form
+(no client_ip/sourceASN/sourceCountry). The mechanism ships in the chart; the
+table is mounted per env overlay. Converting the upstream range-based ip2asn
+dump to CIDRs is the artifact builder's job (scripts/build-geo-table.py), so the chart carries
+only the small per-env table the operator pins.
+
+The deployment mounts this at /etc/traefik-log-shipper/geo/ and passes the file
+path via TRAEFIK_GEO_TABLE_PATH; a malformed table fails the shipper fast at
+startup (auditxform.ParseGeoTable names the bad line) rather than silently
+shipping without enrichment — a detective control must not degrade to a blind
+spot silently.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.traefikLogShipper.fullname" . }}-geo-table
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.traefikLogShipper.labels" . | nindent 4 }}
+data:
+  geo-table.txt: |
+    {{- .Values.traefikLogShipper.geoTable.data | nindent 4 }}
+{{- end }}

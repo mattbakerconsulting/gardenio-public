@@ -1,0 +1,136 @@
+{{- if and .Values.keycloak.enabled .Values.keycloak.githubIdp.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+# ── KeycloakAuthFlow: GitHub first broker login, no account linking ───────────
+# Lands Track B 7.3 (gd-0o4Ggf9ngP). The github IdP's firstBrokerLoginFlowAlias
+# (templates/keycloak/identity-providers.yaml). Anyone with a GitHub account can
+# register, so a GitHub sign-in must never take over an existing realm user.
+# Keycloak's stock `first broker login` flow would link one: when the email or
+# username matches, it offers "verify existing account by email" (one click on a
+# link mail once SMTP exists) or re-authentication. This flow has no linking
+# branch at all:
+#
+#   gardenio-github-first-broker-login   topLevel
+#     ├─ idp-review-profile          REQUIRED  (only when the profile is missing a field)
+#     └─ idp-create-user-if-unique   REQUIRED
+#
+# idp-create-user-if-unique REQUIRED creates a new user when no user has the same
+# email or username, and otherwise shows Keycloak's "user already exists" error
+# page and stops: every GitHub registrant is a new user, and an existing user
+# never links by email. An existing user who wants GitHub linked does it signed
+# in, from the account console.
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakAuthFlow
+metadata:
+  name: {{ $fullname }}-github-first-broker-login
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: "gardenio-github-first-broker-login"
+  description: "First broker login for the github IdP: create a new user, never link an existing one (managed by gardenio helm chart)"
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: basic-flow
+  topLevel: true
+  builtIn: false
+  authenticationExecutions:
+    - authenticator: idp-review-profile
+      requirement: REQUIRED
+      priority: 10
+      authenticatorConfig:
+        alias: "gardenio-github-review-profile"
+        config:
+          update.profile.on.first.login: "missing"
+    - authenticator: idp-create-user-if-unique
+      requirement: REQUIRED
+      priority: 20
+{{- $adminRole := .Values.keycloak.mfa.adminRole | default "gardenio-admin" }}
+---
+# ── KeycloakAuthFlow: GitHub post broker login, no admin session ──────────────
+# The github IdP's postBrokerLoginFlowAlias. Keycloak runs it after every
+# GitHub sign-in, the first one included. The admin passkey lives in
+# gardenio-mfa-browser's username/password subflow (auth-flow-mfa.yaml), and an
+# IdP sign-in never runs that subflow, so without this flow a {{ $adminRole }}
+# holder who has GitHub linked (from the account console, or promoted after
+# registering with GitHub) would get an admin session, kd login tokens
+# included, with no passkey. This flow refuses that sign-in instead:
+#
+#   gardenio-github-post-broker-login            topLevel
+#     ├─ allow-access-authenticator         REQUIRED     (everyone else gets in)
+#     └─ gardenio-github-post-broker-admin  CONDITIONAL  subflow
+#          ├─ conditional-user-role         (condUserRole={{ $adminRole }})
+#          └─ deny-access-authenticator     REQUIRED
+#
+# The role is keycloak.mfa.adminRole, the role the passkey guards, and Keycloak
+# checks it the way the MFA flow does: realm role, through groups and composites.
+# Admins sign in with a password and passkey. allow-access gives the flow a
+# required step that succeeds, so a non-admin is not refused by a flow whose
+# only step is a skipped conditional subflow.
+#
+# The subflow is its own CR (parentName), reconciled independently like the MFA
+# subflows. Until the EDP operator has created it, the flow only allows: check
+# that the subflow exists before anyone with {{ $adminRole }} links GitHub.
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakAuthFlow
+metadata:
+  name: {{ $fullname }}-github-post-broker-login
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: "gardenio-github-post-broker-login"
+  description: "Post broker login for the github IdP: refuse the {{ $adminRole }} role, whose passkey a GitHub sign-in would skip (managed by gardenio helm chart)"
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: basic-flow
+  topLevel: true
+  builtIn: false
+  authenticationExecutions:
+    - authenticator: allow-access-authenticator
+      requirement: REQUIRED
+      priority: 10
+---
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakAuthFlow
+metadata:
+  name: {{ $fullname }}-github-post-broker-admin
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: "gardenio-github-post-broker-admin"
+  description: "Deny a GitHub sign-in to the {{ $adminRole }} role"
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: basic-flow
+  topLevel: false
+  builtIn: false
+  parentName: "gardenio-github-post-broker-login"
+  childType: basic-flow
+  childRequirement: CONDITIONAL
+  authenticationExecutions:
+    - authenticator: conditional-user-role
+      requirement: REQUIRED
+      priority: 10
+      authenticatorConfig:
+        alias: "gardenio-github-post-broker-cond-admin"
+        config:
+          condUserRole: {{ $adminRole | quote }}
+          negate: "false"
+    - authenticator: deny-access-authenticator
+      requirement: REQUIRED
+      priority: 20
+      authenticatorConfig:
+        alias: "gardenio-github-post-broker-deny-admin"
+        config:
+          denyErrorMessage: "Administrators sign in with a password and passkey, not GitHub."
+{{- end }}

@@ -1,0 +1,114 @@
+# AWS cloud-controller-manager, node-lifecycle controller ONLY, for the
+# gardenio k3s cluster (chart aws-ccm/aws-cloud-controller-manager from
+# https://kubernetes.github.io/cloud-provider-aws, namespace kube-system).
+#
+# ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+# Nothing in this cluster deleted a Node object when its EC2 instance was
+# gone. k3s runs its own stub cloud-controller (the servers have no
+# --disable-cloud-controller) whose InstanceExists always answers "yes";
+# there was no AWS CCM and no termination handler. So every spot reclaim and
+# every cluster-autoscaler scale-in left a Ready=Unknown ghost Node behind
+# forever. Pods on a ghost get a deletionTimestamp from the unreachable
+# eviction (~5 min) but stay Terminating indefinitely because the dead
+# kubelet never acks -- and ARC counts a Terminating runner pod against
+# maxRunners. Measured 2026-09-21 ~20:50Z: 5 ghost ci Nodes, 2 of the
+# gardenio-k3s scale set's 6 runner slots held by pods on instances dead for
+# over an hour, 24 runs queued, and the autoscaler scaling a healthy node IN
+# under that backlog because the zombie slots hid the demand (no Pending
+# pods for it to see). Deleting the 5 ghost Nodes by hand freed both slots
+# within seconds; this makes that automatic.
+#
+# ── WHAT IT DOES ────────────────────────────────────────────────────────────
+# Runs only the cloud-node-lifecycle controller. Every node-monitor-period it
+# lists Nodes; for each Node whose Ready condition is not True it asks EC2
+# whether the instance named in spec.providerID still exists
+# (DescribeInstances by id). Not found or terminated -> the Node is deleted,
+# and kube's pod GC then removes the pods bound to it. Ready nodes are never
+# touched. An EC2 or IAM error is logged and the node skipped -- never
+# treated as "gone".
+#
+# ── WHAT IT DELIBERATELY DOES NOT DO ────────────────────────────────────────
+# The cloud-node, service and route controllers stay off. Turning cloud-node
+# on would need --disable-cloud-controller on the k3s servers and
+# cloud-provider=external on every kubelet (terraform modules/k3s, a rolling
+# restart of the whole cluster) and would gate every new node's scheduling on
+# this pod's health via the uninitialized taint. Not worth it for the one
+# controller we need. The k3s stub keeps doing node addresses.
+#
+# THAT TRADE WAS PRICED AGAINST A BENEFIT OF ZERO, and one has since been
+# named -- recorded here because the decision still stands and the next person
+# to find `node.kubernetes.io/instance-type: k3s` should not re-derive this
+# chain from scratch. cloud-node is the ONLY thing that writes
+# node.kubernetes.io/instance-type and topology.kubernetes.io/zone. Without it
+# every node in this cluster reports instance-type `k3s` (the k3s stub's
+# placeholder) and carries no zone label at all, so:
+#
+#   * the cluster cannot say what hardware any node is. That is not cosmetic:
+#     the ci ASG is spot across ten xlarge types that differ ~2x per core, and
+#     it silently drifts generation through the day (gd-Q6iltiM1TO -- 94%
+#     7th-gen at 06-09Z, 96% 5th-gen at 15-18Z on 2026-09-22). Recovering that
+#     for ONE day took a CloudTrail RunInstances crawl.
+#   * the AZ dimension of litellm's topologySpreadConstraints
+#     (helm/gardenio/values.yaml, topologyKey: topology.kubernetes.io/zone) is
+#     inert. Harmless today -- it is ScheduleAnyway, and that block's own
+#     comment already says "once the nodes allow it" -- but it will stay inert
+#     after gd-XQbLzXqrhR widens the VPC past two AZs, which is exactly when
+#     someone will expect it to start working.
+#
+# The decision is UNCHANGED, because the first consequence is obtainable for
+# free and the second does not justify the cost on its own. ddf2c15f has the
+# peak-memory probe read the host CPU model out of /proc/cpuinfo, which is not
+# namespaced -- generation attribution per job, no cluster change, no rolling
+# restart, and no gating new-node scheduling on this pod's health. Turn
+# cloud-node on when something needs REAL zone topology, not for labels.
+#
+# Node ip-10-90-24-28 (the original server) still has providerID k3s://...
+# rather than aws:///; the lifecycle controller cannot map that to an instance
+# and logs an error for it if it ever goes NotReady. Fail-safe: it is never
+# deleted by this. Every other node carries aws:///<az>/<id> from
+# --kubelet-arg=provider-id (terraform templates/node.sh.tftpl).
+#
+# Credentials: none mounted. The chart's DaemonSet runs in the pod network
+# on the servers (not hostNetwork) -> IMDS via hop limit 2 -> instance role
+# gardenio-k3s, which already grants ec2:DescribeInstances for the
+# cluster-autoscaler (terraform modules/k3s/main.tf). Exactly the
+# autoscaler's path, so it shares the autoscaler's dependency: if IMDS is
+# ever closed to pods (gd-fTCYDqMYeH), this needs the same exemption or it
+# silently stops deleting anything (errors are logged, nodes are skipped).
+
+image:
+  # Chart 0.0.11 defaults to v1.35.0; the cluster is v1.36.x (k3s) and the
+  # CCM tracks the kube minor. v1.36.1 confirmed present in registry.k8s.io.
+  tag: v1.36.1
+
+args:
+  - --v=2
+  - --cloud-provider=aws
+  # ClusterID comes from a ConfigMap, not an instance tag -- and the choice
+  # is load-bearing for safety. See aws-ccm-cloud-config.yaml.
+  - --cloud-config=/etc/aws/cloud-config
+  - --controllers=cloud-node-lifecycle-controller
+  - --configure-cloud-routes=false
+  - --leader-elect=true
+  # k3s's stub CCM holds the lease "k3s-cloud-controller-manager"; name this
+  # one explicitly rather than trusting the upstream default never to collide.
+  - --leader-elect-resource-name=aws-cloud-controller-manager
+
+# k3s labels servers control-plane=true; the chart default selects "" and
+# would match no node here, leaving the DaemonSet with zero pods.
+nodeSelector:
+  node-role.kubernetes.io/control-plane: "true"
+
+# One pod per server, leader-elected -- survives any single server dying,
+# which is exactly the situation it exists for. Servers are t3.small: small.
+resources:
+  requests: { cpu: 20m, memory: 64Mi }
+  limits: { memory: 256Mi }
+
+extraVolumes:
+  - name: cloud-config
+    configMap:
+      name: aws-ccm-cloud-config
+extraVolumeMounts:
+  - name: cloud-config
+    mountPath: /etc/aws

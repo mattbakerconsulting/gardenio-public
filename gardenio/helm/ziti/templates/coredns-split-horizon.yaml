@@ -1,0 +1,37 @@
+{{- if and .Values.ziti.enabled .Values.ziti.corednsSplitHorizon.enabled }}
+# Split-horizon DNS for the in-cluster ziti controller (gd-Vn8uWTbQ9S / gd-dCvIWuT6t6).
+#
+# The controller's PKI server cert has exactly one DNS SAN, ziti-ctrl.clonk.tv
+# (its advertised address, decision gd-zU3VrMUTpo), and router enrollment
+# JWTs carry that name as the controller address. router-public-1
+# (hostNetwork on the ziti edge node) therefore has to enroll against and
+# dial the ctrl channel at ziti-ctrl.clonk.tv:8440 -- and 8440 also serves the
+# MANAGEMENT API and the fabric, so it is deliberately never published
+# (0a2dbea3 reverted PR #6 for exactly that).
+#
+# (Not fixed by this: `ziti edge login` in the controller pod still returns
+# rc=0 and then 401s every call, via localhost AND via this name, with a
+# well-formed OIDC token whose iss matches. Legacy password auth
+# (POST /edge/management/v1/authenticate?method=password -> zt-session) works.)
+#
+# So, inside the cluster only, rewrite ziti-ctrl.clonk.tv to the controller
+# Service. Public DNS for the name (when the 8441 client listener is exposed)
+# is a separate record and is unaffected by this. k3s's Corefile already does
+# `import /etc/coredns/custom/*.override` and mounts this ConfigMap
+# (optional: true), so no change to the k3s-managed Corefile is needed.
+#
+# NOTE: coredns-custom is one ConfigMap for the whole cluster. If another
+# component ever needs an override, add a KEY here; do not create a second
+# manifest that owns the same object.
+#
+# Rendered only when ziti.enabled=true (gardenio/helm/ziti/README.md).
+# (CoreDNS's `reload` plugin picks it up within ~30s; no restart.)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  ziti-ctrl.override: |
+    rewrite name exact ziti-ctrl.clonk.tv ziti-controller.ziti.svc.cluster.local
+{{- end }}

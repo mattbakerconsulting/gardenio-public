@@ -1,0 +1,283 @@
+{{- if .Values.postgres.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "gardenio.postgres.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.postgres.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "gardenio.postgres.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.postgres.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.postgres.selectorLabels" . | nindent 8 }}
+      {{- $exporter := .Values.postgres.exporter.enabled }}
+      {{- $dnd := include "gardenio.doNotDisrupt" . }}
+      {{- if or $dnd $exporter }}
+      annotations:
+        {{- with $dnd }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- if $exporter }}
+        # vmagent keeps only the target whose containerPort equals this port,
+        # so the pod is scraped once, on the exporter.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.postgres.exporter.port | quote }}
+        prometheus.io/path: "/metrics"
+        {{- end }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.postgres.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          {{- if or .Values.postgres.pgStatStatements.enabled .Values.postgres.settings }}
+          # Overrides the image CMD, so it must start with `postgres`.
+          # shared_preload_libraries only takes effect at server start (this
+          # rolls the pod once); `CREATE EXTENSION pg_stat_statements` in the
+          # beads database then exposes the per-query view (values.yaml).
+          args:
+            - postgres
+            {{- if .Values.postgres.pgStatStatements.enabled }}
+            - -c
+            - shared_preload_libraries=pg_stat_statements
+            - -c
+            - pg_stat_statements.track=top
+            {{- end }}
+            {{- range $k, $v := .Values.postgres.settings }}
+            - -c
+            - {{ printf "%s=%v" $k $v | quote }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | default "beads" }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .) }}
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          # PROBE TIMEOUTS ARE SIZED FOR A CONTENDED NODE, NOT A QUIET ONE.
+          # These are EXEC probes: each one forks pg_isready, so they need CPU
+          # to answer at all. When the node is saturated the probe times out
+          # even though Postgres is perfectly healthy, and the kubelet then
+          # kills the database.
+          #
+          # That is not hypothetical. On 2026-09-20 gardenio-postgres-0 was
+          # killed by this liveness probe while ip-10-90-29-1 sat at 2000m/2000m
+          # CPU, taking beads down (~40s of 500s) — the second beads outage that
+          # day. The same 1s/5s-timeout-on-a-busy-node pattern also killed the
+          # ziti controller and put gardenio-trigger-engine into a restart loop
+          # (21 restarts). Same bug, three components.
+          #
+          # liveness 15s x 5 gives ~2.5 minutes of contention tolerance before a
+          # kill; readiness stays tighter (10s) because a failed readiness only
+          # removes the endpoint, which is recoverable, whereas a failed liveness
+          # destroys the process. The startupProbe gets an explicit timeout too:
+          # it previously inherited the 1s default, which is the tightest of the
+          # three and fires when the node is busiest — during start.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /var/run/postgresql
+        {{- if .Values.postgres.exporter.enabled }}
+        {{- $e := .Values.postgres.exporter }}
+        {{- $exporterSecret := printf "%s-exporter" (include "gardenio.postgres.fullname" .) }}
+        # Creates the exporter's read-only role (setup.sql, idempotent) once the
+        # server answers on the shared socket, retrying until it succeeds, then
+        # idles: a container that exits would be restarted by the pod. A failed
+        # setup only leaves the exporter reporting pg_up=0. The sidecars are not
+        # fully isolated, though: a pod is Ready only while every container is,
+        # so while either sidecar sits in a crash backoff (e.g. OOMKilled at its
+        # memory limit) the postgres Service loses its endpoint. Neither sidecar
+        # has a readinessProbe for that reason; nothing routes to them.
+        - name: exporter-setup
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.postgres.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -q -h /var/run/postgresql -U postgres; do sleep 5; done
+              until psql -q -h /var/run/postgresql -U postgres -d "$PGDATABASE" \
+                  -v ON_ERROR_STOP=1 -v role="$EXPORTER_ROLE" \
+                  -f /etc/postgres-exporter/setup.sql; do
+                echo "exporter setup failed, retrying in 30s"
+                sleep 30
+              done
+              echo "exporter role $EXPORTER_ROLE ready"
+              exec sleep infinity
+          env:
+            - name: PGDATABASE
+              value: {{ .Values.postgres.database | default "beads" }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .) }}
+                  key: password
+            - name: EXPORTER_ROLE
+              value: {{ $e.role | quote }}
+            - name: EXPORTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $exporterSecret }}
+                  key: password
+          resources:
+            {{- toYaml $e.setupResources | nindent 12 }}
+          volumeMounts:
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: exporter-config
+              mountPath: /etc/postgres-exporter
+              readOnly: true
+        - name: exporter
+          image: {{ include "gardenio.mirroredImage" (dict "image" $e.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ $e.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            - --web.listen-address=:{{ $e.port }}
+            - --extend.query-path=/etc/postgres-exporter/queries.yaml
+            - --auto-discover-databases
+            - --exclude-databases=postgres
+            # Legacy built-ins (incl. ~300 pg_settings series); the collector
+            # package below and queries.yaml cover what the dashboard reads.
+            - --disable-default-metrics
+            - --no-collector.settings
+            - --no-collector.stat_user_tables
+            - --no-collector.statio_user_tables
+            - --collector.postmaster
+            - --collection-timeout=10s
+          ports:
+            - name: metrics
+              containerPort: {{ $e.port }}
+              protocol: TCP
+          env:
+            - name: DATA_SOURCE_URI
+              value: "127.0.0.1:5432/{{ .Values.postgres.database | default "beads" }}?sslmode=disable&application_name=postgres_exporter"
+            - name: DATA_SOURCE_USER
+              value: {{ $e.role | quote }}
+            - name: DATA_SOURCE_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $exporterSecret }}
+                  key: password
+          resources:
+            {{- toYaml $e.resources | nindent 12 }}
+          volumeMounts:
+            - name: exporter-config
+              mountPath: /etc/postgres-exporter
+              readOnly: true
+        {{- end }}
+      volumes:
+        {{- if not .Values.postgres.persistence.enabled }}
+        {{- /* When persistence is disabled (throwaway ephemeral test
+               namespaces, ka-0000000711), back the data dir with an emptyDir
+               instead of a PVC. The volumeClaimTemplates block below only
+               renders when persistence is enabled, so without this the `data`
+               volumeMount would reference a non-existent volume. emptyDir
+               sidesteps EBS entirely — every ephemeral postgres PVC otherwise
+               consumes one of the node's 27 EBS attachment slots, and at
+               maxConcurrent=10 ephemerals (×postgres+nats+vmsingle+coopmux)
+               they pile onto a single POC node and trip AttachmentLimitExceeded,
+               wedging postgres-0 in ContainerCreating -> beads-migrate
+               BackoffLimitExceeded -> the deploy fails. */}}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        {{- if .Values.postgres.exporter.enabled }}
+        - name: exporter-config
+          configMap:
+            name: {{ include "gardenio.postgres.fullname" . }}-exporter
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.postgres.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.postgres.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.postgres.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- if .Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ .Values.global.systemPriorityClass.name }}
+      {{- end }}
+  {{- if .Values.postgres.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.postgres.persistence.storageClass }}
+        storageClassName: {{ .Values.postgres.persistence.storageClass }}
+        {{- else if .Values.global.storageClass }}
+        storageClassName: {{ .Values.global.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.persistence.size }}
+  {{- end }}
+{{- end }}

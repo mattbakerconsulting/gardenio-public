@@ -1,0 +1,56 @@
+{{/*
+PV Garbage Collector ClusterRole + ClusterRoleBinding.
+Grants the controller SA permission to list, patch (remove finalizers),
+and delete PersistentVolumes that are stuck in Released state.
+
+PVs are cluster-scoped resources, so a ClusterRole is required even though
+the controller only GCs PVs whose claimRef belongs to gardenio namespaces.
+
+Always enabled when agents are enabled — the PV GC is opt-out via
+PV_GC_INTERVAL=0, but RBAC must be in place for it to work.
+
+RESIDUAL RISK / DEFENSE-IN-DEPTH (F7, ka-0000004901). The cluster-wide
+verbs above CANNOT be tightened in RBAC alone. Two layers protect against
+abuse of these tokens:
+
+  1. Controller-side filter: gardenio/controller/internal/pvgc/collector.go
+     `isManaged` only patches/deletes PVs whose claimRef.namespace is in
+     the configured PV_GC_NAMESPACES allow-list (defaults to the release
+     namespace).
+  2. ValidatingAdmissionPolicy: pv-gc-admission-policy.yaml (gated on
+     `agents.pvGc.admissionPolicy.enabled`, default true) enforces the
+     same constraint at admission time, so a compromised controller pod
+     cannot use the SA token via the K8s API directly to mutate
+     unrelated PVs (e.g. monitoring, kube-system).
+*/}}
+{{- /* agents.pvGc.rbac.enabled (default true) exists for installers that hold no
+     cluster-scoped rights -- the live-namespace e2e lane installs this chart
+     into a pool namespace with a namespaced Role only (gd-WBz2qt9ADZ). PV
+     garbage collection is irrelevant there. Default rendering is unchanged. */}}
+{{- if and .Values.agents.enabled .Values.agents.pvGc.rbac.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-pv-gc
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["list", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-pv-gc
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.agents.fullname" . }}-pv-gc
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.agents.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

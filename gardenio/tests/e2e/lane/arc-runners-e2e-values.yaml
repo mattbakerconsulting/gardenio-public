@@ -1,0 +1,223 @@
+# gardenio-k3s-e2e: the live-namespace e2e lane's scale set (gd-WBz2qt9ADZ).
+# OPERATOR-APPLIED, from the repo root:
+#
+#   helm upgrade --install gardenio-k3s-e2e \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+#     --version $ARC -n arc-runners -f gardenio/tests/e2e/lane/arc-runners-e2e-values.yaml
+#
+# Shape: a byte-for-byte copy of gardenio/helm/ci/arc-runners-medium-values.yaml
+# (750m / 1Gi request, 4Gi limit, no dind, same node-local Go cache) with
+# exactly two deltas, both at the bottom of `template.spec`:
+#
+#   * serviceAccountName: gardenio-e2e-runner -- the identity that holds one
+#     Role per pool namespace (gardenio/tests/e2e/lane/rbac/namespace-pool.yaml).
+#     The gha-runner-scale-set chart honours template.spec.serviceAccountName
+#     and skips its own no-permission SA when it is set (templates/
+#     autoscalingrunnerset.yaml). This is WHY a fourth set exists: the SA is a
+#     property of the scale set, and the medium set must not carry a cluster
+#     credential into terraform-fmt / quench / dictation jobs.
+#   * maxRunners: 6 -- one run peaks at 5 e2e runners (smoke + 4 shards); the
+#     6th lets the next run's setup start while the first drains.
+#
+# Why medium's shape: the shard jobs do what shell-hermetic does (two Go builds
+# + shell modules), measured 2039Mi anonmax on this shape (helm/ci/README.md,
+# Task 12). 6 x 750m = 4.5 CPU of requests co-schedules onto nodes already
+# hosting a heavy runner (README "Runner tiers"), so node demand is +0 and
+# ci_max_nodes is untouched. Keep this file in lockstep with the medium values
+# file: a Go toolcache pin that moves there must move here (the two seeding
+# blocks share one hostPath under one lock -- README "Go tools are a separate
+# cache").
+githubConfigUrl: https://github.com/mattbakerconsulting/gardenio
+githubConfigSecret: gardenio-github
+
+
+minRunners: 0
+maxRunners: 6
+
+
+template:
+  spec:
+    nodeSelector:
+      gardenio.io/role: ci
+    tolerations:
+      - key: ci
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+
+    initContainers:
+      - name: dns-preflight
+        image: ghcr.io/actions/actions-runner:latest
+        command:
+          - sh
+          - -c
+          - |
+            i=1
+            while [ $i -le 20 ]; do
+              if getent hosts github.com >/dev/null 2>&1; then
+                echo "cluster dns ok on $NODE_NAME (attempt $i)"
+                exit 0
+              fi
+              sleep 3
+              i=$((i + 1))
+            done
+            echo "FATAL: cluster dns unusable on node $NODE_NAME after 60s." >&2
+            echo "This node likely has no kube-proxy service rules; confirm with" >&2
+            echo "  iptables-save | grep -c KUBE-SERVICES   (0 == broken)" >&2
+            exit 1
+        env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        resources:
+          requests: { cpu: 10m, memory: 32Mi }
+      - name: prepare-build-cache
+        image: ghcr.io/actions/actions-runner:latest
+        command:
+          - sh
+          - -c
+          - |
+            set -e
+            mkdir -p /cache/go-build /cache/go-mod /cache/go-bin /cache/golangci-lint /cache/tool-cache
+            chown 1001:1001 /cache /cache/go-build /cache/go-mod /cache/go-bin /cache/golangci-lint /cache/tool-cache
+            GO_TOOLCACHE_VERSION=1.25.14
+            GO_TOOLCACHE_SHA256=a21ae5633a269bcd7e90cf767e48225633795e99d831742cbf3397064fee7712
+            shared=/cache/tool-cache/go/$GO_TOOLCACHE_VERSION/x64
+            if [ ! -e "$shared.complete" ]; then
+              seed_rc=0
+              (
+                set +e
+                flock -n 9 || exit 3
+                if [ -e "$shared.complete" ]; then exit 0; fi
+                began=$(date +%s)
+                tmp=$(mktemp -d /cache/tool-cache/.seed-XXXXXX) || exit 0
+                printf '%s  %s\n' "$GO_TOOLCACHE_SHA256" "$tmp/go.tgz" > "$tmp/sum"
+                if curl -fsSL --retry 3 --max-time 300 -o "$tmp/go.tgz" \
+                     "https://go.dev/dl/go$GO_TOOLCACHE_VERSION.linux-amd64.tar.gz" \
+                   && sha256sum -c "$tmp/sum" >/dev/null \
+                   && tar -xzf "$tmp/go.tgz" -C "$tmp" \
+                   && [ -x "$tmp/go/bin/go" ]; then
+                  mkdir -p "$(dirname "$shared")"
+                  rm -rf "$shared"
+                  mv "$tmp/go" "$shared"
+                  touch "$shared.complete"
+                  echo "seeded go $GO_TOOLCACHE_VERSION on $NODE_NAME in $(( $(date +%s) - began ))s"
+                else
+                  echo "WARN: could not seed go $GO_TOOLCACHE_VERSION on $NODE_NAME after $(( $(date +%s) - began ))s; jobs will download it per pod" >&2
+                fi
+                rm -rf "$tmp"
+              ) 9>/cache/tool-cache/.go-seed.lock || seed_rc=$?
+              if [ "$seed_rc" = 3 ]; then
+                waited=0
+                while [ ! -e "$shared.complete" ]; do
+                  if flock -n /cache/tool-cache/.go-seed.lock true 2>/dev/null; then break; fi
+                  if [ "$waited" -ge 30 ]; then break; fi
+                  sleep 1
+                  waited=$(( waited + 1 ))
+                done
+                if [ -e "$shared.complete" ]; then
+                  echo "waited ${waited}s for a sibling pod to seed go $GO_TOOLCACHE_VERSION on $NODE_NAME"
+                else
+                  echo "WARN: no seed on $NODE_NAME after ${waited}s; this pod's jobs download go per pod" >&2
+                fi
+              fi
+            fi
+            if [ -e "$shared.complete" ]; then
+              mkdir -p /toolcache/go/$GO_TOOLCACHE_VERSION
+              ln -sfn "$shared" /toolcache/go/$GO_TOOLCACHE_VERSION/x64
+              touch /toolcache/go/$GO_TOOLCACHE_VERSION/x64.complete
+            fi
+            chown -R 1001:1001 /toolcache
+        env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+          - name: build-cache
+            mountPath: /cache
+          - name: tool-cache
+            mountPath: /toolcache
+        resources:
+          requests: { cpu: 10m, memory: 32Mi }
+    volumes:
+      - name: build-cache
+        hostPath:
+          path: /var/lib/gardenio-ci-cache
+          type: DirectoryOrCreate
+      - name: tool-cache
+        emptyDir: {}
+
+    serviceAccountName: gardenio-e2e-runner
+    containers:
+      - name: runner
+        image: ghcr.io/actions/actions-runner:latest
+        command: ["/home/runner/run.sh"]
+        env:
+          - name: GOCACHE
+            value: /cache/go-build
+          - name: GOMODCACHE
+            value: /cache/go-mod
+          - name: GOTOOLS_BIN
+            value: /cache/go-bin
+          - name: GOLANGCI_LINT_CACHE
+            value: /cache/golangci-lint
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          - name: RUNNER_TOOL_CACHE
+            value: /toolcache
+        volumeMounts:
+          - name: build-cache
+            mountPath: /cache
+          - name: tool-cache
+            mountPath: /toolcache
+        resources:
+          requests: { cpu: "750m", memory: 1Gi }
+          limits: { memory: 4Gi }
+
+
+listenerTemplate:
+  spec:
+    containers:
+      - name: listener # required by the ARS CRD even when only tolerations change
+        # CPU 200m -> 50m on 2026-10-23 (gd-TEP4ygX3dq); requests == limits
+        # keeps Guaranteed QoS. Rationale in helm/ci/arc-runners-values.yaml.
+        resources:
+          requests: { cpu: 50m, memory: 128Mi }
+          limits:   { cpu: 50m, memory: 128Mi }
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      # Home off the servers (gd-ybTutceJpn). The 2 GiB servers ran out of memory
+      # one after another on 2026-10-14 because a server drain piled the ARC
+      # listeners onto the survivors. Tolerate the platform pool's taint and
+      # PREFER those nodes; the control-plane toleration above stays as the
+      # fallback, so a listener is never stranded Pending.
+      - key: gardenio.agent
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: gardenio.io/role
+                  operator: In
+                  values: ["platform"]
+
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            actions.github.com/repository: gardenio
+            app.kubernetes.io/component: runner-scale-set-listener

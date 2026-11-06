@@ -1,0 +1,202 @@
+{{template "layout" .}}
+{{define "title"}}{{.Bead.ID}}: {{.Bead.Title}} - Beads Viewer{{end}}
+{{define "content"}}
+{{template "title_block" .}}
+{{with .GardenHref}}{{template "garden_banner" .}}{{end}}
+{{operatedByBanner .Bead .BasePath .ViewerEmail}}
+{{/* Altitude-up "part of wish" chip (task 2-6, ka-0000008112): rendered only
+     when this bead carries a thread_id field (.ThreadChip is non-nil), linking
+     UP to the containing wish's /threads detail. The inverse of the
+     wish→members roll-up. */}}
+{{with .ThreadChip}}
+<a class="thread-wish-chip" href="{{.Href}}"
+   title="Part of wish: {{.FullTitle}} ({{.ThreadID}}) — open this wish's thread">
+  <span class="thread-wish-chip-icon" aria-hidden="true">🧵</span>
+  <span class="thread-wish-chip-label">part of wish:</span>
+  {{if .Resolved}}<span class="thread-wish-chip-title">{{.Title}}</span>{{else}}<span class="thread-wish-chip-title thread-wish-chip-title-raw">{{.ThreadID}}</span>{{end}}
+</a>
+{{end}}
+{{template "row_badges" (dict "Row" .Bead "BasePath" .BasePath)}}
+{{template "release_shipped" .ShippedIn}}
+{{template "taint_badges" (dict "Actions" .TaintActions "BasePath" .BasePath)}}
+{{template "bead_show_inline_header" .}}
+<p class="meta">ID: <code>{{.Bead.ID}}</code><button type="button" class="copy-btn" data-copy="id" data-value="{{.Bead.ID}}" aria-label="Copy bead ID">Copy ID</button><button type="button" class="copy-btn" data-copy="permalink" aria-label="Copy permalink">Copy permalink</button></p>
+{{template "bead_actions" .}}
+
+{{/* Per-type detail dispatch — hoisted above generic chrome so primary type-specific
+     content (e.g. rich-report widget grid, bundle docs) renders right beneath the title. */}}
+{{/* A gardener (type=trigger + role:gardener, or a legacy type=schedule bead with a
+     gardener spec) renders the rich gardener summary inline (task ka-0000006542) instead
+     of the bare schedule field-list / generic dump. Gated on .IsGardener, set by
+     injectGardenerBeadView, so it takes priority over the type-keyed branches below. */}}
+{{/* Generic-type beads (task/bug/feature/epic/doc/message/…) intentionally have NO
+     hoisted branch here: their bare Fields dump renders DOWN in the main column beneath
+     the description/comments narrative (ka-0000006872), so it no longer sits above them.
+     Only the rich types with real primary content stay hoisted under the title. */}}
+{{if .IsGardener}}{{template "type_gardener" .}}
+{{else if eq .Bead.Type "decision"}}{{template "type_decision" .}}
+{{else if eq .Bead.Type "escalation"}}{{template "type_escalation" .}}
+{{else if eq .Bead.Type "schedule"}}{{template "type_schedule" .}}
+{{else if eq .Bead.Type "formula"}}{{template "type_formula" .}}
+{{else if eq .Bead.Type "molecule"}}{{template "type_molecule" .}}
+{{else if eq .Bead.Type "merge-request"}}{{template "type_mr" .}}
+{{else if eq .Bead.Type "agent"}}{{template "type_agent" .}}
+{{else if eq .Bead.Type "advice"}}{{template "type_advice" .}}
+{{else if eq .Bead.Type "dashboard"}}{{template "type_dashboard" .}}
+{{else if eq .Bead.Type "rating"}}{{template "type_rating" .}}
+{{else if eq .Bead.Type "rich-report"}}{{template "type_rich_report" .}}
+{{else if eq .Bead.Type "report"}}{{template "type_report" .}}
+{{else if eq .Bead.Type "bundle"}}{{template "type_bundle" .}}
+{{else if eq .Bead.Type "widget-type"}}{{template "type_widget_type" .}}
+{{end}}
+
+{{if ne .Bead.Type "rating"}}
+{{/* Two-column layout on wide screens: primary narrative on the left
+     (description, notes, comments, chat FIRST — ka-0000006872: operators want
+     the human-readable narrative at the top, above the field dump and the
+     constellation graph — then the generic Fields list, then the constellation
+     reveal, then activity + forward); secondary chrome (metadata, labels,
+     ratings, dependencies, similar) on the right. The constellation graph is
+     collapsed by default behind an obvious reveal button — users can flip the
+     default to expanded via the checkbox in the reveal strip (cookie-backed
+     ConstellationDefaultState). Collapses to a single column below 900px. */}}
+<div class="bead-show-layout">
+<div class="bead-show-main">
+
+{{/* Description, Notes and Fields keep h3's size but say aria-level 2: they
+     sit straight under the title's h1, beside the h2 sections (gd-ddw0WBzm9S). */}}
+{{template "description_block" .}}
+
+<h3 aria-level="2">Notes</h3>
+{{if .Bead.Notes}}
+<pre>{{.Bead.Notes}}</pre>
+{{else}}
+<p class="empty">&mdash;</p>
+{{end}}
+
+{{template "comments" .}}
+
+{{/* Message-bead chat thread (feature ka-0000007791 follow-on): squawks / Slack
+     drops / delivery reports that reference this bead, interleaved by timestamp
+     as a chat log instead of constellation node disks. No-op when empty. */}}
+{{template "bead_chat" .}}
+
+{{/* Jira conversation timeline (design-doc F-C, epic ka-0000007401): for a
+     source:jira mirror bead, the inbound @gardenio mentions + outbound replies
+     linked to it by triggered-by edges, read in order. No-op for every other
+     bead (JiraTimeline is unset). */}}
+{{template "jira_timeline" .}}
+
+{{/* Generic Fields dump for plain beads (task/bug/feature/epic/doc/…). Moved
+     down here from its former hoisted position beneath the title (ka-0000006872)
+     so the description/comments narrative reads first. Rich types render their
+     own primary content hoisted above the layout and set IsGenericType=false. */}}
+{{if .IsGenericType}}{{template "type_generic" .}}{{end}}
+
+{{with .Constellation}}{{if .HasAnything}}
+<details class="constellation-reveal"{{if eq $.ConstellationDefaultState "expanded"}} open{{end}}>
+  <summary class="constellation-reveal-toggle">
+    <span class="constellation-reveal-icon" aria-hidden="true">🌌</span>
+    <span class="constellation-reveal-label">Constellation graph</span>
+    <span class="constellation-reveal-counts">
+      {{if .HasForward}}{{len .Forward}} parent{{if ne (len .Forward) 1}}s{{end}}{{end}}
+      {{if and .HasForward (or .HasReverse .HasSimilar)}} · {{end}}
+      {{if .HasReverse}}{{len .Reverse}} child{{if ne (len .Reverse) 1}}ren{{end}}{{end}}
+      {{if and .HasReverse .HasSimilar}} · {{end}}
+      {{if .HasSimilar}}{{len .Similar}} similar{{end}}
+    </span>
+  </summary>
+  <div class="constellation-reveal-body">
+    {{template "constellation" $}}
+    <div class="constellation-reveal-pref">
+      <a class="constellation-reveal-pref-link"
+         href="?constellation={{if eq $.ConstellationDefaultState "expanded"}}collapsed{{else}}expanded{{end}}"
+         title="Persist your preferred default in a cookie for this browser.">
+        {{if eq $.ConstellationDefaultState "expanded"}}✓ Showing constellation by default — click to hide by default{{else}}Constellation is hidden by default — click to show by default{{end}}
+      </a>
+    </div>
+  </div>
+</details>
+{{end}}{{end}}
+
+{{/* Trickle-MR eligibility checklist (bundle ka-0000005053 §5/§7, epic
+     ka-0000005560): the per-MR HARD/ADVISORY checkbox grid + live merge status
+     + ancestry links back to the dark MR(s) and originating ticket. Rendered
+     right beneath the ancestry constellation so the graph and its textual
+     companion read together. .TrickleChecklist is nil for every non-MR bead, so
+     the partial's {{with}} makes this a no-op elsewhere. */}}
+{{template "trickle_checklist" .}}
+
+{{template "bead_activity" .}}
+
+{{template "forward_panel" .}}
+
+</div>
+<aside class="bead-show-side">
+
+<h2>Metadata</h2>
+<dl class="field-list">
+  <dt>Slug</dt>           <dd>{{if .Bead.Slug}}<code>{{.Bead.Slug}}</code>{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Kind</dt>           <dd>{{if .Bead.Kind}}{{.Bead.Kind}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Type</dt>           <dd>{{if .Bead.Type}}{{.Bead.Type}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Status</dt>         <dd>{{if .Bead.Status}}{{.Bead.Status}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Priority</dt>       <dd>{{template "priority_block" .}}</dd>
+  <dt>Assignee</dt>       <dd>{{template "assignee_block" .}}</dd>
+  <dt>Owner</dt>          <dd>{{template "owner_block" .}}</dd>
+  <dt>Created By</dt>     <dd>{{if .Bead.CreatedBy}}{{.Bead.CreatedBy}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Operated By</dt>    <dd>{{beadOperatorChip .Bead .BasePath .ViewerEmail}} <a class="ownership-history-link" href="{{.BasePath}}/b/{{.Bead.ID}}/ownership" title="Show ownership transition history for this bead">history &rarr;</a></dd>
+  <dt>Closed By</dt>      <dd>{{if .Bead.ClosedBy}}{{.Bead.ClosedBy}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Project</dt>        <dd>{{if .Project}}{{.Project}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Fleet</dt>          <dd>{{if .Bead.Fleet}}{{.Bead.Fleet}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Created At</dt>     <dd>{{if not .Bead.CreatedAt.IsZero}}<span title="{{.Bead.CreatedAt.Format "2006-01-02 15:04:05 MST"}}">{{humanizeTime .Bead.CreatedAt}}</span>{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Updated At</dt>     <dd>{{if not .Bead.UpdatedAt.IsZero}}<span title="{{.Bead.UpdatedAt.Format "2006-01-02 15:04:05 MST"}}">{{humanizeTime .Bead.UpdatedAt}}</span>{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Closed At</dt>      <dd>{{if .Bead.ClosedAt}}{{.Bead.ClosedAt}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Due At</dt>         <dd>{{if .Bead.DueAt}}{{.Bead.DueAt}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+  <dt>Defer Until</dt>    <dd>{{if .Bead.DeferUntil}}{{.Bead.DeferUntil}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+</dl>
+
+{{template "labels_block" .}}
+
+{{if and .Bead .Bead.Type}}
+  {{if ne .Bead.Type "rating"}}{{template "ratings_summary" .}}{{end}}
+{{end}}
+
+{{template "deps" .}}
+
+{{if .Similar}}
+<h2>Similar beads</h2>
+<ul class="similar-list">
+  {{range .Similar}}
+  <li>
+    <a href="{{$.BasePath}}/{{.ID}}"
+       hx-get="{{$.BasePath}}/{{.ID}}"
+       hx-trigger="mouseover once"
+       hx-target="none"
+       hx-swap="none"><code>{{.ID}}</code></a>
+    <span class="similar-title">{{.Title}}</span>
+    <span class="similar-score">{{.Score}}</span>
+  </li>
+  {{end}}
+</ul>
+{{end}}
+
+</aside>
+</div>
+{{end}}
+
+{{if .SpawnSheet}}
+{{template "quick_spawn_inline" (dict "Sheet" .SpawnSheet "BasePath" .BasePath)}}
+{{end}}
+
+<script src="{{.BasePath}}/assets/static/comment_badge.js" defer></script>
+{{if eq .Bead.Type "molecule"}}
+<script src="{{.BasePath}}/assets/static/molecule_events.js" defer></script>
+{{end}}
+{{if eq .Bead.Type "agent"}}
+<link rel="stylesheet" href="{{.BasePath}}/assets/static/xterm.css">
+<link rel="stylesheet" href="{{.BasePath}}/assets/static/agent_terminal.css">
+<script src="{{.BasePath}}/assets/static/xterm.bundle.js" defer></script>
+<script src="{{.BasePath}}/assets/static/agent_terminal.js" defer></script>
+<script src="{{.BasePath}}/assets/static/agent_events.js" defer></script>
+{{end}}
+{{end}}

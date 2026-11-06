@@ -1,0 +1,156 @@
+# Based on gascity/contrib/k8s/dolt-statefulset.yaml (object names, labels,
+# security context, init-user shape kept). Divergences are listed in
+# gardenio/docs/beads-on-k3s.md.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dolt
+  namespace: beads
+  labels:
+    app: dolt
+    app.kubernetes.io/part-of: gas-city
+spec:
+  serviceName: dolt
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dolt
+  template:
+    metadata:
+      labels:
+        app: dolt
+    spec:
+      # local-path volumes are node-bound; keep the store on the one server
+      # that is not on the spot market (terraform k3s: server_on_demand_base).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: gardenio.io/lifecycle
+                operator: In
+                values: ["on-demand"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: init-user
+        image: dolthub/dolt:2.3.5
+        env:
+        - name: HOME
+          value: /tmp
+        - name: DOLT_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: dolt-root
+              key: password
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+        command:
+        - sh
+        - -c
+        - |
+          # Phone-home metrics off (HOME=/tmp is shared with the server container).
+          dolt config --global --add metrics.disabled true
+          # Start a temporary loopback server, make root@% match the Secret
+          # (create on first boot, re-align on every restart), then stop.
+          DOLT_ROOT_HOST=% dolt sql-server --host=127.0.0.1 --port=3307 --data-dir=/var/lib/dolt &
+          pid=$!
+          q() { dolt --host=127.0.0.1 --port=3307 --user=root --no-tls sql -q "$1"; }
+          mode=""
+          for i in $(seq 1 60); do
+            if DOLT_CLI_PASSWORD="$DOLT_ROOT_PASSWORD" q "SELECT 1" >/dev/null 2>&1; then mode=pw; break; fi
+            if DOLT_CLI_PASSWORD="" q "SELECT 1" >/dev/null 2>&1; then mode=nopw; break; fi
+            sleep 1
+          done
+          if [ -z "$mode" ]; then echo "init-user: temporary server never answered"; kill $pid; exit 1; fi
+          if [ "$mode" = pw ]; then export DOLT_CLI_PASSWORD="$DOLT_ROOT_PASSWORD"; else export DOLT_CLI_PASSWORD=""; fi
+          q "CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '$DOLT_ROOT_PASSWORD';
+             ALTER USER 'root'@'%' IDENTIFIED BY '$DOLT_ROOT_PASSWORD';
+             GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+             CREATE USER IF NOT EXISTS 'root'@'localhost' IDENTIFIED BY '$DOLT_ROOT_PASSWORD';
+             ALTER USER 'root'@'localhost' IDENTIFIED BY '$DOLT_ROOT_PASSWORD';"
+          echo "init-user: root aligned with Secret (connected as $mode)"
+          kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
+        volumeMounts:
+        - name: dolt-data
+          mountPath: /var/lib/dolt
+        - name: tmp
+          mountPath: /tmp
+      containers:
+      - name: dolt
+        image: dolthub/dolt:2.3.5
+        env:
+        - name: HOME
+          value: /tmp
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+        command:
+        - dolt
+        - sql-server
+        - --config=/etc/dolt/config.yaml
+        ports:
+        - name: mysql
+          containerPort: 3306
+          protocol: TCP
+        volumeMounts:
+        - name: dolt-data
+          mountPath: /var/lib/dolt
+        - name: dolt-backups
+          mountPath: /backups
+        - name: config
+          mountPath: /etc/dolt
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          tcpSocket:
+            port: mysql
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          failureThreshold: 3
+        readinessProbe:
+          tcpSocket:
+            port: mysql
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 3
+        # Lab (m6a.xlarge, 300 beads, 30 min sustained): Dolt mean 46 %, p95 87 %
+        # of one core, idle 0 %. One city on t3.small servers; upstream's
+        # 500m/1Gi-2/4Gi is sized for 100 agents.
+        resources:
+          requests:
+            cpu: 250m
+            memory: 250Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: config
+        configMap:
+          name: dolt-config
+      # Shared with the dolt-backup CronJob (same node, RWO is node-scoped).
+      - name: dolt-backups
+        persistentVolumeClaim:
+          claimName: dolt-backups
+  volumeClaimTemplates:
+  - metadata:
+      name: dolt-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: local-path
+      resources:
+        requests:
+          storage: 20Gi

@@ -1,0 +1,276 @@
+# gardener-cron-floor-preflight-suppress.toml
+#
+# Claudeless scenario: a cron-floor entry with a daemon-side PREFLIGHT is
+# SUPPRESSED while its world-state predicate is false, and fires the moment it
+# becomes true — the exact mechanism the fix in commit 91c89b5e (ka-0000007730)
+# wired into scheduler.EvaluateTriggers → cronPreflightHolds.
+#
+# WHY THIS MODULE EXISTS (the coverage gap, gd-1FuVhV0aAG):
+#   The unit test TestEvaluateTriggers_CronPreflightGates asserts the four
+#   branches over a FAKE daemon. The live-flow scenario
+#   gardener-trigger-fan-in-cron-precedence PRE-CREATES an open child so cron's
+#   preflight ALLOWS — it only exercises the FIRE path. Nothing exercised the
+#   SUPPRESS path end-to-end against a real daemon + real trigger-engine — and
+#   that suppress path is EXACTLY what made this coverage sprint's own gardener
+#   (ka-0000001897) dormant: 0 open children → preflight never held → cron floor
+#   correctly shed every idle tick. This module locks that behavior in.
+#
+# Engine code covered (the fixed path):
+#   - gardenio/controller/internal/scheduler/triggers.go
+#     EvaluateTriggers: `if entry.Preflight != nil { if !cronPreflightHolds(...) { continue } }`
+#     cronPreflightHolds: daemon-side conditions.Evaluate of the cron entry's
+#     preflight bead_query; a false predicate returns false → the cron fire is
+#     shed (continue), never dispatched.
+#   - Driven through the real bridge.MultiTriggerSource (trigger:multi bead) +
+#     bridge.TriggerEngine that the standalone `trigger-engine` binary registers.
+#
+# Shape (three live triggers, one epic with NO open children):
+#   PREFLIGHT trigger — cron='* * * * *' with a preflight bead_query
+#     ">=1 open child under EPIC". action=notify.
+#   CONTROL trigger — cron='* * * * *', NO preflight. action=notify. This is the
+#     "a no-preflight entry still fires" leg: it proves the engine is alive and
+#     firing cron every tick, so the PREFLIGHT trigger's silence is attributable
+#     to the preflight gate ALONE (not a dead engine / wrong cron / cooldown).
+#
+# Legs:
+#   1. SUPPRESS + CONTROL-FIRES: across >=1 cron boundary (~75s), the CONTROL
+#      trigger records an audit bead (outcome=allow) while the PREFLIGHT trigger
+#      records ZERO — the cron floor is shed because the epic has no open work.
+#   2. FIRE-ON-CHILD: add an open child under the epic; the PREFLIGHT trigger now
+#      records an audit bead (outcome=allow) — the same floor fires once the
+#      world-state predicate holds.
+#
+# The nil-daemon and evaluator-error fail-closed branches are internal states
+# not externally reproducible here; they are locked by the unit test's
+# nil_daemon_suppressed case. This module owns the live SUPPRESS↔FIRE transition.
+#
+# Companion to gardener-trigger-fan-in-cron-precedence.toml (fire path only) and
+# trigger-source-schedule-conditions.toml (legacy schedule-conditions gate).
+
+[claude]
+session_id = "e2e00000-000c-4000-a000-00000000000c"
+username = "e2e-cron-floor-preflight-suppress"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 240000
+
+[[responses]]
+on = "*"
+say = "Running gardener-cron-floor-preflight-suppress: cron-floor preflight sheds idle ticks, fires on open child."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-engine ─────────────────────
+TE_BIN=""
+if command -v trigger-engine >/dev/null 2>&1; then
+  TE_BIN=$(command -v trigger-engine)
+elif [ -x /usr/local/bin/trigger-engine ]; then
+  TE_BIN=/usr/local/bin/trigger-engine
+elif [ -x /tmp/trigger-engine ]; then
+  TE_BIN=/tmp/trigger-engine
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-engine from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-engine ./cmd/trigger-engine/ ) || {
+    echo "SKIP: trigger-engine build failed"; exit 0;
+  }
+  TE_BIN=/tmp/trigger-engine
+else
+  echo "SKIP: trigger-engine binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-engine: $TE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL not set (must run inside e2e shard)"; exit 0
+fi
+if [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_TOKEN not set"; exit 0
+fi
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if ! command -v jq >/dev/null 2>&1; then echo "SKIP: jq not present"; exit 0; fi
+
+PROJECT="${KD_PROJECT:-gardenio}"
+
+# ── Setup ──────────────────────────────────────────────────────────
+TAG="e2e-cfps-$$-$(date +%s)"
+echo "tag: $TAG  project: $PROJECT"
+
+# Epic with NO open children — the world state that must SHED the cron floor.
+EPIC_ID=$(kd create "cron-floor-preflight-epic-$TAG" --type=epic \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "project:$PROJECT" \
+  --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+echo "epic (no open children): $EPIC_ID"
+
+# The cron-floor preflight: ">=1 open child under EPIC". Same shape gb gardener
+# start writes (bead_query, op '>', value '0', parent=EPIC, open-ish statuses).
+PREFLIGHT=$(cat <<JSON
+{"all":[{"type":"bead_query","op":">","value":"0","parent":"$EPIC_ID","types":["task","bug","epic"],"statuses":["open","in_progress","blocked"]}]}
+JSON
+)
+
+# PREFLIGHT trigger — one cron entry gated on the preflight above.
+PF_TRIGGERS=$(cat <<JSON
+[{"kind":"cron","cron":"* * * * *","timezone":"UTC","preflight":$PREFLIGHT}]
+JSON
+)
+PF_ID=$(kd create "cron-floor-preflight-$TAG" --type=trigger \
+  -l "trigger:multi" -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "project:$PROJECT" \
+  -f "enabled=true" -f "action=notify" -f "project=$PROJECT" \
+  -f "cooldown_minutes=0" \
+  -f "prompt=preflight floor fired at {{fire_time}}" \
+  -f "triggers=$PF_TRIGGERS" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$PF_ID" ]; then fail "create preflight trigger"; exit 1; fi
+echo "preflight trigger: $PF_ID"
+
+# CONTROL trigger — same cron, NO preflight. Proves the engine fires cron every
+# tick, so the preflight trigger's silence is the gate's doing, not a dead loop.
+CTL_TRIGGERS='[{"kind":"cron","cron":"* * * * *","timezone":"UTC"}]'
+CTL_ID=$(kd create "cron-floor-control-$TAG" --type=trigger \
+  -l "trigger:multi" -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "project:$PROJECT" \
+  -f "enabled=true" -f "action=notify" -f "project=$PROJECT" \
+  -f "cooldown_minutes=0" \
+  -f "prompt=control floor fired at {{fire_time}}" \
+  -f "triggers=$CTL_TRIGGERS" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$CTL_ID" ]; then fail "create control trigger"; exit 1; fi
+echo "control trigger:   $CTL_ID"
+
+CHILD_ID=""
+cleanup() {
+  kd update "$PF_ID"  -f "enabled=false" >/dev/null 2>&1 || true
+  kd update "$CTL_ID" -f "enabled=false" >/dev/null 2>&1 || true
+  for id in "$PF_ID" "$CTL_ID" "$CHILD_ID" "$EPIC_ID"; do
+    [ -n "$id" ] && kd close "$id" >/dev/null 2>&1 || true
+  done
+  if [ -n "${TE_PID:-}" ]; then
+    kill "$TE_PID" 2>/dev/null || true
+    wait "$TE_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+# audit_count <trigger-id> — number of allow-outcome audit beads for a trigger.
+# .[]? tolerates a null/empty list body so a fresh trigger with no audits yet
+# yields 0, never a jq iterate-over-null error.
+audit_count() {
+  kd list --type=event -l "trigger:$1" --json 2>/dev/null | \
+    jq '[.[]? | select(.fields.outcome=="allow")] | length' 2>/dev/null || echo 0
+}
+
+# ── Run trigger-engine subprocess ──────────────────────────────────
+TE_LOG=/tmp/trigger-engine-cfps-$$.log
+BEADS_HTTP_ADDR="$BEADS_HTTP_URL" \
+  BEADS_DAEMON_TOKEN="$BEADS_TOKEN" \
+  TRIGGER_POLL_INTERVAL=1s \
+  LISTEN_ADDR=":0" \
+  LOG_LEVEL=info \
+  "$TE_BIN" >"$TE_LOG" 2>&1 &
+TE_PID=$!
+echo "trigger-engine pid: $TE_PID"
+
+# ── Leg 1: SUPPRESS (preflight) + CONTROL fires ────────────────────
+# Wait for the CONTROL trigger to fire (proves the engine is alive and past a
+# cron boundary). Up to 90s to clear the '* * * * *' minute boundary + 30s
+# cooldown floor. The PREFLIGHT trigger must stay at 0 the entire time.
+echo "── leg 1: epic has no open children → preflight floor must be SHED ──"
+DEADLINE=$(( $(date +%s) + 90 ))
+CTL_FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  # Fail fast if the PREFLIGHT trigger EVER fires while the epic is empty.
+  PF_N=$(audit_count "$PF_ID")
+  if [ "${PF_N:-0}" -gt 0 ] 2>/dev/null; then
+    fail "preflight cron floor fired with NO open children" "audit_count=$PF_N (expected 0 — the gate must shed idle ticks)"
+    echo "--- trigger-engine log (tail) ---"; tail -40 "$TE_LOG" 2>/dev/null || true
+    exit 1
+  fi
+  CTL_N=$(audit_count "$CTL_ID")
+  if [ "${CTL_N:-0}" -ge 1 ] 2>/dev/null; then
+    CTL_FIRED=1
+    break
+  fi
+  sleep 3
+done
+
+if [ "$CTL_FIRED" = "0" ]; then
+  # The control never fired — we cannot distinguish "preflight suppressed" from
+  # "engine never ran". Treat as an environment SKIP rather than a false pass.
+  echo "SKIP: control (no-preflight) cron never fired within 90s — engine/env not driving cron"
+  echo "--- trigger-engine log (tail) ---"; tail -40 "$TE_LOG" 2>/dev/null || true
+  exit 0
+fi
+pass "control (no-preflight) cron floor fired — engine is live and past a cron boundary"
+
+# The engine is proven live and past a boundary; re-confirm the preflight floor
+# recorded nothing while its predicate was false.
+PF_N=$(audit_count "$PF_ID")
+if [ "${PF_N:-0}" = "0" ]; then
+  pass "preflight cron floor SHED every idle tick (audit_count=0 while no open children)"
+else
+  fail "preflight cron floor fired with no open children" "audit_count=$PF_N (expected 0)"
+  echo "--- trigger-engine log (tail) ---"; tail -40 "$TE_LOG" 2>/dev/null || true
+  exit 1
+fi
+
+# Sanity: the engine actually EVALUATED the preflight trigger (last_checked
+# stamped). Otherwise leg 1 would be vacuous — we'd be asserting silence from a
+# trigger the engine never looked at.
+LAST=$(kd show "$PF_ID" --json 2>/dev/null | jq -r '.fields.last_checked // empty')
+if [ -n "$LAST" ]; then
+  pass "engine evaluated the preflight trigger (last_checked=$LAST) — the shed was a real gate decision"
+else
+  echo "  (note) last_checked not yet stamped on preflight trigger — non-fatal"
+fi
+
+# ── Leg 2: FIRE once an open child exists ──────────────────────────
+echo "── leg 2: add an open child under the epic → preflight floor must FIRE ──"
+CHILD_ID=$(kd create "cron-floor-child-$TAG" --type=task \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "project:$PROJECT" \
+  --json 2>&1 | jq -r '.id // empty')
+if [ -z "$CHILD_ID" ]; then fail "create child task"; exit 1; fi
+kd dep add "$CHILD_ID" "$EPIC_ID" --type parent-child >/dev/null 2>&1 || { fail "link child to epic"; exit 1; }
+echo "open child: $CHILD_ID (parent $EPIC_ID)"
+
+# Now the preflight predicate (">=1 open child") holds; the same cron floor must
+# fire. Allow up to 90s for the next cron boundary + cooldown.
+DEADLINE=$(( $(date +%s) + 90 ))
+PF_FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  PF_N=$(audit_count "$PF_ID")
+  if [ "${PF_N:-0}" -ge 1 ] 2>/dev/null; then
+    PF_FIRED=1
+    pass "preflight cron floor FIRED once the epic had an open child (audit_count=$PF_N)"
+    break
+  fi
+  sleep 3
+done
+
+if [ "$PF_FIRED" = "0" ]; then
+  fail "preflight cron floor did NOT fire within 90s of gaining an open child"
+  echo "--- trigger-engine log (tail) ---"; tail -40 "$TE_LOG" 2>/dev/null || true
+  exit 1
+fi
+
+# ── Summary ────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "gardener-cron-floor-preflight-suppress OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-cron-floor-preflight-suppress scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

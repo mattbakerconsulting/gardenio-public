@@ -1,0 +1,49 @@
+{{/*
+Node-lifecycle collector ClusterRole + ClusterRoleBinding (Track D,
+ka-0000001509; operator ask ka-0000006448).
+
+Grants the controller SA cluster-wide READ (list/watch) on Nodes so the
+node-lifecycle collector (internal/nodelifecycle) can sweep the cluster Node
+API and publish gardenio_node_lifecycle_events_total{reason=...} — the live
+series backing the AgentNodeLifecycleEvents Slack alert for node reclaim /
+disruption / deletion churn.
+
+Nodes are cluster-scoped, so a ClusterRole is required. Read-only (list/watch)
+— the collector never mutates nodes. Gated on agents.nodeLifecycle.enabled
+so the feature ships zero cluster-scoped footprint until an operator opts in;
+the NODE_LIFECYCLE_INTERVAL env (deployment.yaml) is gated on the same value, so
+the collector is a no-op whenever this RBAC is absent.
+
+The node-drain nudge (agents.nodeDrainNudge, node-drain-rbac.yaml) grants the
+SAME nodes read on a DIFFERENT gate, so a cluster running both simply holds two
+equivalent-scope ClusterRoles bound to the one controller SA — harmless
+overlap, and keeping the grants independent means either feature can ship alone
+with a minimal footprint.
+*/}}
+{{- if .Values.agents.nodeLifecycle.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-node-lifecycle
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-node-lifecycle
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.agents.fullname" . }}-node-lifecycle
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.agents.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

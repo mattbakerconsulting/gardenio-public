@@ -1,0 +1,326 @@
+name: release-binaries
+
+# Prebuilt laptop binaries on every calver release (gd-WjWqxeddE3), attached
+# to the GitHub release for the tag as <bin>-<os>-<arch>.tar.gz (the binary
+# at the top level) plus a <asset>.sha256 in sha256sum format beside each --
+# the shape scripts/onboard.sh downloads from releases/latest/download/:
+#
+#   kd, gb   darwin-arm64, darwin-amd64, linux-amd64
+#   coop     linux-amd64 only (the tarball also holds coopmux)
+#
+# ── Everything runs on the ARC pool, $0 per minute ──────────────────────────
+# Owner decision gd-gNvy7dymbw ("drop"): no hosted macOS runners. On a private
+# repo they bill at 10x, about $2 a tag for the coop darwin builds (PR #1290).
+# kd and gb are CGO_ENABLED=0, so Go cross-compiles them for darwin from Linux
+# with nothing from Apple; the Go linker also ad-hoc signs darwin/arm64 output
+# itself, which arm64 macOS needs to exec it. coop is different: its darwin
+# graph links Apple frameworks (Security, CoreFoundation, CoreServices) that
+# only the license-restricted macOS SDK provides, so ka-0000001190 still
+# stands -- no darwin coop here, no osxcross/zig. Mac users build coop from
+# source: `cd coop && cargo build --release` (docs/onboarding-mac-operator.md).
+#
+# ── Triggers ────────────────────────────────────────────────────────────────
+#   push tags 20*      build, verify, publish to the release for the tag
+#   workflow_dispatch  same for an EXISTING tag (backfill, or re-publish after
+#                      a failed run); never creates a tag
+#   pull_request       build + verify only, nothing is published
+on:
+  push:
+    tags: ['20*'] # calver release tags, as images.yml -- see docs/release-pipeline.md
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing calver tag to build and attach binaries to (e.g. 2026.300.3)
+        required: true
+  pull_request:
+    paths:
+      - '.github/workflows/release-binaries.yml'
+
+# Same shape as images.yml: a PR supersedes its own previous run; a tag or a
+# dispatch never shares a group, so nothing evicts a release build.
+concurrency:
+  group: release-binaries-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Keep in step with GO_VERSION in ci.yml / checks.yml.
+  GO_VERSION: "1.25.14"
+  # The tag being released; empty on a PR, where binaries version themselves
+  # from `git describe` (a short sha).
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_type == 'tag' && github.ref_name || '' }}
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: kd + gb (${{ matrix.goos }}-${{ matrix.goarch }})
+    # Heavy tier: gb is the controller module, which ci.yml builds on heavy.
+    runs-on: gardenio-k3s
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: linux, goarch: amd64 }
+    env:
+      P: ${{ matrix.goos }}-${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG && format('refs/tags/{0}', env.TAG) || '' }}
+
+      # The ARC runner image ships neither make nor file (the darwin check).
+      - name: deps
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends make file
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # Through the component Makefiles so the version ldflags (main.Version
+      # for kd, main.version for gb, the version-skew signal ka-0000002965)
+      # are the same ones every other build stamps. GOOS/GOARCH reach
+      # `go build` from the environment; CGO stays off, so the darwin builds
+      # need no Apple toolchain.
+      - name: build kd + gb
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          make -C kbeads build ${TAG:+VERSION="$TAG"}
+          make -C gardenio/controller build-gb ${TAG:+VERSION="$TAG"}
+
+      - name: package
+        run: |
+          set -euo pipefail
+          mkdir -p dist stage/kd stage/gb
+          install -m 0755 kbeads/kd stage/kd/
+          install -m 0755 gardenio/controller/bin/gb stage/gb/
+          for b in kd gb; do
+            tar -C "stage/$b" -czf "dist/$b-$P.tar.gz" "$b"
+            (cd dist && sha256sum "$b-$P.tar.gz" > "$b-$P.tar.gz.sha256")
+          done
+          ls -l dist
+
+      # The acceptance test on exactly what will be published: check the
+      # .sha256, unpack into an empty dir, then
+      #   linux-amd64: run it -- the version must be the tag on a release;
+      #   darwin-*:    it cannot run here, so check it is a Mach-O executable
+      #                for the right CPU (`file`, and Go's debug/macho), that
+      #                the tag is stamped into it, and on arm64 that it
+      #                carries a code signature (LC_CODE_SIGNATURE, without
+      #                which arm64 macOS kills it on exec; the Go linker signs
+      #                darwin/arm64 only, and Intel Macs do not require it).
+      - name: verify tarballs (${{ env.P }})
+        run: |
+          set -euo pipefail
+          rm -rf verify && mkdir verify
+          for b in kd gb; do
+            (cd dist && sha256sum -c "$b-$P.tar.gz.sha256")
+            tar -C verify -xzf "dist/$b-$P.tar.gz"
+          done
+          ls -l verify
+          want_tag() { # <what> <text>
+            [ -z "$TAG" ] && return 0
+            case "$2" in *"$TAG"*) ;; *) echo "::error::$1 does not carry the tag $TAG"; exit 1 ;; esac
+          }
+          if [ "$P" = linux-amd64 ]; then
+            kd="$(./verify/kd --version)"; echo "$kd"
+            gb="$(./verify/gb version)"; echo "$gb"
+            want_tag "kd --version ('$kd')" "$kd"
+            want_tag "gb version ('$gb')" "$gb"
+            exit 0
+          fi
+          case "$P" in
+            darwin-arm64) file_arch=arm64 ;;
+            darwin-amd64) file_arch=x86_64 ;;
+          esac
+          check="$RUNNER_TEMP/machocheck"
+          mkdir -p "$check"
+          cat > "$check/main.go" <<'EOF'
+          // machocheck <arm64|amd64> <file>: a Mach-O executable for that CPU,
+          // with an LC_CODE_SIGNATURE load command on arm64.
+          package main
+
+          import (
+          	"debug/macho"
+          	"fmt"
+          	"os"
+          )
+
+          func main() {
+          	f, err := macho.Open(os.Args[2])
+          	if err != nil {
+          		fmt.Println("not Mach-O:", err)
+          		os.Exit(1)
+          	}
+          	want := map[string]macho.Cpu{"arm64": macho.CpuArm64, "amd64": macho.CpuAmd64}[os.Args[1]]
+          	if f.Cpu != want || f.Type != macho.TypeExec {
+          		fmt.Printf("got cpu %v type %v, want cpu %v executable\n", f.Cpu, f.Type, want)
+          		os.Exit(1)
+          	}
+          	if want != macho.CpuArm64 {
+          		fmt.Printf("ok: %v executable\n", f.Cpu)
+          		return
+          	}
+          	for _, l := range f.Loads {
+          		if raw := l.Raw(); len(raw) >= 4 && f.ByteOrder.Uint32(raw) == 0x1d { // LC_CODE_SIGNATURE
+          			fmt.Printf("ok: %v executable, code-signed\n", f.Cpu)
+          			return
+          		}
+          	}
+          	fmt.Println("no LC_CODE_SIGNATURE")
+          	os.Exit(1)
+          }
+          EOF
+          (cd "$check" && go mod init machocheck >/dev/null 2>&1 && go build -o machocheck .)
+          for b in kd gb; do
+            desc="$(file -b "verify/$b")"; echo "$b: $desc"
+            case "$desc" in
+              *Mach-O*"$file_arch"*executable*|*Mach-O*executable*"$file_arch"*) ;;
+              *) echo "::error::$b-$P is not a Mach-O $file_arch executable: $desc"; exit 1 ;;
+            esac
+            "$check/machocheck" "${P#darwin-}" "verify/$b" || { echo "::error::$b-$P failed the Mach-O check"; exit 1; }
+            # -X stamps the version as a plain string in the binary.
+            if [ -n "$TAG" ]; then
+              grep -aqF "$TAG" "verify/$b" || { echo "::error::$b-$P does not carry the tag $TAG"; exit 1; }
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-go-${{ env.P }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  coop:
+    name: coop (linux-amd64)
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci); heavy tier, same as ci.yml's coop job
+    timeout-minutes: 60
+    env:
+      P: linux-amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG && format('refs/tags/{0}', env.TAG) || '' }}
+
+      # protoc is for tonic-build in coop/crates/cli/build.rs. The ARC runner
+      # ships neither a C toolchain nor rustup (see ci.yml's coop job for both).
+      - name: deps
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends build-essential protobuf-compiler libprotobuf-dev pkg-config libssl-dev
+      - name: rustup
+        run: |
+          set -euo pipefail
+          CH="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CH/bin/rustup" ]; then
+            # Download-to-file, never curl | sh (scripts/check-no-curl-pipe-shell.sh).
+            init="$(mktemp)"
+            curl -sSfL --retry 5 --retry-delay 2 --retry-connrefused \
+                 --max-time 180 -o "$init" https://sh.rustup.rs
+            [ -s "$init" ] || { echo "::error::rustup-init downloaded empty"; exit 1; }
+            sh "$init" -y --no-modify-path --profile minimal --default-toolchain none
+            rm -f "$init"
+          fi
+          echo "$CH/bin" >> "$GITHUB_PATH"
+
+      # The ARC runner's CARGO_TARGET_DIR is a node-local hostPath shared
+      # between jobs, so copy the binaries out in the same step, before
+      # another job on the node can rebuild over them.
+      - name: build coop + coopmux
+        working-directory: coop
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install
+          cargo build --release --locked -p coop -p coopmux
+          out="${CARGO_TARGET_DIR:-$PWD/target}/release"
+          mkdir -p "$RUNNER_TEMP/coop-out"
+          cp "$out/coop" "$out/coopmux" "$RUNNER_TEMP/coop-out/"
+          echo "COOP_OUT=$RUNNER_TEMP/coop-out" >> "$GITHUB_ENV"
+
+      - name: package
+        run: |
+          set -euo pipefail
+          mkdir -p dist stage
+          install -m 0755 "$COOP_OUT/coop" "$COOP_OUT/coopmux" stage/
+          tar -C stage -czf "dist/coop-$P.tar.gz" coop coopmux
+          (cd dist && sha256sum "coop-$P.tar.gz" > "coop-$P.tar.gz.sha256")
+          ls -l dist
+
+      - name: verify tarball runs
+        run: |
+          set -euo pipefail
+          rm -rf verify && mkdir verify
+          (cd dist && sha256sum -c "coop-$P.tar.gz.sha256")
+          tar -C verify -xzf "dist/coop-$P.tar.gz"
+          ls -l verify
+          out="$(./verify/coop --version)"; echo "$out"
+          ./verify/coopmux --version
+          if [ -n "$TAG" ]; then
+            case "$out" in *"$TAG"*) ;; *) echo "::error::'$out' does not carry the tag $TAG"; exit 1 ;; esac
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-coop-${{ env.P }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: attach to release
+    needs: [go, coop]
+    if: github.event_name != 'pull_request'
+    runs-on: gardenio-k3s-light # light ARC scale set (gardenio/helm/ci): no build, only the API
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      # Creates the release if the tag has none yet (no calver tag has one
+      # today; images.yml publishes images only) and replaces an asset of the
+      # same name, so a dispatch re-run is idempotent.
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const tag = process.env.TAG;
+            const { owner, repo } = context.repo;
+            let release;
+            try {
+              release = (await github.rest.repos.getReleaseByTag({ owner, repo, tag })).data;
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              release = (await github.rest.repos.createRelease({
+                owner, repo, tag_name: tag, name: tag,
+                body: `Release ${tag}. Images: \`gardenio/<image>:${tag}\` in ECR. ` +
+                      'Binaries below: `<bin>-<os>-<arch>.tar.gz`, checksum in the `.sha256` beside each. ' +
+                      'kd and gb for darwin-arm64, darwin-amd64 and linux-amd64; coop for linux-amd64 ' +
+                      '(on macOS, build coop from source: `cd coop && cargo build --release`).',
+              })).data;
+            }
+            const existing = await github.paginate(github.rest.repos.listReleaseAssets,
+              { owner, repo, release_id: release.id });
+            for (const name of fs.readdirSync('dist').sort()) {
+              const old = existing.find(a => a.name === name);
+              if (old) await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: old.id });
+              const data = fs.readFileSync(path.join('dist', name));
+              await github.rest.repos.uploadReleaseAsset({
+                owner, repo, release_id: release.id, name, data,
+                headers: { 'content-type': 'application/octet-stream', 'content-length': data.length },
+              });
+              core.info(`attached ${name} (${data.length} bytes)`);
+            }
+            core.notice(`binaries attached to ${release.html_url}`);

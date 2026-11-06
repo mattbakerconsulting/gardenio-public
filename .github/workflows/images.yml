@@ -1,0 +1,597 @@
+name: images
+
+on:
+  push:
+    # NOT branches: [main]. An ordinary merge's :latest/:<sha> images are never
+    # consumed: deploy-values/gardenio-k3s.yaml sets global.latestMode: false
+    # (RETIRED 2026-09-20 after a stale-:latest incident), so every gardenio
+    # pod -- including agent pods the controller spawns -- resolves its image
+    # tag to Chart.AppVersion (the calver release), never :latest or a raw
+    # commit sha; global_image_tag_test.go asserts this. No e2e/test reads a
+    # sha-tagged image either. So the only build that matters is a calver tag
+    # push (the actual release artifact). Rebuilding+pushing the full
+    # ~19-image matrix on every one of ~20 ordinary merges/day was queuing
+    # for hours against the 8-node CI pool shared with 3 other orgs (CI-speed
+    # epic gd-irs5C9BEBi); this was the single heaviest, least necessary chunk
+    # of that fan-out.
+    tags: ['20*'] # calver release tags, e.g. 2026.263.1 -- see docs/release-pipeline.md
+  # NO pull_request TRIGGER (decision gd-bjj3robkjs, gd-NWKY8wZJRt). Since
+  # Task 7.3 part B (gd-19ECZxvFQw) a PR run built no image and only ran
+  # `changes`, which fed nothing: `images` is not a required check, and the
+  # release tag's run is the image net (gd-AhtX12C2Aj). Dropping it saves one
+  # light pod per PR push, ~130 runner-min/day. gd-whdmfznixO retired the
+  # PR-only arms the jobs below kept (paths-filter, the agent and leaf skips,
+  # the PR ECR role). scripts/check-ci-draft-gate.py refuses the trigger
+  # coming back.
+  workflow_dispatch:
+    inputs:
+      images:
+        description: >-
+          Space- or comma-separated image names to build (e.g.
+          "ziti-ctrl-backup" or "kbeads agent"). Leave EMPTY to build all.
+          Added because a cancelled or failed single image previously had no
+          cheap recovery: a dispatch rebuilt all ~19 images and the only
+          alternatives were a rerun buried in the queue or cutting a tag.
+        required: false
+        default: ""
+
+# The group key is per-event-instance (github.sha for a tag push,
+# github.run_id for workflow_dispatch), NOT a shared images-${{ github.ref }}
+# (gd-R1kL4sUECV). A concurrency group holds at most one RUNNING and one
+# PENDING run; a new run in the group always replaces the PENDING one
+# regardless of cancel-in-progress, which only governs the RUNNING one. With
+# one shared group per ref, every push and dispatch after the first silently
+# evicted its predecessor from the single pending slot -- no completed proof
+# run at all for hours on 2026-09-21, including a workflow_dispatch
+# (35558982274) evicted 56s after creation by the next push. Keying groups
+# uniquely per run means there is never a second run to contend for the slot.
+#
+# cancel-in-progress is FALSE: a release (tag) build must never be cancelled
+# by anything later, and mass-cancelling across refs is how a needed
+# ziti-ctrl-backup build got killed on 2026-09-20.
+concurrency:
+  group: images-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.sha }}
+  cancel-in-progress: false
+
+env:
+  # Images and caches live in ECR, same region as the CI nodes: a push there
+  # is free, a push to ghcr is paid internet egress (plan
+  # 2026-10-21-aws-cost-cuts). Guarded by scripts/check-image-registry.py.
+  ECR_REGISTRY: 360190250083.dkr.ecr.us-east-1.amazonaws.com
+  IMAGE_PREFIX: 360190250083.dkr.ecr.us-east-1.amazonaws.com/gardenio
+  ECR_ROLE_RELEASE: arn:aws:iam::360190250083:role/gardenio-ci-ecr-release
+
+jobs:
+  # Decide which images this run builds: every enabled image on a calver tag
+  # push and an un-narrowed dispatch (a release must publish every
+  # component), or the named ones on a narrowed dispatch.
+  changes:
+    runs-on: gardenio-k3s-light # light ARC scale set (gardenio/helm/ci) -- adversarially verified safe 2026-09-21, see arc-runners-light-values.yaml
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      count: ${{ steps.select.outputs.count }}
+      # Whether the selection contains any image that pulls its binary from
+      # images/_controller-base/. Derived from images.json rather than from a
+      # hand-kept list in the `controller-base` job's `if:` -- that list is
+      # exactly what drifted: phase 2 wired six images onto the base and the
+      # `if:` named those six, so the other fourteen stayed on their own
+      # `go build` and nobody noticed for a week. A name added to images.json
+      # with "controllerBase": true is now covered automatically.
+      needs_base: ${{ steps.select.outputs.needs_base }}
+    steps:
+      # SPARSE, DEPTH 1, NO BLOBS (gd-LjoM6ipXQX). This used to be a
+      # `fetch-depth: 0` clone of the whole history: 69 s at the median and
+      # ~430 of this job's ~525 runner-min/day (Task 4.1, gd-WFMvg9sDKE).
+      # `select images` reads only .github/images.json. Do not go back to
+      # fetch-depth: 0; scripts/check-ci-draft-gate.py refuses it.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/images.json
+          sparse-checkout-cone-mode: false
+      # Job-level `if:` cannot see `matrix`, so per-image skipping is done by
+      # shrinking the matrix itself. .github/images.json is the single source
+      # of truth.
+      - name: select images
+        id: select
+        run: |
+          WANT='${{ inputs.images }}'
+
+          # ── DISABLED IMAGES (gd-OQSDvm7cHz) ───────────────────────────
+          # Owner 2026-10-15: "gate them off for now". An images.json entry
+          # with "enabled": false is not built by any automatic path (calver
+          # tag, un-narrowed dispatch) -- 17 of the 26 images are
+          # off because nothing deployed from deploy-values/gardenio-k3s.yaml
+          # (or the ziti chart / raw manifests) references them; they cost
+          # ~1 min of heavy-pool time each and queued behind the runner cap.
+          # Their sources and Dockerfiles are untouched, and
+          # scripts/check-controller-base.py still validates every entry,
+          # disabled or not. TO TURN ONE BACK ON: delete its "enabled": false
+          # line in .github/images.json. A NARROWED dispatch (the `images`
+          # input) still builds a disabled image on request, so one can be
+          # built on demand without re-enabling it.
+          all_images=$(jq -c '.' .github/images.json)
+          enabled_images=$(jq -c '[.[] | select(.enabled != false)]' .github/images.json)
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$WANT" ]; then
+            # Narrowed dispatch: build only the named images. Unknown names are
+            # dropped by the join below rather than silently building
+            # everything, so a typo yields count=0 and a visible no-op instead
+            # of ~19 surprise builds.
+            want_json=$(printf '%s' "$WANT" | tr ',' ' ' | tr -s ' ' '\n' | sed '/^$/d' | jq -R . | jq -sc .)
+            sel=$(jq -c --argjson want "$want_json" \
+                  '[.[] | select(.image as $i | $want | index($i))]' <<< "$all_images")
+            echo "narrowed dispatch -> $(echo "$want_json" | jq -r 'join(" ")')"
+          else
+            # Tag push and un-narrowed dispatch.
+            sel="$enabled_images"
+          fi
+
+          # `any` over an EMPTY array is false, which is the answer we want:
+          # nothing selected means the base is not needed. Emitted as the
+          # strings "true"/"false" because a job output is always a string and
+          # the `if:` below compares it as one.
+          needs_base=$(echo "$sel" | jq 'any(.[]; .controllerBase == true)')
+          echo "matrix=$sel" >> "$GITHUB_OUTPUT"
+          echo "count=$(echo "$sel" | jq 'length')" >> "$GITHUB_OUTPUT"
+          echo "needs_base=$needs_base" >> "$GITHUB_OUTPUT"
+          echo "selected: $(echo "$sel" | jq -r '[.[].image]|join(" ")')"
+          echo "controller-base needed: $needs_base"
+
+  # One shared compile of every controller/cmd/ binary (images/_controller-base/
+  # Dockerfile), consumed by the CONTROLLER_BASE-derived images below via a
+  # COPY --from=<registry ref> instead of each recompiling controller/ from
+  # scratch -- see gardenio/images/CACHE_STRATEGY.md (gd-B2c8OinSs7). Only
+  # runs when the selection contains one, which needs_base answers from
+  # images.json.
+  #
+  # This is on the critical path of every image that pulls from it, so it looks
+  # like a serialization cost and is not one: those images already waited for
+  # it (they are all `needs: [changes, controller-base]`), and what changed on
+  # 2026-09-22 is that the twenty that pull from it stopped ALSO compiling the
+  # same package graph again afterwards. Measured shape of a full-matrix run
+  # before: base 337 s, then 14 self-compiling images at ~150 s each plus 6 at
+  # ~50 s -- ~2700 node-seconds, ~790 s of wall clock through a 10-slot pool.
+  # Projected after, by pricing all 20 at the 6 rewired images' observed ~50 s:
+  # ~1340 node-seconds.
+  #
+  # MEASURED, full-matrix dispatch 35694871982: base 228 s + the twenty
+  # totalling 713 s (mean 35.6, max 44) = 941 node-seconds. That beats the
+  # projection because both terms came in low -- the twenty averaged 35.6 s
+  # rather than 50, and the base hit a warm registry cache at 228 s rather
+  # than 337. Price a COLD base at its 337 s and the honest figure is ~1050.
+  #
+  # Wall was 590 s, NOT the ~440 s projected, and that gap is not the build:
+  # the same run queued 2612 summed seconds across those 21 jobs against crew
+  # PR traffic. Node-seconds is what this change controls and what it cut by
+  # ~2.9x; wall is pool contention and belongs to ci_max_nodes. Note the
+  # shape that leaves behind -- 324 s of the 590 is the base's own build plus
+  # its queue wait, all of it serial ahead of twenty ~36 s jobs. The base is
+  # now the majority of this family's wall clock, so it is the next lever if
+  # wall ever matters more than compute.
+  #
+  # That lever was then pulled, once: the registry build cache came off this
+  # job (see the long comment on the build step) after measuring that its
+  # export cost ~75 s to save ~13 s and never once cached the compile. The
+  # remaining shape is ~95 s compile + ~33 s image export; module download is
+  # only ~10-20 s of the compile (152 of 169 `go: downloading` lines land in
+  # its first 10 s), so splitting go.mod into its own layer is NOT worth a
+  # layer here now that there is no cache to restore it from.
+  # Do not "optimise" this job away by inlining it back into the images; that
+  # is the state this replaced.
+  controller-base:
+    needs: changes
+    # Only when a selected image pulls it, so every push has a consumer
+    # (scripts/check-image-registry.py, gd-eGXedWQJfw).
+    if: needs.changes.result == 'success' && needs.changes.outputs.needs_base == 'true'
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci)
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC -> STS -> ECR; runners never touch IMDS
+    steps:
+      - uses: actions/checkout@v4
+
+      # TEMPORARY DIAGNOSTIC (gd-iW6lkpTi7W) -- baseline + end probes.
+      #
+      # THEY DO NOT SIZE THIS JOB, and the paragraph that used to stand here
+      # said they did. peak-memory runs as a job step, so it reads the
+      # `runner` container's cgroup (/proc/self/cgroup there is `0::/` -- a
+      # cgroup namespace; memory.max reads back runner's own 14Gi limit).
+      # Every `docker build` in this workflow runs in the `dind` native
+      # sidecar, which is a different cgroup, has no requests and no limits,
+      # and is invisible from here.
+      #
+      # So the readings are real but they measure an almost-idle shell:
+      # `agent` (Playwright + Whisper + Rust + Terraform, ~1200s) reported
+      # cpuavg=29m anonmax=159Mi, while its node sat at loadavg 14.50 on
+      # 4 vCPU. A near-zero number from these two probes is the probe missing
+      # the workload, NOT a cheap job -- do not demote a tier on it.
+      #
+      # Kept anyway, for two things they DO measure: `loadavg`, which is
+      # node-scoped and is the only view we have of dind's contention, and
+      # the runner container's own floor. The baseline is load-bearing: it
+      # starts the anon sampler, and an end probe alone reports its own seed.
+      # See the SCOPE section in .github/actions/peak-memory/action.yml.
+      # Delete both once the ruling is in gardenio/helm/ci/README.md.
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "controller-base-baseline" }
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      # Pushed whenever it runs: the CONTROLLER_BASE images below run as
+      # separate matrix entries on separate runner pods and pull this by
+      # registry reference (COPY --from), so it must exist in the registry
+      # before they build -- unlike cache-from/cache-to, this is a hard
+      # dependency, not a best-effort cache hint. The push goes to ECR as
+      # gardenio-ci-ecr-release (terraform ci_ecr.tf), through the GitHub
+      # OIDC token (`id-token: write` above).
+      - name: AWS credentials (GitHub OIDC, no IMDS)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ env.ECR_ROLE_RELEASE }}
+          role-session-name: images-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: build + push controller-base
+        uses: docker/build-push-action@v6
+        with:
+          context: gardenio
+          file: gardenio/images/_controller-base/Dockerfile
+          push: true
+          # Tagged by commit SHA only -- NEVER :latest. A concurrent build on
+          # another ref could overwrite :latest mid-flight and hand a
+          # different ref's binaries to whichever downstream build reads it
+          # next.
+          tags: ${{ env.IMAGE_PREFIX }}/cache/controller-base:${{ github.sha }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+          # NO cache-from/cache-to here, deliberately -- do not "restore" them.
+          #
+          # This job had `cache-to: ...,mode=max` and it was a measured net
+          # LOSS. The expensive layer is the 20-binary `go build`, and its
+          # cache key can never repeat across commits: COMMIT is interpolated
+          # into the RUN's own command text via -ldflags, so the layer digest
+          # is unique per SHA by construction. mode=max dutifully exported
+          # cache for a layer that is provably unreusable.
+          #
+          # Measured over the 11 successful controller-base builds in the 30
+          # images runs to 2026-09-22 06:29Z: cache export cost 64-90 s
+          # (mean ~75) on jobs totalling 221-341 s. The compile step was
+          # CACHED in 0 of 11. The only steps that ever hit were WORKDIR and
+          # the two COPYs -- worth ~13 s -- and even those missed in 4 of 11.
+          # On dispatch 35694871982 the export ran 06:31:39-06:32:43 against
+          # an image export that finished 06:31:44, so ~59 s of it was pure
+          # serial tail, not overlap.
+          #
+          # That tail is the expensive kind. This job gates the twenty
+          # CONTROLLER_BASE images (they COPY --from its registry tag), so it
+          # is serial ahead of all of them: 324 s of the 590 s wall on that
+          # same dispatch was the base's build plus its queue wait, ahead of
+          # twenty ~36 s jobs.
+          #
+          # If you want this cacheable, the lever is the ldflags COMMIT, not
+          # the cache flags. Note the leaf images below DO keep mode=max --
+          # their runtime stages have apt layers that genuinely repeat. The base has no such layer.
+          #
+          # Removing cache-to also stops every base build racing to overwrite
+          # one untagged (= :latest) manifest in the same repo the SHA-tagged
+          # images live in. That was a cache manifest, not an image one, so
+          # nothing resolved :latest by accident -- but it sat directly under
+          # a comment saying this repo must never carry :latest.
+
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "controller-base-end" }
+
+  build:
+    needs: [changes, controller-base]
+    # Skipped `changes` (parked CI) or an empty selection both stop here,
+    # before `strategy` -- which is where fromJSON would otherwise fail.
+    # controller-base is conditional (see above); a skip there must not block
+    # the images that don't depend on it (as of 2026-09-22 that is six --
+    # kbeads, controller, agent, coop-claude, coopmux, ziti-ctrl-backup; the
+    # other twenty are "controllerBase": true), so 'skipped' is accepted too.
+    # Bracket notation (not needs.controller-base.result): the expression
+    # parser reads a dotted hyphen as subtraction, not a job-id lookup.
+    # !cancelled() is LOAD-BEARING, not decoration. GitHub skips a job whose
+    # dependency was skipped and does NOT evaluate this `if` at all unless the
+    # expression contains a status function. controller-base is conditional, so
+    # without this the whole matrix silently skipped whenever controller-base
+    # did -- which is any run whose selection contains none of the twenty
+    # "controllerBase": true images (before 2026-09-22, none of its five).
+    # "run", not "push": this workflow fires only on calver tags and
+    # workflow_dispatch (see the `on:` block).
+    # Symptom: the images run reports SUCCESS with `matrix.image: skipped` and
+    # no image is published, so a merge looks built and is not. Measured: no
+    # kbeads image existed for main between #19 landing and this fix, including
+    # a workflow_dispatch that also reported success.
+    # !cancelled() rather than always() so a cancelled run still stops.
+    if: >-
+      !cancelled() &&
+      needs.changes.result == 'success' && needs.changes.outputs.count != '0' &&
+      (needs['controller-base'].result == 'success' || needs['controller-base'].result == 'skipped')
+    name: ${{ matrix.image }}
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci)
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC -> STS -> ECR; runners never touch IMDS
+    strategy:
+      fail-fast: false
+      # THROTTLE, added 2026-09-22 (gd-DmOvY4zfKt). The e2e design doc says
+      # "no pre-emptive max-parallel -- throttle only if starvation is real and
+      # observed" (docs/superpowers/specs/2026-09-21-e2e-optional-ci-jobs-design.md
+      # T9). It is now observed, twice, so this is no longer pre-emptive:
+      #
+      #   * live at 2026-09-22, gardenio-k3s (heavy) pegged 10/10 while
+      #     gardenio-k3s-light sat 0/10 and -medium 0/6. SIXTY jobs queued
+      #     repo-wide; FIFTY-FOUR of them (90%) were arms of three concurrent
+      #     images runs (22 + 19 + 12). ci.yml had 5 jobs stuck behind them.
+      #   * run 35723339431, the last full 22-arm matrix to complete: the
+      #     twenty controller-base leaf images RAN for 29-47 s each but WAITED
+      #     86-357 s. They are a `COPY --from=controller_base /out/<bin>` onto
+      #     distroless -- 16 s of build and ~14 s of job overhead -- yet each
+      #     claims a whole heavy slot, and they displaced the real work:
+      #     `agent` waited 218 s and `controller` 207 s behind them.
+      #
+      # Why 5, from that run's measured durations (agent 1220 s, controller
+      # 198 s, twenty leaves 682 s total, ~40 s pod acquisition each):
+      #
+      #   max-parallel | matrix wall-clock | vs today | peak heavy slots
+      #     3 / 4 / 5  |      1260 s       |  -178 s  |     3 / 4 / 5
+      #        22      |      1260 s       |  -178 s  |        22
+      #
+      # `agent` alone is 58% of the matrix's runner-seconds and is index 2 in
+      # .github/images.json, so it starts in the first wave at any value >= 3
+      # and the whole matrix is bounded by it, not by the throttle. Anything
+      # from 3 up is therefore FREE on the expensive shape; 5 leaves a lane of
+      # slack if a leaf grows or agent's index moves.
+      #
+      # MEASURED AFTERWARDS, and it corrects the clause that used to close this
+      # paragraph -- "and still leaves 5 of heavy's 10 slots for ci.yml's 3
+      # heavy jobs". A full matrix never reached 10. Interval-overlap over
+      # every completed images run of 2026-09-22 carrying >= 10 arms, n = 9,
+      # all of them PRE-throttle:
+      #
+      #   peak concurrent arms | 3 | 7 | 8 | 8 | 8 | 8 | 8 | 8 | 10
+      #
+      # Six of nine land on exactly 8. With 42-85 s leaves and ~40 s of pod
+      # acquisition the early arms drain before the last pods are ready, so 8
+      # is a throughput ceiling of the arm shape, NOT maxRunners. The 3 is run
+      # 35762950679, starved by an already-contended pool. So the throttle
+      # leaves about THREE slots for the rest of the fleet, not five. It does
+      # not change the choice of 5 -- `agent` still bounds the matrix -- but do
+      # not spend that headroom twice.
+      #
+      # THE HONEST TRADE, because it is not free in every shape: on a
+      # controller/** change that misses agent's filter, the matrix is twenty
+      # trivial leaves. Against an OTHERWISE IDLE pool those would finish in
+      # two waves of ten (~174 s); at 5 they take ~300 s. So this buys the rest
+      # of the fleet's worst case with images.yml's best case. Given that the
+      # queue is 90% images arms, that is the right way round -- but it is a
+      # trade, not a pure win, and if the pool ever stops being contended this
+      # is the first thing to reconsider.
+      #
+      # WHAT THIS RESTS ON, and how to refute it: that a matrix job held back
+      # by max-parallel is never offered to the scale set, so ARC neither
+      # counts it nor scales for it. If that is wrong the held arms still queue
+      # and this change is merely inert -- the downside is bounded at zero,
+      # which is why it was landed before being measured.
+      #
+      # FIRST POST-THROTTLE DATA POINT: run 35767268222, 22 arms, success,
+      # finished 2026-09-22 19:04Z. NOT REFUTED, and it clamped:
+      #
+      #                                peak | time AT peak | unstarted at peak
+      #   post, this run                  5 |     94 s     |        7
+      #   pre, healthy   (35722940378)    8 |      3 s     |        5
+      #   pre, starved   (35762950679)    3 |    191 s     |       16
+      #
+      # The cap's signature is SITTING at its value, not touching it. This run
+      # held exactly 5 for 94 s with seven arms still unstarted; the uncapped
+      # run passed through 5 in 25 s on its way to 8. Starvation looks
+      # different again -- it never reaches 5 at all.
+      #
+      # AND IT COST NOTHING. Matrix wall-clock minus its longest single arm
+      # ("tail") was 143 s, inside the pre-throttle healthy range of
+      # 0/6/88/96/113/188/224/235 s. `agent` was the longest arm in ALL TEN
+      # measured runs, so "agent bounds the matrix" is measured now, not
+      # assumed.
+      #
+      # Still n = 1, and the pool was saturated (8 Running + 1 Pending of 10)
+      # at the peak instant, so this is consistent-with rather than proof-of.
+      # A peak >= 6 on any later run refutes.
+      #
+      # THAT TAIL COMPARISON IS NOT APPLES-TO-APPLES, measured afterwards. The
+      # ci ASG is spot across SEVEN types that `ci_instance_types` calls
+      # interchangeable "4 vCPU / 16-32 GiB candidates", and they are not:
+      # m7a (Genoa, 3.7 GHz) against r5a (Naples, 2.5 GHz) is roughly 2x per
+      # core. price-capacity-optimized weighs price and interruption risk,
+      # never throughput, so the fleet DRIFTS generation through the day. From
+      # CloudTrail RunInstances on 2026-09-22:
+      #
+      #   06:00-09:00Z   34 of 36 launches (94%) 7th-gen (24 m7a + 10 m7i)
+      #   15:00-18:00Z   23 of 24 launches (96%) 5th-gen (20 r5a + 3 r5)
+      #
+      # The post-throttle run ran 18:42Z, i.e. on the 5th-gen fleet; most of
+      # the pre-throttle "healthy range" ran on the 7th-gen one. So the 143 s
+      # tail is inflated relative to the 0/6/88/96/113/188/224/235 s it was
+      # compared against. The bias runs TOWARD the conclusion -- on comparable
+      # hardware the tail would be smaller still -- so "cost nothing" survives,
+      # but the precision claimed for it does not. Treat 143 s as an upper
+      # bound, not a measurement.
+      #
+      # GENERAL TRAP, and it is not specific to this workflow: any A/B on this
+      # pool whose arms are hours apart is confounded by fleet generation. Run
+      # both arms interleaved, or record the instance type per job -- nothing
+      # does that today, which is why this went unnoticed.
+      #
+      # CONFIRM IT by interval-overlap over a COMPLETED run's jobs API; a peak
+      # >= 6 refutes. Two traps, both walked into while writing this:
+      #   * A runner pod carries NO run or job attribution. Its labels and
+      #     annotations name the scale set and nothing else, so the recipe that
+      #     used to stand here -- "`kubectl -n arc-runners get
+      #     autoscalingrunnersets gardenio-k3s` must never show more than 5
+      #     runners attributable to one images run" -- CANNOT BE RUN. Measured:
+      #     run_id, job_id and the run number occur zero times in the full pod
+      #     list. An unrunnable check reads as a verified one.
+      #   * A `queued` job still reports a `started_at` -- its queue time --
+      #     with an empty `steps`. Sweeping an in-flight run therefore counts
+      #     arms that never started: it scored 12 on a run that was holding 4.
+      #     Filter to jobs with a non-empty `steps`, and sweep completed runs
+      #     only.
+      # Peak <= 5 is evidence only when the pool had >= 6 free slots to give;
+      # a saturated pool holds a run under 5 by itself, as the 3 above shows.
+      max-parallel: 5
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # TEMPORARY DIAGNOSTIC (gd-iW6lkpTi7W) -- baseline + end probes.
+      #
+      # THEY DO NOT SIZE THIS JOB, and the paragraph that used to stand here
+      # said they did. peak-memory runs as a job step, so it reads the
+      # `runner` container's cgroup (/proc/self/cgroup there is `0::/` -- a
+      # cgroup namespace; memory.max reads back runner's own 14Gi limit).
+      # Every `docker build` in this workflow runs in the `dind` native
+      # sidecar, which is a different cgroup, has no requests and no limits,
+      # and is invisible from here.
+      #
+      # So the readings are real but they measure an almost-idle shell:
+      # `agent` (Playwright + Whisper + Rust + Terraform, ~1200s) reported
+      # cpuavg=29m anonmax=159Mi, while its node sat at loadavg 14.50 on
+      # 4 vCPU. A near-zero number from these two probes is the probe missing
+      # the workload, NOT a cheap job -- do not demote a tier on it.
+      #
+      # Kept anyway, for two things they DO measure: `loadavg`, which is
+      # node-scoped and is the only view we have of dind's contention, and
+      # the runner container's own floor. The baseline is load-bearing: it
+      # starts the anon sampler, and an end probe alone reports its own seed.
+      # See the SCOPE section in .github/actions/peak-memory/action.yml.
+      # Delete both once the ruling is in gardenio/helm/ci/README.md.
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "image-${{ matrix.image }}-baseline" }
+
+      # The agent image is 9 stages carrying Playwright, Whisper, a Rust
+      # toolchain and Terraform providers; it exhausts the runner's ~14GB.
+      # Reclaim the preinstalled toolchains we never use (~25GB).
+      - name: free disk space
+        if: matrix.image == 'agent' && runner.environment == 'github-hosted'
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost /usr/local/share/powershell \
+                      /usr/local/lib/node_modules "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          df -h / | tail -1
+
+      - uses: docker/setup-buildx-action@v3
+        # Ephemeral runner pods keep no daemon layer cache between jobs, so
+        # the cache lives in the registry (cache-from/cache-to below), which
+        # needs the docker-container driver: the plain docker driver only
+        # exports inline cache. The builder runs in the pod's dind sidecar.
+        with:
+          driver: docker-container
+
+      # A CONTROLLER_BASE image below (see matrix.controllerBase) pulls the
+      # controller-base image the `controller-base` job pushed, and the
+      # cache-from read and the push need auth too. All three are ECR.
+      - name: AWS credentials (GitHub OIDC, no IMDS)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ env.ECR_ROLE_RELEASE }}
+          role-session-name: images-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # A calver tag push (github.ref_type == 'tag') additionally publishes
+      # :<calver>, derived straight from the ref name (e.g. 2026.263.1), on
+      # top of the existing :latest and :<sha> -- Phase 2 owns retiring
+      # :latest, so it is NOT removed here. Nothing is pushed to ghcr any
+      # more (Task A5); scripts/check-image-registry.py (no_ghcr) keeps it so.
+      - name: compute tags
+        id: tags
+        run: |
+          {
+            echo "list<<TAGS_EOF"
+            echo "${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:latest"
+            echo "${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ github.sha }}"
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              echo "${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ github.ref_name }}"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # matrix.controllerBase (set in .github/images.json for the images
+      # rewired onto images/_controller-base/) needs CONTROLLER_BASE pointed
+      # at the sha-tagged image the controller-base job just pushed; every
+      # other image build-args unchanged.
+      - name: compute build args
+        id: build_args
+        run: |
+          {
+            echo "list<<BUILD_ARGS_EOF"
+            echo "VERSION=${{ github.ref_name }}"
+            echo "COMMIT=${{ github.sha }}"
+            if [ "${{ matrix.controllerBase }}" = "true" ]; then
+              echo "CONTROLLER_BASE=${{ env.IMAGE_PREFIX }}/cache/controller-base:${{ github.sha }}"
+            fi
+            echo "BUILD_ARGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: build + push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: ${{ steps.build_args.outputs.list }}
+          # Ephemeral runners keep no layer cache; the registry does. Not
+          # type=gha: that is the paid GitHub cache.
+          # Cache in ECR (free in-region). ECR needs the cache written as an
+          # OCI image manifest. One mutable tag per image; the lifecycle
+          # policy expires the replaced manifest after a day.
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/cache/${{ matrix.image }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/cache/${{ matrix.image }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+
+      # KEYLESS SIGNING, calver tags only (gd-oHQrFnsQ39). The release image is
+      # signed by digest with this job's GitHub OIDC identity (Fulcio cert,
+      # Rekor entry), which the Kyverno verify-image-signatures policy trusts:
+      #   issuer  https://token.actions.githubusercontent.com
+      #   subject https://github.com/mattbakerconsulting/gardenio/.github/workflows/images.yml@refs/tags/<calver>
+      # Tags only, so a dispatch never reaches it. cosign v2 writes the classic
+      # <repo>:sha256-<digest>.sig tag, which every Kyverno verifyImages reads.
+      # cache/controller-base is never signed: nothing deploys it.
+      - uses: sigstore/cosign-installer@v3
+        if: github.ref_type == 'tag'
+        with:
+          cosign-release: v2.6.5
+      - name: sign (cosign keyless, by digest)
+        if: github.ref_type == 'tag'
+        env:
+          IMAGE: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      # The pre-build df brackets the reclamation, not the build, so a passing
+      # run tells us nothing about the margin. Record what is left afterwards:
+      # this image will grow, and the next ceiling hit would look identical to
+      # the last one. `always()` so a failure still reports.
+      - name: disk remaining after build
+        if: matrix.image == 'agent' && always()
+        run: df -h / | tail -1
+
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "image-${{ matrix.image }}-end" }

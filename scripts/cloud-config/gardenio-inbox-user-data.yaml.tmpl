@@ -1,0 +1,180 @@
+#cloud-config
+# =============================================================================
+# gardenio-inbox-user-data.yaml.tmpl — EC2 user-data for Gardenio in a Box
+# =============================================================================
+# A #cloud-config user-data template that bootstraps a fresh EC2 instance into a
+# full single-node gardenio install: clone the repo, then run
+# scripts/bootstrap-ec2.sh (k3s + optional gVisor + helm install via the BYO
+# path). Phase 0, epic ka-0000007690; source inbox-ec2-sizing-bootstrap.md §5.
+#
+# This is a TEMPLATE — substitute the @@PLACEHOLDER@@ tokens before passing it
+# to `aws ec2 run-instances --user-data`. Render it with:
+#
+#   scripts/render-user-data.sh --scenario A --repo-ref main > /tmp/user-data.yaml
+#   aws ec2 run-instances --instance-type r7i.2xlarge \
+#     --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=150,VolumeType=gp3}' \
+#     --user-data file:///tmp/user-data.yaml ...
+#
+# Placeholders:
+#   @@SCENARIO@@      A | B | C   (sizing scenario; see bootstrap-ec2.sh --print-scenarios)
+#   @@REPO_URL@@      https git URL of the gardenio repo to clone
+#   @@REPO_REF@@      branch / tag / sha to check out (e.g. main)
+#   @@REPO_TOKEN@@    read-only deploy-token / PAT used to clone the PRIVATE repo,
+#                     or empty for an anonymous clone (public mirror / AMI-baked /
+#                     air-gap repo already staged under /opt/gardenio/repo). When
+#                     set, it is written to a 0600 git credential store on the box
+#                     and never echoed to the cloud-init logs. The repo is gardenio
+#                     and PRIVATE, so a fresh box with neither a staged repo nor a
+#                     token here fails the clone — see runbook A.0 for the three
+#                     repo-delivery options.
+#   @@REPO_TOKEN_USER@@ username paired with @@REPO_TOKEN@@. Default "oauth2"
+#                     works for a Personal Access Token; for a GitLab deploy token
+#                     pass the deploy token's username.
+#   @@NAMESPACE@@     target k8s namespace (default gardenio)
+#   @@VALUES_FILE@@   base chart values overlay, repo-relative (default deploy-values/gardenio-byo.yaml)
+#   @@EXTRA_VALUES@@  space-separated repo-relative overlays layered on top, in
+#                     order (public-safe profile: the two in-box overlays). Empty to skip.
+#   @@GVISOR@@        1 to install the runsc sandbox runtime, 0 to skip
+#   @@HARDEN@@        1 to apply the public-internet host hardening, 0 to skip
+#   @@OPERATOR_USER@@ the single SSH account the hardened sshd admits
+#   @@K3S_VERSION@@   pinned INSTALL_K3S_VERSION, or empty for k3s stable
+#   @@SLACK_CHANNEL@@ per-box Slack channel id (C0…), or empty. Set together with
+#                     layering deploy-values/gardenio-inbox-slack.yaml in
+#                     @@EXTRA_VALUES@@ to slack-enable the box reproducibly.
+#   @@APP_VERSION@@   pinned image tag (known-published calver), or empty for
+#                     the chart's appVersion default. Pin this to avoid
+#                     ErrImagePull when appVersion outpaces published images
+#                     (ka-0000001967).
+#   @@OFFLINE_ASSETS@@ staged offline-assets dir the tarboat tarball unpacks to
+#                     (default /opt/gardenio/tarboat). When the tarball stages the
+#                     gardenio subset under <OFFLINE_ASSETS>/repo (Tarboat T1/G1.2),
+#                     cloud-init links it to /opt/gardenio/repo and SKIPS the private
+#                     clone entirely — the true air-gap path (ka-0000008214). Also
+#                     passed to bootstrap-ec2.sh --offline-assets so its staged
+#                     binaries/manifests/charts (G1.1) are consumed too.
+#
+# cloud-init logs land in /var/log/cloud-init-output.log — `set -euxo pipefail`
+# in the bootstrap script makes failures visible there.
+# =============================================================================
+
+write_files:
+  - path: /etc/profile.d/gardenio-kubeconfig.sh
+    permissions: "0644"
+    content: |
+      # Point kubectl/helm/kd at the in-box k3s cluster for any login shell.
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+  - path: /opt/gardenio/bootstrap-env
+    permissions: "0644"
+    content: |
+      # Provenance of this box's bootstrap (read by humans + re-runs).
+      SCENARIO=@@SCENARIO@@
+      REPO_URL=@@REPO_URL@@
+      REPO_REF=@@REPO_REF@@
+      # NB: the clone deploy-token is NOT recorded here (this file is 0644). It is
+      # consumed once in runcmd step 2 with xtrace disabled and never persisted.
+      NAMESPACE=@@NAMESPACE@@
+      VALUES_FILE=@@VALUES_FILE@@
+      EXTRA_VALUES="@@EXTRA_VALUES@@"
+      GVISOR=@@GVISOR@@
+      K3S_VERSION=@@K3S_VERSION@@
+      APP_VERSION=@@APP_VERSION@@
+      HARDEN=@@HARDEN@@
+      OPERATOR_USER=@@OPERATOR_USER@@
+      OFFLINE_ASSETS=@@OFFLINE_ASSETS@@
+      # Per-box Slack channel id (C0…). Set ONLY when EXTRA_VALUES layers
+      # deploy-values/gardenio-inbox-slack.yaml; injects slackBridge.slack.channel
+      # via deploy-byo --slack-channel so the overlay needs no hand-edit. Empty =
+      # slack off (overlay not layered) or the overlay's own channel value.
+      SLACK_CHANNEL=@@SLACK_CHANNEL@@
+
+runcmd:
+  # 1. Base tooling needed to clone + run the bootstrap (bootstrap-ec2.sh
+  #    re-installs/verifies these too, but git is needed first to fetch it).
+  - |
+    set -euxo pipefail
+    if command -v dnf >/dev/null 2>&1; then
+      dnf install -y git curl-minimal tar || dnf install -y git curl tar
+    elif command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y git curl ca-certificates tar
+    fi
+
+  # 2. Make the gardenio repo available at the location bootstrap-ec2.sh probes.
+  #    Idempotent + repo-delivery-agnostic (runbook A.0):
+  #      - If /opt/gardenio/repo is already a checkout (AMI-baked, .git present)
+  #        OR a tarball-staged tree (Tarboat T1/G1.2 ka-0000008214 — NO .git, the
+  #        gardenio subset under OFFLINE_ASSETS/repo), short-circuit — do NOT
+  #        touch it, do NOT require any network/token. The sentinel for "repo
+  #        tree present" is scripts/deploy-byo.sh (the same file bootstrap-ec2.sh
+  #        probes), NOT .git — a tarball tree never carries .git.
+  #      - If the tarboat tarball staged the tree at OFFLINE_ASSETS/repo but it is
+  #        not yet at /opt/gardenio/repo, symlink it there so the clone is never
+  #        reached. This is the TRUE air-gap path: untar, no clone (ka-0000001441).
+  #      - Otherwise clone. gardenio is PRIVATE, so inject the deploy-token credential
+  #        when one was rendered in; an empty token falls back to an anonymous clone
+  #        (public mirror). The token is applied via a 0600 git credential store and
+  #        with shell xtrace OFF so it never lands in /var/log/cloud-init-output.log.
+  - |
+    set -euo pipefail
+    mkdir -p /opt/gardenio
+    OFFLINE_ASSETS="@@OFFLINE_ASSETS@@"
+    : "${OFFLINE_ASSETS:=/opt/gardenio/tarboat}"
+    # Repo tree already present (AMI-baked .git OR tarball-staged, no .git)?
+    # Detect on the sentinel scripts/deploy-byo.sh so a no-.git tarball tree wins.
+    if [ -f /opt/gardenio/repo/scripts/deploy-byo.sh ] || [ -d /opt/gardenio/repo/.git ]; then
+      echo "repo already present at /opt/gardenio/repo (AMI-baked or tarball-staged) — skipping clone"
+      exit 0
+    fi
+    # Tarboat tarball staged the gardenio subset under OFFLINE_ASSETS/repo (no
+    # .git). Symlink it to the probed location so bootstrap finds it and the
+    # private clone is never attempted.
+    if [ -f "${OFFLINE_ASSETS%/}/repo/scripts/deploy-byo.sh" ]; then
+      echo "tarball-staged repo tree found at ${OFFLINE_ASSETS%/}/repo — linking to /opt/gardenio/repo (no clone)"
+      ln -sfn "${OFFLINE_ASSETS%/}/repo" /opt/gardenio/repo
+      exit 0
+    fi
+    # Configure credentials quietly (xtrace stays off for this whole heredoc so the
+    # token is never printed). REPO_TOKEN is empty -> anonymous clone.
+    REPO_URL="@@REPO_URL@@"
+    REPO_REF="@@REPO_REF@@"
+    REPO_TOKEN="@@REPO_TOKEN@@"
+    REPO_TOKEN_USER="@@REPO_TOKEN_USER@@"
+    CRED_FILE=/opt/gardenio/.git-credentials
+    if [ -n "$REPO_TOKEN" ]; then
+      host="$(printf '%s' "$REPO_URL" | sed -E 's#^https?://([^/]+)/.*#\1#')"
+      scheme="$(printf '%s' "$REPO_URL" | sed -E 's#^(https?)://.*#\1#')"
+      umask 077
+      printf '%s://%s:%s@%s\n' "$scheme" "${REPO_TOKEN_USER:-oauth2}" "$REPO_TOKEN" "$host" > "$CRED_FILE"
+      # Drive the store helper via GIT_CONFIG_* env so the value (which contains a
+      # space) is passed cleanly and the token never lands in the repo's .git/config
+      # remote URL. Cleared right after the clone.
+      export GIT_CONFIG_COUNT=1
+      export GIT_CONFIG_KEY_0=credential.helper
+      export GIT_CONFIG_VALUE_0="store --file=$CRED_FILE"
+    fi
+    git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" /opt/gardenio/repo
+    # Drop the credential store + config once the clone is done — bootstrap re-runs
+    # short-circuit on the .git check above and never need to re-auth.
+    unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+    rm -f "$CRED_FILE"
+
+  # 3. Run the bootstrap. SCENARIO/NAMESPACE/etc. come from /opt/gardenio/bootstrap-env.
+  - |
+    set -euxo pipefail
+    set -a; . /opt/gardenio/bootstrap-env; set +a
+    GVISOR_FLAG=--no-gvisor; [ "${GVISOR:-0}" = "1" ] && GVISOR_FLAG=--gvisor
+    HARDEN_FLAG=--no-harden; [ "${HARDEN:-0}" = "1" ] && HARDEN_FLAG=--harden
+    /opt/gardenio/repo/scripts/bootstrap-ec2.sh \
+      --scenario "${SCENARIO}" \
+      --namespace "${NAMESPACE}" \
+      --values "${VALUES_FILE}" \
+      --repo-dir /opt/gardenio/repo \
+      --offline-assets "${OFFLINE_ASSETS:-/opt/gardenio/tarboat}" \
+      ${K3S_VERSION:+--k3s-version "${K3S_VERSION}"} \
+      ${APP_VERSION:+--app-version "${APP_VERSION}"} \
+      ${SLACK_CHANNEL:+--slack-channel "${SLACK_CHANNEL}"} \
+      "${GVISOR_FLAG}" \
+      "${HARDEN_FLAG}" \
+      --operator-user "${OPERATOR_USER:-gardenio-op}" \
+      2>&1 | tee /var/log/gardenio-bootstrap.log

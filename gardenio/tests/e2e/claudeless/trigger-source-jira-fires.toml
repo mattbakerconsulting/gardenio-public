@@ -1,0 +1,159 @@
+# trigger-source-jira-fires.toml
+#
+# Claudeless scenario: a trigger:jira bead matches a JQL result → notify action
+# fires once → audit bead recorded with outcome=allow.
+#
+# Epic ka-0000004568 / task ka-0000003167:
+#   "claudeless coverage for jira source fire."
+#
+# The standalone `trigger-engine` binary registers only the webhook / schedule /
+# bead / multi / schedule-mirror sources — the JIRA source needs a live
+# JiraClient HTTP API, which that binary does not own. So this scenario drives
+# the source through the purpose-built `trigger-probe` test binary
+# (gardenio/controller/cmd/trigger-probe), which wires the REAL JiraTriggerSource
+# + REAL TriggerEngine + REAL beadsapi.Client (pointed at the in-test daemon)
+# against a stub JIRA HTTP server returning one canned matching issue. That
+# exercises the genuine evaluation→fireAction→recordTriggerAudit loop end-to-end
+# — the same code path jira-bridge runs in production.
+#
+# Steps:
+#   1. Create a trigger:jira bead (action=notify, JQL set) via `gb trigger create jira`.
+#   2. Run `trigger-probe --source=jira --trigger=<id>` against $BEADS_HTTP_URL.
+#      The probe seeds the engine's dedup set with a sentinel so the
+#      runtime-bootstrap guard is skipped (we want the seeded match to FIRE on
+#      the first pass, not be silently absorbed), then runs one EvaluateSource.
+#   3. Assert an audit bead (type=event, label=trigger:<id>, fields.outcome=allow,
+#      source=jira) exists.
+#
+# Skips gracefully when go / sources / daemon env are unavailable.
+
+[claude]
+session_id = "e2e00000-000a-4000-a000-000000000010"
+username = "e2e-trigger-jira-fires"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 60000
+
+[[responses]]
+on = "*"
+say = "Running trigger-source-jira-fires: JQL match → notify action observed."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-probe ─────────────────────
+PROBE_BIN=""
+if command -v trigger-probe >/dev/null 2>&1; then
+  PROBE_BIN=$(command -v trigger-probe)
+elif [ -x /usr/local/bin/trigger-probe ]; then
+  PROBE_BIN=/usr/local/bin/trigger-probe
+elif [ -x /tmp/trigger-probe ]; then
+  PROBE_BIN=/tmp/trigger-probe
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-probe from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-probe ./cmd/trigger-probe/ ) || {
+    echo "SKIP: trigger-probe build failed"; exit 0;
+  }
+  PROBE_BIN=/tmp/trigger-probe
+else
+  echo "SKIP: trigger-probe binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-probe: $PROBE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then echo "SKIP: BEADS_HTTP_URL not set"; exit 0; fi
+if [ -z "${BEADS_TOKEN:-}" ]; then echo "SKIP: BEADS_TOKEN not set"; exit 0; fi
+if ! command -v gb >/dev/null 2>&1; then echo "SKIP: gb not present"; exit 0; fi
+
+# ── Setup ──────────────────────────────────────────────────────────
+TAG="e2e-jira-$$-$(date +%s)"
+echo "tag: $TAG"
+
+TRIG_OUT=$(gb trigger create jira \
+  --http-url "$BEADS_HTTP_URL" \
+  --title "$TAG" \
+  --jql "project = PROBE AND status = Open" \
+  --action notify \
+  --prompt "jira {{jira_key}}: {{jira_summary}}" \
+  --label "e2e:claudeless" \
+  --label "e2e-tag:$TAG" \
+  --json 2>&1) || { fail "gb trigger create jira" "$TRIG_OUT"; exit 1; }
+
+TRIG_ID=$(echo "$TRIG_OUT" | jq -r '.id // .ID // empty')
+if [ -z "$TRIG_ID" ]; then fail "extract trigger id" "out=$TRIG_OUT"; exit 1; fi
+echo "trigger: $TRIG_ID"
+
+cleanup() {
+  gb trigger disable "$TRIG_ID" --http-url "$BEADS_HTTP_URL" >/dev/null 2>&1 || true
+  # Close audit beads produced by this trigger so they don't accumulate.
+  for bid in $(kd list --type=event -l "trigger:$TRIG_ID" --json 2>/dev/null | jq -r '.[].id'); do
+    kd close "$bid" >/dev/null 2>&1 || true
+  done
+  kd close "$TRIG_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ── Fire the source via the probe ──────────────────────────────────
+PROBE_LOG=/tmp/trigger-probe-jira-$$.log
+if ! "$PROBE_BIN" \
+    --source=jira \
+    --trigger="$TRIG_ID" \
+    --http-url="$BEADS_HTTP_URL" \
+    --token="$BEADS_TOKEN" \
+    --jira-key="PROBE-7" \
+    --jira-summary="probe issue $TAG" >"$PROBE_LOG" 2>&1; then
+  fail "trigger-probe exited non-zero"
+  echo "--- probe log ---"; cat "$PROBE_LOG"; echo "--- end ---"
+  exit 1
+fi
+pass "trigger-probe ran one jira EvaluateSource cycle"
+
+# ── Assert: audit bead recorded with outcome=allow ─────────────────
+DEADLINE=$(( $(date +%s) + 20 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  AUDIT=$(kd list --type=event -l "trigger:$TRIG_ID" --json 2>/dev/null | \
+    jq -c '[.[] | select(.fields.outcome=="allow" and .fields.source=="jira")][0] // empty' 2>/dev/null)
+  if [ -n "$AUDIT" ] && [ "$AUDIT" != "null" ]; then
+    FIRED=1
+    pass "jira audit bead recorded with outcome=allow"
+    echo "  audit: $(echo "$AUDIT" | jq -c '{id, title, fields: {source: .fields.source, action: .fields.action, outcome: .fields.outcome, match_key: .fields.match_key}}')"
+    # The match key for a jira fire is the issue key.
+    MK=$(echo "$AUDIT" | jq -r '.fields.match_key')
+    if [ "$MK" = "PROBE-7" ]; then
+      pass "audit match_key is the JIRA issue key (PROBE-7)"
+    else
+      fail "unexpected match_key" "got=$MK want=PROBE-7"
+    fi
+    break
+  fi
+  sleep 1
+done
+
+if [ "$FIRED" = "0" ]; then
+  fail "jira trigger fired within 20s"
+  echo "--- probe log ---"; cat "$PROBE_LOG"; echo "--- end ---"
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "trigger-source-jira-fires: JQL match → notify action observed OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "trigger-source-jira-fires scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

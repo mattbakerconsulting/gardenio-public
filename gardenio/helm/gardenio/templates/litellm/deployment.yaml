@@ -1,0 +1,850 @@
+{{- if .Values.litellm.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.litellm.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.litellm.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.litellm.autoscaling.enabled }}
+  # When the HPA is active (H5, epic ka-0000005228) the replica count is owned
+  # by the HorizontalPodAutoscaler (templates/litellm/hpa.yaml), so this field
+  # is omitted — rendering it would make every `helm upgrade` reset replicas
+  # back to replicaCount and fight the autoscaler on each apply. The HPA's
+  # minReplicas holds the floor (>=2) instead. The strategy conditional below
+  # still keys off replicaCount, which stays >=2 in every HA overlay.
+  replicas: {{ .Values.litellm.replicaCount | default 1 }}
+  {{- end }}
+  {{- if gt (int (.Values.litellm.replicaCount | default 1)) 1 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  {{- else }}
+  # Single-replica proxy: Recreate (terminate-then-create), NOT a RollingUpdate
+  # surge (ka-0000005233). maxSurge:1 briefly runs a SECOND litellm pod, which
+  # needs 2x capacity for the overlap. Every Karpenter nodepool is tainted and
+  # the untainted system-node pool has no headroom for the surge replica, so on
+  # a capacity-tight cluster the surge pod sits Pending (FailedScheduling:
+  # Insufficient cpu/memory; tolerates no autoscaling pool) and the atomic prod
+  # `terraform apply` helm --wait hangs to its 40m timeout — leaving a
+  # pending-upgrade helm rev that blocks the next release. A singleton gains no
+  # real availability from surge anyway (any node event already drops the sole
+  # replica), so Recreate is strictly safer here. Mirrors coopmux's conditional
+  # strategy. When litellm runs HA (replicaCount > 1, epic ka-0000005228 H2/H4)
+  # the RollingUpdate surge above is restored and the PDB keeps capacity.
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.litellm.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.litellm.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "gardenio.contentChecksum" (include (print $.Template.BasePath "/litellm/configmap.yaml") .) }}
+        {{- include "gardenio.doNotDisrupt" . | nindent 8 }}
+    spec:
+      # The proxy always rides its own ServiceAccount, which is rendered
+      # unconditionally whenever litellm is enabled (unconditional-sa decision
+      # ka-0000000992; templates/litellm/serviceaccount.yaml). Naming an
+      # always-present SA makes the prod SA-not-found / FailedCreate failure
+      # (ka-0000006740) structurally impossible — the referenced SA is
+      # guaranteed to exist.
+      serviceAccountName: {{ include "gardenio.litellm.serviceAccountName" . }}
+      {{- if include "gardenio.litellm.usesDedicatedSA" . }}
+      # IRSA strategy (ka-0000007591, Stage-3 ka-0000002573): the proxy must
+      # assume a Bedrock-capable role for the Titan embedding AND any Bedrock
+      # chat InvokeModel calls. The EKS pod-identity webhook keys off the SA's
+      # role-arn annotation and needs the projected web-identity token mounted,
+      # so automount is flipped on only under this strategy.
+      automountServiceAccountToken: true
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if and .Values.litellm.dbInit.enabled (or .Values.postgres.enabled .Values.postgresExternal.enabled) }}
+      initContainers:
+        # db-init: ensures the litellm database exists on the target postgres
+        # instance. Bypasses CREATE DATABASE when it already exists so the
+        # init is idempotent across redeploys. Targets the in-chart postgres
+        # by default, or the external RDS instance when postgresExternal is
+        # enabled — uses the same in-cluster password Secret the bundled
+        # beads daemon and litellm proxy read from. Postgres-external dbInit
+        # added under tier h2 (ka-0000005272) so the AWS POC overlay no
+        # longer needs an operator-side `CREATE DATABASE` step.
+        - name: db-init
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.postgres.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          command:
+            - sh
+            - -c
+            - |
+              # HARD GATE on the litellm DB existing before the main container
+              # starts: exit non-zero on any failure to create-or-confirm the
+              # database so kubelet restarts this initContainer and the main
+              # litellm container never runs against a missing DB.
+              #
+              # Previously this was a single best-effort `SELECT 1 ... || CREATE
+              # DATABASE` with no error check. A mid-init connectivity flap on
+              # the ephemeral postgres (ka-0000005559) let the CREATE DATABASE
+              # fail silently while the script still fell through to
+              # `echo "database ready"` and exited 0 — the litellm DB was never
+              # created, the proxy looped on Prisma P1003 ("Database `litellm`
+              # does not exist"), readiness never passed, and e2e-shard-1 hit
+              # its 20m wall (exit 137). The retry-and-verify loop below only
+              # exits 0 once the DB is confirmed present, so a transient flap is
+              # survived rather than swallowed.
+              set -eu
+              DB="{{ .Values.litellm.database | default "litellm" }}"
+              {{- $timeout := .Values.litellm.dbInit.statementTimeout | default "" | toString }}
+              {{- if and $timeout (not (regexMatch "^[0-9]+(us|ms|s|min|h)?$" $timeout)) }}
+              {{- fail (printf "litellm.dbInit.statementTimeout %q: want a Postgres duration like 20s or 20000ms, or empty" $timeout) }}
+              {{- end }}
+              STATEMENT_TIMEOUT="{{ $timeout }}"
+              i=0
+              while [ "$i" -lt 30 ]; do
+                i=$((i + 1))
+                if ! pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" >/dev/null 2>&1; then
+                  echo "[$i/30] waiting for postgres at $PGHOST:$PGPORT..."
+                  sleep 2
+                  continue
+                fi
+                # Create the DB if absent. A flap mid-create just retries.
+                if ! psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc \
+                    "SELECT 1 FROM pg_database WHERE datname = '$DB'" | grep -q 1; then
+                  echo "[$i/30] creating database $DB..."
+                  psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -c \
+                    "CREATE DATABASE \"$DB\"" || {
+                      echo "[$i/30] CREATE DATABASE failed (transient?), retrying..."
+                      sleep 2
+                      continue
+                    }
+                fi
+                # Confirm the DB is actually present before declaring success.
+                # This post-create verification is what the old script lacked —
+                # without it a failed CREATE went undetected.
+                if psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc \
+                    "SELECT 1 FROM pg_database WHERE datname = '$DB'" | grep -q 1; then
+                  # The chart owns the database's statement_timeout
+                  # (litellm.dbInit.statementTimeout, gd-oih6JxjJMM): Postgres
+                  # then cancels a runaway LiteLLM query (a full-table GET
+                  # /spend/tags scan) instead of running it to the end after
+                  # the HTTP caller hung up. Empty resets it. Best-effort: a
+                  # failure warns and never blocks LiteLLM from starting.
+                  if [ -n "$STATEMENT_TIMEOUT" ]; then
+                    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -c \
+                      "ALTER DATABASE \"$DB\" SET statement_timeout = '$STATEMENT_TIMEOUT'" \
+                      || echo "WARNING: could not set statement_timeout=$STATEMENT_TIMEOUT on $DB" >&2
+                  else
+                    psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -c \
+                      "ALTER DATABASE \"$DB\" RESET statement_timeout" \
+                      || echo "WARNING: could not reset statement_timeout on $DB" >&2
+                  fi
+                  echo "database $DB ready"
+                  exit 0
+                fi
+                echo "[$i/30] database $DB still absent after create attempt, retrying..."
+                sleep 2
+              done
+              echo "ERROR: database $DB not present after $i attempts" >&2
+              exit 1
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  {{- if .Values.postgres.enabled }}
+                  name: {{ .Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .) }}
+                  key: password
+                  {{- else }}
+                  name: {{ .Values.postgresExternal.passwordSecret.name }}
+                  key: {{ .Values.postgresExternal.passwordSecret.key | default "password" }}
+                  {{- end }}
+            {{- if .Values.postgres.enabled }}
+            - name: PGHOST
+              value: {{ include "gardenio.postgres.fullname" . | quote }}
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              value: "postgres"
+            {{- else }}
+            - name: PGHOST
+              value: {{ .Values.postgresExternal.host | quote }}
+            - name: PGPORT
+              value: {{ .Values.postgresExternal.port | default 5432 | quote }}
+            - name: PGUSER
+              value: {{ .Values.postgresExternal.username | quote }}
+            {{- end }}
+            {{- if .Values.postgresExternal.enabled }}
+            # Aurora/RDS endpoints require sslmode=require for the master user.
+            # Without this `psql` falls back to "prefer" which Aurora rejects.
+            - name: PGSSLMODE
+              value: {{ .Values.postgresExternal.sslmode | default "require" | quote }}
+            {{- end }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      {{- else }}
+      initContainers:
+      {{- end }}
+        # Seed an emptyDir with the upstream image's /app so the main container
+        # can mount it writable and run as non-root (65534) with a read-only
+        # root filesystem. The upstream ghcr.io/berriai/litellm image owns /app
+        # as root and Prisma writes schema + engine binaries there at startup;
+        # an emptyDir overlay at /app hides those contents, so we copy them in
+        # here before the main container starts. `cp -r` (not `-a`) intentionally
+        # drops source ownership so the copy inherits the 65534 uid of this
+        # process — making the overlay writable by the main container without
+        # needing a root chown step.
+        - name: seed-app
+          image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag | default "main-latest" }}"
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy | default "Always" }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              cp -r /app/. /mnt/app/
+          volumeMounts:
+            - name: app-overlay
+              mountPath: /mnt/app
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+        # Seed an emptyDir with the upstream image's bundled Prisma migrations
+        # so the main container can mount it writable at the site-packages
+        # migrations path. litellm_proxy_extras._resolve_all_migrations runs a
+        # post-migrate sanity check that writes a `<timestamp>_baseline_diff`
+        # subdirectory alongside the shipped migrations; that path is on the
+        # read-only rootfs, so without this overlay the container CrashLoops
+        # after the first prisma migrate deploy. Copy strategy matches seed-app:
+        # `cp -r` (not `-a`) drops source ownership so the overlay is writable
+        # by uid 65534 without a root chown step.
+        - name: seed-migrations
+          image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag | default "main-latest" }}"
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy | default "Always" }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              src=$(python3 -c 'import litellm_proxy_extras, os; print(os.path.join(os.path.dirname(litellm_proxy_extras.__file__), "migrations"))')
+              cp -r "$src"/. /mnt/migrations/
+          volumeMounts:
+            - name: migrations-overlay
+              mountPath: /mnt/migrations
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+        # Copy the Prisma query engine binary into an emptyDir readable by uid
+        # 65534, so the main container can run non-root with a read-only rootfs.
+        #
+        # UPSTREAM MOVED THIS PATH — the lookup below deliberately probes BOTH
+        # layouts, so the chart boots on either tag and a rollback stays safe:
+        #
+        #   <= v1.84.8: the image did `COPY --from=builder /root/.cache
+        #     /root/.cache`, baking BINARY_PATHS at
+        #     /root/.cache/prisma-python/binaries/<ver>/<hash>/node_modules/
+        #     prisma/query-engine-debian-openssl-3.0.x. /root is mode 0700, so
+        #     uid 65534 could not traverse in: prisma.client.connect() raised
+        #     PermissionError before the DB ever opened, surfacing as
+        #     NotConnectedError at proxy startup. That is why this copy exists.
+        #   >= v1.95.0: upstream fixed exactly that problem (#33650, #24554) by
+        #     staging the CLI + engines at /opt/prisma with `chmod -R a+rX`,
+        #     dropping the /root/.cache copy entirely. Verified live on the
+        #     v1.95.0 image (ka-0000005360): the old glob matches NOTHING, so
+        #     the `set -eu` guard below would abort and the pod would never
+        #     start; /opt/prisma/binaries/node_modules/prisma/ holds the engine
+        #     and IS traversable as uid 65534.
+        #
+        # This initContainer runs as root (overriding the pod-level
+        # runAsNonRoot) solely to read the 0700 /root/.cache on the older
+        # layout; it is a harmless no-op privilege on the newer one. The copy
+        # lands in /mnt/prisma-engine, mounted writable here and read-only at
+        # /tmp/prisma-engine in the main container, which then sets
+        # PRISMA_QUERY_ENGINE_BINARY to it and short-circuits prisma-python's
+        # BINARY_PATHS resolution on both layouts.
+        - name: seed-prisma-engine
+          image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag | default "main-latest" }}"
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy | default "Always" }}
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              # Probe the >= v1.95.0 layout first, then the <= v1.84.8 one.
+              # `ls` is guarded with || true so a non-matching glob does not
+              # trip `set -e` before the other candidate is tried.
+              src=$(ls /opt/prisma/binaries/node_modules/prisma/query-engine-debian-openssl-3.0.x 2>/dev/null | head -n1 || true)
+              if [ -z "$src" ]; then
+                src=$(ls /root/.cache/prisma-python/binaries/*/*/node_modules/prisma/query-engine-debian-openssl-3.0.x 2>/dev/null | head -n1 || true)
+              fi
+              if [ -z "$src" ]; then
+                echo "ERROR: prisma query engine binary not found under /opt/prisma/binaries/ (>= v1.95.0) or /root/.cache/prisma-python/binaries/ (<= v1.84.8)" >&2
+                exit 1
+              fi
+              echo "using prisma query engine: $src"
+              cp "$src" /mnt/prisma-engine/query-engine-debian-openssl-3.0.x
+              chmod 0755 /mnt/prisma-engine/query-engine-debian-openssl-3.0.x
+          volumeMounts:
+            - name: prisma-engine
+              mountPath: /mnt/prisma-engine
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+        {{- if .Values.litellm.jemalloc.enabled }}
+        # Allocator swap — the DURABLE fix for the litellm OOM (ka-0000003951;
+        # RCA ka-0000000169). The upstream ghcr.io/berriai/litellm image does
+        # NOT ship libjemalloc, and an LD_PRELOAD to a missing .so is a SILENT
+        # no-op (linker warns, falls back to glibc malloc) — so we must stage
+        # the real library. This initContainer `apk fetch`es the libjemalloc2
+        # package from the image's baked-in Chainguard/Wolfi apk repo (verified
+        # reachable as uid 65534 in-pod) and extracts libjemalloc.so.2 into a
+        # shared emptyDir the main container mounts read-only and LD_PRELOADs.
+        # Mirrors the seed-prisma-engine copy-into-emptyDir pattern; runs as the
+        # same non-root uid under a read-only rootfs, writing only into the
+        # mounted volume (HOME + apk cache are redirected there).
+        - name: stage-jemalloc
+          image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag | default "main-latest" }}"
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy | default "Always" }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              DEST=/mnt/jemalloc
+              # apk + tar need a writable HOME/cache; the only writable path is
+              # the mounted emptyDir, so anchor everything there.
+              export HOME="$DEST"
+              PKG="{{ .Values.litellm.jemalloc.package | default "libjemalloc2" }}"
+              # Fetch the .apk (no root, no install into the read-only rootfs).
+              apk fetch --no-cache "$PKG" -o "$DEST"
+              APK="$(ls "$DEST"/"$PKG"-*.apk | head -n1)"
+              if [ -z "$APK" ]; then
+                echo "ERROR: $PKG apk not fetched into $DEST" >&2
+                exit 1
+              fi
+              # Extract just the shared object; an .apk is a gzip tar.
+              tar -xzf "$APK" -C "$DEST" usr/lib/libjemalloc.so.2
+              cp "$DEST/usr/lib/libjemalloc.so.2" "$DEST/libjemalloc.so.2"
+              chmod 0755 "$DEST/libjemalloc.so.2"
+              # Tidy the scratch so only the .so remains on the mount.
+              rm -rf "$DEST/usr" "$DEST"/*.apk "$DEST/.cache" 2>/dev/null || true
+              # Fail loud if the linker could not resolve the staged lib.
+              if [ ! -s "$DEST/libjemalloc.so.2" ]; then
+                echo "ERROR: staged libjemalloc.so.2 is missing/empty" >&2
+                exit 1
+              fi
+              echo "staged libjemalloc.so.2 ($(wc -c < "$DEST/libjemalloc.so.2") bytes)"
+          volumeMounts:
+            - name: jemalloc
+              mountPath: /mnt/jemalloc
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+        {{- end }}
+        {{- if .Values.litellm.thinkingCapture.enabled }}
+        # Thinking-capture telepathy producer (ka-0000002697). The upstream
+        # litellm image does not ship nats-py; pip-install it into an emptyDir
+        # (`callback-deps`) that the main container mounts on PYTHONPATH. The
+        # callback module itself rides in via the `callback-src` configMap.
+        #
+        # litellm >= v1.84 ships as a uv-managed venv (/app/.venv) with NO `pip`
+        # on PATH and no `pip` module installed in the venv (`python -m pip` →
+        # "No module named pip"). `python -m ensurepip` also fails here because it
+        # tries to write pip into the venv on the read-only rootfs. So we invoke
+        # pip straight from the interpreter's BUNDLED wheel via PYTHONPATH — no
+        # install-into-venv step, works read-only as uid 65534 (ka-0000004508).
+        - name: install-callback-deps
+          image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag | default "main-latest" }}"
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy | default "Always" }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              PIP_WHEEL="$(ls /usr/share/python-wheels/pip-*.whl 2>/dev/null | head -1)"
+              if [ -n "$PIP_WHEEL" ] && ! python -m pip --version >/dev/null 2>&1; then
+                # uv venv (litellm >= v1.84): run pip from the bundled wheel.
+                PY="PYTHONPATH=$PIP_WHEEL python -m pip"
+              else
+                # legacy image with pip on the venv (litellm <= v1.82).
+                PY="python -m pip"
+              fi
+              eval "$PY install --no-cache-dir --target=/mnt/callback-deps \
+                \"nats-py=={{ .Values.litellm.thinkingCapture.natsPyVersion }}\""
+          env:
+            - name: HOME
+              value: /tmp
+            - name: PIP_CACHE_DIR
+              value: /tmp/pip-cache
+          volumeMounts:
+            - name: callback-deps
+              mountPath: /mnt/callback-deps
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+        {{- end }}
+      containers:
+        - name: litellm
+          image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag | default "main-latest" }}"
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy | default "Always" }}
+          securityContext:
+            # Re-hardened to non-root + read-only rootfs (ka-0000005619),
+            # closing out the ka-0000001032 follow-up. The emergency revert
+            # to runAsUser:0 (MR !1265) was only ever a stopgap to unblock
+            # the release train while a Wolfi/Debian Prisma engine fix was
+            # designed. That fix is the seed-prisma-engine initContainer +
+            # PRISMA_BINARY_PLATFORM / PRISMA_QUERY_ENGINE_BINARY env vars
+            # (MR !1264), which copy the baked query engine out of the
+            # 0700 /root cache into a uid-65534-readable /tmp overlay so the
+            # non-root main container can reach it. Verified on the RWX-era
+            # staging env (non-prod): this hardened config reaches 1/1 Ready, 0 restarts,
+            # /health/readiness 200 (which exercises the Prisma DB-query path
+            # that previously raised NotConnectedError) — no PermissionError,
+            # no NotConnectedError. Matches the pod-level securityContext and
+            # the seed-app / seed-migrations init containers.
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          args:
+            - "--config"
+            - "/app/config.yaml"
+            - "--port"
+            - "{{ .Values.litellm.port | default 4000 }}"
+            {{- if .Values.litellm.detailedDebug }}
+            - "--detailed_debug"
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.litellm.port | default 4000 }}
+              protocol: TCP
+          env:
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.litellm.masterKeySecretName" . }}
+                  key: token
+            {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.litellm.saltKey.remoteRef }}
+            # Salt-key encrypts virtual-key material at rest in the litellm DB.
+            # Materialized by templates/litellm/external-secret.yaml from the
+            # same K8s Secret that carries master-key (tier h1, ka-0000001624).
+            - name: LITELLM_SALT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.litellm.masterKeySecretName" . }}
+                  key: salt-key
+            {{- end }}
+            {{- if .Values.postgres.enabled }}
+            - name: LITELLM_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .) }}
+                  key: {{ if .Values.externalSecrets.enabled }}password_url{{ else }}password{{ end }}
+            - name: DATABASE_URL
+              value: {{ include "gardenio.litellm.databaseURL" . }}
+            - name: STORE_MODEL_IN_DB
+              value: "True"
+            {{- else if .Values.postgresExternal.enabled }}
+            # External postgres (e.g. AWS RDS) — password sourced from the
+            # in-cluster Secret the chart's postgresExternal block points at
+            # (rendered by the operator overlay, typically materialized by an
+            # ExternalSecret from the RDS-managed master secret).
+            # LITELLM_DATABASE_PASSWORD is substituted into DATABASE_URL
+            # (postgresql://user:$(LITELLM_DATABASE_PASSWORD)@host/db), so it
+            # needs the URL-encoded copy (urlKey, falling back to key). The
+            # db-init PGPASSWORD above keeps the literal key. ka-0000005248.
+            - name: LITELLM_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgresExternal.passwordSecret.name }}
+                  key: {{ include "gardenio.beads.postgresExternal.passwordSecretURLKey" . }}
+            - name: DATABASE_URL
+              value: {{ include "gardenio.litellm.databaseURL" . }}
+            - name: STORE_MODEL_IN_DB
+              value: "True"
+            {{- end }}
+            # HOME must point to a writable directory under readOnlyRootFilesystem.
+            # /tmp is a tmpfs-backed emptyDir and avoids the need for individual
+            # mounts for ~/.cache, ~/.npm, ~/.local, etc. The Prisma/npm cache
+            # redirects keep engine binaries off the /app overlay.
+            - name: HOME
+              value: /tmp
+            - name: PRISMA_BINARY_CACHE_DIR
+              value: /tmp/prisma-cache
+            - name: NPM_CONFIG_CACHE
+              value: /tmp/npm-cache
+            # litellm_proxy_extras copies its entire prisma package (schema,
+            # generated client, migrations) to this directory at startup and
+            # uses it as the working dir for all Prisma operations. Without it
+            # the library tries to regenerate the client in-place under
+            # site-packages (read-only), which leaves the Prisma query engine
+            # unstarted and startup fails with NotConnectedError. Upstream
+            # refs: BerriAI/litellm#13369 / #13383.
+            - name: LITELLM_MIGRATION_DIR
+              value: /tmp/litellm-migrations
+            # prisma-python's generated client bakes BINARY_PATHS into
+            # site-packages/prisma/client.py at image build time, pointing at
+            # /root/.cache/prisma-python/binaries/<ver>/<hash>/. /root is
+            # 0700 in the upstream image, so uid 65534 cannot reach the
+            # engine binary. The seed-prisma-engine initContainer copies it
+            # into /tmp/prisma-engine (readable, executable).
+            #
+            # BOTH env vars are required:
+            #   PRISMA_BINARY_PLATFORM pins the target so
+            #   _resolve_from_binary_paths returns a single Path without
+            #   calling .exists() on the other (unreachable) /root/ paths —
+            #   which would raise PermissionError and abort ensure().
+            #   PRISMA_QUERY_ENGINE_BINARY then takes precedence in
+            #   prisma.engine.utils.ensure() and points at the copy.
+            - name: PRISMA_BINARY_PLATFORM
+              value: debian-openssl-3.0.x
+            - name: PRISMA_QUERY_ENGINE_BINARY
+              value: /tmp/prisma-engine/query-engine-debian-openssl-3.0.x
+            {{- if .Values.litellm.thinkingCapture.enabled }}
+            # Thinking-capture telepathy producer (ka-0000002697). The callback
+            # MODULE is resolved by litellm's get_instance_fn as a file path
+            # relative to the --config dir (/app), NOT via PYTHONPATH — so it is
+            # mounted directly at /app/litellm_thinking_callback.py (see the
+            # callback-src subPath volumeMount below; bug ka-0000004812).
+            # PYTHONPATH only needs to carry the pip-installed nats-py target,
+            # which the callback imports at module load.
+            - name: PYTHONPATH
+              value: /app/callback-deps
+            - name: COOP_NATS_URL
+              value: {{ .Values.litellm.thinkingCapture.natsURL | default (include "gardenio.natsURL" .) | quote }}
+            - name: COOP_NATS_PREFIX
+              value: {{ .Values.litellm.thinkingCapture.natsPrefix | quote }}
+            {{- if .Values.litellm.thinkingCapture.natsTokenSecret }}
+            - name: COOP_NATS_TOKEN_FILE
+              value: /etc/coop-nats/token
+            {{- end }}
+            {{- end }}
+            {{- if .Values.litellm.cacheTTL.enabled }}
+            # 1h prompt-cache TTL upgrade (ka-0000003469 / ka-0000004405). The
+            # litellm_cache_ttl_callback reads this to decide the ttl stamped on
+            # ephemeral cache breakpoints ("1h" upgrades; "5m" is an in-place
+            # kill switch). Module mounted at /app/litellm_cache_ttl_callback.py
+            # (callback-src subPath below).
+            - name: LITELLM_CACHE_TTL
+              value: {{ .Values.litellm.cacheTTL.ttl | quote }}
+            {{- end }}
+            {{- if and .Values.litellm.redis.enabled .Values.litellm.redis.passwordSecret }}
+            # Redis AUTH for multi-replica router coordination (H4,
+            # ka-0000003463). The Router reads this via `redis_password:
+            # os.environ/LITELLM_REDIS_PASSWORD` (configmap.yaml), so the token
+            # stays out of the rendered ConfigMap. Sourced from
+            # litellm.redis.passwordSecret (managed endpoints supply auth; the
+            # in-chart Redis runs auth-less behind NetworkPolicy).
+            - name: LITELLM_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litellm.redis.passwordSecret }}
+                  key: {{ .Values.litellm.redis.passwordKey | default "password" }}
+            {{- end }}
+            {{- if and (include "gardenio.litellm.needsBedrockCreds" .) .Values.litellm.embedding.staticCredsSecret }}
+            # Static-credential strategy (ka-0000007591, Stage-3 ka-0000002573):
+            # AWS keys for the Bedrock Titan embedding AND any Bedrock chat
+            # InvokeModel calls, sourced from a K8s Secret (typically ESO-synced
+            # from AWS SM) for accounts without an IRSA trust path. Consumed by
+            # the AWS SDK default credential chain.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litellm.embedding.staticCredsSecret }}
+                  key: {{ .Values.litellm.embedding.accessKeyIdKey | default "AWS_ACCESS_KEY_ID" }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litellm.embedding.staticCredsSecret }}
+                  key: {{ .Values.litellm.embedding.secretAccessKeyKey | default "AWS_SECRET_ACCESS_KEY" }}
+            {{- if .Values.litellm.embedding.sessionTokenKey }}
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litellm.embedding.staticCredsSecret }}
+                  key: {{ .Values.litellm.embedding.sessionTokenKey }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.litellm.jemalloc.enabled }}
+            # Allocator swap (ka-0000003951 / RCA ka-0000000169). LD_PRELOAD the
+            # libjemalloc.so.2 staged by the stage-jemalloc initContainer into
+            # the shared emptyDir (mounted read-only at jemalloc.mountPath).
+            # jemalloc returns freed pages to the OS aggressively, curing the
+            # glibc main-arena high-water-mark retention that OOMKilled the pod.
+            - name: LD_PRELOAD
+              value: "{{ .Values.litellm.jemalloc.mountPath | default "/opt/jemalloc" }}/libjemalloc.so.2"
+            {{- if .Values.litellm.jemalloc.arenaMax }}
+            # Belt-and-suspenders: cap glibc malloc arenas so that if LD_PRELOAD
+            # ever fails to load, arena sprawl/fragmentation is still reined in.
+            # jemalloc ignores this glibc tunable, so it is inert under the swap.
+            - name: MALLOC_ARENA_MAX
+              value: {{ .Values.litellm.jemalloc.arenaMax | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.litellm.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: app-overlay
+              mountPath: /app
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            # Writable overlay for the Prisma migrations dir under site-packages.
+            # Python minor version is pinned to match the upstream litellm image;
+            # bump here if the image moves to a newer interpreter.
+            - name: migrations-overlay
+              mountPath: /usr/lib/python3.13/site-packages/litellm_proxy_extras/migrations
+            - name: prisma-engine
+              mountPath: /tmp/prisma-engine
+              readOnly: true
+            {{- if .Values.litellm.jemalloc.enabled }}
+            # Read-only mount of the staged libjemalloc.so.2 (ka-0000003951).
+            # LD_PRELOAD above points at <mountPath>/libjemalloc.so.2.
+            - name: jemalloc
+              mountPath: {{ .Values.litellm.jemalloc.mountPath | default "/opt/jemalloc" | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.litellm.thinkingCapture.enabled }}
+            # litellm's custom-callback loader (get_instance_fn) resolves the
+            # bare module name "litellm_thinking_callback" as a file path under
+            # the --config dir (/app), so the module file must live at
+            # /app/litellm_thinking_callback.py exactly. subPath mounts the
+            # single key from the callback-src configMap as that file without
+            # shadowing the rest of the /app overlay (bug ka-0000004812).
+            - name: callback-src
+              mountPath: /app/litellm_thinking_callback.py
+              subPath: litellm_thinking_callback.py
+              readOnly: true
+            - name: callback-deps
+              mountPath: /app/callback-deps
+              readOnly: true
+            {{- if .Values.litellm.thinkingCapture.natsTokenSecret }}
+            - name: coop-nats-token
+              mountPath: /etc/coop-nats
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- if .Values.litellm.cacheTTL.enabled }}
+            # 1h prompt-cache TTL callback (ka-0000003469 / ka-0000004405).
+            # Same subPath pattern as the thinking callback: the module must live
+            # at /app/litellm_cache_ttl_callback.py exactly for get_instance_fn
+            # to resolve "litellm_cache_ttl_callback.instance". Pure stdlib, so
+            # no callback-deps PYTHONPATH entry is needed.
+            - name: callback-src
+              mountPath: /app/litellm_cache_ttl_callback.py
+              subPath: litellm_cache_ttl_callback.py
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.litellm.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "gardenio.litellm.fullname" . }}-config
+        - name: tmp
+          emptyDir: {}
+        - name: app-overlay
+          emptyDir: {}
+        - name: migrations-overlay
+          emptyDir: {}
+        - name: prisma-engine
+          emptyDir: {}
+        {{- if .Values.litellm.jemalloc.enabled }}
+        # Shared scratch for the staged libjemalloc.so.2 (ka-0000003951). The
+        # stage-jemalloc initContainer writes it; the main container mounts it
+        # read-only and LD_PRELOADs it.
+        - name: jemalloc
+          emptyDir: {}
+        {{- end }}
+        {{- if or .Values.litellm.thinkingCapture.enabled .Values.litellm.cacheTTL.enabled }}
+        # Shared callback source configMap — carries whichever callback modules
+        # are enabled (thinking-capture and/or cache-ttl). Each is subPath-mounted
+        # into /app individually (see volumeMounts above).
+        - name: callback-src
+          configMap:
+            name: {{ include "gardenio.litellm.fullname" . }}-callback
+        {{- end }}
+        {{- if .Values.litellm.thinkingCapture.enabled }}
+        - name: callback-deps
+          emptyDir: {}
+        {{- if .Values.litellm.thinkingCapture.natsTokenSecret }}
+        - name: coop-nats-token
+          secret:
+            secretName: {{ .Values.litellm.thinkingCapture.natsTokenSecret }}
+        {{- end }}
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.litellm.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- /*
+        HA spread (ka-0000007221 / epic ka-0000005228 H2). Only rendered at
+        replicaCount > 1, so a single-replica deploy stays byte-identical: a
+        spread constraint or anti-affinity term over ONE pod is inert noise, and
+        with whenUnsatisfiable:DoNotSchedule it would be an outright scheduling
+        hazard the moment the topology has a single eligible node.
+        WHY THIS MATTERS: two replicas pinned to the same node buy nothing — the
+        node dying still takes the whole LLM data-plane with it, which is the
+        SPOF this epic exists to remove. Spread across nodes first, then AZs.
+        ScheduleAnyway (soft), NOT DoNotSchedule: litellm has no tolerations, so
+        it is confined to the untainted `infra` managed nodegroup, and a hard
+        constraint there would leave the second replica Pending forever if the
+        pool is momentarily tight — the exact class of failure that produced the
+        40m `helm --wait` hang in ka-0000005233. Availability must degrade to
+        "both on one node" rather than to "one replica".
+      */}}
+      {{- if gt (int (.Values.litellm.replicaCount | default 1)) 1 }}
+      {{- with .Values.litellm.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew | default 1 }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable | default "ScheduleAnyway" }}
+          labelSelector:
+            matchLabels:
+              {{- include "gardenio.litellm.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- /* Explicit affinity always wins outright. Otherwise, litellm.nodeAffinity
+             (e.g. a soft lifecycle=spot preference, gd-cTobdw0kAL) layers onto the
+             default soft pod anti-affinity at replicas>1 rather than replacing it —
+             the two express independent concerns (which nodes vs. spreading across
+             them) and neither should silently suppress the other. */}}
+      {{- if .Values.litellm.affinity }}
+      affinity:
+        {{- toYaml .Values.litellm.affinity | nindent 8 }}
+      {{- else if or .Values.litellm.nodeAffinity (and (gt (int (.Values.litellm.replicaCount | default 1)) 1) .Values.litellm.podAntiAffinity.enabled) }}
+      affinity:
+        {{- with .Values.litellm.nodeAffinity }}
+        nodeAffinity:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- if and (gt (int (.Values.litellm.replicaCount | default 1)) 1) .Values.litellm.podAntiAffinity.enabled }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: {{ .Values.litellm.podAntiAffinity.weight | default 100 }}
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "gardenio.litellm.selectorLabels" . | nindent 20 }}
+        {{- end }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.litellm.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- /* Same class as the interactive (thread/dm/gardener) agent pods the
+      controller stamps: agents depend on this pod, so they must not be able
+      to preempt it (gd-cTobdw0kAL). */}}
+      {{- if .Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ .Values.global.systemPriorityClass.name }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,106 @@
+{{template "layout" .}}
+{{define "title"}}Pool · Beads Viewer{{end}}
+{{define "content"}}
+{{- $pool := .Pool -}}
+{{- $base := .BasePath -}}
+<span class="wide-page" hidden></span>
+
+<nav class="crumbs" aria-label="Breadcrumb">
+  <a href="{{$base}}/agents">Agents</a> &rsaquo; <span>Pool</span>
+</nav>
+
+{{/* Prewarmed-pool view at /pool (epic ka-0000007327, task ka-0000001128).
+     Prewarmed members are filtered out of /agents (ka-0000005111) so warm-
+     standby pods do not clutter the fleet; this page gives that data a home:
+     one row per (project, role) pool joining the configured prewarmed_pool
+     sizing against the live pool-member agent beads. */}}
+<h1>Prewarmed pool</h1>
+<p>Warm-standby pods the pool manager holds per <a href="{{$base}}/agents">project</a> and
+   <a href="{{$base}}/roles">role</a>, kept out of the fleet view so idle standby rows
+   don't clutter <a href="{{$base}}/agents">/agents</a>. Configured target sizes come from
+   each project's <code>prewarmed_pool</code>; live occupancy comes from the
+   <code>prewarmed-</code> member beads.</p>
+
+{{if $pool.Error}}
+<div class="banner banner-error">{{$pool.Error}}</div>
+{{else}}
+
+<div class="project-header-band" aria-label="Pool summary">
+  <span class="band-group">
+    <span class="band-label">Pools</span>
+    <span class="band-count">{{$pool.ConfiguredPools}}</span>
+  </span>
+  <span class="band-sep"></span>
+  <span class="band-group">
+    <span class="band-label" title="Warm members holding standby pod capacity, ready to hand to a cold spawn.">Warm</span>
+    <span class="band-count">{{$pool.TotalWarm}}</span>
+  </span>
+  <span class="band-group">
+    <span class="band-label" title="Members assigned off the pool onto real work — live hits in flight.">Engaged</span>
+    <span class="band-count">{{$pool.TotalEngaged}}</span>
+  </span>
+  <span class="band-sep"></span>
+  <span class="band-group">
+    <span class="band-label" title="Configured pools whose warm capacity is below their min target — starved or mid-refill.">Starved</span>
+    <span class="band-count{{if gt $pool.StarvedPools 0}} badge-warn{{end}}">{{$pool.StarvedPools}}</span>
+  </span>
+  <span class="band-group">
+    <span class="band-label" title="Live members carrying a (project,role) no prewarmed_pool config declares — undeclared drift.">Drift</span>
+    <span class="band-count{{if gt $pool.DriftPools 0}} badge-warn{{end}}">{{$pool.DriftPools}}</span>
+  </span>
+</div>
+
+{{if $pool.Rows}}
+<div class="pool-table-wrap">
+<table class="pool-table">
+  <thead>
+    <tr>
+      <th scope="col">Project</th>
+      <th scope="col">Role</th>
+      <th scope="col" class="pool-num" title="Configured target range (min–max) from prewarmed_pool.">Target</th>
+      <th scope="col" class="pool-num" title="Current occupancy = warm + engaged members.">Current</th>
+      <th scope="col" class="pool-num" title="Warm members holding standby pod capacity.">Warm</th>
+      <th scope="col" class="pool-num" title="Members assigned off the pool onto real work.">Engaged</th>
+      <th scope="col" class="pool-num" title="Age of warm members (oldest / newest).">Warm&nbsp;age</th>
+      <th scope="col" class="pool-num" title="Last {{$pool.RecentWindowLabel}}: members served (hits) vs closed unengaged (expired).">Hits&nbsp;/&nbsp;exp&nbsp;({{$pool.RecentWindowLabel}})</th>
+      <th scope="col">Health</th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range $pool.Rows}}
+    <tr class="{{if .NeedsAttention}}pool-row-attention{{end}}">
+      <td><a href="{{$base}}/agents?project={{.Project}}">{{.Project}}</a></td>
+      <td><a href="{{$base}}/role/{{.Role}}">{{.Role}}</a>{{if .Mode}} <span class="pool-mode" title="pool spawn mode">{{.Mode}}</span>{{end}}</td>
+      <td class="pool-num">
+        {{if .Configured}}<span class="pool-target">{{.MinSize}}–{{.MaxSize}}</span>{{else}}<span class="pool-muted" title="no prewarmed_pool config declares this pool">—</span>{{end}}
+      </td>
+      <td class="pool-num">{{.Current}}</td>
+      <td class="pool-num{{if .BelowMin}} pool-cell-warn{{end}}">{{.Warm}}</td>
+      <td class="pool-num">{{.Engaged}}</td>
+      <td class="pool-num">
+        {{if .OldestWarmAge}}<span title="oldest warm member">{{.OldestWarmAge}}</span>{{if ne .OldestWarmAge .NewestWarmAge}} <span class="pool-muted" title="newest warm member">/ {{.NewestWarmAge}}</span>{{end}}{{else}}<span class="pool-muted">—</span>{{end}}
+      </td>
+      <td class="pool-num">
+        <span title="members the pool served (engaged before close)">{{.RecentHits}}</span>
+        <span class="pool-muted">/</span>
+        <span class="{{if gt .RecentExpired 0}}pool-cell-warn{{end}}" title="members closed still unengaged (pruned/evicted before use)">{{.RecentExpired}}</span>
+      </td>
+      <td>
+        {{if .Drift}}<span class="pool-badge pool-badge-drift" title="Live members with no prewarmed_pool config — undeclared pool.">drift</span>
+        {{else}}
+          {{if .BelowMin}}<span class="pool-badge pool-badge-warn" title="Warm capacity below min target — starved or mid-refill.">below&nbsp;min</span>{{end}}
+          {{if .OverMax}}<span class="pool-badge pool-badge-warn" title="Current occupancy exceeds max target.">over&nbsp;max</span>{{end}}
+          {{if not .NeedsAttention}}<span class="pool-badge pool-badge-ok" title="Warm capacity within configured range.">ok</span>{{end}}
+        {{end}}
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+</div>
+{{else}}
+<p class="empty">No prewarmed pools configured and no pool members live.</p>
+{{end}}
+
+{{end}}
+{{end}}

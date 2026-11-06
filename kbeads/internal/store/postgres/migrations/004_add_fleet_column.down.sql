@@ -1,0 +1,17 @@
+DROP INDEX IF EXISTS idx_configs_fleet;
+ALTER TABLE configs DROP COLUMN IF EXISTS fleet;
+
+DROP INDEX IF EXISTS idx_events_fleet;
+ALTER TABLE events DROP COLUMN IF EXISTS fleet;
+
+DROP INDEX IF EXISTS idx_comments_fleet;
+ALTER TABLE comments DROP COLUMN IF EXISTS fleet;
+
+DROP INDEX IF EXISTS idx_deps_fleet;
+ALTER TABLE deps DROP COLUMN IF EXISTS fleet;
+
+DROP INDEX IF EXISTS idx_labels_fleet;
+ALTER TABLE labels DROP COLUMN IF EXISTS fleet;
+
+DROP INDEX IF EXISTS idx_beads_fleet_status_type;
+ALTER TABLE beads DROP COLUMN IF EXISTS fleet;

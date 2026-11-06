@@ -1,0 +1,98 @@
+{
+  "description": "Start a local agent on this machine for a project: sign in, check the setup, pick a role, gb agent start --local, and confirm it is on the roster. The manual form is the Join as a local agent section of .claude/skills/gardenio/SKILL.md.",
+  "phase": "liquid",
+  "vars": [
+    {
+      "name": "project",
+      "required": true,
+      "description": "Project the agent works on (the type:project bead name)"
+    },
+    {
+      "name": "role",
+      "default": "local",
+      "description": "Role the agent runs as. `local` is the role built for laptops; until it lands (gd-SzPJDNTBXS), `crew` stands in"
+    }
+  ],
+  "steps": [
+    {
+      "id": "sign-in",
+      "title": "Sign in to the gardenio daemon on this machine",
+      "short_title": "sign in with gb login",
+      "type": "task",
+      "gate": {
+        "type": "manual",
+        "timeout": "24h"
+      },
+      "description": "Human step: only the person can do this.\n\n1. Export the daemon and the person the writes are attributed to:\n   ```sh\n   export BEADS_HTTP_URL=<daemon URL>\n   export BEADS_OPERATED_BY=oidc:<your email>\n   ```\n2. Run `gb login` (or `kd login`; it is the same Keycloak device code). Open the printed link in your own browser and sign in. kd and gb then send your token and refresh it themselves. A deployment that uses a static bearer instead takes `GARDENIO_TOKEN`; never paste it into a bead.\n\nA local agent acts as its owner, with the owner's permissions and no more. Close this step once `gb prime` names you."
+    },
+    {
+      "id": "doctor",
+      "title": "Check this machine can run a local agent for {{project}}",
+      "short_title": "check the machine",
+      "type": "task",
+      "needs": [
+        "sign-in"
+      ],
+      "description": "Run from the repo root:\n\n```sh\nkd --version; gb --version      # both present, same calver\ngb ping                        # nonzero exit = daemon unreachable\ngb prime                       # names the person\ngb agent roster                # is a local agent already registered?\ngit rev-parse --show-toplevel  # inside the repo\ncommand -v claude coop         # both needed to run a session\n```\n\nFix anything broken with the Doctor section of the gardenio skill before closing this step."
+    },
+    {
+      "id": "list-roles",
+      "title": "List the roles a local agent can run as",
+      "short_title": "list roles",
+      "type": "task",
+      "needs": [
+        "sign-in"
+      ],
+      "description": "```sh\ngb role list\n```\n\nComment the list on the pick-role step. If a `local` role is listed, it is the one built for laptops. If it is not, `crew` stands in until the local role lands (gd-SzPJDNTBXS). A role sets the model and the agent's instructions; it does not widen or narrow its permissions, which come from the owner."
+    },
+    {
+      "id": "pick-role",
+      "title": "Pick the role for the {{project}} local agent",
+      "short_title": "pick the agent's role",
+      "gate": {
+        "type": "decision",
+        "prompt": "Which role should this local agent run as?",
+        "options": [
+          {
+            "id": "local",
+            "label": "local (built for laptops, when it is listed)"
+          },
+          {
+            "id": "crew",
+            "label": "crew (the stand-in until the local role lands)"
+          },
+          {
+            "id": "other",
+            "label": "Another listed role (name it in the answer)"
+          }
+        ],
+        "timeout": "72h"
+      },
+      "needs": [
+        "list-roles"
+      ],
+      "description": "Decision for the person. The formula was poured with `--var role={{role}}`. If the answer differs, use that role in the start step."
+    },
+    {
+      "id": "start",
+      "title": "Start the {{project}} local agent as {{role}}",
+      "short_title": "start the local agent",
+      "type": "task",
+      "needs": [
+        "doctor",
+        "pick-role"
+      ],
+      "description": "From the repo root, in a terminal you keep open (the agent runs attached; ctrl-C stops it):\n\n```sh\ngb agent start --local --role {{role}} --project {{project}}\n# optional: --name <agent-name>, --dir <path>, --watch-escalations, --task <bead-id>\n```\n\nUse the role chosen at pick-role. It registers on start, heartbeats, and deregisters and closes its agent bead on exit. `--watch-escalations` lets it run approved escalations aimed at this machine."
+    },
+    {
+      "id": "verify-roster",
+      "title": "Confirm the {{project}} local agent is on the roster",
+      "short_title": "confirm it is on the roster",
+      "type": "task",
+      "needs": [
+        "start"
+      ],
+      "description": "From a second shell:\n\n```sh\ngb agent roster\n```\n\nThe agent is listed with role {{role}} and project {{project}}. Today a local agent pulls work with `gb ready`; it does not yet get Slack nudges. Its agent card shows in Slack once it has a task. Next: pour first-task.json."
+    }
+  ]
+}

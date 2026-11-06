@@ -1,0 +1,78 @@
+{{- /*
+  Shared /agents row markup. ONE bead->view-model->markup path per row shape so
+  the static page render and the SSE event-driven swap can never diverge — the
+  fix for the "agents view changes when it updates from events vs static load"
+  drift (ka-0000007652). Mirrors the gardener_iteration_card precedent
+  (renderGardenerStreamCard): the SSE writer rehydrates a BeadDetail, runs it
+  through the same agentRowFromBeadCtx the page uses, and renders THIS template.
+
+  Dot context (passed via `dict`, because a sub-template rebinds `$`):
+    { Row agentRowView, BasePath string, ProjectFilter string, Kind string }
+  Kind is the SSE lifecycle kind ("created"/"updated"/"closed"); it is EMPTY for
+  the static page render. When non-empty we add the client-swap hooks
+  (id="agent-row-<id>", data-bead-kind, data-project, agents-row classes) the
+  agents_stream.js client keys on. The COLUMN set is identical either way, so a
+  swapped-in live row keeps the table aligned. Since ka-0000000482 the SSE path
+  carries the full bead payload (created_at, updated_at, description, owner,
+  operated_by*), so Owner, Up via CreatedAt, Active via UpdatedAt, and the
+  operator chip render with real values on the streamed node — they no longer
+  blank until the next eager reload. Any field the SSE payload genuinely lacks
+  still degrades to the same empty/placeholder cell the static template renders,
+  preserving column count. OperatedBySlug (a viewer-side lookup, not on the wire)
+  is resolved on the streamed node via populateOperatedBySlug before render, so
+  the operator chip carries its /u/<slug> deep-link too (ka-0000007344).
+*/ -}}
+{{define "agents_compact_row"}}
+{{- $base := .BasePath -}}
+{{- $pf := .ProjectFilter -}}
+{{- $kind := .Kind -}}
+{{- with .Row -}}
+<tr data-bead-id="{{.ID}}" data-last-activity-ts="{{.UpdatedAtRFC}}"{{if $kind}} id="agent-row-{{.ID}}" data-bead-kind="{{$kind}}" data-project="{{.Project}}" class="agents-row agents-row-{{$kind}}{{if .Stale}} agent-row-stale{{end}}"{{else if .Stale}} class="agent-row-stale"{{end}}>
+  <td><a href="{{$base}}/{{.ID}}"
+         title="{{.ID}}"
+         hx-get="{{$base}}/{{.ID}}"
+         hx-trigger="mouseover once"
+         hx-target="none"
+         hx-swap="none">{{.Name}}</a></td>
+  {{if not $pf}}<td>{{if .Project}}<a class="chip chip-type" href="{{$base}}/agents?project={{.Project}}" title="Filter to {{.Project}}">{{.Project}}</a>{{end}}</td>{{end}}
+  <td class="agents-table-owner">{{if .OperatedByDisplay}}{{ownerInitials .OperatedByDisplay .OperatedBySlug}}{{else}}<span class="owner-initials owner-initials-empty" title="no owner" aria-label="no owner">—</span>{{end}}</td>
+  <td>{{if .Role}}<span class="chip chip-type">{{.Role}}</span>{{end}}{{if and .Harness (ne .Harness "claude")}} <span class="chip chip-type agent-harness-{{.Harness}}" title="Runs on the {{.Harness}} harness (not Claude Code)">{{.Harness}}</span>{{end}}</td>
+  <td>{{if .AgentState}}<span class="chip chip-type agent-state-{{.AgentState}}">{{.AgentState}}</span>{{end}}{{if .Stale}} <span class="chip chip-type agent-state-stale" title="alive but no activity in >1h">stale</span>{{end}}</td>
+  <td>{{if .PodPhase}}<span class="meta">{{.PodPhase}}</span>{{end}}</td>
+  <td class="agents-table-task">
+    {{if .TaskTitle}}<a class="agents-task-title" href="{{$base}}/{{.TaskID}}">{{.TaskTitle}}</a>{{end}}
+    {{if .TaskID}}<a class="meta bead-row-id" href="{{$base}}/{{.TaskID}}">{{.TaskID}}</a>{{end}}
+    {{if .SpawnedBy}}<span class="meta agent-spawned-by" title="spawned_by">by {{.SpawnedBy}}</span>{{end}}
+    {{if .OperatedByDisplay}}<span class="meta agent-operated-by" title="operated_by">op {{userLink .OperatedByDisplay .OperatedBySlug}}</span>{{end}}
+  </td>
+  <td class="agents-table-links">
+    {{if .TerminalURL}}<a class="meta chip-link agent-terminal-link" href="{{.TerminalURL}}" title="Open live terminal in coopmux" rel="noopener">term</a>{{end}}
+    {{if .SlackURL}}<a class="meta chip-link agent-slack-link" href="{{.SlackURL}}" title="Open Slack thread" rel="noopener">slack</a>{{end}}
+    {{if .ScheduleID}}<a class="meta chip-link agent-gardener-link" href="{{$base}}/gardener/{{.ScheduleID}}" title="View this gardener's life-thread">gardener</a>{{end}}
+  </td>
+  <td class="agents-table-ctx" data-ctx-pct="{{.Usage.ContextPct}}">{{template "agent_ctx_gauge_mini" .Usage}}</td>
+  <td class="agents-table-usage">{{template "agent_cost_turns_chips" .Usage}}</td>
+  <td>{{if .Uptime}}<span class="bead-row-ago agent-uptime{{if .LongRunning}} agent-uptime-warn{{end}}" title="started {{.CreatedAtRFC}}">up {{.Uptime}}</span>{{end}}</td>
+  <td><span class="bead-row-ago" title="last activity">{{if .Ago}}active {{.Ago}}{{else}}active just now{{end}}</span></td>
+</tr>
+{{- end -}}
+{{end}}
+{{define "agents_recent_row"}}
+{{- $base := .BasePath -}}
+{{- $kind := .Kind -}}
+{{- with .Row -}}
+<tr class="bead-row-terminated{{if $kind}} agents-row agents-row-{{$kind}}{{end}}"{{if $kind}} id="agent-row-{{.ID}}" data-bead-kind="{{$kind}}" data-project="{{.Project}}"{{end}} data-bead-id="{{.ID}}" data-last-activity-ts="{{.UpdatedAtRFC}}">
+  <td><a href="{{$base}}/{{.ID}}"
+         title="{{.ID}}"
+         hx-get="{{$base}}/{{.ID}}"
+         hx-trigger="mouseover once"
+         hx-target="none"
+         hx-swap="none">{{.Name}}</a></td>
+  <td>{{if .Project}}<span class="chip chip-type">{{.Project}}</span>{{end}}</td>
+  <td class="agents-table-owner">{{if .OperatedByDisplay}}{{ownerInitials .OperatedByDisplay .OperatedBySlug}}{{else}}<span class="owner-initials owner-initials-empty" title="no owner" aria-label="no owner">—</span>{{end}}</td>
+  <td>{{if .Role}}<span class="chip chip-type">{{.Role}}</span>{{end}}{{if and .Harness (ne .Harness "claude")}} <span class="chip chip-type agent-harness-{{.Harness}}" title="Runs on the {{.Harness}} harness (not Claude Code)">{{.Harness}}</span>{{end}}</td>
+  <td class="agents-table-desc">{{if .WrapUpSummary}}{{.WrapUpSummary}}{{else}}{{.Desc}}{{end}}</td>
+  <td><span class="bead-row-ago">{{.Ago}}</span></td>
+</tr>
+{{- end -}}
+{{end}}

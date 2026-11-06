@@ -1,0 +1,195 @@
+{{- if .Values.keycloak.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- /* Collect chart-managed realm client-scope names (keycloak.clientScopes,
+       rendered as KeycloakClientScope CRs by client-scopes.yaml) grouped by
+       type, so we can attach them EXPLICITLY to every KeycloakClient's
+       defaultClientScopes / optionalClientScopes below.
+
+       Why this is required (ka-0000003256 — tarboat login gate verdict=no-form):
+       a `type: default` KeycloakClientScope is registered by the EDP
+       keycloak-operator as a realm *default-default-client-scope*
+       (PUT /admin/realms/{realm}/default-default-client-scopes/{id}). Keycloak
+       applies a realm default-default-client-scope ONLY to clients created
+       AFTER it becomes a realm default — it does NOT retro-attach to existing
+       clients. The KeycloakClient (gardenio-traefik-forwardauth) and the
+       KeycloakClientScope (groups) CRs reconcile INDEPENDENTLY with no ordering
+       guarantee, so the forwardauth client is typically created before `groups`
+       is a realm default and never receives it. And the operator's
+       KeycloakClient reconciler (chain/put_client_scope.go putDefaultClientScope)
+       no-ops when spec.defaultClientScopes is empty — the forwardauth client
+       leaves it empty — so nothing ever attaches `groups` to it. oauth2-proxy
+       then requests `scope=openid email profile groups`, Keycloak rejects the
+       unattached `groups` with invalid_scope, and the login chain never renders
+       a Sign-in form (tarboat gate 5 verdict=no-form).
+
+       Listing the scope in the client's defaultClientScopes makes the operator's
+       additive AddDefaultScopeToClient() attach it deterministically and
+       idempotently, regardless of reconcile order. EMPTY in base + prod
+       (keycloak.clientScopes: []), so this whole block is a strict no-op there
+       and cannot regress the gitlab-provider front doors. */ -}}
+{{- $chartDefaultScopeNames := list -}}
+{{- $chartOptionalScopeNames := list -}}
+{{- range .Values.keycloak.clientScopes -}}
+{{-   $scopeType := .type | default "default" -}}
+{{-   if eq $scopeType "optional" -}}
+{{-     $chartOptionalScopeNames = append $chartOptionalScopeNames .name -}}
+{{-   else if eq $scopeType "default" -}}
+{{-     $chartDefaultScopeNames = append $chartDefaultScopeNames .name -}}
+{{-   end -}}
+{{- end -}}
+{{- /* The GitHub IdP's github-identity scope (client-scopes.yaml) is a
+       chart-managed default scope too. */ -}}
+{{- if .Values.keycloak.githubIdp.enabled -}}
+{{-   $chartDefaultScopeNames = append $chartDefaultScopeNames "github-identity" -}}
+{{- end -}}
+{{- /* The per-land land-<name> scopes (client-scopes.yaml, gd-eAfptUBh9Z) are
+       optional scopes of keycloak.landScopeClients only. */ -}}
+{{- $landScopeNames := list -}}
+{{- range (.Values.keycloak.landScopes | default list) -}}
+{{-   $landScopeNames = append $landScopeNames (printf "land-%s" .) -}}
+{{- end -}}
+{{- range .Values.keycloak.projectGroups -}}
+{{-   $landScopeNames = append $landScopeNames (printf "land-%s" .name) -}}
+{{- end -}}
+{{- /* And the scopes the Lands provisioner made for runtime lands
+       (internal/lands/landscope: KeycloakClientScope resources labelled
+       gardenio.io/land-scope, held to the land scope shape by the
+       <agents>-land-scopes admission policy). lookup reads them on a real
+       install/upgrade, so a new land's scope is attached on the next helm
+       upgrade; under `helm template` it finds none. Only a resource the
+       keycloak-operator has made (status.id) is listed: the operator fails
+       the whole client's scope sync on a name Keycloak does not have yet.
+       The operator only ever adds a client's scopes, so a scope attached
+       once stays attached whatever a later render lists. */ -}}
+{{- $runtimeScopes := lookup "v1.edp.epam.com/v1" "KeycloakClientScope" .Release.Namespace "" -}}
+{{- range ($runtimeScopes.items | default list) -}}
+{{-   $labels := .metadata.labels | default dict -}}
+{{-   $scopeName := .spec.name | default "" -}}
+{{-   if and (eq (get $labels "gardenio.io/land-scope") "true") (eq (get $labels "app.kubernetes.io/managed-by") "gardenio-controller") ((.status).id) (regexMatch "^land-[a-z][a-z0-9-]{0,57}$" $scopeName) -}}
+{{-     $landScopeNames = append $landScopeNames $scopeName -}}
+{{-   end -}}
+{{- end -}}
+{{- $landScopeNames = $landScopeNames | uniq -}}
+{{- $landScopeClients := .Values.keycloak.landScopeClients | default list -}}
+{{- $clients := .Values.keycloak.clients | default list -}}
+{{- if include "gardenio.keycloakRuntime.roleDriftProbe.on" . -}}
+{{-   $clients = append $clients (include "gardenio.keycloakRuntime.roleDriftProbe.client" . | fromYaml) -}}
+{{- end -}}
+{{- range $clients }}
+# ── KeycloakClient: {{ .clientId }} ───────────────────────────────────────────
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakClient
+metadata:
+  name: {{ $fullname }}-client-{{ .clientId }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  clientId: {{ .clientId | quote }}
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  {{- if .name }}
+  name: {{ .name | quote }}
+  {{- end }}
+  {{- if .description }}
+  description: {{ .description | quote }}
+  {{- end }}
+  enabled: {{ .enabled | default true }}
+  public: {{ .public | default false }}
+  standardFlowEnabled: {{ if hasKey . "standardFlowEnabled" }}{{ .standardFlowEnabled }}{{ else }}true{{ end }}
+  directAccess: {{ .directAccess | default false }}
+  fullScopeAllowed: {{ if hasKey . "fullScopeAllowed" }}{{ .fullScopeAllowed }}{{ else }}true{{ end }}
+  {{- /* directGrantRole binds the password grant to the flow in
+        auth-flow-direct-grant.yaml, which signs in only holders of that role.
+        A public client has no secret, so its password grant takes any realm
+        user's password from anyone and skips the browser-flow passkey: such a
+        client must name the role (gd-Hq1PnUVOUC). */}}
+  {{- if .directGrantRole }}
+  {{- if not .directAccess }}
+  {{- fail (printf "keycloak.clients %s: directGrantRole needs directAccess: true" .clientId) }}
+  {{- end }}
+  authenticationFlowBindingOverrides:
+    directGrant: {{ printf "%s-direct-grant" .clientId | quote }}
+  {{- else if and .public .directAccess }}
+  {{- fail (printf "keycloak.clients %s: a public client with directAccess must set directGrantRole" .clientId) }}
+  {{- end }}
+  {{- if .webUrl }}
+  webUrl: {{ .webUrl | quote }}
+  {{- end }}
+  {{- /* Special-case for the gardenio-traefik-forwardauth client: always
+        whitelist the EXACT callback oauth2-proxy redeems on. The deployment
+        template renders --redirect-url=https://<forwardAuth.ingress.host>/oauth2/callback,
+        so Keycloak MUST list that same URI or the code exchange fails with
+        "Invalid parameter: redirect_uri". Deriving it from the SAME
+        forwardAuth.ingress.host the deployment uses keeps the two in lockstep —
+        the cloud overlays already list their host's callback explicitly (the
+        derived URI just dedupes into it), and a from-scratch box (whose apex is
+        only known at install, injected via forwardAuth.ingress.host) gets its
+        real callback whitelisted with no hand-edited client redirectUris.
+        See ka-0000000068. */}}
+  {{- $redirectUris := .redirectUris | default (list) -}}
+  {{- if and (eq .clientId "gardenio-traefik-forwardauth") $.Values.keycloak.forwardAuth.enabled $.Values.keycloak.forwardAuth.ingress.enabled $.Values.keycloak.forwardAuth.ingress.host -}}
+  {{-   $faCallback := printf "https://%s/oauth2/callback" $.Values.keycloak.forwardAuth.ingress.host -}}
+  {{-   if not (has $faCallback $redirectUris) -}}
+  {{-     $redirectUris = append $redirectUris $faCallback -}}
+  {{-   end -}}
+  {{- end }}
+  {{- if $redirectUris }}
+  redirectUris:
+    {{- toYaml $redirectUris | nindent 4 }}
+  {{- end }}
+  {{- if .webOrigins }}
+  webOrigins:
+    {{- toYaml .webOrigins | nindent 4 }}
+  {{- end }}
+  {{- /* Special-case for the gardenio-traefik-forwardauth client: reference the
+        gardenio-forwardauth-secrets K8s Secret (created from the same secret-store
+        value by the deploy step, or by ExternalSecrets) using the EDP
+        keycloak-operator's `$<secret-name>:<key>` reference syntax. The
+        operator dereferences the Secret and imports its client-secret value
+        into Keycloak, so oauth2-proxy (which reads the same Secret/key) and
+        Keycloak stay in sync across chart reinstalls. spec.secret is always
+        a Secret reference in the EDP operator — passing the literal value
+        causes it to be treated as a Secret name and fail to resolve. */}}
+  {{- if and (eq .clientId "gardenio-traefik-forwardauth") $.Values.keycloak.forwardAuth.clientSecretRef.name $.Values.keycloak.forwardAuth.clientSecretRef.key }}
+  secret: {{ printf "$%s:%s" $.Values.keycloak.forwardAuth.clientSecretRef.name $.Values.keycloak.forwardAuth.clientSecretRef.key | quote }}
+  {{- else if .secret }}
+  secret: {{ .secret | quote }}
+  {{- end }}
+  {{- if .attributes }}
+  attributes:
+    {{- toYaml .attributes | nindent 4 }}
+  {{- end }}
+  {{- /* Effective default client scopes = per-client defaultClientScopes PLUS
+        every chart-managed `type: default` KeycloakClientScope (see the header
+        comment). Deduped, order-stable. Attaching them here is what actually
+        binds the realm-default scope (e.g. `groups`) to THIS client so
+        oauth2-proxy can request it without invalid_scope. */ -}}
+  {{- $effectiveDefaultScopes := concat (.defaultClientScopes | default (list)) $chartDefaultScopeNames | uniq -}}
+  {{- if $effectiveDefaultScopes }}
+  defaultClientScopes:
+    {{- toYaml $effectiveDefaultScopes | nindent 4 }}
+  {{- end }}
+  {{- /* Same treatment for chart-managed `type: optional` client scopes. */ -}}
+  {{- $effectiveOptionalScopes := concat (.optionalClientScopes | default (list)) $chartOptionalScopeNames | uniq -}}
+  {{- if has .clientId $landScopeClients -}}
+  {{-   $effectiveOptionalScopes = concat $effectiveOptionalScopes $landScopeNames | uniq -}}
+  {{- end -}}
+  {{- if $effectiveOptionalScopes }}
+  optionalClientScopes:
+    {{- toYaml $effectiveOptionalScopes | nindent 4 }}
+  {{- end }}
+  {{- if .protocolMappers }}
+  protocolMappers:
+    {{- toYaml .protocolMappers | nindent 4 }}
+  {{- end }}
+  {{- if .serviceAccount }}
+  serviceAccount:
+    {{- toYaml .serviceAccount | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+{{- end }}

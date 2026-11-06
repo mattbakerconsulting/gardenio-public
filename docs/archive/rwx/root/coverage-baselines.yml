@@ -1,0 +1,359 @@
+# One-shot per-component coverage baselines (W2b-6, ka-0000007750).
+#
+# Run ONCE at the 2a→2b boundary, and re-run by an operator on demand
+# after a major refactor that legitimately moves the per-component
+# coverage floor. NOT a continuous loop — see
+# docs/research/coverage-2b-w6-baselines.md §"Why one-shot, not continuous"
+# (and coverage-phase2b-design.md §8.2). Continuous recalibration drifts
+# the patch-cov gate's bar under reviewers' feet, which is the exact
+# anti-pattern this design avoids.
+#
+# What it does:
+#   1. Calls the GitLab Pipelines API to find the last 10 SUCCESSFUL
+#      main-push pipelines whose `coverage-report` job uploaded a
+#      `coverage.merged.lcov` artifact. (Newer-first; oldest-pipeline-id
+#      acceptable up to the window size.)
+#   2. Downloads each coverage.merged.lcov into an inputs/ directory,
+#      named <pipeline-id>.lcov, and writes a 2-column commits TSV
+#      mapping pipeline-id → commit-sha for the audit trail.
+#   3. Runs `coverage-baselines` (Go binary built from
+#      gardenio/controller/cmd/coverage-baselines/) which computes the
+#      per-component **median** line-coverage % across the window and
+#      emits baselines.json in the §8.1 schema.
+#   4. Uploads baselines.json to the GitLab Generic Package Registry at
+#      coverage-baselines/latest/baselines.json AND a stamped audit copy
+#      under coverage-baselines/<computed_at_iso>/baselines.json.
+#
+# How to trigger:
+#   - From the GitLab CI manual job `coverage-baselines-recompute` in
+#     .gitlab-ci.yml (preferred — operator clicks "play" on a green
+#     main-branch pipeline). Same dispatch-and-wait shape as the
+#     coverage-merge dispatch.
+#   - Direct CLI:
+#       rwx run .rwx/coverage-baselines.yml \
+#         --init commit-sha=$(git rev-parse main) \
+#         --wait
+#
+# Reads:
+#   - secrets.GITLAB_API_TOKEN — GitLab token with `read_api` + write_package
+#     scope. Required: the pipelines/jobs/artifacts/package-upload REST
+#     endpoints all need `read_api` (or broader), which GITLAB_CLONE_TOKEN
+#     (provisioned for git clone only — `read_repository` scope) does not
+#     have. Falls back to GITLAB_CLONE_TOKEN if GITLAB_API_TOKEN is unset
+#     so the workflow stays runnable while the new secret is being
+#     provisioned, but the fallback will fail with a clear scope error.
+#   - secrets.GITLAB_CLONE_TOKEN — used only as the legacy fallback above.
+#
+# Writes:
+#   - https://gitlab.com/api/v4/projects/<id>/packages/generic/coverage-baselines/latest/baselines.json
+#   - https://gitlab.com/api/v4/projects/<id>/packages/generic/coverage-baselines/<computed_at_iso>/baselines.json
+#
+# Output artifact:
+#   - baselines.json (the same file that's uploaded; downloadable from RWX
+#     for inspection without going through the package registry).
+
+on:
+  dispatch:
+    - key: gardenio-coverage-baselines
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full commit SHA on main to clone for build context. Required."
+          required: true
+      title: Coverage baselines (one-shot)
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  # ── Clone gardenio monorepo ─────────────────────────────────────────
+  - key: code
+    # ── Retry-wrapped shallow clone (ka-0000001787 / ka-0000004454) ─────────
+    # Hand-rolled shallow clone with a bounded retry loop instead of
+    # `call: git/clone` — the pattern proven in docker.yml (ka-0000007550) and
+    # the release-DAG workflows (!7031). The stock package (through 2.0.8) has
+    # NO retry and RWX has no task-level auto-retry, so a single transient
+    # gitlab.com blip during fetch-pack (`Connection to gitlab.com closed by
+    # remote host`, exit 128) fails the whole run.
+    #
+    # Parity with `git/clone` DEFAULTS (all this task used): shallow `--depth=1`
+    # fetch of the exact ref, detached checkout, `.git` stripped afterwards
+    # (cleanup-git-dir default) for identical downstream cache keys, no
+    # submodules, no LFS. Token auth stays in the repository URL.
+    run: |
+      set -eu
+      : "${GITLAB_CLONE_TOKEN:?GITLAB_CLONE_TOKEN is required}"
+      REPO="https://oauth2:${GITLAB_CLONE_TOKEN}@gitlab.com/Acme/Platform/gardenio.git"
+      SHA="${COMMIT_SHA}"
+      MAX_ATTEMPTS=5
+
+      # Redact the token from any tracing/output; never echo $REPO.
+      git init -q -b main
+      git remote add origin "$REPO"
+      git config --local maintenance.auto false
+      git config --local gc.auto 0
+
+      attempt=1
+      while :; do
+        echo "git-clone attempt ${attempt}/${MAX_ATTEMPTS} for ${SHA}"
+        if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch --no-auto-gc --depth=1 origin "+${SHA}:refs/rwx/git-clone/checkout"; then
+          echo "git-clone: fetch succeeded on attempt ${attempt}"
+          break
+        else
+          rc=$?
+          if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+            echo "git-clone: fetch FAILED after ${MAX_ATTEMPTS} attempts (last exit ${rc})" >&2
+            exit "$rc"
+          fi
+          # Exponential backoff: 5s, 10s, 20s, 40s.
+          sleep_s=$((5 * (1 << (attempt - 1))))
+          echo "git-clone: fetch failed (exit ${rc}); retrying in ${sleep_s}s" >&2
+          sleep "$sleep_s"
+          attempt=$((attempt + 1))
+        fi
+      done
+
+      git checkout -q --detach "$(git rev-parse refs/rwx/git-clone/checkout^{commit})"
+      git clean -fdq
+      echo "Checked out git repository at $(git rev-parse HEAD)"
+
+      # Strip .git for cache-key parity with git/clone's cleanup-git-dir default.
+      rm -rf .git
+    env:
+      GITLAB_CLONE_TOKEN:
+        value: ${{ secrets.GITLAB_CLONE_TOKEN }}
+        cache-key: excluded
+      COMMIT_SHA: ${{ init.commit-sha }}
+
+  # ── Toolchain ────────────────────────────────────────────────────────
+  - key: go
+    call: golang/install 1.2.1
+    with:
+      go-version: "1.25"
+
+  # ── Tooling: jq + curl come with the base image. Nothing else needed. ──
+
+  # ── Build the baseline computer binary ──────────────────────────────
+  - key: build-baselines
+    use: [code, go]
+    filter:
+      - gardenio/controller/cmd/coverage-baselines/**
+      - gardenio/controller/internal/coverage/**
+      - gardenio/controller/go.mod
+      - gardenio/controller/go.sum
+    run: |
+      set -euo pipefail
+      cd gardenio/controller
+      GOWORK=off go build -o "$PWD/../../coverage-baselines-bin" ./cmd/coverage-baselines/
+    outputs:
+      filesystem: false
+      artifacts:
+        - key: coverage-baselines-bin
+          path: coverage-baselines-bin
+
+  # ── Compute baselines + upload to Generic Package Registry ──────────
+  # Single task because the work after the binary build is sequential
+  # I/O (download → compute → upload) and gains nothing from splitting.
+  - key: compute-and-publish
+    use: code
+    after: build-baselines
+    cache: false
+    env:
+      # Prefer an API-scoped token; fall back to the clone token so existing
+      # deployments keep running (but they will fail with a clear HTTP error
+      # surfaced by the diagnostic curl wrapper below if the fallback lacks
+      # the required scope).
+      GITLAB_API_TOKEN: ${{ secrets.GITLAB_API_TOKEN }}
+      GITLAB_CLONE_TOKEN: ${{ secrets.GITLAB_CLONE_TOKEN }}
+      BASELINES_BIN: ${{ tasks.build-baselines.artifacts.coverage-baselines-bin }}
+      # GitLab project id 12345678 = Acme/Platform/gardenio. Hard-coded
+      # because we run against exactly this project; if forked, update here.
+      GITLAB_PROJECT_ID: "12345678"
+      WINDOW_SIZE: "10"
+    run: |
+      set -euo pipefail
+
+      # Prefer GITLAB_API_TOKEN (read_api scope); fall back to GITLAB_CLONE_TOKEN.
+      # The clone token only has read_repository scope and will 401/403 against
+      # the pipelines/jobs/artifacts/package endpoints.
+      if [ -n "${GITLAB_API_TOKEN:-}" ]; then
+        GITLAB_TOKEN="$GITLAB_API_TOKEN"
+        TOKEN_SOURCE="GITLAB_API_TOKEN"
+      elif [ -n "${GITLAB_CLONE_TOKEN:-}" ]; then
+        GITLAB_TOKEN="$GITLAB_CLONE_TOKEN"
+        TOKEN_SOURCE="GITLAB_CLONE_TOKEN (fallback — likely lacks read_api scope)"
+      else
+        echo "ERROR: neither GITLAB_API_TOKEN nor GITLAB_CLONE_TOKEN is configured for this RWX project"
+        exit 1
+      fi
+      echo "Using token from: $TOKEN_SOURCE"
+
+      # The RWX artifact mount is read-only; copy the binary to a writable
+      # location before chmod +x.
+      install -m 0755 "$BASELINES_BIN" /tmp/coverage-baselines-bin
+      BASELINES_BIN=/tmp/coverage-baselines-bin
+
+      API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}"
+      AUTH=(-H "PRIVATE-TOKEN: ${GITLAB_TOKEN}")
+
+      # Diagnostic curl wrapper: replaces `curl -sf` so HTTP failures print the
+      # status code + response body before exiting, instead of curl silently
+      # exiting 22 from anywhere in a pipeline. Usage:
+      #   body=$(curl_api GET "${API}/pipelines?...")
+      curl_api() {
+        local method="$1"; shift
+        local url="$1"; shift
+        local body_file http_code
+        body_file=$(mktemp)
+        http_code=$(curl -sS -o "$body_file" -w "%{http_code}" \
+          -X "$method" "${AUTH[@]}" "$@" "$url" || echo "000")
+        if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+          echo "ERROR: $method $url returned HTTP $http_code" >&2
+          echo "Response body:" >&2
+          head -c 2000 "$body_file" >&2
+          echo "" >&2
+          rm -f "$body_file"
+          return 22
+        fi
+        cat "$body_file"
+        rm -f "$body_file"
+      }
+
+      # ── 1. Find the last N successful main-push pipelines ──────────
+      # We sort by id desc and walk pages until we have N pipelines whose
+      # `coverage-report` job exposes a `coverage.merged.lcov` artifact.
+      # 50 pipelines per page is enough — even with 100% green, the last
+      # 10 are within the first page.
+      mkdir -p inputs
+      : > pipelines.tsv
+
+      page=1
+      collected=0
+      attempted=0
+      max_attempts=60   # circuit-breaker: refuse to walk more than 6 pages
+
+      while [ "$collected" -lt "$WINDOW_SIZE" ] && [ "$attempted" -lt "$max_attempts" ]; do
+        echo "Fetching pipelines page $page (collected=$collected/$WINDOW_SIZE)..."
+        page_json=$(curl_api GET \
+          "${API}/pipelines?ref=main&status=success&per_page=50&page=${page}&order_by=id&sort=desc")
+
+        page_count=$(echo "$page_json" | jq 'length')
+        if [ "$page_count" = "0" ]; then
+          echo "No more main-push pipelines available; stopping."
+          break
+        fi
+
+        # Walk this page. For each pipeline, hit /jobs and find a
+        # `coverage-report` job; download its coverage.merged.lcov
+        # artifact. Skip pipelines where the job is missing or where the
+        # artifact 404s — those reflect the allow_failure: true branch
+        # of coverage-report.
+        for row in $(echo "$page_json" | jq -r '.[] | @base64'); do
+          attempted=$((attempted + 1))
+          if [ "$collected" -ge "$WINDOW_SIZE" ]; then
+            break
+          fi
+          row_json=$(echo "$row" | base64 -d)
+          pid=$(echo "$row_json" | jq -r '.id')
+          sha=$(echo "$row_json" | jq -r '.sha')
+
+          # Fetch the pipeline's jobs (per_page=100 covers the largest
+          # pipeline shape).
+          jobs_json=$(curl_api GET \
+            "${API}/pipelines/${pid}/jobs?per_page=100" || echo "[]")
+          job_id=$(echo "$jobs_json" | jq -r \
+            '[.[] | select(.name=="coverage-report" and .status=="success")] | .[0].id // empty')
+          if [ -z "$job_id" ]; then
+            echo "  pipeline $pid: no successful coverage-report job (skip)"
+            continue
+          fi
+
+          # Download just the lcov from the job artifact zip. The
+          # `/artifacts/<path>` endpoint returns the file directly when
+          # it exists in the artifact set.
+          http_code=$(curl -s -o "inputs/${pid}.lcov" -w "%{http_code}" \
+            "${AUTH[@]}" \
+            "${API}/jobs/${job_id}/artifacts/coverage.merged.lcov")
+          if [ "$http_code" != "200" ]; then
+            echo "  pipeline $pid: coverage.merged.lcov not in job $job_id (HTTP $http_code; skip)"
+            rm -f "inputs/${pid}.lcov"
+            continue
+          fi
+
+          # Sanity-check the file is a non-empty LCOV (has at least one SF: line).
+          if ! grep -q '^SF:' "inputs/${pid}.lcov"; then
+            echo "  pipeline $pid: artifact present but not LCOV (skip)"
+            rm -f "inputs/${pid}.lcov"
+            continue
+          fi
+
+          printf '%s\t%s\n' "$pid" "$sha" >> pipelines.tsv
+          collected=$((collected + 1))
+          echo "  pipeline $pid (sha ${sha:0:8}): captured ($collected/$WINDOW_SIZE)"
+        done
+
+        page=$((page + 1))
+      done
+
+      if [ "$collected" -lt "$WINDOW_SIZE" ]; then
+        echo ""
+        echo "WARNING: collected only $collected / $WINDOW_SIZE green pipelines with coverage."
+        echo "         Computing baseline anyway, but the result may be less stable than"
+        echo "         the design assumes (10-pipeline window). Consider re-running once"
+        echo "         more main-push pipelines have populated."
+      fi
+
+      if [ "$collected" -eq 0 ]; then
+        echo "ERROR: no green main-push pipelines with coverage.merged.lcov artifacts found."
+        echo "       2a SOAK should have produced these — check artifact retention."
+        exit 1
+      fi
+
+      # ── 2. Compute baselines.json ──────────────────────────────────
+      echo ""
+      echo "Computing per-component median baselines..."
+      "$BASELINES_BIN" \
+        --inputs-dir ./inputs \
+        --commits ./pipelines.tsv \
+        --output ./baselines.json
+      echo ""
+      echo "--- baselines.json ---"
+      cat baselines.json
+      echo ""
+
+      # ── 3. Upload to Generic Package Registry ─────────────────────
+      # Mirrors the publish-release-metadata pattern in .gitlab-ci.yml:
+      # PUT to the package URL with PRIVATE-TOKEN, expect 200/201.
+      LATEST_URL="${API}/packages/generic/coverage-baselines/latest/baselines.json"
+      ts=$(date -u +%Y-%m-%dT%H-%M-%SZ)   # filesystem-safe iso8601
+      STAMPED_URL="${API}/packages/generic/coverage-baselines/${ts}/baselines.json"
+
+      for url in "$LATEST_URL" "$STAMPED_URL"; do
+        http_code=$(curl -sS -o /tmp/upload.out -w "%{http_code}" \
+          "${AUTH[@]}" \
+          --upload-file ./baselines.json \
+          "$url" || echo "000")
+        if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+          echo "Uploaded → $url (HTTP $http_code)"
+        else
+          echo "ERROR: upload to $url failed (HTTP $http_code)"
+          cat /tmp/upload.out || true
+          exit 1
+        fi
+      done
+
+      echo ""
+      echo "Baselines published. Consumer URL:"
+      echo "  $LATEST_URL"
+    outputs:
+      artifacts:
+        - key: baselines-json
+          path: baselines.json
+        - key: pipelines-tsv
+          path: pipelines.tsv

@@ -1,0 +1,112 @@
+# gardener-stop-no-progress.toml
+#
+# Claudeless scenario: gardener `stop.loop_end.any` includes
+# `no_progress_for: {runs: 3}` so a wedged loop (three runs in a row with
+# `progress_score=0`) closes the schedule.
+#
+# Plan §T9: "gardener-stop-no-progress: three runs with progress_score=0
+# trigger no_progress_for."
+#
+# StopEvaluator runtime is covered by scheduler/stop_test.go. The E2E
+# claudeless surface asserts the *schedule shape* persists the
+# `no_progress_for` entry with `runs:3` so the §3.4 wedge-detection
+# behavior is wired end-to-end. If the stop-block lowering ever drops
+# this entry, the gardener becomes wedge-blind and this test fails.
+
+[claude]
+session_id = "e2e00000-0009-4000-a000-000000000004"
+username = "e2e-gardener-no-progress"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 30000
+
+[[responses]]
+on = "*"
+say = "Running gardener-stop-no-progress: assert stop.loop_end carries no_progress_for runs=3."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+if ! gb gardener --help >/dev/null 2>&1; then
+  echo "SKIP: gb gardener not present (pre-T6)"
+  exit 0
+fi
+
+EPIC_ID=$(kd create "e2e-gardener-no-progress-$$-$(date +%s)" --type=epic --json 2>/dev/null | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+echo "epic: $EPIC_ID"
+
+cleanup() {
+  gb gardener stop "$EPIC_ID" --reason "e2e cleanup" >/dev/null 2>&1 || true
+  kd close "$EPIC_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+gb gardener start "$EPIC_ID" --i-read-the-gardener-instructions >/dev/null 2>&1 || { fail "gb gardener start"; exit 1; }
+STOP=$(gb gardener status "$EPIC_ID" --json 2>/dev/null | jq -c '.stop // empty')
+if [ -z "$STOP" ] || [ "$STOP" = "null" ]; then
+  fail "stop field present" "got=[$STOP]"
+  exit 1
+fi
+
+# ── no_progress_for present in loop_end.any ─────────────────────────
+NPF=$(echo "$STOP" | jq -c '.loop_end.any[] | select(.kind=="no_progress_for")' 2>/dev/null | head -n1)
+if [ -n "$NPF" ]; then
+  pass "loop_end.any contains no_progress_for"
+else
+  fail "loop_end.any contains no_progress_for" "stop=$STOP"
+  exit 1
+fi
+
+# ── runs: 3 (the §5.1 default — three wedged runs in a row) ─────────
+RUNS=$(echo "$NPF" | jq -r '.runs // empty')
+if [ "$RUNS" = "3" ]; then
+  pass "no_progress_for.runs=3"
+else
+  fail "no_progress_for.runs=3" "got=[$RUNS] entry=$NPF"
+fi
+
+# ── Sanity: the rest of the §5.1 loop_end.any kinds are also present ─
+LOOP_KINDS=$(echo "$STOP" | jq -r '[ .loop_end.any[].kind ] | sort | join(",")')
+for k in bead_query specific_bead_closed max_runs wall_clock; do
+  if echo ",$LOOP_KINDS," | grep -q ",$k,"; then
+    pass "loop_end.any contains kind=$k"
+  else
+    fail "loop_end.any contains kind=$k" "got=[$LOOP_KINDS]"
+  fi
+done
+
+# ── Progress in_wrapup must be on (no_progress_for needs the field) ─
+IN_WRAPUP=$(gb gardener status "$EPIC_ID" --json 2>/dev/null | jq -r '.progress.surface.in_wrapup // false')
+if [ "$IN_WRAPUP" = "true" ]; then
+  pass "progress.surface.in_wrapup=true (progress_score required for wedge detection)"
+else
+  fail "progress.surface.in_wrapup=true" "got=[$IN_WRAPUP]"
+fi
+
+# ── Summary ─────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "gardener-stop-no-progress: stop shape OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-stop-no-progress scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

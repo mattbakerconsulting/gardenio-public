@@ -1,0 +1,111 @@
+# local-escalation-roundtrip.toml
+#
+# Claudeless scenario: Local-mode escalation round-trip
+#
+# Exercises the cross-process escalation path for a local agent:
+#
+#   1. Runner seeds a runner bead and pre-creates an escalation bead with
+#      execution_target=local and target_runner=<that runner>
+#   2. Runner starts `gb agent start --local --runner=<runner>` with this
+#      scenario — the agent bead carries runtime_id=<runner> and the
+#      escalation executor starts
+#   3. Runner approves the escalation → kbeads mails the agent joined on
+#      the runner control:escalation-approved
+#   4. The agent's mail subscriber hands the mail to the executor, which
+#      fetches the escalation and POSTs a nudge ("ESCALATION APPROVED: …")
+#      to coop
+#   5. Coop injects the nudge as claudeless input — this scenario's
+#      `ESCALATION APPROVED` response fires
+#   6. Scenario records success to escalation, closes the assigned bead,
+#      and calls `gb stop` to despawn
+#
+# Side channels:
+#   /tmp/local-escalation-id       — runner writes escalation id here before
+#                                    approving, so the scenario can report
+#                                    results regardless of nudge text parsing
+#   /tmp/local-escalation-handled  — scenario writes handled escalation id
+#                                    here so the runner can assert the nudge
+#                                    actually reached the scenario
+#
+# Environment inputs:
+#   BOAT_TASK_ID — pre-assigned bead the agent will close on exit (set by
+#                  the runner via `gb agent start --local --task=<id>`)
+#
+# Run via (through the runner):
+#   gb agent start --local --runner=<runner bead id> \
+#                  --test-scenario=local-escalation-roundtrip
+
+# Local-mode startup prompt for `gb agent start --local` lives in the
+# sidecar local-escalation-roundtrip.startup-prompt.txt next to this file
+# (claudeless rejects unknown TOML keys). The sidecar prompt must NOT
+# contain "ESCALATION APPROVED" — that would prematurely fire Phase 1
+# before the runner approves the real escalation.
+
+[claude]
+session_id = "e2e00000-0004-4000-a000-000000000006"
+username = "e2e-local-escalation"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+# ── Phase 1: Escalation nudge arrives ───────────────────────────────
+# The executor builds a prompt starting with "ESCALATION APPROVED: …" —
+# match on that string so we only fire on the real nudge, not on
+# prime/other startup input that may mention "escalation" in passing.
+[[responses]]
+on = { contains = "ESCALATION APPROVED" }
+say = "Escalation nudge received. Recording result and closing."
+tools = [
+  { call = "Bash", input = { command = """set -eu
+# Prefer the id the runner stashed; fall back to parsing the nudge text
+# from the scenario input via $CLAUDE_USER_INPUT if claudeless sets it.
+ESC_ID="$(cat /tmp/local-escalation-id 2>/dev/null || true)"
+if [ -z "$ESC_ID" ] && [ -n "${CLAUDE_USER_INPUT:-}" ]; then
+  ESC_ID="$(printf '%s' "$CLAUDE_USER_INPUT" | grep -oE 'kd-[A-Za-z0-9]+' | head -n1 || true)"
+fi
+if [ -z "$ESC_ID" ]; then
+  echo 'ERROR: could not determine escalation id' >&2
+  exit 1
+fi
+echo "handled_escalation=$ESC_ID"
+# Marker the runner asserts on — proves the nudge reached the scenario.
+printf '%s\\n' "$ESC_ID" > /tmp/local-escalation-handled
+
+# Record the result. The executor only stamps prompt_delivered_at; this is
+# the agent-reports-done path that closes the escalation, and it is
+# idempotent (server accepts repeat result capture on closed escalations).
+gb escalation close "$ESC_ID" \\
+  --status success \\
+  --result '{"status":"handled_by_scenario"}' \\
+  2>&1 || true
+
+# Close the pre-assigned task bead so the runner's lifecycle asserts pass.
+if [ -n "${BOAT_TASK_ID:-}" ]; then
+  kd close "$BOAT_TASK_ID" 2>&1 || true
+fi
+
+# Signal pass to gb-agent (ka-0000006600) before despawning. The runner
+# treats a missing/empty GB_SCENARIO_RESULT_FILE as failure.
+if [ -n "${GB_SCENARIO_RESULT_FILE:-}" ]; then
+  echo pass > "$GB_SCENARIO_RESULT_FILE"
+fi
+
+# Despawn cleanly.
+gb stop 2>&1 || true""" } }
+]
+
+# ── Fallback ────────────────────────────────────────────────────────
+# Any other input (prime output, hook injections) — stay idle and wait
+# for the escalation nudge.
+[default]
+say = "Local escalation roundtrip scenario idle. Waiting for escalation nudge."
+
+# ── Tool config ─────────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

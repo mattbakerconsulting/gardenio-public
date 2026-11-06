@@ -1,0 +1,80 @@
+{{- if .Values.releaseDeployer.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.fullname" . }}-release-deployer-entrypoint
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+data:
+  entrypoint.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # release-deployer entrypoint: resolve the newest calver tag of this repo,
+    # shallow-clone it, and run its own gardenio/scripts/release-deploy.sh
+    # against the live helm release. Exit 3 (skip -- paused, helm busy, not
+    # newer, values drift, or the tag's images.yml / ci.yml / checks.yml not
+    # green) from release-deploy.sh is treated as a SUCCESSFUL Job; every
+    # other non-zero status propagates unchanged.
+
+    echo "=== release-deployer entrypoint starting: repo=${REPO} namespace=${NAMESPACE} release=${RELEASE_NAME} ==="
+
+    # --- Git credentials -----------------------------------------------
+    # Read from the mounted Secret files (not env vars -- env-var secrets
+    # leak via /proc/<pid>/environ, `ps eww`, `kubectl describe pod`;
+    # ka-0000002787). Written to a git-credentials store file consumed by
+    # `git config --global credential.helper store`.
+    GIT_USERNAME="$(cat /etc/git-creds/username)"
+    GIT_TOKEN="$(cat /etc/git-creds/token)"
+    printf 'https://%s:%s@github.com\n' "$GIT_USERNAME" "$GIT_TOKEN" > /tmp/.git-credentials
+    chmod 600 /tmp/.git-credentials
+    git config --global credential.helper 'store --file=/tmp/.git-credentials'
+
+    # gh (used by release-deploy.sh's rule 4: gh api on the tag's commit and
+    # its images.yml, ci.yml and checks.yml runs and jobs; owner 2026-11-03)
+    # reads GH_TOKEN from its own process env -- a
+    # process env var set here, not a pod env var on the container spec, so
+    # this still stays within ka-0000002787.
+    export GH_TOKEN="$GIT_TOKEN"
+
+    # --- Resolve the newest calver tag ----------------------------------
+    # Calver tags look like YYYY.N.N (e.g. 2026.9.3). Filter to that shape,
+    # strip the refs/tags/ prefix, and take the highest via version sort --
+    # newest is whatever `sort -V | tail -1` picks, not whatever git returns
+    # last. The `|| true` on grep keeps a no-match (exit 1) from tripping
+    # `set -o pipefail` before the friendly "no tags found" check below runs.
+    TAG="$(git ls-remote --tags "$REPO" \
+      | { grep -oE 'refs/tags/20[0-9]{2}\.[0-9]+\.[0-9]+$' || true; } \
+      | sed 's#^refs/tags/##' \
+      | sort -V | tail -1)"
+
+    if [ -z "$TAG" ]; then
+      echo "release-deployer: no calver tags (^20YY.N.N) found on ${REPO}" >&2
+      exit 1
+    fi
+    echo "=== resolved newest calver tag: ${TAG} ==="
+
+    # --- Shallow clone the tag -------------------------------------------
+    WORKDIR="$(mktemp -d)"
+    git clone --depth 1 --branch "$TAG" "$REPO" "$WORKDIR"
+
+    # --- Run the tagged release-deploy.sh against the live release -------
+    # release-deploy.sh self-locates its own chart dir + default values file
+    # via `git rev-parse --show-toplevel` from its own path inside the
+    # freshly-cloned tag, so no extra flags are needed beyond the tag +
+    # --namespace/--release.
+    set +e
+    KD_URL="${KD_URL}" KD_TOKEN="${KD_TOKEN:-}" KD_OPERATED_BY="${KD_OPERATED_BY:-}" \
+      bash "${WORKDIR}/gardenio/scripts/release-deploy.sh" "$TAG" \
+        --namespace "$NAMESPACE" --release "$RELEASE_NAME"
+    rc=$?
+    set -e
+
+    if [ "$rc" -eq 3 ]; then
+      echo "=== release-deploy.sh skipped (exit 3) -- treating as a successful Job ==="
+      exit 0
+    fi
+    exit "$rc"
+{{- end }}

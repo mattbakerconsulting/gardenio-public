@@ -1,0 +1,99 @@
+# local-yield-close.toml
+#
+# Claudeless scenario: Local-mode decision → yield → resolve → close
+#
+# Exercises the human-in-the-loop path for a local agent:
+#
+#   1. Agent creates a decision via `gb decision create --no-wait`
+#   2. Runner (outside claudeless) resolves the decision as if a human did
+#   3. Agent calls `gb yield` and returns quickly (resolution already present)
+#   4. Agent acts on the chosen option (here: a noop acknowledgement)
+#   5. Agent closes its claimed bead and stops
+#
+# The scenario stays contained — it exercises the CLI shapes. Validating
+# that the Slack bridge path still delivers in local mode is a laptop-only
+# concern (A6 escalation round-trip covers the Slack side separately).
+#
+# Environment inputs:
+#   BOAT_TASK_ID  — pre-assigned bead the agent will close (set by runner
+#                   via `gb agent start --local --task=<id>`)
+#
+# Run via:
+#   gb agent start --local --test-scenario=local-yield-close
+
+# Local-mode startup prompt for `gb agent start --local` lives in the
+# sidecar local-yield-close.startup-prompt.txt next to this file
+# (claudeless rejects unknown TOML keys). Follow-up nudges that drive
+# yield and close phases live in local-yield-close.nudges.txt — see
+# decision ka-0000006129 (multi-nudge).
+
+[claude]
+session_id = "e2e00000-0004-4000-a000-000000000003"
+username = "e2e-local-yield"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+[[responses]]
+on = { contains = "decision" }
+say = "Creating a decision and yielding to it."
+tools = [
+  { call = "Bash", input = { command = """set -eu
+# Make the prompt unique per run. `gb decision create` refuses to create a
+# decision whose normalized prompt-prefix matches an existing OPEN decision
+# in scope (the ka-0000003825 dedup guard). With a FIXED prompt, the first
+# run that leaves a decision open (e.g. a run the runner never got to
+# resolve) poisons every retry: create returns non-zero, `set -e` aborts
+# this bash BEFORE the side-channel write, and the runner reports
+# "side-channel /tmp/local-yield-decision-id never populated" — deterministic
+# on retries (gd-WTiyh6TLsn). The sibling gardener-trigger-decision-* scenarios
+# already avoid this by tagging their prompts; mirror that here. --allow-duplicate
+# is belt-and-suspenders: this throwaway test decision is exempt from dedup.
+TAG="e2e-lyc-$$-$(date +%s)"
+PROMPT="Local-mode yield test $TAG: approve or skip?"
+OPTIONS='[{"id":"approve","short":"Approve","label":"Proceed with the local work","artifact_type":"report"},{"id":"skip","short":"Skip","label":"Do not proceed","artifact_type":"report"}]'
+OUT=$(gb decision create --no-wait --allow-duplicate --prompt="$PROMPT" --options="$OPTIONS" 2>&1)
+echo "$OUT"
+# Stash the decision ID so the runner can resolve it from outside.
+DEC_ID=$(echo "$OUT" | grep -oE 'kd-[A-Za-z0-9]+' | head -n1 || true)
+if [ -n "$DEC_ID" ]; then
+  echo "$DEC_ID" > /tmp/local-yield-decision-id
+  echo "DECISION_ID=$DEC_ID"
+else
+  echo "WARN: could not extract decision id from create output"
+fi""" } }
+]
+
+# ── Phase 2: Yield (runner resolves in the meantime) ────────────────
+[[responses]]
+on = { contains = "yield" }
+say = "Yielding to the decision."
+tools = [
+  { call = "Bash", input = { command = """# Poll briefly — runner resolves decision out of band and we expect
+# yield to return quickly. Cap wait so the scenario never hangs the CI.
+timeout 30 gb yield 2>&1 || true""" } }
+]
+
+# ── Phase 3: Close ──────────────────────────────────────────────────
+[[responses]]
+on = { contains = "close" }
+say = "Yield returned. Closing the assigned bead."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+# Signal pass to gb-agent (ka-0000006600) before despawning.
+command = "if [ -n \"$BOAT_TASK_ID\" ]; then kd close \"$BOAT_TASK_ID\" 2>&1 || true; fi && if [ -n \"${GB_SCENARIO_RESULT_FILE:-}\" ]; then echo pass > \"$GB_SCENARIO_RESULT_FILE\"; fi && gb stop 2>&1 || true"
+
+# ── Fallback ────────────────────────────────────────────────────────
+[default]
+say = "Local yield/close scenario idle."
+
+# ── Tool config ─────────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

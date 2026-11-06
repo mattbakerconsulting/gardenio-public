@@ -1,0 +1,40 @@
+{{- /*
+S3 archival → IRSA guard (ka-0000007586 / ka-0000005411).
+
+When agents.s3.bucket is set, every ServiceAccount the controller or its
+agent pods may ride for S3 archival must carry the
+eks.amazonaws.com/role-arn annotation so IRSA can mint AWS credentials.
+The bug fixed in ka-0000005411 and the follow-on regression in
+ka-0000007426 both shipped values overlays where the IRSA annotation was
+missing on at least one SA. This guard catches that misconfiguration at
+chart-render time so it never reaches a cluster.
+
+The check is scoped to SAs the chart actually creates: agentServiceAccount
+(create=true), the controller serviceAccount (create=true), and the
+clusterAdmin SA (enabled=true). SAs the chart does not create are not
+checked.
+
+In-box object store (ka-0000004955): when agents.s3.endpoint is set the
+store is an in-cluster S3-compatible server (e.g. MinIO) whose credentials
+are injected from a k8s secret as AWS_ACCESS_KEY_ID/SECRET, not minted via
+IRSA. The IRSA annotation is therefore irrelevant in that mode, so the guard
+is skipped when an endpoint override is present.
+*/}}
+{{- if and .Values.agents.enabled .Values.agents.s3.bucket (not .Values.agents.s3.endpoint) }}
+{{- $irsa := "eks.amazonaws.com/role-arn" }}
+{{- if .Values.agents.agentServiceAccount.create }}
+{{- if not (index (default (dict) .Values.agents.agentServiceAccount.annotations) $irsa) }}
+{{- fail (printf "agents.s3.bucket=%q is set but agents.agentServiceAccount.annotations[%q] is unset — IRSA annotation is required for S3 archival. See ka-0000005411." .Values.agents.s3.bucket $irsa) }}
+{{- end }}
+{{- end }}
+{{- if .Values.agents.serviceAccount.create }}
+{{- if not (index (default (dict) .Values.agents.serviceAccount.annotations) $irsa) }}
+{{- fail (printf "agents.s3.bucket=%q is set but agents.serviceAccount.annotations[%q] is unset — IRSA annotation is required for S3 archival. See ka-0000005411." .Values.agents.s3.bucket $irsa) }}
+{{- end }}
+{{- end }}
+{{- if .Values.agents.clusterAdmin.enabled }}
+{{- if not (index (default (dict) .Values.agents.clusterAdmin.annotations) $irsa) }}
+{{- fail (printf "agents.s3.bucket=%q is set but agents.clusterAdmin.annotations[%q] is unset — IRSA annotation is required for S3 archival. See ka-0000005411." .Values.agents.s3.bucket $irsa) }}
+{{- end }}
+{{- end }}
+{{- end }}

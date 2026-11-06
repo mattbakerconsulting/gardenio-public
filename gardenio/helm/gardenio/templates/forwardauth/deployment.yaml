@@ -1,0 +1,226 @@
+{{- if and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled }}
+{{- /* Resolve the issuer once: explicit forwardAuth.oidcIssuerUrl wins; when it
+       is empty and the in-box Keycloak runtime is up, derive the realm issuer
+       from runtime.host (box auth profile — ka-0000006087 §6). */ -}}
+{{- $issuerURL := include "gardenio.forwardAuth.issuerURL" . -}}
+{{- if not (hasPrefix "https://" ($issuerURL | default "")) -}}
+{{- fail (printf "keycloak.forwardAuth.oidcIssuerUrl must resolve to an https:// issuer (got: %q). Set keycloak.forwardAuth.oidcIssuerUrl, or enable the in-box Keycloak runtime (keycloak.runtime.enabled + runtime.host) so it auto-derives. Plaintext OIDC discovery exposes session tokens in transit; refusing to render. See audit F11 (ka-0000007912)." ($issuerURL | default "")) -}}
+{{- end -}}
+{{- $fullname := include "gardenio.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-forwardauth
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: forwardauth
+spec:
+  replicas: {{ .Values.keycloak.forwardAuth.replicaCount | default 2 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}-forwardauth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Chart.Name }}-forwardauth
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: forwardauth
+      annotations:
+        # Roll the deployment when the custom error.html ConfigMap changes.
+        # oauth2-proxy reads templates only at process startup. The ConfigMap
+        # carries no helm.sh/chart label (templateLabels), so this hash, and the
+        # pod, change only on a real template edit, never on a calver release:
+        # a rolled oauth2-proxy has an empty JWKS cache and 401s valid bearers
+        # while Keycloak is still booting (gd-NrzwHXUxV0).
+        checksum/error-template: {{ include (print $.Template.BasePath "/forwardauth/error-template-configmap.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.keycloak.forwardAuth.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.keycloak.forwardAuth.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.name }}
+      {{- end }}
+      containers:
+        - name: oauth2-proxy
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.keycloak.forwardAuth.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.keycloak.forwardAuth.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 4180
+              protocol: TCP
+          args:
+            - --http-address=0.0.0.0:4180
+            # provider defaults to "oidc" (Keycloak realm broker — the chart
+            # default and the path ephemeral CI namespaces still use). The
+            # prod + staging front doors override this to "gitlab" in their
+            # deploy-values so oauth2-proxy talks to gitlab.com directly AND
+            # gates on GitLab group membership (ka-0000005030, durable fix for
+            # ka-0000002569). With --provider=oidc against gitlab.com there is
+            # no usable groups claim, so --allowed-group is a no-op and only
+            # --email-domain restricts; --provider=gitlab makes oauth2-proxy
+            # query the GitLab userinfo `groups` claim and enforce
+            # --gitlab-group below.
+            - --provider={{ .Values.keycloak.forwardAuth.provider | default "oidc" }}
+            - --provider-display-name=Gardenio
+            - --oidc-issuer-url={{ $issuerURL }}
+            - --client-id={{ .Values.keycloak.forwardAuth.clientId }}
+            {{- range .Values.keycloak.forwardAuth.emailDomains }}
+            - --email-domain={{ . }}
+            {{- end }}
+            {{- /* GitLab group-membership gate. Only meaningful with
+                   --provider=gitlab (oauth2-proxy queries the gitlab.com
+                   userinfo `groups` claim and admits a session only if the
+                   user is a member of one of these full group paths, e.g.
+                   "example-org"). Comma-joined into a single
+                   --gitlab-group flag (oauth2-proxy treats it as a list).
+                   Kept alongside --email-domain as defense-in-depth: a user
+                   must be BOTH in an allowed domain AND in an allowed group.
+                   See ka-0000005030. */}}
+            {{- with .Values.keycloak.forwardAuth.gitlabGroups }}
+            - --gitlab-group={{ join "," . }}
+            {{- end }}
+            - --cookie-secure={{ .Values.keycloak.forwardAuth.cookieSecure | default true }}
+            # Pin SameSite=lax explicitly to avoid drift if oauth2-proxy
+            # changes its default in a future image upgrade (audit F12).
+            - --cookie-samesite=lax
+            {{- /* Empty cookieDomain => host-only cookies (no --cookie-domain), one
+                   sign-in cookie per public host (plan ziti-to-keycloak, S2a). */}}
+            {{- if .Values.keycloak.forwardAuth.cookieDomain }}
+            - --cookie-domain={{ .Values.keycloak.forwardAuth.cookieDomain }}
+            {{- end }}
+            - --cookie-name=_gardenio_oauth2
+            {{- if eq .Values.keycloak.forwardAuth.sessionStore.type "redis" }}
+            {{- /* Server-side sessions (gd-C2Sl6ClxAY). The cookie is a small
+                   ticket, so concurrent refreshes cannot interleave 4KB cookie
+                   chunks into a signature-invalid mix. */}}
+            - --session-store-type=redis
+            - --redis-connection-url=redis://{{ include "gardenio.forwardAuth.redis.host" . }}:{{ .Values.keycloak.forwardAuth.sessionStore.redis.port | default 6379 }}
+            {{- end }}
+            {{- if .Values.keycloak.forwardAuth.cookieRefresh }}
+            - --cookie-refresh={{ .Values.keycloak.forwardAuth.cookieRefresh }}
+            {{- end }}
+            {{- if .Values.keycloak.forwardAuth.cookieDomain }}
+            - --whitelist-domain=.{{ trimPrefix "." .Values.keycloak.forwardAuth.cookieDomain }}
+            {{- end }}
+            {{- /* Exact hosts the rd= redirect may return to. Needed when
+                   cookieDomain is empty (host-only cookies), where there is no
+                   domain-wide whitelist above. */}}
+            {{- range .Values.keycloak.forwardAuth.whitelistDomains }}
+            - --whitelist-domain={{ . }}
+            {{- end }}
+            {{- /* Whitelist the OIDC issuer host so /oauth2/sign_out?rd=
+                   can redirect to Keycloak's end_session_endpoint. Without
+                   this, sign_out only clears local cookies — the SSO
+                   session at Keycloak stays alive and the next request
+                   silently re-logs the user in. */}}
+            {{- $issuerHost := $issuerURL | replace "https://" "" | replace "http://" "" | regexFind "^[^/]+" }}
+            {{- if $issuerHost }}
+            - --whitelist-domain={{ $issuerHost }}
+            {{- end }}
+            - --upstream=static://202
+            - --reverse-proxy=true
+            - --set-xauthrequest=true
+            - --set-authorization-header=true
+            - --pass-access-token=true
+            - --pass-user-headers=true
+            - --skip-provider-button=true
+            - --code-challenge-method=S256
+            # Per-request CSRF token. Without this, browser pre-fetches and
+            # double-submits race to redeem the same single-use auth code,
+            # the second redeem fails with "Code not valid" and oauth2-proxy
+            # serves a 500 with a sign-in link. With per-request CSRF the
+            # state cookie scopes to a single attempt, so retries don't
+            # collide with the original. (oauth2-proxy ≥7.4.)
+            - --cookie-csrf-per-request=true
+            # 15m expiry — the CSRF/state cookie has to survive the full
+            # Keycloak round-trip (load login page + type creds + maybe 2FA
+            # + redirect back). 15s broke mobile entirely (revert documented
+            # in audit F12); 5m (oauth2-proxy default) was good for desktop
+            # autofill but still tail-bit slow human flows (mobile keypads,
+            # SMS-based 2FA, IdP password resets). Per-request CSRF scopes
+            # the cookie to a single attempt, so widening the window does
+            # not reintroduce the original collision the 15s tightening
+            # tried to fix. (ka-0000001516)
+            - --cookie-csrf-expire=15m
+            # Custom error.html: self-heals stale-callback 403s by chaining
+            # sign_out -> start with the original target preserved from the
+            # failed callback's `state`. See the configmap template for the
+            # full rationale and ka-0000001516 for the bug.
+            - --custom-templates-dir=/etc/oauth2_proxy/templates
+            {{- if .Values.keycloak.forwardAuth.ingress.enabled }}
+            - --redirect-url=https://{{ .Values.keycloak.forwardAuth.ingress.host }}/oauth2/callback
+            {{- end }}
+            {{- if .Values.keycloak.forwardAuth.scope }}
+            - --scope={{ .Values.keycloak.forwardAuth.scope }}
+            {{- end }}
+            {{- range .Values.keycloak.forwardAuth.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.keycloak.forwardAuth.clientSecretRef.name }}
+                  key: {{ .Values.keycloak.forwardAuth.clientSecretRef.key }}
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.keycloak.forwardAuth.cookieSecretRef.name }}
+                  key: {{ .Values.keycloak.forwardAuth.cookieSecretRef.key }}
+            {{- if and (eq .Values.keycloak.forwardAuth.sessionStore.type "redis") .Values.keycloak.forwardAuth.sessionStore.redis.passwordSecret }}
+            - name: OAUTH2_PROXY_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.keycloak.forwardAuth.sessionStore.redis.passwordSecret }}
+                  key: {{ .Values.keycloak.forwardAuth.sessionStore.redis.passwordKey | default "password" }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: templates
+              mountPath: /etc/oauth2_proxy/templates
+              readOnly: true
+          resources:
+            {{- toYaml .Values.keycloak.forwardAuth.resources | nindent 12 }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.keycloak.forwardAuth.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.keycloak.forwardAuth.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.keycloak.forwardAuth.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: templates
+          configMap:
+            name: {{ $fullname }}-forwardauth-templates
+{{- end }}

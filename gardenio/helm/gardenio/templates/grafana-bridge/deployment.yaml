@@ -1,0 +1,206 @@
+{{- if .Values.grafanaBridge.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.fullname" . }}-grafana-bridge
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana-bridge
+spec:
+  replicas: {{ .Values.grafanaBridge.replicaCount | default 1 }}
+  # Recreate: the bridge mounts a ReadWriteOnce PVC for loop-breaker/SSE-dedup
+  # state. A RollingUpdate brings the new pod up before the old releases the RWO
+  # volume → FailedAttachVolume Multi-Attach deadlock that trips verify-prod on
+  # every deploy (ka-0000003526). Terminate the old pod first, then attach.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: grafana-bridge
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: grafana-bridge
+    spec:
+      serviceAccountName: {{ include "gardenio.fullname" . }}-grafana-bridge
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: grafana-bridge
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.grafanaBridge.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.grafanaBridge.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: {{ .Values.grafanaBridge.listenPort | default 8093 }}
+              protocol: TCP
+          env:
+            - name: BEADS_HTTP_ADDR
+              value: "http://{{ include "gardenio.beads.host" . }}:{{ include "gardenio.beads.httpPort" . }}"
+            {{- /* The shared static token is injected only while the machine
+                 principal is off (rollback path): with it on, every daemon call
+                 AND the SSE stream authenticate as the Keycloak service account
+                 (gd-5QYwXtV7IA). */}}
+            {{- if and .Values.beads.tokenSecret (not .Values.grafanaBridge.machinePrincipal.enabled) }}
+            - name: BEADS_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.tokenSecretName" . }}
+                  key: token
+            {{- end }}
+            {{- /* Machine principal (gd-Hc34EENbO9): the bridge's daemon writes
+                 authenticate as the Keycloak service account of
+                 grafanaBridge.machinePrincipal.clientId (SSE reads included). The secret is a file, never an env var; its
+                 Secret is operator-created and optional, so a missing Secret
+                 still starts the pod and the writes fail closed
+                 (auth_unavailable). Same contract as templates/controller. */}}
+            {{- if .Values.grafanaBridge.machinePrincipal.enabled }}
+            - name: BEADS_OIDC_TOKEN_URL
+              value: {{ include "gardenio.keycloak.tokenURL" . | quote }}
+            - name: BEADS_OIDC_CLIENT_ID
+              value: {{ .Values.grafanaBridge.machinePrincipal.clientId | quote }}
+            - name: BEADS_OIDC_CLIENT_SECRET_FILE
+              value: /var/run/secrets/gardenio-machine/clientSecret
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            # The token URL is the keycloak-runtime https port: trust its CA
+            # (gd-lYPZlslOM7).
+            - name: BEADS_OIDC_CA_FILE
+              value: {{ include "gardenio.keycloakRuntime.caFile" . | quote }}
+            {{- end }}
+            {{- end }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: GRAFANA_LISTEN_ADDR
+              value: ":{{ .Values.grafanaBridge.listenPort | default 8093 }}"
+            - name: GRAFANA_PROJECT
+              value: {{ .Values.grafanaBridge.project | default "gardenio" | quote }}
+            - name: STATE_PATH
+              value: {{ .Values.grafanaBridge.statePath | quote }}
+            {{- if .Values.grafanaBridge.backfill.enabled }}
+            - name: GRAFANA_BACKFILL
+              value: "true"
+            - name: GRAFANA_DASHBOARDS_DIR
+              value: {{ .Values.grafanaBridge.backfill.dir | quote }}
+            {{- end }}
+            {{- if .Values.grafanaBridge.grafana.url }}
+            - name: GRAFANA_URL
+              value: {{ .Values.grafanaBridge.grafana.url | quote }}
+            - name: GRAFANA_READBACK_INTERVAL
+              value: {{ .Values.grafanaBridge.grafana.readbackInterval | quote }}
+            - name: GRAFANA_CONFLICT_POLICY
+              value: {{ .Values.grafanaBridge.grafana.conflictPolicy | quote }}
+            {{- if .Values.grafanaBridge.grafana.tokenSecret }}
+            - name: GRAFANA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.grafanaBridge.grafana.tokenSecret }}
+                  key: token
+            {{- end }}
+            {{- end }}
+            {{- if .Values.grafanaBridge.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.grafanaBridge.logLevel | quote }}
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: "{{ .Values.global.coverage.mountPath }}/grafana-bridge"
+            {{- end }}
+          volumeMounts:
+            - name: state
+              mountPath: {{ dir .Values.grafanaBridge.statePath }}
+            {{- /*
+              No `dashboards` volumeMount: the backfill models are baked into
+              the grafana-bridge IMAGE at GRAFANA_DASHBOARDS_DIR (default
+              /dashboards; images.yml builds grafana-bridge). They used to be
+              mounted from the chart-rendered {agents.fullname}-grafana-dashboard
+              ConfigMap, but that ConfigMap (and 3 siblings) double-stored ~200KB
+              of dashboard JSON in every release-history Secret and overflowed the
+              K8s 1 MiB limit, stranding prod (ka-0000002799 / ka-0000003724).
+            */}}
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+            {{- if .Values.grafanaBridge.machinePrincipal.enabled }}
+            - name: machine-client-secret
+              mountPath: /var/run/secrets/gardenio-machine
+              readOnly: true
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            {{- include "gardenio.keycloakRuntime.caVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.grafanaBridge.resources | nindent 12 }}
+      {{- if .Values.global.coverage.enabled }}
+      terminationGracePeriodSeconds: 45
+      {{- end }}
+      volumes:
+        - name: state
+          {{- if .Values.grafanaBridge.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.fullname" . }}-grafana-bridge
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- /*
+          No `dashboards` volume: the backfill models ride in the bridge image
+          (see the volumeMounts note above). Removing the
+          chart-ConfigMap source is what eliminates the release-Secret
+          double-store (ka-0000002799).
+        */}}
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+        {{- if .Values.grafanaBridge.machinePrincipal.enabled }}
+        # Machine-principal client secret (gd-Hc34EENbO9). optional: the operator
+        # creates the Secret by hand; without it the pod still starts and the
+        # bridge's writes fail closed with auth_unavailable in the log.
+        - name: machine-client-secret
+          secret:
+            secretName: {{ .Values.grafanaBridge.machinePrincipal.secretName | quote }}
+            optional: true
+        {{- if include "gardenio.keycloak.inClusterCA" . }}
+        {{- include "gardenio.keycloakRuntime.caVolume" . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.grafanaBridge.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.grafanaBridge.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.grafanaBridge.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

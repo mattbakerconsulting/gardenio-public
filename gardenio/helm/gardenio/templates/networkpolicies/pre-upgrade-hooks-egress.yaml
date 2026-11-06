@@ -1,0 +1,145 @@
+{{- /*
+Egress carve-outs for the pre-install/pre-upgrade hook Jobs (ka-0000006927).
+
+The chart ships two short-lived hook Jobs that call the Kubernetes API via
+kubectl:
+  • {release}-psa-labels   (namespace-psa.yaml,         hook-weight -20)
+  • {release}-adopt-pvcs   (pre-upgrade-adopt-pvcs.yaml, hook-weight -10)
+
+When the target namespace already carries `{release}-default-deny-egress`
+(podSelector: {}) from a prior release, those hook pods match the default-deny
+but have NO egress allow-rule. They crashloop on
+`dial tcp <api>:443: connect: connection refused`, helm blocks on the hook
+forever, and the upgrade aborts before the controller ever deploys
+(ka-0000006927, dup ka-0000001091). The same egress-gap class kept beads-viewer
+and slack-bridge down for days.
+
+Fix: ship a hook-scoped egress NetworkPolicy per hook Job, allowing exactly
+DNS (kube-dns) + the Kubernetes API server. Each policy is itself a helm hook
+in the same phase as its Job, at hook-weight one LOWER (-21, -11) so it is
+created before the Job pod starts.
+
+Notes:
+  • Selection is by the auto-added `job-name` label so the carve-out applies
+    only to the hook pod, not to any other pod that happens to match.
+  • hook-delete-policy is `before-hook-creation` ONLY — NOT `hook-succeeded`.
+    A NetworkPolicy is "Ready" the instant it is created, so adding
+    `hook-succeeded` would let helm delete the policy before the Job pod has
+    finished talking to the API. The stale policy is cleaned up by the next
+    upgrade's before-hook-creation sweep.
+  • Gated on defaultDenyEgress: without the namespace-wide deny the hook pods
+    already have unrestricted egress, and adding an egress policy would only
+    NARROW what they can reach.
+  • Kube API reachability mirrors controller-egress: configured private CIDRs
+    (networkPolicies.controller.kubeApiServer.cidrs — needed for in-cluster
+    endpoints like k3s 10.43.0.1) plus an internet 443/6443 allow (RFC1918 +
+    IMDS + CGNAT excluded) for public EKS endpoints.
+  • k3s / kube-router post-DNAT gotcha (ka-0000003176): on k3s the hook pod
+    dials the in-cluster apiserver at 10.43.0.1:443, but kube-proxy DNATs
+    that to <node-private-IP>:6443 in nat/PREROUTING — BEFORE the embedded
+    kube-router netpol controller evaluates egress ipBlocks in the filter
+    table. The node IP is RFC1918, so the internet allow's exceptions REJECT
+    the connection ("connect: connection refused"), the kubectl container
+    crash-loops fast, the Job hits BackoffLimitExceeded (~6 min with the
+    default backoffLimit 6), and helm aborts the whole install with 0 pods.
+    kubeApiServer.cidrs cannot express this either: the post-DNAT node IP is
+    DHCP-assigned and unknowable in a tracked values file. Fix: a dedicated
+    private-range TCP/6443 allow below. 6443 is the kube-apiserver port —
+    nothing else in the gardenio threat model serves it on a private address —
+    and IMDS (169.254/16, port 80/443) stays excluded, so the pivot surface
+    this opens for a seconds-lived pinned-kubectl pod is negligible next to
+    an install path that fails closed on every k3s box.
+*/ -}}
+{{- if and .Values.networkPolicies.enabled .Values.networkPolicies.defaultDenyEgress -}}
+{{- $releaseName := include "gardenio.fullname" . -}}
+{{- $namespace := .Release.Namespace -}}
+{{- $kubeDns := .Values.networkPolicies.kubeDns -}}
+{{- $apiCidrs := .Values.networkPolicies.controller.kubeApiServer.cidrs -}}
+{{- $hooks := list -}}
+{{- if .Values.podSecurityAdmission.enabled -}}
+  {{- $hooks = append $hooks (dict "name" "psa-labels" "phase" "pre-install,pre-upgrade" "weight" "-21") -}}
+{{- end -}}
+{{- $hooks = append $hooks (dict "name" "adopt-pvcs" "phase" "pre-upgrade" "weight" "-11") -}}
+{{- range $i, $hook := $hooks }}
+{{- if $i }}
+---
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $releaseName }}-{{ $hook.name }}-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+  annotations:
+    "helm.sh/hook": {{ $hook.phase }}
+    "helm.sh/hook-weight": {{ $hook.weight | quote }}
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  podSelector:
+    matchLabels:
+      job-name: {{ $releaseName }}-{{ $hook.name }}
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution — pinned to kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $kubeDns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml $kubeDns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if $apiCidrs }}
+    # Kubernetes API server (configured private/in-cluster endpoints, e.g.
+    # k3s 10.43.0.1). Mirrors networkPolicies.controller.kubeApiServer.cidrs.
+    - to:
+        {{- range $apiCidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    {{- end }}
+    # Kubernetes API server (public EKS endpoint). RFC1918 + IMDS + CGNAT
+    # excluded so a hook pod cannot pivot to other cluster services or node IAM.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    # Kubernetes API server, k3s post-DNAT path (ka-0000003176 — see header).
+    # kube-proxy rewrites 10.43.0.1:443 → <node-private-IP>:6443 before the
+    # kube-router netpol controller evaluates this policy, so the apiserver
+    # allow must name the PRIVATE ranges on the apiserver port. 6443 ONLY —
+    # 443 keeps its RFC1918 exclusion above, preserving the no-pivot posture
+    # for everything that is not a kube-apiserver.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+        - ipBlock:
+            cidr: 172.16.0.0/12
+        - ipBlock:
+            cidr: 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 6443
+{{- end }}
+{{- end }}

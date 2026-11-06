@@ -1,0 +1,147 @@
+{{- if .Values.edgeBackends.enabled }}
+{{- /* Ingress-only NetworkPolicies for the apps behind the public edge (plan
+       ziti-to-keycloak S2a, gd-hRltljHGon). Independent of networkPolicies.enabled.
+       Every `from` entry names a real peer: an empty `from` or a bare `{}` peer
+       would admit every pod, so peers are only ever built from non-empty
+       selectors. */ -}}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- $eb := .Values.edgeBackends -}}
+{{- $edgeNS := $eb.edgeNamespace | default "public-edge" -}}
+{{- $grafanaPort := int (.Values.grafana.service.port | default 3000) -}}
+{{- $viewerPort := int (.Values.beadsViewer.service.port | default 8095) -}}
+{{- if .Values.keycloak.forwardAuth.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-edge-forwardauth
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}-forwardauth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $edgeNS | quote }}
+        {{- range $eb.forwardauthCallers }}
+        {{- if . }}
+        - podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 4180
+---
+{{- end }}
+{{- if .Values.grafana.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-edge-grafana
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.grafana.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $edgeNS | quote }}
+        {{- /* gd-2TXOKAXFcQ: with auth.proxy on, this port trusts
+               grafana.auth.proxy.headerName, so a ziti client could name
+               itself Admin through ziti-host. A trusted-header port never
+               admits ziti-host; grafanaZitiHost=false drops it otherwise. */}}
+        {{- if and $eb.zitiHostSelector $eb.grafanaZitiHost (not .Values.grafana.auth.proxy.enabled) }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml $eb.zitiHostSelector | nindent 14 }}
+        {{- end }}
+        {{- range $eb.grafanaCallers }}
+        {{- if . }}
+        - podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $grafanaPort }}
+    {{- /* Agent path (gd-RUhOpXWwmz): the header-stripping port, for callers
+           that must never present an identity. No rule without a caller: an
+           empty `from` would admit every pod. */}}
+    {{- if and .Values.grafana.auth.proxy.agentPath.enabled $eb.grafanaAgentCallers }}
+    - from:
+        {{- range $eb.grafanaAgentCallers }}
+        {{- if . }}
+        - podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.grafana.auth.proxy.agentPath.port }}
+    {{- end }}
+---
+{{- end }}
+{{- if .Values.beadsViewer.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-edge-beads-viewer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: beads-viewer
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if or $eb.viewerAuthproxySelector $eb.zitiHostSelector $eb.viewerCallers }}
+    - from:
+        {{- with $eb.viewerAuthproxySelector }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+        {{- with $eb.zitiHostSelector }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+        {{- range $eb.viewerCallers }}
+        {{- if . }}
+        - podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $viewerPort }}
+    {{- end }}
+    {{- if .Values.vmagent.enabled }}
+    # vmagent scrapes the internal metrics port; without this the pod would
+    # lose its scrape the moment this policy selects it.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gardenio.vmagent.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.beadsViewer.metrics.port | default 9095 }}
+    {{- end }}
+{{- end }}
+{{- end }}

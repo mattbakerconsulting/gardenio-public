@@ -1,0 +1,610 @@
+{{- if .Values.releaseDeployer.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "gardenio.fullname" . }}-release-deployer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+# automountServiceAccountToken is intentionally NOT set here -- it belongs on
+# the pod (see cronjob.yaml), not the ServiceAccount, so nothing else that
+# happens to reference this SA inherits an automatic mount.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "gardenio.fullname" . }}-release-deployer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+rules:
+  # Operator-accepted: a `helm upgrade` of this chart can touch any
+  # namespaced kind the chart adds over time (Deployments, StatefulSets,
+  # Services, Secrets, ConfigMaps, CRDs the chart owns, ...), and pinning
+  # this to an enumerated list would mean editing RBAC on every future
+  # template. Namespace-scoped only -- see the ClusterRole below for the
+  # tightly-bounded cluster-scoped grant.
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "gardenio.fullname" . }}-release-deployer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "gardenio.fullname" . }}-release-deployer
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.fullname" . }}-release-deployer
+    namespace: {{ .Release.Namespace }}
+{{- $kc := .Values.keycloak }}
+{{- $imds := .Values.imdsDeny }}
+{{- $relNs := .Release.Namespace }}
+{{- $infra := and .Values.agents.enabled .Values.agents.infraReader.enabled }}
+{{- $infraName := .Values.agents.infraReader.name }}
+{{- /* Every namespace outside the release that the chart renders a
+       deployer-managed object into: the keycloak-runtime operator namespace
+       (admin Secret copy, ClusterKeycloak CA ConfigMap), each imdsDeny
+       namespace, and the infra-reader's keycloakclients and ARC runner
+       namespaces. One Role per namespace, because the sets overlap (operators
+       is in all three). */}}
+{{- $kcSecret := and $kc.enabled $kc.runtime.enabled $kc.runtime.admin.generate }}
+{{- $kcCA := include "gardenio.keycloakRuntime.clusterKeycloakTLS" . }}
+{{- $kcNs := "" }}
+{{- if or $kcSecret $kcCA }}
+{{- $kcNs = $kc.runtime.clusterKeycloak.operatorNamespace }}
+{{- end }}
+{{- $foreign := list }}
+{{- if and $kcNs (ne $kcNs $relNs) }}
+{{- $foreign = append $foreign $kcNs }}
+{{- end }}
+{{- if $imds.enabled }}
+{{- range $imds.namespaces }}
+{{- if and (ne . $relNs) (not (has . $foreign)) }}
+{{- $foreign = append $foreign . }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $gvK3s := and .Values.gvisor.enabled .Values.gvisor.k3sInstaller.enabled }}
+{{- $gvK3sNs := .Values.gvisor.k3sInstaller.namespace | default "kube-system" }}
+{{- if and $gvK3s (ne $gvK3sNs $relNs) (not (has $gvK3sNs $foreign)) }}
+{{- $foreign = append $foreign $gvK3sNs }}
+{{- end }}
+{{- $infraNss := list }}
+{{- if $infra }}
+{{- range (list .Values.agents.infraReader.keycloakClientsNamespace .Values.agents.infraReader.arcRunnersNamespace) }}
+{{- if . }}
+{{- $infraNss = append $infraNss . }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- range $infraNss }}
+{{- if and (ne . $relNs) (not (has . $foreign)) }}
+{{- $foreign = append $foreign . }}
+{{- end }}
+{{- end }}
+{{- $edgeNs := .Values.releaseDeployer.edgeNamespace | default "" }}
+{{- if and $edgeNs (ne $edgeNs $relNs) (not (has $edgeNs $foreign)) }}
+{{- $foreign = append $foreign $edgeNs }}
+{{- end }}
+{{- range $ns := $foreign }}
+{{- $isEdge := and $edgeNs (eq $ns $edgeNs) }}
+{{- $isKc := eq $ns $kcNs }}
+{{- $isImds := and $imds.enabled (has $ns $imds.namespaces) }}
+{{- $isGvK3s := and $gvK3s (eq $ns $gvK3sNs) }}
+{{- $isInfra := has $ns $infraNss }}
+---
+# Foreign-namespace grant for namespace {{ $ns }}. helm reads every object it
+# owns on every upgrade AND rollback, so without this the deployer fails on
+# EVERY release, not just ones that change the object: 2026.266.3 at
+# 2026-09-23T12:15Z failed its atomic rollback on exactly this and left the
+# release `failed` for 4.5h.
+{{- if and $isKc $kcSecret }}
+#
+# keycloak-runtime admin Secret copy (templates/keycloak-runtime/admin-secret.yaml):
+# get/update/patch on that ONE name only -- deliberately NO create and NO
+# delete (operator decision 2026-09-23, tests pin it). With delete+create+get
+# on the name the deployer could re-create it as a service-account-token Secret
+# for an operators SA and read the token back: privilege escalation into this
+# namespace. A Secret's `type` is immutable, so update/patch alone cannot do
+# that. helm never needs delete here (the copy is `resource-policy: keep`), but
+# it does need create the FIRST time: that first creation is an ADMIN step,
+# done by the same operator roll that bootstraps this Role (the SA cannot grant
+# itself access anyway). If the copy is ever deleted, an autonomous roll fails
+# until an admin roll re-creates it.
+{{- end }}
+{{- if and $isKc $kcCA }}
+#
+# ClusterKeycloak CA ConfigMap (templates/keycloak-runtime/cluster-keycloak-ca.yaml,
+# gd-PhU6jPtSxa): get/update/patch on that ONE name, same shape as the Secret
+# copy and for the same reason no create/delete (tests pin it). Its FIRST
+# creation, and the first install of this rule, is an ADMIN roll: escalation
+# prevention stops the deployer adding a grant it does not already hold.
+{{- end }}
+{{- if $isGvK3s }}
+#
+# gVisor k3s installer (templates/gvisor-k3s-installer.yaml, gd-VtHRlD6gvB):
+# get/update/patch on its DaemonSet and script ConfigMap, by name only. NO
+# create and NO delete: the DaemonSet is privileged + hostPID (node root on
+# every platform node), so installing or removing it is an ADMIN roll, the
+# same one that bootstraps this Role. Later autonomous rolls only re-apply it
+# (a release or script bump, which they can still push).
+{{- end }}
+{{- if $isImds }}
+#
+# imds-deny NetworkPolicies (templates/networkpolicies/imds-deny.yaml, P7 Task
+# 6): get/update/patch/delete on those names only. create cannot be
+# name-restricted by RBAC, so it is granted on networkpolicies in this
+# namespace; the first install of a policy needs it.
+{{- end }}
+{{- if $isEdge }}
+#
+# Public edge (releaseDeployer.edgeNamespace, gd-t6Re9igBAj, P-R2
+# gd-WHBtmG7K3Z): release-deploy.sh rule 4c server-side applies
+# gardenio-ziti/public-edge.yaml from the tag, then runs `nginx -t` in the
+# Running edge pods and reloads them. get/patch on the edge objects by name;
+# pods get/list (list cannot be name-restricted) and pods/exec. Cost: pods/exec
+# reaches the nginx container, which mounts Secret public-edge-tls (the edge TLS
+# key); the deployer already holds */* in the release namespace, Secrets
+# included. The first install of this rule is an ADMIN roll.
+{{- end }}
+{{- if $isInfra }}
+#
+# infra-reader Role + RoleBinding (templates/controller/infra-reader-rbac.yaml,
+# gd-3Xa9PZgybq, gd-6FEbhRnAkd): get/update/patch on that ONE name, plus
+# `escalate` and `bind` on that one Role, as the infra-reader ClusterRole rule
+# does cluster-wide: this SA writes the Role without holding its keycloakclients
+# or ARC runner reads, and binds it.
+# No create and no delete: installing or removing the pair is an ADMIN roll
+# (escalate checks the request's name, which a create does not carry), the same
+# one that bootstraps this rule. Cost: a compromised deployer can rewrite this
+# Role to anything in this namespace, and the infra-reader SA holds it.
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "gardenio.fullname" $ }}-release-deployer
+  namespace: {{ $ns | quote }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+rules:
+  {{- if and $isKc $kcSecret }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $kc.runtime.admin.existingSecret | quote }}]
+    verbs: ["get", "update", "patch"]
+  {{- end }}
+  {{- if and $isKc $kcCA }}
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ include "gardenio.keycloakRuntime.caConfigMapName" $ | quote }}]
+    verbs: ["get", "update", "patch"]
+  {{- end }}
+  {{- if $isGvK3s }}
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    resourceNames: ["gvisor-k3s-installer"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["gvisor-k3s-installer"]
+    verbs: ["get", "update", "patch"]
+  {{- end }}
+  {{- if $isImds }}
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    resourceNames: ["imds-deny"{{ if has $ns $imds.exemptLabelNamespaces }}, "imds-deny-agents"{{ end }}]
+    verbs: ["get", "update", "patch", "delete"]
+  {{- end }}
+  {{- if $isEdge }}
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["public-edge", "public-edge-become"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["public-edge"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["public-edge"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    resourceNames: ["public-edge"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+  {{- end }}
+  {{- if $isInfra }}
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    resourceNames: [{{ $infraName | quote }}]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    resourceNames: [{{ $infraName | quote }}]
+    verbs: ["escalate", "bind"]
+  {{- end }}
+  # This Role and its RoleBinding are helm-owned objects here too, so later
+  # upgrades must be able to read and re-apply them. The FIRST install of this
+  # pair needs an operator (admin) roll: the SA cannot grant itself access.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    resourceNames: [{{ printf "%s-release-deployer" (include "gardenio.fullname" $) | quote }}]
+    verbs: ["get", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "gardenio.fullname" $ }}-release-deployer
+  namespace: {{ $ns | quote }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "gardenio.fullname" $ }}-release-deployer
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.fullname" $ }}-release-deployer
+    namespace: {{ $relNs }}
+{{- end }}
+{{- /* Agent-operated project infra grants (templates/project-infra-role.yaml):
+       helm owns objects in the project namespace, so the deployer needs a Role
+       there or every autonomous roll fails reading them (same failure as the
+       keycloak operator namespace above). Escalation prevention also means it can
+       only write the infra Role if it HOLDS every permission in it, so the rules
+       are copied verbatim from the grant. Everything else is named: create cannot
+       be name-restricted, get/update/patch/delete are. The FIRST install of this
+       Role needs an operator (admin) roll: the SA cannot grant itself access. */ -}}
+{{- if and .Values.projectNamespaceRbac.enabled .Values.projectNamespaceRbac.grants }}
+{{- $seenNs := dict }}
+{{- range $key, $g := .Values.projectNamespaceRbac.grants }}
+{{- if and $g.enabled ($g.agentInfra | default dict).enabled }}
+{{- if hasKey $seenNs $g.namespace }}
+{{- fail (printf "projectNamespaceRbac.grants.%s: namespace %s already has an agentInfra grant. One agentInfra grant per namespace (the release-deployer Role there is named after the release)." $key $g.namespace) }}
+{{- end }}
+{{- $_ := set $seenNs $g.namespace true }}
+{{- $base := $g.name | default $key }}
+{{- $deployerName := printf "%s-release-deployer" (include "gardenio.fullname" $) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $deployerName }}
+  namespace: {{ $g.namespace | quote }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+rules:
+  # Held so it can create/patch the infra Role below (no `escalate`).
+  {{- toYaml $g.rules | nindent 2 }}
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    resourceNames: [{{ $base | quote }}]
+    verbs: ["get", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    resourceNames: [{{ printf "%s-egress-internal" $base | quote }}, {{ printf "%s-egress-https" $base | quote }}]
+    verbs: ["get", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    resourceNames: [{{ $base | quote }}, {{ $deployerName | quote }}]
+    verbs: ["get", "update", "patch", "delete"]
+  # create cannot be name-restricted. roles/rolebindings are deliberately NOT
+  # here (design s12, N2): `create` on rolebindings would let a compromised
+  # deployer bind any Role it holds (including the infra rules, which the VAP
+  # does not fence for this identity) to a subject of its choosing. The first
+  # install of the infra Role/RoleBinding is an operator roll anyway; after that
+  # the named get/update/patch/delete above is enough. A NEW Role or RoleBinding
+  # added to this namespace later is an operator roll too.
+  - apiGroups: ["", "networking.k8s.io"]
+    resources: ["resourcequotas", "limitranges", "networkpolicies"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $deployerName }}
+  namespace: {{ $g.namespace | quote }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $deployerName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $deployerName }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- end }}
+---
+# Cluster-scoped grant, kept to the bare minimum. NO blanket */* read rule:
+# a ClusterRole's apiGroups/resources match ALL instances of that resource
+# kind cluster-wide, including NAMESPACED kinds in every namespace (e.g.
+# Secrets in kube-system, ziti) -- helm doesn't need that (every chart
+# lookup is namespaced, and API discovery isn't RBAC-gated), and granting
+# it would let this SA read every namespace's Secrets. So read is scoped
+# per cluster-scoped kind, same as write, below.
+#
+# For each cluster-scoped kind this chart renders (release_deployer_test.go
+# pins this set against a full render of deploy-values/gardenio-k3s.yaml,
+# and fails if a rendered object's name is missing from resourceNames):
+#   - create/list/watch: granted unrestricted -- RBAC cannot name-restrict
+#     create, and list/watch don't support resourceNames either.
+#   - get/update/patch/delete: restricted via resourceNames to exactly the
+#     names this chart renders, so this SA can't touch another chart's (or
+#     kube-system's) ClusterRole/ClusterRoleBinding/etc of the same kind.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.fullname" . }}-release-deployer
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+rules:
+  # The release namespace itself. NOT for this SA's own use: templates/
+  # namespace-psa.yaml re-creates the <fullname>-psa-labels ClusterRole on
+  # every upgrade (pre-upgrade hook, before-hook-creation), and that role
+  # grants get/patch on this namespace. RBAC refuses to let a subject create a
+  # role granting permissions it does not itself hold, so without this rule
+  # every autonomous roll fails at the hook ("attempting to grant RBAC
+  # permissions not currently held") and helm rolls back. Same verbs, same
+  # single name -- release_deployer_test.go pins it to the psa-labels grant.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: [{{ .Release.Namespace | quote }}]
+    verbs: ["get", "patch"]
+  {{- with .Values.releaseDeployer.edgeNamespace }}
+  # The public-edge namespace object (gardenio-ziti/public-edge.yaml), which
+  # release-deploy.sh rule 4c server-side applies (gd-WHBtmG7K3Z,
+  # gd-t6Re9igBAj). Same verbs and single name as the release-namespace rule.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: [{{ . | quote }}]
+    verbs: ["get", "patch"]
+  {{- end }}
+  # Nodes. NOT for this SA's own use: templates/controller/ha-drill-rbac.yaml
+  # renders the gardenio-ha-drill-operator ClusterRole (and its binding) with
+  # nodes get/list/watch/patch, cluster-wide and unnamed, for the scripted
+  # cordon/uncordon drill. Escalation prevention refuses to let this SA patch
+  # that role or its binding without holding the same grant, so 2026.284.4
+  # failed every autonomous roll and rolled back (helm revs 74-101). Same verbs,
+  # no resourceNames because the granted rule has none. Cost: this SA can
+  # cordon/uncordon (and relabel/retaint) any node; still no delete and no
+  # nodes/status. Deliberately not `escalate`/`bind`, which would let it grant
+  # anything at all. release_deployer_test.go checks every chart role this way.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  # PersistentVolumes. NOT for this SA's own use: templates/controller/
+  # pv-gc-rbac.yaml renders the <agents>-pv-gc ClusterRole (and its binding)
+  # with persistentvolumes list/patch/delete, cluster-wide and unnamed (PVs are
+  # cluster-scoped; the controller's GC narrows by claimRef). Same failure as
+  # the nodes rule above. Same verbs, no resourceNames because the granted rule
+  # has none. Cost: this SA can delete any PV object in the cluster; the
+  # pv-gc-admission-policy VAP matches only the controller SA, not this one.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["list", "patch", "delete"]
+  # RBAC objects, read-only. NOT for this SA's own use: templates/beads/
+  # rbac.yaml renders the <beads>-rbac-reader ClusterRole with get/list on
+  # roles, rolebindings, clusterroles and clusterrolebindings, cluster-wide and
+  # unnamed (the daemon's spawn permission snapshot probe reads every
+  # namespace's bindings, gd-SyEYkqe601). Same failure as the nodes rule
+  # above. Same verbs, no resourceNames because the granted rule has none.
+  # Cost: this SA can read any RBAC object; it could already create and list
+  # ClusterRoles.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list"]
+  {{- if $infra }}
+  # The infra-reader ClusterRole (templates/controller/infra-reader-rbac.yaml,
+  # agents.infraReader). NOT for this SA's own use. It grants cluster-wide
+  # get/list/watch on pods, pods/log, configmaps, workloads, nodes and more
+  # (plus any agents.infraReader.extraRules). Holding those would give this SA
+  # every namespace's pods and logs, which the Lands rule below forbids, so as
+  # there it holds `escalate` on exactly that role (to write it without holding
+  # its rules) and `bind` on exactly that role (the chart's ClusterRoleBinding
+  # of the same name references it).
+  #
+  # Cost: a compromised deployer can rewrite the infra-reader ClusterRole to
+  # anything, and the infra-reader SA, which crews in the `infra` role run as,
+  # holds it cluster-wide; that is a path to whatever it writes into that role.
+  #
+  # FIRST install: RBAC checks `escalate` against the request's name, and a
+  # create request carries none, so this SA cannot CREATE this role; the roll
+  # that first turns agents.infraReader on is an operator (admin) roll. Later
+  # autonomous rolls update it in place. release_deployer_test.go
+  # (HoldsEveryChartRoleGrant, InfraReaderRoles) checks this coverage.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames: [{{ $infraName | quote }}]
+    verbs: ["escalate", "bind"]
+  {{- end }}
+  {{- if and .Values.agents.enabled .Values.landNamespaces.enabled }}
+  # The two Lands land-namespace ClusterRoles (templates/controller/
+  # lands-namespace-rbac.yaml, Lands gate 3 gd-9FH9SNjrGE). NOT for this SA's
+  # own use. gardenio-land-agent-manager grants pods, secrets, configmaps and
+  # PVCs, and <agents>-lands-namespaces grants namespaces, rolebindings and
+  # serviceaccounts, all cluster-wide and unnamed. Holding those (the rules
+  # above do it for nodes and PVs) would put every namespace's Secrets and
+  # pods in this SA's hands, so instead it holds `escalate` on exactly those
+  # two roles (so it may write them without holding their rules) and `bind`
+  # on exactly the one the chart binds (<agents>-lands-namespaces' own
+  # ClusterRoleBinding). Nothing else may be escalated or bound.
+  #
+  # Cost: a compromised deployer can rewrite these two roles to anything, and
+  # the controller SA holds <agents>-lands-namespaces cluster-wide; this SA
+  # can already act as the controller SA (*/* in the release namespace), so
+  # that is a path to whatever it writes into that role. The three land
+  # admission policies are names this SA manages too (VAP rule below), so they
+  # do not fence it.
+  #
+  # FIRST install: RBAC checks `escalate` against the request's name, and a
+  # create request carries none, so this SA cannot CREATE these roles; the
+  # roll that first turns landNamespaces on is an operator (admin) roll.
+  # Later autonomous rolls update them in place.
+  # release_deployer_test.go (HoldsEveryChartRoleGrant, LandNamespaceRoles)
+  # checks this coverage.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames:
+      - "gardenio-land-agent-manager"
+      - {{ printf "%s-lands-namespaces" (include "gardenio.agents.fullname" .) | quote }}
+    verbs: ["escalate"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames:
+      - {{ printf "%s-lands-namespaces" (include "gardenio.agents.fullname" .) | quote }}
+    verbs: ["bind"]
+  {{- end }}
+  # ClusterRole / ClusterRoleBinding.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings"]
+    verbs: ["create", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings"]
+    resourceNames:
+      - {{ printf "%s-pv-gc" (include "gardenio.agents.fullname" .) | quote }}
+      - {{ printf "%s-psa-labels" (include "gardenio.fullname" .) | quote }}
+      - {{ printf "%s-release-deployer" (include "gardenio.fullname" .) | quote }}
+      {{- /* The beads daemon's rbac-reader role + binding (templates/beads/rbac.yaml,
+           beads.rbacProbe.enabled). Listed unconditionally, like land-scopes below. */}}
+      - {{ printf "%s-rbac-reader" (include "gardenio.beads.fullname" .) | quote }}
+      # Unconditional, like the other static-name entries below (PriorityClass /
+      # StorageClass / ClusterKeycloak): the value always exists regardless of
+      # agents.haDrillOperator.enabled, and naming it here doesn't depend on the
+      # ClusterRole/ClusterRoleBinding actually being rendered (templates/controller/ha-drill-rbac.yaml).
+      - {{ .Values.agents.haDrillOperator.name | quote }}
+      # Same reasoning for templates/controller/infra-admin-rbac.yaml: helm
+      # reads the cluster-admin ClusterRoleBinding on every upgrade, so this SA
+      # needs get on it. update/patch are listed with the other verbs but
+      # cannot be used to change it: escalation prevention requires `bind` on
+      # cluster-admin (or holding every permission) to write a binding that
+      # references it, and this SA is deliberately given neither. Changing that
+      # binding is therefore an operator roll, never an autonomous one.
+      - {{ .Values.agents.infraAdmin.name | quote }}
+      {{- if $infra }}
+      # templates/controller/infra-reader-rbac.yaml; see the escalate/bind rule above.
+      - {{ $infraName | quote }}
+      {{- end }}
+      {{- if and $infra .Values.agents.verifier.enabled }}
+      # templates/controller/verifier-rbac.yaml (P9.2): its ClusterRoleBinding to
+      # the infra-reader ClusterRole, which the bind rule above covers.
+      - {{ .Values.agents.verifier.name | quote }}
+      {{- end }}
+      {{- if and .Values.agents.enabled .Values.landNamespaces.enabled }}
+      # Lands land namespaces (templates/controller/lands-namespace-rbac.yaml);
+      # see the escalate/bind rules above.
+      - "gardenio-land-agent-manager"
+      - {{ printf "%s-lands-namespaces" (include "gardenio.agents.fullname" .) | quote }}
+      {{- end }}
+    verbs: ["get", "update", "patch", "delete"]
+  # ValidatingAdmissionPolicy / ...Binding.
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings"]
+    verbs: ["create", "list", "watch"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings"]
+    resourceNames:
+      - {{ printf "%s-pv-gc" (include "gardenio.agents.fullname" .) | quote }}
+      - {{ printf "%s-ha-drill" (include "gardenio.agents.fullname" .) | quote }}
+      {{- /* The land-scopes policy + binding (templates/controller/lands-scope-rbac.yaml),
+           rendered once the Lands provisioner is on. Listed unconditionally: a name
+           grant on an object that does not exist is inert. */}}
+      - {{ printf "%s-land-scopes" (include "gardenio.agents.fullname" .) | quote }}
+      {{- /* The agentInfra no-secrets set (templates/project-infra-role.yaml). */}}
+      {{- if and .Values.projectNamespaceRbac.enabled .Values.projectNamespaceRbac.grants }}
+      {{- range $key, $g := .Values.projectNamespaceRbac.grants }}
+      {{- if and $g.enabled ($g.agentInfra | default dict).enabled (($g.agentInfra.admissionPolicy | default dict).enabled) }}
+      {{- range $shape := list "pod" "workload" "cronjob" }}
+      - {{ printf "%s-no-secrets-%s" ($g.name | default $key) $shape | quote }}
+      {{- end }}
+      - {{ printf "%s-service-exposure" ($g.name | default $key) | quote }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- /* The three Lands land-namespace policies + bindings
+           (templates/controller/lands-namespace-rbac.yaml). */}}
+      {{- if and .Values.agents.enabled .Values.landNamespaces.enabled }}
+      {{- range $p := list "lands-namespaces" "land-agent-manager-binding" "land-pods" }}
+      - {{ printf "%s-%s" (include "gardenio.agents.fullname" $) $p | quote }}
+      {{- end }}
+      {{- end }}
+    verbs: ["get", "update", "patch", "delete"]
+  # PriorityClass -- static names (global.systemPriorityClass and its tiers).
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["create", "list", "watch"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    {{- $pc := .Values.global.systemPriorityClass }}
+    resourceNames: [{{ $pc.name | quote }}, {{ $pc.infra.name | quote }}, {{ $pc.interactive.name | quote }}, {{ $pc.scheduled.name | quote }}, {{ $pc.agent.name | quote }}]
+    verbs: ["get", "update", "patch", "delete"]
+  {{- if and .Values.gvisor.enabled .Values.gvisor.runtimeClass.create }}
+  # RuntimeClass -- static name (gvisor.runtimeClass.name). No delete: the
+  # object is helm.sh/resource-policy keep, so helm never deletes it.
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["create", "list", "watch"]
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    resourceNames: [{{ .Values.gvisor.runtimeClass.name | default "runsc" | quote }}]
+    verbs: ["get", "update", "patch"]
+  {{- end }}
+  # StorageClass -- static name (storageClassRetain.name).
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["create", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    resourceNames: [{{ .Values.storageClassRetain.name | quote }}]
+    verbs: ["get", "update", "patch", "delete"]
+  # ClusterKeycloak -- static name (keycloak.runtime.clusterKeycloak.name).
+  - apiGroups: ["v1.edp.epam.com"]
+    resources: ["clusterkeycloaks"]
+    verbs: ["create", "list", "watch"]
+  - apiGroups: ["v1.edp.epam.com"]
+    resources: ["clusterkeycloaks"]
+    resourceNames: [{{ .Values.keycloak.runtime.clusterKeycloak.name | quote }}]
+    verbs: ["get", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.fullname" . }}-release-deployer
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: release-deployer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.fullname" . }}-release-deployer
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.fullname" . }}-release-deployer
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -1,0 +1,1858 @@
+{{- if .Values.agents.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.agents.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "gardenio.agents.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.agents.selectorLabels" . | nindent 8 }}
+      annotations:
+        {{- include "gardenio.doNotDisrupt" . | nindent 8 }}
+        {{- /* gd-sqfOLZE7i7: most config reaches this pod as inline env values,
+               so ordinary env/image diffs already roll it via native Deployment
+               spec diffing. The two secretKeyRef-sourced exceptions
+               (nats-infra-creds, minio-credentials) are hashed below via
+               checksum/ annotations so a values-only rotation of their inline
+               (non-ESO) content still rolls the pod even though the
+               secretKeyRef name itself never changes. The restartedAt stamp
+               only needs to fire when an operator explicitly asks for it —
+               e.g. to pick up an ExternalSecret rotation the pod spec can't
+               see at all. */}}
+        {{- if .Values.agents.forceRestartOnUpgrade }}
+        rollout.kubernetes.io/restartedAt: {{ now | date "2006-01-02T15:04:05Z07:00" | quote }}
+        {{- end }}
+        {{- /* Hashes whatever this template renders for the current values —
+               the raw Secret content in non-ESO/inline mode, or the (rotation-
+               insensitive) ExternalSecret manifest otherwise — so the pod
+               still restarts when the chart-rendered credential changes. */}}
+        checksum/nats-infra-creds: {{ include "gardenio.contentChecksum" (include (print .Template.BasePath "/nats/infra-creds-secret.yaml") .) }}
+        checksum/minio-credentials: {{ include "gardenio.contentChecksum" (include (print .Template.BasePath "/minio/secret.yaml") .) }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9092"
+        prometheus.io/path: "/metrics"
+    spec:
+      {{- /* harden-thaw (ka-0000001355): when freeze/thaw is on, graceful
+           shutdown drains in-flight thaws (THAW_DRAIN_TIMEOUT, default 90s)
+           before the process exits so a controller roll never abandons an
+           in-flight restore/rehydrate mid-flight. The grace period MUST exceed
+           that drain budget or the kubelet SIGKILLs us mid-drain — set it with
+           headroom. Only applied when freeze/thaw is enabled; otherwise the k8s
+           default (30s) is preserved (zero blast radius for non-gVisor
+           deployments). */}}
+      {{- /* gd-Hk4RBE2MC7: the Codex keeper (gd-6ggiM3hiV5) drains an in-flight
+           token rotation on shutdown (30s rotate + persist, 10s bounded wait,
+           65s total budget); a rotated single-use refresh token that is not
+           persisted is a dead login. The grace period therefore has a floor
+           (agents.terminationGracePeriodSeconds, 90) that applies whether or not
+           freeze/thaw is on; with freeze/thaw on, the larger of the two wins. */}}
+      {{- $grace := int .Values.agents.terminationGracePeriodSeconds }}
+      {{- if .Values.gvisor.freezeThaw.enabled }}
+      {{- $grace = max $grace (int .Values.gvisor.freezeThaw.terminationGracePeriodSeconds) }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $grace }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "gardenio.agents.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if .Values.nats.enabled }}
+      initContainers:
+        - name: nats-stream-init
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.natsBoxImage "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.natsBoxImage.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          {{- if .Values.nats.auth.subjectIsolation.enabled }}
+          {{- /* Stream admin needs full access → infra creds. The nats CLI
+                 reads NATS_USER/NATS_PASSWORD from the environment; the
+                 shared secret is the infra user's PASSWORD under multi-user
+                 auth (ka-0000000002). Without these the init container
+                 connects anonymously and is refused, wedging the controller
+                 rollout. */}}
+          env:
+            - name: NATS_USER
+              value: infra
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.fullname" . }}-nats-infra-creds
+                  key: token
+          {{- else if and .Values.nats.auth.enabled .Values.nats.auth.token }}
+          env:
+            - name: NATS_TOKEN
+              value: {{ .Values.nats.auth.token | quote }}
+          {{- end }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              NATS_URL="{{ include "gardenio.natsURL" . }}"
+              # Wait for NATS to be ready (up to 60s)
+              for i in $(seq 1 30); do
+                if nats server check connection -s "$NATS_URL" 2>/dev/null; then break; fi
+                echo "Waiting for NATS... ($i/30)"
+                sleep 2
+              done
+              # Create MUTATION_EVENTS stream (idempotent — exits 0 if already exists)
+              if nats stream info MUTATION_EVENTS -s "$NATS_URL" >/dev/null 2>&1; then
+                echo "MUTATION_EVENTS stream already exists"
+              else
+                nats stream add MUTATION_EVENTS -s "$NATS_URL" \
+                  --subjects "beads.>" \
+                  --retention limits \
+                  --max-age 72h \
+                  --storage file \
+                  --replicas 1 \
+                  --discard old \
+                  --dupe-window 2m \
+                  --defaults
+                echo "Created MUTATION_EVENTS stream"
+              fi
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+      {{- end }}
+      containers:
+        - name: agents
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.agents.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.agents.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: health
+              containerPort: 8091
+              protocol: TCP
+            - name: metrics
+              containerPort: 9092
+              protocol: TCP
+          # startupProbe + timeoutSeconds: 5 (gd-egWmqMoXGJ): same fix as
+          # trigger-engine — timeoutSeconds: 1 (k8s default) on
+          # a node pinned at 100% CPU is a false-dead verdict against a
+          # CFS-throttled-but-healthy process, not an actual hang. The
+          # controller carries the identical gap and shares that node; fixed
+          # here before it hits the same restart loop. readinessProbe is new
+          # (there was none) — the agents Service (controller/service.yaml)
+          # already exposes port `health`, so gating its endpoint on /healthz
+          # only delays a still-starting surge pod from receiving traffic
+          # during the existing maxSurge=1/maxUnavailable=0 rollout; it does
+          # not change replica counting.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          env:
+            {{- include "gardenio.otelTracingEnv" . | nindent 12 }}
+            - name: NAMESPACE
+              value: {{ .Release.Namespace }}
+            {{- if .Values.global.env }}
+            - name: GARDENIO_ENV
+              value: {{ .Values.global.env | quote }}
+            {{- end }}
+            {{- /* gd-Hk4RBE2MC7: ALWAYS on. The Codex keeper (gd-6ggiM3hiV5)
+                 rotates a single-use ChatGPT refresh token, so exactly one
+                 controller may run it. At replicaCount=1 a RollingUpdate
+                 (maxSurge 1) still runs old and new pods side by side, and
+                 without the lease both would run the keeper. Lease RBAC is
+                 already in controller/rbac.yaml. */}}
+            - name: ENABLE_LEADER_ELECTION
+              value: "true"
+            {{- with .Values.agents.accountRotationRestart }}
+            - name: ACCOUNT_ROTATION_RESTART_ENABLED
+              value: {{ .enabled | quote }}
+            - name: STALE_VKEY_RESTART_ENABLED
+              value: {{ .staleVKeyEnabled | quote }}
+            {{- end }}
+            {{- if hasKey .Values.agents "spreadServedModelGateEnabled" }}
+            - name: SPREAD_SERVED_MODEL_GATE_ENABLED
+              value: {{ .Values.agents.spreadServedModelGateEnabled | quote }}
+            {{- end }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: BEADS_GRPC_ADDR
+              value: {{ include "gardenio.beads.host" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ include "gardenio.beads.port" . }}
+            - name: BEADS_HTTP_ADDR
+              value: http://{{ include "gardenio.beads.host" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ include "gardenio.beads.httpPort" . }}
+            - name: COOP_IMAGE
+              value: {{ include "gardenio.imageRef" (dict "image" .Values.agents.agentImage "global" .Values.global "Chart" .Chart) | quote }}
+            {{- if .Values.agents.initCloneImage }}
+            - name: INIT_CLONE_IMAGE
+              value: {{ .Values.agents.initCloneImage | quote }}
+            {{- end }}
+            {{- /* Agent coop StartupProbe budget = failureThreshold × 5s.
+                   Controller default is 180 (=15min). Set on a slow-egress
+                   cluster to widen the cold-start window (ka-0000000649). */}}
+            {{- if .Values.agents.startupProbeFailureThreshold }}
+            - name: AGENT_STARTUP_PROBE_FAILURE_THRESHOLD
+              value: {{ .Values.agents.startupProbeFailureThreshold | quote }}
+            {{- end }}
+            {{- /* Clone-storm stagger (ka-0000000995): init-clone sleeps a random
+                   0..N s before a cold clone. Empty -> compiled default (20s);
+                   "0" disables. Use `ne "" ` (not a bare `if`) so an explicit
+                   "0" is still emitted to override the compiled default. */}}
+            {{- if ne (.Values.agents.initCloneJitterMaxSeconds | toString) "" }}
+            - name: AGENT_INIT_CLONE_JITTER_MAX_SECONDS
+              value: {{ .Values.agents.initCloneJitterMaxSeconds | quote }}
+            {{- end }}
+            {{- if .Values.agents.dindImage }}
+            - name: DIND_IMAGE
+              value: {{ .Values.agents.dindImage | quote }}
+            {{- end }}
+            {{- /* Air-gap blocker P4.3 (ka-0000007177): explicit override wins;
+                   else global.airgap defaults the agent pull policy to
+                   IfNotPresent so a seeded image is reused with no registry
+                   round-trip. Cloud deploys (airgap=false, no override) keep
+                   the controller's PullAlways default. */}}
+            {{- $agentPull := .Values.agents.agentPullPolicy }}
+            {{- if and (not $agentPull) .Values.global.airgap }}
+            {{- $agentPull = "IfNotPresent" }}
+            {{- end }}
+            {{- if $agentPull }}
+            - name: AGENT_PULL_POLICY
+              value: {{ $agentPull | quote }}
+            {{- end }}
+            {{- /* Wire the prewarmed-pool PriorityClass ONLY when the chart
+                   renders it (prewarmed-priorityclass.yaml). The controller
+                   stamps this class on prewarmed/standby pods + warm
+                   placeholders so a cold real agent preempts an idle pool member
+                   under node pressure (ka-0000000722). Gating the env on create
+                   guarantees the controller never references a missing class. */}}
+            {{- if .Values.agents.prewarmedPriorityClass.create }}
+            - name: PREWARMED_PRIORITY_CLASS
+              value: {{ .Values.agents.prewarmedPriorityClass.name | quote }}
+            {{- end }}
+            {{- /* Agent-pod tiers (system-priorityclass.yaml): interactive-
+                   role (thread/dm/gardener) pods can preempt crew pods under
+                   node pressure (gd-Vtnt5lAGeQ), a scheduled gardener only
+                   queues ahead of them (gd-Y2KaNE233g); crew pods never preempt
+                   anything, and no agent pod can evict infra (gd-2qjxTVMBkC).
+                   Gating the env on create guarantees the controller never
+                   references a missing class. */}}
+            {{- if .Values.global.systemPriorityClass.create }}
+            - name: INTERACTIVE_PRIORITY_CLASS
+              value: {{ .Values.global.systemPriorityClass.interactive.name | quote }}
+            - name: SCHEDULED_PRIORITY_CLASS
+              value: {{ .Values.global.systemPriorityClass.scheduled.name | quote }}
+            - name: AGENT_PRIORITY_CLASS
+              value: {{ .Values.global.systemPriorityClass.agent.name | quote }}
+            {{- end }}
+            {{- /* Neutralize IMAGE_PULL_SECRETS under air-gap: the in-box
+                   registry needs no pull creds, and a stale secret would
+                   trigger a pull against the dead GitLab registry. */}}
+            {{- if and .Values.imagePullSecrets (not .Values.global.airgap) }}
+            - name: IMAGE_PULL_SECRETS
+              value: {{ range $i, $s := .Values.imagePullSecrets }}{{ if $i }},{{ end }}{{ $s.name }}{{ end }}
+            {{- end }}
+            {{- if .Values.agents.claudeOAuthSecret }}
+            - name: CLAUDE_OAUTH_SECRET
+              value: {{ .Values.agents.claudeOAuthSecret }}
+            {{- end }}
+            {{- /* The shared Secret's NAME for agent pods, used only when
+                 per-agent tokens are off. With them on, every spawn with an
+                 agent bead mounts its own Secret, and the shared kd-beads-token
+                 was deleted on 11-05 (gd-gdf3L8kjT5), so naming it would leave
+                 a bead-less pod stuck in CreateContainerConfigError. */}}
+            {{- if not .Values.agents.perAgentTokens }}
+            - name: BEADS_TOKEN_SECRET
+              value: {{ include "gardenio.beads.tokenSecretName" . }}
+            {{- end }}
+            {{- if .Values.agents.perAgentTokens }}
+            - name: PER_AGENT_TOKENS
+              value: "true"
+            {{- end }}
+            {{- with .Values.agents.secretAllowlist }}
+            {{- /* Bead-supplied agent-pod Secrets allow-list (gd-q8nBnOP65d). */}}
+            - name: AGENT_SECRET_ALLOWLIST
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if .Values.agents.githubApp.enabled }}
+            {{- /* GitHub App per-agent installation tokens (gd-BHLDnjX1Hw). Only
+                 the App id / installation id / key FILE PATH ride env; the
+                 private key itself is a mounted file, never an env var. */}}
+            - name: GITHUB_APP_ENABLED
+              value: "true"
+            - name: GITHUB_APP_ID
+              value: {{ required "agents.githubApp.appId is required when agents.githubApp.enabled" .Values.agents.githubApp.appId | quote }}
+            {{- with .Values.agents.githubApp.installationId }}
+            - name: GITHUB_APP_INSTALLATION_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agents.githubApp.apiUrl }}
+            - name: GITHUB_APP_API_URL
+              value: {{ . | quote }}
+            {{- end }}
+            - name: GITHUB_APP_PRIVATE_KEY_FILE
+              value: {{ printf "%s/private-key" (.Values.agents.githubApp.mountPath | trimSuffix "/") | quote }}
+            {{- if include "gardenio.releaseDeployer.mintsAppToken" . }}
+            {{- /* The release deployer's read-only App token (gd-q48ldwLspl):
+                 the controller writes it to this Secret in its own namespace,
+                 which the Role's secrets create/update already covers. */}}
+            - name: RELEASE_DEPLOYER_GITHUB_TOKEN_SECRET
+              value: {{ include "gardenio.releaseDeployer.appTokenSecret" . | quote }}
+            - name: RELEASE_DEPLOYER_GITHUB_REPO
+              value: {{ .Values.releaseDeployer.repo | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Lands spawn wall (steps 8.3/8.4). Off renders nothing: the
+                 controller then refuses every tenant spawn but the land's steward. */}}
+            {{- if .Values.agents.lands.tenantSpawns }}
+            - name: LANDS_TENANT_SPAWNS
+              value: "true"
+            {{- end }}
+            {{- with .Values.agents.lands.spawnsPerHour }}
+            - name: LANDS_SPAWNS_PER_HOUR
+              value: {{ . | quote }}
+            {{- end }}
+            {{- /* Lands provisioner (step 8.6, gd-l1CTMNSH3A). Like githubApp
+                 above, only ids and secret FILE PATHS ride env; the Keycloak
+                 client secret and the Lands App key are mounted read-only.
+                 Reserved groups are every group this chart renders, so a new
+                 chart group is reserved without editing a list. */}}
+            {{- $prov := .Values.agents.lands.provisioner }}
+            {{- if $prov.enabled }}
+            {{- /* The URL defaults to the keycloak-runtime Service over
+                 in-cluster TLS (gd-XRsosVFAau). It must be https; the check
+                 mirrors keycloakadmin.checkBaseURL so a bad URL fails here,
+                 not at controller start. */}}
+            {{- $kcURL := required "agents.lands.provisioner.keycloak.url is required when agents.lands.provisioner.enabled (or enable keycloak.runtime and keycloak.runtime.tls for the in-cluster https default)" ($prov.keycloak.url | default (include "gardenio.keycloak.adminBaseURL" .)) }}
+            {{- $kcParsed := urlParse $kcURL }}
+            {{- if not (and (eq $kcParsed.scheme "https") $kcParsed.host (not $kcParsed.userinfo) (not $kcParsed.query) (not $kcParsed.fragment)) }}
+            {{- fail (printf "agents.lands.provisioner.keycloak.url must be an https URL (keycloakadmin refuses anything else), got %q" $kcURL) }}
+            {{- end }}
+            {{- $reserved := list }}
+            {{- range .Values.keycloak.groups }}
+            {{- $reserved = append $reserved .name }}
+            {{- end }}
+            {{- range .Values.keycloak.projectGroups }}
+            {{- $reserved = append $reserved (printf "project-%s" .name) }}
+            {{- end }}
+            {{- $reserved = concat $reserved ($prov.keycloak.extraReservedGroups | default list) | uniq }}
+            - name: LANDS_PROVISION_ENABLED
+              value: "true"
+            - name: LANDS_KEYCLOAK_URL
+              value: {{ $kcURL | quote }}
+            - name: LANDS_KEYCLOAK_REALM
+              value: {{ $prov.keycloak.realm | default .Values.keycloak.realm.name | default .Release.Name | quote }}
+            - name: LANDS_KEYCLOAK_CLIENT_ID
+              value: {{ $prov.keycloak.clientId | quote }}
+            - name: LANDS_KEYCLOAK_CLIENT_SECRET_PATH
+              value: {{ printf "%s/clientSecret" ($prov.keycloak.mountPath | trimSuffix "/") | quote }}
+            {{- if include "gardenio.keycloakRuntime.tlsEnabled" . }}
+            - name: LANDS_KEYCLOAK_CA_FILE
+              value: {{ printf "%s/ca.crt" ($prov.keycloak.caMountPath | trimSuffix "/") | quote }}
+            {{- end }}
+            {{- with $reserved }}
+            - name: LANDS_KEYCLOAK_RESERVED_GROUPS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- /* Runtime lands' land-<name> client scopes (gd-eAfptUBh9Z) are
+                   KeycloakClientScope resources for this realm resource, the
+                   write lands-scope-rbac.yaml grants and holds. */}}
+            {{- if .Values.keycloak.enabled }}
+            - name: LANDS_KEYCLOAK_REALM_RESOURCE
+              value: {{ printf "%s-realm" (include "gardenio.fullname" .) | quote }}
+            {{- end }}
+            - name: LANDS_GITHUB_APP_ID
+              value: {{ required "agents.lands.provisioner.githubApp.appId is required when agents.lands.provisioner.enabled" $prov.githubApp.appId | quote }}
+            {{- with $prov.githubApp.apiUrl }}
+            - name: LANDS_GITHUB_APP_API_URL
+              value: {{ . | quote }}
+            {{- end }}
+            - name: LANDS_GITHUB_APP_PRIVATE_KEY_PATH
+              value: {{ printf "%s/private-key" ($prov.githubApp.mountPath | trimSuffix "/") | quote }}
+            {{- /* The repo size cap the viewer's setup check holds, held again
+                 at every mint and refresh (gd-95ksM47sDp): one value, so the
+                 two checks never disagree. Empty keeps the binary default. */}}
+            {{- $viewerApp := .Values.beadsViewer.landsGithubApp | default dict }}
+            {{- if and (hasKey $viewerApp "maxRepoSizeMB") (ne (toString $viewerApp.maxRepoSizeMB) "") }}
+            - name: LANDS_MAX_REPO_SIZE_MB
+              value: {{ $viewerApp.maxRepoSizeMB | toString | quote }}
+            {{- end }}
+            {{- /* The operator's own GitHub accounts: a Lands installation on
+                 one is never minted from (gd-72m3STiqya). It rides with the
+                 Lands App, the only thing that could mint for one. */}}
+            {{- with .Values.agents.lands.operatorGithubOrgs }}
+            - name: LANDS_OPERATOR_GITHUB_ORGS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            - name: LANDS_ACCOUNT_TEMPLATE
+              value: {{ required "agents.lands.provisioner.accountTemplate is required when agents.lands.provisioner.enabled" $prov.accountTemplate | quote }}
+            {{- end }}
+            {{- /* The demo land (gd-c6LzZkk0qy): the provisioner ends a guest
+                 pass into it LANDS_DEMO_GUEST_TTL after the join, the same
+                 value the viewer's door shows. Empty land renders nothing. */}}
+            {{- $demo := .Values.agents.lands.demo | default dict }}
+            {{- if $demo.land }}
+            - name: LANDS_DEMO_LAND
+              value: {{ $demo.land | quote }}
+            {{- with $demo.guestTTL }}
+            - name: LANDS_DEMO_GUEST_TTL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Lands purge sweep (step 8.11). It deletes data, so off
+                 renders nothing and the controller never starts it. */}}
+            {{- $purge := .Values.agents.lands.purge | default dict }}
+            {{- if $purge.enabled }}
+            - name: LANDS_PURGE_ENABLED
+              value: "true"
+            {{- /* A dry run unless dryRun is exactly false; a missing key is
+                 a dry run too (sprig's default would turn false into true). */}}
+            - name: LANDS_PURGE_DRY_RUN
+              value: {{ if and (hasKey $purge "dryRun") (eq (toString $purge.dryRun) "false") }}"false"{{ else }}"true"{{ end }}
+            {{- with $purge.retentionDays }}
+            - name: LANDS_RETENTION_DAYS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $purge.recordsRetentionDays }}
+            - name: LANDS_RECORDS_RETENTION_DAYS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $purge.applicationRetentionDays }}
+            - name: LANDS_APPLICATION_RETENTION_DAYS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Outbound mail (internal/mailer) for the Lands purse watcher
+                 and provisioner. Off renders nothing, which is a no-op mailer. */}}
+            {{- if .Values.agents.mailer.enabled }}
+            - name: MAILER_ENABLED
+              value: "true"
+            - name: MAILER_FROM
+              value: {{ required "agents.mailer.from is required when agents.mailer.enabled" .Values.agents.mailer.from | quote }}
+            - name: MAILER_BASE_URL
+              value: {{ required "agents.mailer.baseUrl is required when agents.mailer.enabled" .Values.agents.mailer.baseUrl | quote }}
+            {{- with .Values.agents.mailer.replyTo }}
+            - name: MAILER_REPLY_TO
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agents.mailer.sesRegion }}
+            - name: MAILER_SES_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agents.mailer.configurationSet }}
+            - name: MAILER_SES_CONFIGURATION_SET
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.agents.mailer.credentialsSecret.name }}
+            # The mailer's own SES keys as files (gd-kSLbp23ekV), not the
+            # MinIO keys the default chain holds below.
+            - name: MAILER_SES_CREDENTIALS_DIR
+              value: /var/run/secrets/gardenio-mailer-ses
+            {{- end }}
+            {{- end }}
+            {{- /* Phase 4 (epic ka-0000007417, task ka-0000003688): opt the
+                 controller into the gVisor freeze/thaw agent lifecycle. Default
+                 off; even when on, only agents pinned to the runsc RuntimeClass
+                 are frozen on graceful stop / thawed on wake. This is the
+                 controller half of the gvisor.enabled substrate flag — keep the
+                 two in sync (a thaw with no runsc RuntimeClass cannot
+                 schedule). Flip off to roll back to the cold-start lifecycle. */}}
+            {{- if .Values.gvisor.freezeThaw.enabled }}
+            - name: FREEZE_THAW_ENABLED
+              value: "true"
+            {{- /* WS3 canary role allowlist (ka-0000000138, epic ka-0000004429).
+                 Freeze-eligibility is otherwise GLOBAL (freezeThaw.enabled AND
+                 runtime_class=runsc), so with prod already running
+                 freezeThaw.enabled=true the instant a second, populated role
+                 (plan-gardener, thread) is pinned to runsc EVERY instance would
+                 freeze at once. A non-empty allowlist narrows freezing to just
+                 the listed roles even if other runsc roles exist, so the operator
+                 can widen one role at a time. EMPTY (default) = no role filter =
+                 pre-WS3 behaviour verbatim, which is why merging this is a no-op.
+                 Comma-separated; maps to FREEZE_THAW_ROLE_ALLOWLIST. */}}
+            {{- with .Values.gvisor.freezeThaw.roleAllowlist }}
+            - name: FREEZE_THAW_ROLE_ALLOWLIST
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- /* C3 (ka-0000004017): bound the post-thaw rehydration gate.
+                 Empty defers to the controller's built-in default. */}}
+            {{- if .Values.gvisor.freezeThaw.rehydrateDeadline }}
+            - name: THAW_REHYDRATE_DEADLINE
+              value: {{ .Values.gvisor.freezeThaw.rehydrateDeadline | quote }}
+            {{- end }}
+            {{- /* harden-thaw (ka-0000001355): the post-commit critical section of
+                 a thaw (barrier restore + rehydration + reap + Pod B teardown) runs
+                 on a ctx DECOUPLED from the leader-election ctx so a controller roll
+                 mid-thaw cannot abort an in-flight rehydrate before its real
+                 deadline (the ka-0000004088 ~6.8s "context canceled" confound) or
+                 orphan Pod B's runsc containers. hardDeadline caps that detached
+                 section; drainTimeout bounds how long graceful shutdown waits for it
+                 (the terminationGracePeriodSeconds below MUST exceed drainTimeout or
+                 the kubelet SIGKILLs us mid-drain). Empty hardDeadline defers to the
+                 controller's computed cap. */}}
+            {{- if .Values.gvisor.freezeThaw.hardDeadline }}
+            - name: THAW_HARD_DEADLINE
+              value: {{ .Values.gvisor.freezeThaw.hardDeadline | quote }}
+            {{- end }}
+            {{- if .Values.gvisor.freezeThaw.drainTimeout }}
+            - name: THAW_DRAIN_TIMEOUT
+              value: {{ .Values.gvisor.freezeThaw.drainTimeout | quote }}
+            {{- end }}
+            {{- /* Post-thaw credential refresher (bug ka-0000000518). A thawed
+                 agent's SA/IRSA token warm copy is a static snapshot outside kubelet
+                 rotation (thaw step [4] runsc-deletes Pod B so the kubelet stops
+                 rotating), so ~1h post-thaw the overlaid token expires and the
+                 agent's k8s/AWS calls 401. When enabled, a periodic loop re-mints
+                 each live thawed agent's tokens (k8s TokenRequest API — requires the
+                 serviceaccounts/token grant added under the same guard in
+                 controller/rbac.yaml + gvisor-namespace.yaml) and re-overlays them
+                 into the warm copy. Gated inside freezeThaw.enabled; default-off is
+                 the rollback switch (zero blast radius — the loop never runs and the
+                 token-mint RBAC is never granted). */}}
+            {{- if .Values.gvisor.freezeThaw.postThawTokenRefresh.enabled }}
+            - name: POST_THAW_TOKEN_REFRESH_ENABLED
+              value: "true"
+            {{- if .Values.gvisor.freezeThaw.postThawTokenRefresh.interval }}
+            - name: POST_THAW_TOKEN_REFRESH_INTERVAL
+              value: {{ .Values.gvisor.freezeThaw.postThawTokenRefresh.interval | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* C2 (ka-0000005834): interruptible freeze. When a user message
+                 arrives mid-freeze, abort the checkpoint and keep Pod A live to
+                 serve it (--leave-running makes the abort a clean no-op on the
+                 live agent). Gated inside freezeThaw.enabled; flip off to drop the
+                 env and always run freezes to completion (zero blast radius). */}}
+            {{- if .Values.gvisor.freezeThaw.interruptEnabled }}
+            - name: FREEZE_INTERRUPT_ENABLED
+              value: "true"
+            {{- end }}
+            {{- /* TOCTOU e2e test seam (ka-0000000996): widen the window between
+                 the snapshot Put and the abort-verdict read so the
+                 abort-races-completion e2e can land an interrupt inside it on the
+                 real substrate. Empty/0 = today's behaviour verbatim (the seam is
+                 inert) — NEVER set in production; only the dedicated
+                 gardenio-gvisor-abort-races canary deploy sets it. Only meaningful
+                 with interruptEnabled on. */}}
+            {{- if .Values.gvisor.freezeThaw.postPutDelay }}
+            - name: FREEZE_POST_PUT_DELAY
+              value: {{ .Values.gvisor.freezeThaw.postPutDelay | quote }}
+            {{- end }}
+            {{- /* ka-0000006667 / MR !3817: pre-freeze watcher-liveness guard.
+                 Refuse to checkpoint a runsc pod whose in-pod gb+coop rehydration
+                 watchers never armed (their thaw-epoch sentinels are absent) — such
+                 a snapshot can never be acked post-thaw. Gated inside
+                 freezeThaw.enabled; flip off to drop the env and freeze every runsc
+                 stop exactly as before (zero blast radius). */}}
+            {{- if .Values.gvisor.freezeThaw.armedGuardEnabled }}
+            - name: FREEZE_ARMED_GUARD_ENABLED
+              value: "true"
+            {{- end }}
+            {{- /* C5 (ka-0000006550, epic ka-0000002590): warm runsc placeholder
+                 ("warm-B") pool. Gated inside freezeThaw.enabled — the pool only
+                 serves thaws and a runsc placeholder cannot schedule without the
+                 gVisor substrate. Flip off to drop the env and keep Thaw's
+                 create-then-restore path (zero blast radius). */}}
+            {{- if .Values.gvisor.warmPlaceholderPool.enabled }}
+            - name: WARM_PLACEHOLDER_POOL_ENABLED
+              value: "true"
+            - name: WARM_PLACEHOLDER_POOL_MIN_SIZE
+              value: {{ .Values.gvisor.warmPlaceholderPool.minSize | quote }}
+            {{- if .Values.gvisor.warmPlaceholderPool.nodeFloor }}
+            - name: WARM_PLACEHOLDER_NODE_FLOOR
+              value: {{ .Values.gvisor.warmPlaceholderPool.nodeFloor | quote }}
+            {{- end }}
+            {{- if .Values.gvisor.warmPlaceholderPool.staleDrainRate }}
+            - name: WARM_PLACEHOLDER_STALE_DRAIN_RATE
+              value: {{ .Values.gvisor.warmPlaceholderPool.staleDrainRate | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- /* Spawn-time VPA memory stamp (task ka-0000004555, epic
+                 ka-0000005189; stamper podmanager/vpareco.go, ka-0000004606).
+                 When vpaRightSizing.stamp.enabled, the controller reads the
+                 per-(project,role) VPA recommendation at pod CREATE and stamps a
+                 clamped memory REQUEST, replacing the flat 8Gi default for
+                 classes with a mature recommendation. This is what turns the
+                 recommendation-only VPA objects (vpa-crew-rightsizing.yaml) into
+                 actual request reductions — they are inert without it. SAFE:
+                 spawn-only + grow-safe (never resizes a running pod); a reco miss
+                 leaves the request at its default (never under-provisions). The
+                 object-name template MUST match the layout vpaRightSizing.classes
+                 renders (gardenio-crew-default-{role}); empty would fall back to
+                 the controller's single-object default and never match crew pods.
+                 Independent of vpaRightSizing.updateMode (that gates the mid-run
+                 updater). Flip stamp.enabled=false to drop the env and revert to
+                 the flat default (zero blast radius). */}}
+            {{- if and .Values.vpaRightSizing .Values.vpaRightSizing.stamp .Values.vpaRightSizing.stamp.enabled }}
+            - name: VPA_MEMORY_STAMP_ENABLED
+              value: "true"
+            {{- if .Values.vpaRightSizing.stamp.objectNameTemplate }}
+            - name: VPA_OBJECT_NAME_TEMPLATE
+              value: {{ .Values.vpaRightSizing.stamp.objectNameTemplate | quote }}
+            {{- end }}
+            {{- if .Values.vpaRightSizing.stamp.memoryFloor }}
+            - name: VPA_MEMORY_FLOOR
+              value: {{ .Values.vpaRightSizing.stamp.memoryFloor | quote }}
+            {{- end }}
+            {{- if .Values.vpaRightSizing.stamp.memoryMax }}
+            - name: VPA_MEMORY_MAX
+              value: {{ .Values.vpaRightSizing.stamp.memoryMax | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* fix-substrate (bug ka-0000004301, epic ka-0000008224): the
+                 namespace that runsc freeze/thaw agents + the gvisor-probe
+                 DaemonSet live in. PSA `baseline` on the main namespace forbids
+                 the runsc thaw-state hostPath and the privileged probe, and
+                 managed EKS exposes no apiserver PSA exemption, so runsc agents
+                 must run in a dedicated PSA-privileged namespace. Empty = the
+                 controller keeps everything in .Release.Namespace (default). */}}
+            {{- if .Values.gvisor.namespace.name }}
+            - name: GVISOR_NAMESPACE
+              value: {{ .Values.gvisor.namespace.name | quote }}
+            {{- end }}
+            {{- /* Lands land namespaces (step 10.2): the provisioner makes
+                 land-<name> per tenant land with the RBAC in
+                 lands-namespace-rbac.yaml. */}}
+            {{- if .Values.landNamespaces.enabled }}
+            - name: LANDS_NAMESPACES_ENABLED
+              value: "true"
+            - name: LANDS_CONTROLLER_SERVICE_ACCOUNT
+              value: {{ include "gardenio.agents.serviceAccountName" . | quote }}
+            {{- with .Values.landNamespaces.runtimeClassName }}
+            - name: LANDS_RUNTIME_CLASS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.slackBridge.enabled }}
+            {{- /* A tenant pod's gb say goes to the bridge's land listener
+                 (gd-pXik57wZA9); unset, tenant pods get no bridge URL. */}}
+            - name: LANDS_BRIDGE_URL
+              value: {{ include "gardenio.slackBridge.landURL" . | quote }}
+            {{- end }}
+            {{- with .Values.landNamespaces.egressPeers }}
+            - name: LANDS_NAMESPACE_EGRESS_PEERS
+              value: {{ toJson . | quote }}
+            {{- end }}
+            {{- /* landgate's crew -> edge deny (gd-ParwLpmgID) covers tenant pods too. */}}
+            {{- $landExcept := .Values.landNamespaces.extraExceptCIDRs | default list }}
+            {{- if .Values.landgate.enabled }}
+            {{- $landExcept = concat $landExcept (.Values.landgate.crewDeny.edgeCIDRs | default list) | uniq }}
+            {{- end }}
+            {{- with $landExcept }}
+            - name: LANDS_NAMESPACE_EXTRA_EXCEPT_CIDRS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Phase 3b/B7-c4: explicit "false" disables the scheduler
+                 RunLoop, leaving only MirrorLoop. Set in prod values overlay
+                 after operator decision approves the cutover. */}}
+            {{- if hasKey .Values.agents "schedulerEnabled" }}
+            - name: SCHEDULER_ENABLED
+              value: {{ .Values.agents.schedulerEnabled | quote }}
+            {{- end }}
+            {{- /* Phase 3b/B7-c3: explicit "false" disables the controller-side
+                 NATS decision/bead-closed/mail listeners. Use once trigger-engine
+                 ownership of those subscriptions is verified. */}}
+            {{- if hasKey .Values.agents "schedulerNatsListenersEnabled" }}
+            - name: SCHEDULER_NATS_LISTENERS_ENABLED
+              value: {{ .Values.agents.schedulerNatsListenersEnabled | quote }}
+            {{- end }}
+            {{- /* The shared static token is injected only while the machine
+                 principal is off (rollback path): with it on, every daemon call
+                 AND the SSE event stream authenticate as the Keycloak service
+                 account (gd-BDirD4F7Iq, gd-5QYwXtV7IA stage 3a). The controller
+                 hands this token to MicroVM satellites only in shared-token
+                 mode, which has no token to hand over once it is gone; that
+                 mode is refused (resolveMicrovmBeadsToken), so MicroVM needs
+                 agents.perAgentTokens. BEADS_TOKEN_SECRET below is a Secret
+                 NAME for agent pods, not the value. */}}
+            {{- if and .Values.beads.tokenSecret (not .Values.agents.machinePrincipal.enabled) }}
+            - name: BEADS_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.tokenSecretName" . }}
+                  key: token
+            {{- end }}
+            {{- /* Machine principal (gd-s7aPIf0Bgp, gd-BDirD4F7Iq): every daemon
+                 call authenticates as the Keycloak service account of
+                 agents.machinePrincipal.clientId (account writes, token mint,
+                 typed ownership, config seed, reads, SSE). The secret is a
+                 file, never an env var; its Secret is operator-created and
+                 optional, so a missing Secret still starts the pod — daemon
+                 calls then fail closed (auth_unavailable in the log). */}}
+            {{- if .Values.agents.machinePrincipal.enabled }}
+            - name: BEADS_OIDC_TOKEN_URL
+              value: {{ include "gardenio.keycloak.tokenURL" . | quote }}
+            - name: BEADS_OIDC_CLIENT_ID
+              value: {{ .Values.agents.machinePrincipal.clientId | quote }}
+            - name: BEADS_OIDC_CLIENT_SECRET_FILE
+              value: /var/run/secrets/gardenio-machine/clientSecret
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            # The token URL is the keycloak-runtime https port: trust its CA
+            # (gd-lYPZlslOM7).
+            - name: BEADS_OIDC_CA_FILE
+              value: {{ include "gardenio.keycloakRuntime.caFile" . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* A box reports its release to the home daemon (plan
+                 gd-UZKZ9H25UD step 4d, releases-design.md §4.3 item 5). It
+                 authenticates by client credentials against the home realm;
+                 the client secret is a file, never an env var. */}}
+            {{- $box := .Values.releases.box }}
+            {{- if $box.name }}
+            - name: GARDENIO_BOX_NAME
+              value: {{ $box.name | quote }}
+            - name: GARDENIO_RELEASE_HOME_ADDR
+              value: {{ required "releases.box.homeAddr is required when releases.box.name is set" $box.homeAddr | quote }}
+            - name: GARDENIO_RELEASE_HOME_PROJECT
+              value: {{ $box.homeProject | default "gardenio" | quote }}
+            - name: GARDENIO_RELEASE_HOME_TOKEN_URL
+              value: {{ required "releases.box.homeTokenURL is required when releases.box.name is set" $box.homeTokenURL | quote }}
+            - name: GARDENIO_RELEASE_HOME_CLIENT_ID
+              value: {{ $box.homeClientID | default (printf "gardenio-box-%s" $box.name) | quote }}
+            - name: GARDENIO_RELEASE_HOME_CLIENT_SECRET_FILE
+              value: /var/run/secrets/gardenio-release-home/clientSecret
+            {{- if $box.homeCA.name }}
+            - name: GARDENIO_RELEASE_HOME_CA_FILE
+              value: /var/run/secrets/gardenio-release-home-ca/ca.crt
+            {{- end }}
+            {{- end }}
+            {{- if .Values.agents.natsURL }}
+            - name: NATS_URL
+              value: {{ .Values.agents.natsURL }}
+            {{- else if .Values.nats.enabled }}
+            - name: NATS_URL
+              value: {{ include "gardenio.natsURL" . }}
+            {{- end }}
+            {{- if .Values.agents.natsTokenSecret }}
+            - name: NATS_TOKEN_SECRET
+              value: {{ .Values.agents.natsTokenSecret }}
+            {{- end }}
+            {{- if .Values.nats.auth.subjectIsolation.enabled }}
+            - name: NATS_AGENT_USER_SECRET
+              value: {{ include "gardenio.fullname" . }}-nats-agent-creds
+            # Controller uses infra credentials for full NATS access. The
+            # username turns the shared secret into that user's PASSWORD —
+            # multi-user server entries only support user/password, so a bare
+            # token can never match one (ka-0000000002).
+            - name: NATS_USER
+              value: infra
+            - name: NATS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.fullname" . }}-nats-infra-creds
+                  key: token
+            {{- if .Values.nats.auth.subjectIsolation.landCallout.enabled }}
+            # The controller answers the NATS auth callout for tenant lands'
+            # own users, signing with this account seed (gd-sS7bSXOdGs).
+            - name: NATS_LAND_CALLOUT_ISSUER_SEED_FILE
+              value: /var/run/secrets/nats-land-callout/seed
+            {{- end }}
+            {{- end }}
+            {{- if .Values.coopmux.landTokens.enabled }}
+            # Mints each tenant land's coopmux bearer into Secret
+            # coopmux-land-token in land-<land> (internal/lands/landtoken).
+            - name: COOP_MUX_LAND_TOKEN_KEY_FILE
+              value: /var/run/secrets/coopmux-land-token-key/key
+            {{- end }}
+            {{- /* Per-project secrets (git, GitHub, GitLab, Mezmo, AWS, etc.)
+                 are now declared on project beads and auto-wired by the
+                 secretreconciler + applyCommonConfig. No hard-coded env vars needed. */}}
+            {{- /* agents.disableCoopmuxIntegration short-circuits all COOPMUX_*
+                 env injection on the controller. Without COOPMUX_URL, the
+                 controller's coopmux client init returns nil — disabling the
+                 5-min credential sync — and applyCommonConfig stops setting
+                 COOP_BROKER_URL/COOP_MUX_URL on spawned agent pods, so new
+                 agents don't register with coopmux and don't get the
+                 auto-assign+switch dance that was looping pods on every
+                 restart. Coopmux itself still runs; agents just bypass it.
+                 See ka-0000007230 for the structural removal of cred rotation. */}}
+            {{- if and (or .Values.agents.coopmuxURL .Values.coopmux.enabled) (not .Values.agents.disableCoopmuxIntegration) }}
+            - name: COOPMUX_URL
+              value: {{ .Values.agents.coopmuxURL | default (include "gardenio.coopmux.serviceURL" .) }}
+            - name: COOPMUX_TOKEN_SECRET
+              value: {{ include "gardenio.coopmux.authTokenSecretName" . }}
+            - name: COOP_MUX_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.coopmux.authTokenSecretName" . }}
+                  key: token
+            {{- end }}
+            - name: COOP_SERVICE_ACCOUNT
+              value: {{ include "gardenio.coop.serviceAccountName" . }}
+            {{- if .Values.agents.verifier.enabled }}
+            # A role bead's verifier=true runs as this read-only SA (P9.2,
+            # gd-6ujfeTZfNL; templates/controller/verifier-rbac.yaml).
+            - name: GARDENIO_VERIFIER_SERVICE_ACCOUNT
+              value: {{ .Values.agents.verifier.name | quote }}
+            {{- end }}
+            {{- if .Values.agents.agentStorageClass }}
+            - name: AGENT_STORAGE_CLASS
+              value: {{ .Values.agents.agentStorageClass }}
+            {{- end }}
+            - name: COOP_MAX_PODS
+              value: {{ .Values.agents.coopMaxPods | quote }}
+            {{- if .Values.agents.coopMaxPodsPerProject }}
+            - name: COOP_MAX_PODS_PER_PROJECT
+              value: {{ .Values.agents.coopMaxPodsPerProject | quote }}
+            {{- end }}
+            {{- if .Values.agents.coopMaxPodsGVisor }}
+            - name: COOP_MAX_PODS_GVISOR
+              value: {{ .Values.agents.coopMaxPodsGVisor | quote }}
+            {{- end }}
+            {{- if .Values.agents.coopBurstLimit }}
+            - name: COOP_BURST_LIMIT
+              value: {{ .Values.agents.coopBurstLimit | quote }}
+            {{- end }}
+            {{- if .Values.agents.coopRateLimitWindow }}
+            - name: COOP_RATE_LIMIT_WINDOW
+              value: {{ .Values.agents.coopRateLimitWindow | quote }}
+            {{- end }}
+            {{- if .Values.agents.coopRateLimitMax }}
+            - name: COOP_RATE_LIMIT_MAX
+              value: {{ .Values.agents.coopRateLimitMax | quote }}
+            {{- end }}
+            {{- if .Values.agents.coopCircuitBreakerThreshold }}
+            - name: COOP_CIRCUIT_BREAKER_THRESHOLD
+              value: {{ .Values.agents.coopCircuitBreakerThreshold | quote }}
+            {{- end }}
+            {{- if .Values.agents.coopCircuitBreakerWindow }}
+            - name: COOP_CIRCUIT_BREAKER_WINDOW
+              value: {{ .Values.agents.coopCircuitBreakerWindow | quote }}
+            {{- end }}
+            {{- if .Values.agents.coopCircuitBreakerCooldown }}
+            - name: COOP_CIRCUIT_BREAKER_COOLDOWN
+              value: {{ .Values.agents.coopCircuitBreakerCooldown | quote }}
+            {{- end }}
+            {{- if .Values.agents.prewarmedPoolInterval }}
+            - name: PREWARMED_POOL_INTERVAL
+              value: {{ .Values.agents.prewarmedPoolInterval | quote }}
+            {{- end }}
+            {{- if .Values.agents.prewarmedMicrovmMaxAge }}
+            - name: PREWARMED_MICROVM_MAX_AGE
+              value: {{ .Values.agents.prewarmedMicrovmMaxAge | quote }}
+            {{- end }}
+            {{- if .Values.agents.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.agents.logLevel }}
+            {{- end }}
+            {{- if .Values.agents.coopSyncInterval }}
+            - name: COOP_SYNC_INTERVAL
+              value: {{ .Values.agents.coopSyncInterval | quote }}
+            {{- end }}
+            {{- if .Values.agents.coopUpgradeDrainTimeout }}
+            - name: COOP_UPGRADE_DRAIN_TIMEOUT
+              value: {{ .Values.agents.coopUpgradeDrainTimeout | quote }}
+            {{- end }}
+            # Node-drain graceful nudge (WS1, ka-0000007969): when true, an agent
+            # whose node is being force-reclaimed (Karpenter disruption taint /
+            # node DeletionTimestamp) is nudged to commit+push+gb-stop before the
+            # kubelet SIGTERMs it, instead of being hard-killed mid-turn. Off by
+            # default; set agents.nodeDrainNudge=true to enable.
+            - name: COOP_NODE_DRAIN_NUDGE
+              value: {{ .Values.agents.nodeDrainNudge | default false | quote }}
+            {{- if or .Values.agents.slackBridgeURL .Values.slackBridge.enabled }}
+            - name: SLACK_BRIDGE_URL
+              value: {{ .Values.agents.slackBridgeURL | default (include "gardenio.slackBridge.serviceURL" .) }}
+            {{- end }}
+            {{- if or .Values.agents.jiraBridgeURL .Values.jiraBridge.enabled }}
+            # Forwarded onto Jira-spawned agent pods as JIRA_BRIDGE_URL so
+            # `gb jira reply` can reach POST /api/jira/reply (F2 ka-0000000065).
+            - name: JIRA_BRIDGE_URL
+              value: {{ .Values.agents.jiraBridgeURL | default (include "gardenio.jiraBridge.serviceURL" .) }}
+            {{- end }}
+            {{- /* Beads-viewer public base URL (bug ka-0000003798): forward
+                 BEADS_VIEWER_URL onto every agent pod so gb-emitted bundle /
+                 image-proxy / widget links resolve to absolute, clickable URLs
+                 on the real viewer host (with its /beads path prefix). Explicit
+                 agents.beadsViewerURL wins; else reuse gardenio.link.beadsViewerURL
+                 — the SAME canonical viewer URL the slack-bridge is given. */}}
+            {{- $beadsViewerURL := .Values.agents.beadsViewerURL | default (include "gardenio.link.beadsViewerURL" .) }}
+            {{- if $beadsViewerURL }}
+            - name: BEADS_VIEWER_URL
+              value: {{ $beadsViewerURL | quote }}
+            {{- end }}
+            {{- /* Beads-viewer IN-CLUSTER Service base (ka-0000000379): forward
+                 BEADS_VIEWER_INTERNAL_URL onto every agent pod so `gb plan
+                 create` / `gb plan add-step` POST straight to the viewer pod
+                 (no base-path/edge prefix) out-of-the-box, without a
+                 hand-supplied --viewer-url. Explicit agents.beadsViewerInternalURL
+                 wins; else auto-wire to the in-cluster Service when the viewer
+                 is enabled. */}}
+            {{- $beadsViewerInternalURL := .Values.agents.beadsViewerInternalURL }}
+            {{- if and (not $beadsViewerInternalURL) .Values.beadsViewer.enabled }}
+            {{-   $beadsViewerInternalURL = include "gardenio.beadsViewer.internalURL" . }}
+            {{- end }}
+            {{- if $beadsViewerInternalURL }}
+            - name: BEADS_VIEWER_INTERNAL_URL
+              value: {{ $beadsViewerInternalURL | quote }}
+            {{- end }}
+            {{- /* Default gardenio host for the in-pod gb CLI (ka-0000002401):
+                 forward GARDENIO_DEFAULT_HOST onto agent pods so gb derives its
+                 zero-config daemon/viewer hosts from the unified host instead of
+                 its COMPILED default (cmd/gb/main.go resolveGardenioHost). The
+                 helper applies the R3 three-tier precedence — explicit
+                 agents.defaultGardenioHost wins, else the derived unifiedHost.host
+                 when unified is on, else "" (empty ⇒ this block is skipped and gb
+                 keeps its compiled fallback, today's behaviour). COUPLED to the
+                 gated default-URL cutover (ka-0000004747): inert until unifiedHost
+                 is flipped on or an explicit override is set. Bare host — no
+                 scheme/path; gb derives /beads + cli.<host> itself. */}}
+            {{- $gardenioDefaultHost := include "gardenio.link.defaultGardenioHost" . }}
+            {{- if $gardenioDefaultHost }}
+            - name: GARDENIO_DEFAULT_HOST
+              value: {{ $gardenioDefaultHost | quote }}
+            {{- end }}
+            {{- if .Values.slackBridge.agentTokenSecret }}
+            # Injected into agent pods as SLACK_BRIDGE_TOKEN so gb slack calls
+            # authenticate to /api/slack/* and /api/permission/*.
+            - name: SLACK_BRIDGE_TOKEN_SECRET
+              value: {{ .Values.slackBridge.agentTokenSecret | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.agentTokenSecret }}
+            # Injected into agent pods as JIRA_BRIDGE_TOKEN so gb jira reply
+            # authenticates to /api/jira/reply (F2 ka-0000000065).
+            - name: JIRA_BRIDGE_TOKEN_SECRET
+              value: {{ .Values.jiraBridge.agentTokenSecret | quote }}
+            {{- end }}
+            {{- /* Grafana render affordance (bug ka-0000005842). The controller
+                 forwards GRAFANA_URL (in-cluster Grafana base) + the auth-proxy
+                 header name onto every agent pod so `gb grafana render <bead>`
+                 works without hand-discovering the svc or the auth path. Explicit
+                 agents.grafanaURL wins; else derive the in-cluster base when
+                 grafana is enabled. The derived base HONORS serveFromSubPath
+                 (bug ka-0000001440): in subpath mode the pod serves /render under
+                 /grafana, so the agent must target <svc>:<port>/grafana — the
+                 SAME base the renderer callback uses — or the render 404s the
+                 SPA's /grafana/public/build/*.js. The header is injected only
+                 when grafana auth-proxy is on (otherwise the render request goes
+                 out bare, which is correct for anonymous Grafana). With the agent
+                 path on (gd-RUhOpXWwmz) agents target the header-stripping port
+                 and get no header: they render as Grafana's anonymous viewer. */}}
+            {{- if or .Values.agents.grafanaURL .Values.grafana.enabled }}
+            - name: GRAFANA_URL
+              value: {{ .Values.agents.grafanaURL | default (include "gardenio.grafana.agentBaseURL" .) | quote }}
+            {{- if and .Values.grafana.enabled .Values.grafana.auth.proxy.enabled (not .Values.grafana.auth.proxy.agentPath.enabled) }}
+            - name: GRAFANA_AUTH_PROXY_HEADER
+              value: {{ .Values.grafana.auth.proxy.headerName | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Service-log read affordance (design ka-0000005579, task
+                 ka-0000005209). The controller forwards GARDENIO_LOGS_URL (the
+                 in-cluster VictoriaLogs base) onto every agent pod so
+                 `gb logs <component>` resolves the log store without the agent
+                 hand-discovering the svc — the READ counterpart to the pod-log
+                 shippers, mirroring the GRAFANA_URL affordance above. Explicit
+                 agents.logsURL wins; else derive the release-relative vlsingle
+                 base when vlsingle is enabled (the SAME store the shippers write
+                 to, so read + write stay in lock-step). This grants NO pod-log
+                 RBAC — the agent reads the store over HTTP (ka-0000001752). */}}
+            {{- if or .Values.agents.logsURL .Values.vlsingle.enabled }}
+            - name: GARDENIO_LOGS_URL
+              value: {{ .Values.agents.logsURL | default (include "gardenio.vlsingle.baseURL" .) | quote }}
+            {{- end }}
+            {{- /* Env-side Grafana Editor token bundle (task ka-0000002337,
+                 design §1). When agents.grafanaApiKeySecret is set, the
+                 controller injects GRAFANA_API_KEY_<ENV> (from that Secret,
+                 key token-<env>) + the non-secret GRAFANA_BASE_URL_<ENV> onto
+                 every agent pod, for the environment Grafana
+                 (e.g. grafana.example.com) — distinct from the in-cluster gardenio
+                 Grafana wired above. */}}
+            {{- if .Values.agents.grafanaApiKeySecret }}
+            - name: GRAFANA_ENV_API_KEY_SECRET
+              value: {{ .Values.agents.grafanaApiKeySecret | quote }}
+            {{- $envs := .Values.agents.grafanaApiKeyExternalSecret.environments | default (list "devel" "perf" "prod") }}
+            - name: GRAFANA_ENV_LIST
+              value: {{ join "," $envs | quote }}
+            {{- $baseURLs := .Values.agents.grafanaBaseURLs | default dict }}
+            {{- range $env := $envs }}
+            {{- $url := index $baseURLs $env | default "" }}
+            {{- if $url }}
+            - name: GRAFANA_BASE_URL_{{ upper $env }}
+              value: {{ $url | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.agents.s3.bucket }}
+            - name: COOP_S3_BUCKET
+              value: {{ .Values.agents.s3.bucket }}
+            {{- end }}
+            {{- with include "gardenio.objectStore.imagesBucket" . }}
+            # Session images bucket (gd-CmjVAU3vgd), passed on to agent pods
+            # for gb image upload/fetch; unset keeps images in COOP_S3_BUCKET.
+            - name: COOP_S3_IMAGES_BUCKET
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.agents.s3.prefix }}
+            - name: COOP_S3_PREFIX
+              value: {{ .Values.agents.s3.prefix }}
+            {{- end }}
+            {{- if .Values.agents.s3.region }}
+            - name: COOP_S3_REGION
+              value: {{ .Values.agents.s3.region }}
+            {{- end }}
+            {{- if .Values.agents.s3.endpoint }}
+            # In-box object store (ka-0000004955): S3-compatible endpoint
+            # override (e.g. in-cluster MinIO) with path-style addressing.
+            - name: COOP_S3_ENDPOINT
+              value: {{ .Values.agents.s3.endpoint }}
+            {{- if .Values.objectStore.enabled }}
+            # In-box MinIO uses static access/secret keys (no IRSA). Feed them
+            # via the default AWS credential chain from the seeded Secret.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.secretName" . }}
+                  key: accesskey
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.secretName" . }}
+                  key: secretkey
+            # Object-store credentials for AGENT pods (gd-W8OwRoHLLn): the
+            # controller reads only the Secret NAME here — never a value — and
+            # podspec.go (podmanager.ObjectStoreCredentialsSecret) projects
+            # the Secret itself onto each agent pod as a tmpfs-backed volume,
+            # mirroring the NATS token pattern. Endpoint mode only; AWS/IRSA
+            # deployments leave this unset and agent pods get no such volume.
+            # It is the least-privilege agent user, never the root Secret
+            # above (gd-urSiLLwPIz): see objectStore.agentCredentials.
+            - name: COOP_S3_CREDENTIALS_SECRET
+              value: {{ include "gardenio.minio.agentSecretName" . }}
+            {{- end }}
+            {{- end }}
+            {{- /* Slack viewer session (gd-QpZeW4qxAU): names the Secret (key
+                 storage-state.json) the controller mounts as an OPTIONAL volume
+                 into pods whose role is listed in SLACK_VIEW_SESSION_ROLES. The
+                 source defaults to the Secret the slackE2ESession ExternalSecret
+                 materializes; set agents.slackViewSession.secretName to point at
+                 a hand-created Secret instead. enabled=false or secretName "-"
+                 renders neither variable, so the controller mounts nothing. A
+                 Secret that does not exist yet is harmless. */}}
+            {{- $svs := .Values.agents.slackViewSession | default dict }}
+            {{- if ne (toString (hasKey $svs "enabled" | ternary $svs.enabled true)) "false" }}
+            {{- $svsSecret := $svs.secretName | default ((.Values.externalSecrets.slackE2ESession | default dict).secretName | default "slack-e2e-session") }}
+            {{- if ne $svsSecret "-" }}
+            - name: SLACK_VIEW_SESSION_SECRET
+              value: {{ $svsSecret | quote }}
+            - name: SLACK_VIEW_SESSION_ROLES
+              value: {{ join "," ($svs.roles | default (list "thread")) | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Role-bead machine_client allowlist (escalation routing Task 15
+                 C5): the controller mounts Secret gardenio-machine-<id> only for
+                 an id listed here. Unset mounts nothing. */}}
+            {{- with .Values.agents.machineClientMounts }}
+            - name: GARDENIO_AGENT_MACHINE_CLIENT_MOUNTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- /* Agent pods cannot dial the public edge that serves the issuer
+                 (landgate crewDeny), so a machine-client pod discovers it at
+                 the Keycloak Service, trusting only its ca.crt (gd-pnrrLJNUHn). */}}
+            {{- if .Values.agents.machineClientMounts }}
+            {{- with include "gardenio.keycloak.discoveryURL" . }}
+            - name: GARDENIO_AGENT_OIDC_DISCOVERY_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            - name: GARDENIO_AGENT_OIDC_CA_SECRET
+              value: {{ include "gardenio.keycloakRuntime.tlsSecretName" . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.agents.claudeModel }}
+            - name: CLAUDE_MODEL
+              value: {{ .Values.agents.claudeModel }}
+            {{- end }}
+            # Pins the Claude Code harness `fable` alias on agent pods
+            # (ka-0000003175). ALWAYS emitted (quoted) — NOT guarded on a truthy
+            # value — so an explicit empty override in a values overlay reaches the
+            # controller as a SET-but-empty env var (os.LookupEnv), disabling
+            # injection. A truthy if-guard would drop the empty value and the
+            # controller's baked default (claude-fable-5-oauth) would silently
+            # re-apply, defeating the escape hatch. The chart default matches that
+            # baked default, so the common case is identical either way.
+            - name: AGENT_DEFAULT_FABLE_MODEL
+              value: {{ .Values.agents.defaultFableModel | quote }}
+            # Pins the Claude Code harness `opus` alias on agent pods
+            # (plan:opus55-release T1). Same ALWAYS-emitted, escape-hatch
+            # reasoning as the fable pin above.
+            - name: AGENT_DEFAULT_OPUS_MODEL
+              value: {{ .Values.agents.defaultOpusModel | quote }}
+            # Pins the Claude Code harness `haiku` alias on agent pods
+            # (ka-0000005599). ALWAYS emitted (quoted) — NOT guarded on a truthy
+            # value — so an explicit empty override in a values overlay reaches the
+            # controller as a SET-but-empty env var (os.LookupEnv), disabling
+            # injection. A truthy if-guard would drop the empty value and the
+            # controller's baked default (anthropic/claude-haiku-4-5) would silently
+            # re-apply, defeating the escape hatch. The chart default matches that
+            # baked default, so the common case is identical either way.
+            - name: AGENT_DEFAULT_HAIKU_MODEL
+              value: {{ .Values.agents.defaultHaikuModel | quote }}
+            {{- if .Values.agents.vmagentURL }}
+            - name: AGENT_VMAGENT_URL
+              value: {{ .Values.agents.vmagentURL | quote }}
+            {{- else if .Values.vmagent.enabled }}
+            - name: AGENT_VMAGENT_URL
+              value: {{ printf "http://%s:8429" (include "gardenio.vmagent.fullname" .) | quote }}
+            {{- end }}
+            {{- if .Values.agents.litellmURL }}
+            - name: LITELLM_URL
+              value: {{ .Values.agents.litellmURL }}
+            {{- else if .Values.litellm.enabled }}
+            - name: LITELLM_URL
+              value: http://{{ include "gardenio.litellm.fullname" . }}:{{ .Values.litellm.port | default 4000 }}
+            {{- end }}
+            {{- if .Values.externalSecrets.litellmMasterKey.remoteRef }}
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-master-key
+                  key: master-key
+            {{- else if .Values.litellm.enabled }}
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.litellm.masterKeySecretName" . }}
+                  key: token
+            - name: LITELLM_ADMIN_SECRET
+              value: {{ include "gardenio.litellm.masterKeySecretName" . }}
+            {{- end }}
+            {{- if .Values.litellm.tagSpendSource }}
+            - name: LITELLM_TAG_SPEND_SOURCE
+              value: {{ .Values.litellm.tagSpendSource | quote }}
+            {{- end }}
+            {{- if .Values.agents.claudeTeams.enabled }}
+            - name: CLAUDE_TEAMS_ENABLED
+              value: "true"
+            {{- if .Values.agents.claudeTeams.teammateMode }}
+            - name: CLAUDE_TEAMMATE_MODE
+              value: {{ .Values.agents.claudeTeams.teammateMode }}
+            {{- end }}
+            {{- if gt (int .Values.agents.claudeTeams.maxTeammates) 0 }}
+            - name: CLAUDE_TEAMS_MAX_TEAMMATES
+              value: {{ .Values.agents.claudeTeams.maxTeammates | quote }}
+            {{- end }}
+            {{- with .Values.agents.claudeTeams.resources }}
+            {{- if .requests }}
+            {{- if .requests.cpu }}
+            - name: CLAUDE_TEAMS_CPU_REQUEST
+              value: {{ .requests.cpu | quote }}
+            {{- end }}
+            {{- if .requests.memory }}
+            - name: CLAUDE_TEAMS_MEMORY_REQUEST
+              value: {{ .requests.memory | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .limits }}
+            {{- if .limits.cpu }}
+            - name: CLAUDE_TEAMS_CPU_LIMIT
+              value: {{ .limits.cpu | quote }}
+            {{- end }}
+            {{- if .limits.memory }}
+            - name: CLAUDE_TEAMS_MEMORY_LIMIT
+              value: {{ .limits.memory | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- /* Daily Postgres efficiency report (gd-ylgk1jBhLi), judged by
+                 the vmalert budget rules' own thresholds. */}}
+            {{- $pgr := .Values.postgres.exporter.report }}
+            {{- if and .Values.postgres.enabled .Values.postgres.exporter.enabled $pgr.enabled }}
+            - name: GARDENIO_PG_BUDGET_REPORT_HOUR
+              value: {{ $pgr.hourUTC | quote }}
+            - name: GARDENIO_PG_BUDGET_LAND
+              value: {{ $pgr.land | quote }}
+            {{- if $pgr.parentEpic }}
+            - name: GARDENIO_PG_BUDGET_EPIC
+              value: {{ $pgr.parentEpic | quote }}
+            {{- end }}
+            - name: GARDENIO_PG_BUDGETS
+              value: {{ .Values.vmalert.postgresBudgets | toJson | quote }}
+            {{- end }}
+            {{- if .Values.agents.gardenioChannel }}
+            - name: GARDENIO_CHANNEL
+              value: "1"
+            {{- end }}
+            {{- if .Values.agents.beadsE2EHTTPAddr }}
+            - name: BEADS_E2E_HTTP_ADDR
+              value: {{ .Values.agents.beadsE2EHTTPAddr }}
+            {{- end }}
+            {{- if .Values.agents.externalSecretStore }}
+            {{- if .Values.agents.externalSecretStore.name }}
+            - name: EXTERNAL_SECRET_STORE_NAME
+              value: {{ .Values.agents.externalSecretStore.name }}
+            {{- end }}
+            {{- if .Values.agents.externalSecretStore.kind }}
+            - name: EXTERNAL_SECRET_STORE_KIND
+              value: {{ .Values.agents.externalSecretStore.kind }}
+            {{- end }}
+            {{- if .Values.agents.externalSecretStore.refreshInterval }}
+            - name: EXTERNAL_SECRET_REFRESH_INTERVAL
+              value: {{ .Values.agents.externalSecretStore.refreshInterval | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.agents.pvGCTTL }}
+            - name: PV_GC_TTL
+              value: {{ .Values.agents.pvGCTTL | quote }}
+            {{- end }}
+            {{- if .Values.agents.pvGCInterval }}
+            - name: PV_GC_INTERVAL
+              value: {{ .Values.agents.pvGCInterval | quote }}
+            {{- end }}
+            {{- if .Values.agents.pvGCNamespaces }}
+            - name: PV_GC_NAMESPACES
+              value: {{ .Values.agents.pvGCNamespaces | quote }}
+            {{- end }}
+            {{- /* Orphaned-Pending-PVC observability collector (ka-0000002737).
+                 Rendered only with agents.pvcObs.enabled, which also provisions
+                 the persistentvolumeclaims:list + pods:list ClusterRole the
+                 collector needs (templates/controller/pvc-obs-rbac.yaml).
+                 Empty/absent = collector disabled (PVC_OBS_INTERVAL defaults to
+                 0). PVC_OBS_THRESHOLD is optional; 0/absent → the collector's
+                 built-in 7d default. */}}
+            {{- if .Values.agents.pvcObs.enabled }}
+            - name: PVC_OBS_INTERVAL
+              value: {{ .Values.agents.pvcObs.interval | quote }}
+            {{- if .Values.agents.pvcObs.threshold }}
+            - name: PVC_OBS_THRESHOLD
+              value: {{ .Values.agents.pvcObs.threshold | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Node-lifecycle collector (Track D, ka-0000001509). Rendered
+                 only with agents.nodeLifecycle.enabled, which also provisions
+                 the nodes:list/watch ClusterRole the collector needs
+                 (templates/controller/node-lifecycle-rbac.yaml). Empty/absent =
+                 collector disabled (NODE_LIFECYCLE_INTERVAL defaults to 0). */}}
+            {{- if .Values.agents.nodeLifecycle.enabled }}
+            - name: NODE_LIFECYCLE_INTERVAL
+              value: {{ .Values.agents.nodeLifecycle.interval | quote }}
+            {{- /* Scope the sweep to the agent nodepool so the metric excludes
+                 ephemeral-pool/reaper churn that cannot cold-resume an agent
+                 (ka-0000003804). Empty selector = list every node (opt-out). */}}
+            - name: NODE_LIFECYCLE_NODE_SELECTOR
+              value: {{ .Values.agents.nodeLifecycle.nodeSelector | quote }}
+            {{- /* Idle-node detection (P1b-follow-up, ka-0000001398). Renders the
+                 namespaces swept for agent pods only when idleNodes.enabled;
+                 empty podNamespaces defaults to the release namespace (where
+                 agent pods run). Reuses the controller's EXISTING namespace
+                 pods:list RBAC — no new grant. Absent env = idle-node gauge not
+                 emitted (NodeLifecycleIdlePodNamespaces defaults to empty). */}}
+            {{- if .Values.agents.nodeLifecycle.idleNodes.enabled }}
+            - name: NODE_LIFECYCLE_IDLE_POD_NAMESPACES
+              {{- $idleNS := .Values.agents.nodeLifecycle.idleNodes.podNamespaces }}
+              value: {{ if $idleNS }}{{ join "," $idleNS | quote }}{{ else }}{{ .Release.Namespace | quote }}{{ end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.agents.pvcGCTTL }}
+            - name: PVC_GC_TTL
+              value: {{ .Values.agents.pvcGCTTL | quote }}
+            {{- end }}
+            {{- if .Values.agents.pvcGCInterval }}
+            - name: PVC_GC_INTERVAL
+              value: {{ .Values.agents.pvcGCInterval | quote }}
+            {{- end }}
+            {{- if .Values.agents.bridgeTokenRotation }}
+            {{- if .Values.agents.bridgeTokenRotation.enabled }}
+            - name: BRIDGE_TOKEN_ROTATION_ENABLED
+              value: "true"
+            - name: BRIDGE_TOKEN_ROTATION_DRY_RUN
+              value: {{ .Values.agents.bridgeTokenRotation.dryRun | default false | quote }}
+            {{- if .Values.agents.bridgeTokenRotation.interval }}
+            - name: BRIDGE_TOKEN_ROTATION_INTERVAL
+              value: {{ .Values.agents.bridgeTokenRotation.interval | quote }}
+            {{- end }}
+            {{- if .Values.agents.bridgeTokenRotation.threshold }}
+            - name: BRIDGE_TOKEN_ROTATION_THRESHOLD
+              value: {{ .Values.agents.bridgeTokenRotation.threshold | quote }}
+            {{- end }}
+            {{- if .Values.agents.bridgeTokenRotation.accessTTL }}
+            - name: BRIDGE_TOKEN_ROTATION_ACCESS_TTL
+              value: {{ .Values.agents.bridgeTokenRotation.accessTTL | quote }}
+            {{- end }}
+            {{- if .Values.agents.bridgeTokenRotation.refreshTTL }}
+            - name: BRIDGE_TOKEN_ROTATION_REFRESH_TTL
+              value: {{ .Values.agents.bridgeTokenRotation.refreshTTL | quote }}
+            {{- end }}
+            {{- /*
+                 The rotator MUST write the same Secret the beads daemon reads,
+                 or a live rotation mints fresh tokens the daemon never sees and
+                 auth breaks at the TTL boundary (ka-0000004295). An explicit
+                 agents.bridgeTokenRotation.secretName wins; otherwise default to
+                 the daemon's resolved bridge-token secret
+                 (gardenio.beads.bridgeTokenSecretName) so a values file that pins
+                 ONLY beads.bridgeFleetTokenSecret / beads.bridgeTokenSecret
+                 cannot silently strand rotation. Always emitted so the two
+                 sides can never diverge to their independent Go defaults.
+            */}}
+            - name: BRIDGE_TOKEN_ROTATION_SECRET
+              value: {{ .Values.agents.bridgeTokenRotation.secretName | default (include "gardenio.beads.bridgeTokenSecretName" .) | quote }}
+            {{- if .Values.agents.bridgeTokenRotation.fleetMapKey }}
+            - name: BRIDGE_TOKEN_ROTATION_FLEET_MAP_KEY
+              value: {{ .Values.agents.bridgeTokenRotation.fleetMapKey | quote }}
+            {{- end }}
+            {{- if .Values.agents.bridgeTokenRotation.fleets }}
+            - name: BRIDGE_TOKEN_ROTATION_FLEETS
+              value: {{ join "," .Values.agents.bridgeTokenRotation.fleets | quote }}
+            {{- end }}
+            {{- if .Values.agents.bridgeTokenRotation.privilegedFleets }}
+            - name: BRIDGE_TOKEN_ROTATION_PRIVILEGED_FLEETS
+              value: {{ join "," .Values.agents.bridgeTokenRotation.privilegedFleets | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.agents.autodestruct.enabled }}
+            {{- if .Values.agents.autodestruct.tokenSecret }}
+            - name: AUTODESTRUCT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.agents.autodestruct.tokenSecret }}
+                  key: token
+            {{- else if .Values.agents.autodestruct.token }}
+            {{- fail "agents.autodestruct.token plaintext value is removed for security (AUDIT §J6) — use agents.autodestruct.tokenSecret pointing at a K8s Secret with key 'token'." }}
+            {{- end }}
+            {{- if .Values.agents.autodestruct.allowedSlackUsers }}
+            - name: AUTODESTRUCT_ALLOWED_USERS
+              value: {{ .Values.agents.autodestruct.allowedSlackUsers | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.agents.controllerApi.tokenSecret }}
+            - name: CONTROLLER_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.agents.controllerApi.tokenSecret }}
+                  key: token
+            {{- end }}
+            # Slack env vars removed — now handled by slack-bridge container (bd-8x8fy).
+            {{- /* OpenZiti per-pod overlay access (epic ka-0000000990). All
+                 gated on agents.zitiAccess.enabled (default false) so a chart
+                 with the feature off renders byte-identically to before. The
+                 broker URL is the controller-side master switch read by
+                 applyZitiAccess; without it, agent pods get no Ziti wiring. */}}
+            {{- if .Values.agents.zitiAccess.enabled }}
+            - name: ZITI_ACCESS_BROKER_URL
+              value: {{ required "agents.zitiAccess.brokerURL is required when zitiAccess.enabled" .Values.agents.zitiAccess.brokerURL | quote }}
+            {{- if .Values.agents.zitiAccess.tokenAudience }}
+            - name: ZITI_ACCESS_TOKEN_AUDIENCE
+              value: {{ .Values.agents.zitiAccess.tokenAudience | quote }}
+            {{- end }}
+            {{- if .Values.agents.zitiAccess.tunnelerImage }}
+            - name: ZITI_TUNNELER_IMAGE
+              value: {{ .Values.agents.zitiAccess.tunnelerImage | quote }}
+            {{- end }}
+            {{- if .Values.agents.zitiAccess.defaultTTL }}
+            - name: ZITI_ACCESS_DEFAULT_TTL
+              value: {{ .Values.agents.zitiAccess.defaultTTL | quote }}
+            {{- end }}
+            - name: ZITI_ACCESS_REVOKE_ON_EXIT
+              {{- /* Direct reference (NOT `| default true`): Helm's `default`
+                     treats a boolean false as empty and would force it back to
+                     true, so `revokeOnExit: false` would render this env var
+                     "true" while the `{{- if .revokeOnExit }}` guard below (raw
+                     value) skips mounting the broker-audience token — telling
+                     the controller to revoke without the credential to do so.
+                     The key always ships in values.yaml (default true). */}}
+              value: {{ .Values.agents.zitiAccess.revokeOnExit | quote }}
+            {{- if .Values.agents.zitiAccess.revokeOnExit }}
+            # The controller's OWN projected broker-audience token, used to
+            # authenticate DELETE /lease?task_id revoke calls. The controller
+            # must be listed in the broker's REVOKER_SUBJECTS.
+            - name: ZITI_ACCESS_CONTROLLER_TOKEN_FILE
+              value: /var/run/secrets/ziti-broker/token
+            {{- end }}
+            {{- end }}
+            {{- /* Lambda MicroVM execution backend (epic ka-0000005010, C3).
+                 All gated on agents.microvm.enabled (default false) so a chart
+                 with the feature off renders byte-identically to before. The
+                 controller assumes the launcher role from its own IRSA identity;
+                 no Lambda authority is granted here — it lives on the launcher.
+                 launcherRoleARN + region are both required when enabled (the
+                 controller treats either-unset as backend-disabled). */}}
+            {{- if .Values.agents.microvm.enabled }}
+            {{- /* Production-mode render gates (ka-0000006687): a values
+                 combination the controller would refuse at boot fails the
+                 render instead, so a bad overlay never reaches the cluster.
+                 Mirrors microvm.StartupConfig.validateProductionMode. */}}
+            {{- if .Values.agents.microvm.productionMode }}
+            {{- if .Values.agents.microvm.staticIdentitySecretARN }}
+            {{- fail "agents.microvm.productionMode refuses staticIdentitySecretARN — the shared POC Ziti identity must be unset in production (per-run identities via zitiBroker.url only)" }}
+            {{- end }}
+            {{- if not .Values.agents.microvm.zitiBroker.url }}
+            {{- fail "agents.microvm.productionMode requires zitiBroker.url — production launches mint per-run Ziti identities" }}
+            {{- end }}
+            {{- if not .Values.agents.microvm.controllerRoleARN }}
+            {{- fail "agents.microvm.productionMode requires controllerRoleARN — the dedicated controller-only launcher-hop role, not the shared agent identity" }}
+            {{- end }}
+            {{- if not .Values.agents.microvm.expectedLauncherAccount }}
+            {{- fail "agents.microvm.productionMode requires expectedLauncherAccount — pin the launcher account explicitly" }}
+            {{- end }}
+            {{- if not .Values.agents.microvm.imageVersion }}
+            {{- fail "agents.microvm.productionMode requires imageVersion — production never floats on the image's active version" }}
+            {{- end }}
+            {{- if not .Values.agents.microvm.logGroup }}
+            {{- fail "agents.microvm.productionMode requires logGroup — production runs deliver runtime logs to CloudWatch (ka-0000002120)" }}
+            {{- end }}
+            - name: MICROVM_PRODUCTION_MODE
+              value: "true"
+            {{- end }}
+            - name: MICROVM_LAUNCHER_ROLE_ARN
+              value: {{ required "agents.microvm.launcherRoleARN is required when microvm.enabled" .Values.agents.microvm.launcherRoleARN | quote }}
+            - name: MICROVM_REGION
+              value: {{ required "agents.microvm.region is required when microvm.enabled" .Values.agents.microvm.region | quote }}
+            {{- if .Values.agents.microvm.controllerRoleARN }}
+            - name: MICROVM_CONTROLLER_ROLE_ARN
+              value: {{ .Values.agents.microvm.controllerRoleARN | quote }}
+            {{- end }}
+            {{- if .Values.agents.microvm.expectedLauncherAccount }}
+            - name: MICROVM_EXPECTED_LAUNCHER_ACCOUNT
+              value: {{ .Values.agents.microvm.expectedLauncherAccount | quote }}
+            {{- end }}
+            {{- if .Values.agents.microvm.assumeRoleSessionName }}
+            - name: MICROVM_ASSUME_ROLE_SESSION_NAME
+              value: {{ .Values.agents.microvm.assumeRoleSessionName | quote }}
+            {{- end }}
+            {{- if .Values.agents.microvm.secretPrefix }}
+            - name: MICROVM_SECRET_PREFIX
+              value: {{ .Values.agents.microvm.secretPrefix | quote }}
+            {{- end }}
+            {{- /* C4 backend launch config (epic ka-0000005010). imageIdentifier
+                 + executionRoleARN are required for the backend to issue
+                 RunMicrovm; without them the identity resolves but launches
+                 fail closed. */}}
+            - name: MICROVM_IMAGE_IDENTIFIER
+              value: {{ required "agents.microvm.imageIdentifier is required when microvm.enabled" .Values.agents.microvm.imageIdentifier | quote }}
+            - name: MICROVM_EXECUTION_ROLE_ARN
+              value: {{ required "agents.microvm.executionRoleARN is required when microvm.enabled" .Values.agents.microvm.executionRoleARN | quote }}
+            {{- if .Values.agents.microvm.imageVersion }}
+            - name: MICROVM_IMAGE_VERSION
+              value: {{ .Values.agents.microvm.imageVersion | quote }}
+            {{- end }}
+            {{- if .Values.agents.microvm.staticIdentitySecretARN }}
+            - name: MICROVM_STATIC_IDENTITY_SECRET_ARN
+              value: {{ .Values.agents.microvm.staticIdentitySecretARN | quote }}
+            {{- end }}
+            {{- /* Per-run git credential minting (ka-0000004762). The factory
+                 token (GitLab api scope, Maintainer) mints per-run project
+                 access tokens for satellites; delivered as a Secret env-ref,
+                 never a plaintext chart value. Unset → shared-fallback mode
+                 (the project's own git secrets ride the per-run document). */}}
+            {{- if .Values.agents.microvm.gitCredentials.factoryTokenSecret }}
+            - name: MICROVM_GIT_FACTORY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.agents.microvm.gitCredentials.factoryTokenSecret | quote }}
+                  key: token
+                  # Optional so the wiring can deploy BEFORE the operator seeds
+                  # the factory token in the secret store: until the Secret
+                  # materializes the controller runs shared-fallback instead of
+                  # wedging on a missing env Secret.
+                  optional: true
+            {{- end }}
+            {{- if .Values.agents.microvm.gitCredentials.gitlabBaseURL }}
+            - name: MICROVM_GITLAB_BASE_URL
+              value: {{ .Values.agents.microvm.gitCredentials.gitlabBaseURL | quote }}
+            {{- end }}
+            {{- /* Per-run Ziti identities (ka-0000001924). When zitiBroker.url
+                 is set, every launch mints a unique short-lived identity via
+                 the ziti-access-broker (fail-closed) and the deprecated
+                 staticIdentitySecretARN above is ignored by the controller. */}}
+            {{- if .Values.agents.microvm.zitiBroker.url }}
+            - name: MICROVM_ZITI_BROKER_URL
+              value: {{ .Values.agents.microvm.zitiBroker.url | quote }}
+            {{- if .Values.agents.microvm.zitiBroker.serverID }}
+            - name: MICROVM_ZITI_BROKER_SERVER_ID
+              value: {{ .Values.agents.microvm.zitiBroker.serverID | quote }}
+            {{- end }}
+            {{- if .Values.agents.microvm.zitiBroker.enroll }}
+            - name: MICROVM_ZITI_BROKER_ENROLL
+              value: "true"
+            {{- end }}
+            {{- end }}
+            {{- /* Wall-clock lifetime cap. 0/unset keeps the controller's
+                 compiled 3600s default; long-lived roles (plan-gardener) need
+                 the 8h ceiling (ka-0000003026). */}}
+            {{- if .Values.agents.microvm.maximumDurationSeconds }}
+            - name: MICROVM_MAXIMUM_DURATION_SECONDS
+              value: {{ .Values.agents.microvm.maximumDurationSeconds | quote }}
+            {{- end }}
+            {{- /* CloudWatch runtime logging (ka-0000002120). logGroup unset
+                 leaves RunMicrovm's Logging member off entirely — the C7 POC
+                 behavior. The stream prefix is only meaningful with a group,
+                 so it is nested rather than independently emitted. */}}
+            {{- if .Values.agents.microvm.logGroup }}
+            - name: MICROVM_LOG_GROUP
+              value: {{ .Values.agents.microvm.logGroup | quote }}
+            {{- if .Values.agents.microvm.logStreamPrefix }}
+            - name: MICROVM_LOG_STREAM_PREFIX
+              value: {{ .Values.agents.microvm.logStreamPrefix | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Bead-scoped S3 session-credential vending (S4 ka-0000006612).
+                 The controller assumes this S2-provisioned role via
+                 AssumeRoleWithWebIdentity and narrows each mint to
+                 coop/sessions/<bead>/*. Unset leaves satellites without S3
+                 session persistence (the MINIMAL execution role grants none);
+                 vending also requires a sessions bucket (agents.s3.bucket). */}}
+            {{- if .Values.agents.microvm.sessionVendorRoleARN }}
+            - name: MICROVM_SESSION_VENDOR_ROLE_ARN
+              value: {{ .Values.agents.microvm.sessionVendorRoleARN | quote }}
+            {{- if .Values.agents.microvm.sessionCredentialDurationSeconds }}
+            - name: MICROVM_SESSION_CREDENTIAL_DURATION_SECONDS
+              value: {{ .Values.agents.microvm.sessionCredentialDurationSeconds | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Native suspend/resume IdlePolicy (plan ka-0000004518). Disabled
+                 leaves RunMicrovm's IdlePolicy member unset (byte-for-byte
+                 pre-idle-policy launch shape). When enabled, all three members
+                 are emitted — the SDK requires them together. Egress-only
+                 topology means suspendedDurationSeconds is the operative
+                 standby-billing auto-terminate backstop. */}}
+            {{- if .Values.agents.microvm.idlePolicy.enabled }}
+            - name: MICROVM_IDLE_POLICY_ENABLED
+              value: "true"
+            {{- if .Values.agents.microvm.idlePolicy.autoResumeEnabled }}
+            - name: MICROVM_IDLE_AUTO_RESUME_ENABLED
+              value: "true"
+            {{- end }}
+            - name: MICROVM_IDLE_MAX_IDLE_DURATION_SECONDS
+              value: {{ .Values.agents.microvm.idlePolicy.maxIdleDurationSeconds | quote }}
+            - name: MICROVM_IDLE_SUSPENDED_DURATION_SECONDS
+              value: {{ .Values.agents.microvm.idlePolicy.suspendedDurationSeconds | quote }}
+            {{- end }}
+            {{- /* Native suspend-on-stop (plan ka-0000004518, step 2
+                 ka-0000007189). When enabled, a freeze-eligible MicroVM thread
+                 agent's `gb stop` suspends the VM and leaves the bead open at
+                 agent_state=stopping; disabled leaves the env unset so every
+                 MicroVM stop terminates as before. */}}
+            {{- if .Values.agents.microvm.suspendOnStop.enabled }}
+            - name: MICROVM_SUSPEND_ENABLED
+              value: "true"
+            {{- end }}
+            {{- /* Resume rehydration correctness boundary (step 5, plan
+                 ka-0000004518). Default-on fail-closed proof-of-life gate: after
+                 ResumeMicrovm the controller waits for the resumed VM's egress
+                 heartbeat before marking it working, else terminates + marks
+                 resume_failed. Set enabled=false for the step-3 rollback (stamp
+                 working immediately). See docs/microvm-resume-rehydration.md. */}}
+            {{- if not .Values.agents.microvm.resumeRehydrate.enabled }}
+            - name: MICROVM_RESUME_REHYDRATE_ENABLED
+              value: "false"
+            {{- end }}
+            {{- if .Values.agents.microvm.resumeRehydrate.deadlineSeconds }}
+            - name: MICROVM_RESUME_REHYDRATE_DEADLINE_SECONDS
+              value: {{ .Values.agents.microvm.resumeRehydrate.deadlineSeconds | quote }}
+            {{- end }}
+            {{- /* Max-standby-age cap (step 4 ka-0000006202). A SUSPENDED
+                 thread-agent VM is intentional standby (its open bead is the
+                 resume target); this cap bounds how long that standby may bill
+                 — leak GC terminates a suspended VM past the cap and closes its
+                 bead as done. Empty/unset leaves the controller cap off, so the
+                 AWS IdlePolicy suspendedDurationSeconds backstop is the only
+                 standby-billing limit. */}}
+            {{- if .Values.agents.microvm.suspendOnStop.maxStandbyAge }}
+            - name: MICROVM_MAX_STANDBY_AGE
+              value: {{ .Values.agents.microvm.suspendOnStop.maxStandbyAge | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: "{{ .Values.global.coverage.mountPath }}/controller"
+            {{- /* Runtime coverage for dynamically-built AGENT pods (C2,
+                   ka-0000000508). The controller reads these to add GOCOVERDIR +
+                   LLVM_PROFILE_FILE to each agent container and mount the shared
+                   coverage PVC. GARDENIO_AGENT_COVERAGE gates the wiring;
+                   _CLAIM names the shared PVC (embeds the release name, so it
+                   cannot be derived at runtime); _MOUNT keeps the agent-pod mount
+                   path in lockstep with global.coverage.mountPath. Gated on the
+                   same coverage.enabled flag as the daemons above. */}}
+            - name: GARDENIO_AGENT_COVERAGE
+              value: "1"
+            - name: GARDENIO_AGENT_COVERAGE_CLAIM
+              value: {{ include "gardenio.agents.fullname" . }}-coverage
+            - name: GARDENIO_AGENT_COVERAGE_MOUNT
+              value: {{ .Values.global.coverage.mountPath | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.agents.resources | nindent 12 }}
+          {{- if or .Values.global.coverage.enabled .Values.agents.githubApp.enabled (and .Values.agents.zitiAccess.enabled .Values.agents.zitiAccess.revokeOnExit) .Values.agents.machinePrincipal.enabled .Values.agents.lands.provisioner.enabled (and .Values.agents.mailer.enabled .Values.agents.mailer.credentialsSecret.name) .Values.releases.box.name (and .Values.nats.auth.subjectIsolation.enabled .Values.nats.auth.subjectIsolation.landCallout.enabled) .Values.coopmux.landTokens.enabled }}
+          volumeMounts:
+            {{- if .Values.coopmux.landTokens.enabled }}
+            - name: coopmux-land-token-key
+              mountPath: /var/run/secrets/coopmux-land-token-key
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.nats.auth.subjectIsolation.enabled .Values.nats.auth.subjectIsolation.landCallout.enabled }}
+            - name: nats-land-callout
+              mountPath: /var/run/secrets/nats-land-callout
+              readOnly: true
+            {{- end }}
+            {{- if .Values.agents.githubApp.enabled }}
+            - name: github-app-private-key
+              mountPath: {{ .Values.agents.githubApp.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+            {{- if and .Values.agents.zitiAccess.enabled .Values.agents.zitiAccess.revokeOnExit }}
+            - name: ziti-broker-token
+              mountPath: /var/run/secrets/ziti-broker
+              readOnly: true
+            {{- end }}
+            {{- if .Values.agents.machinePrincipal.enabled }}
+            - name: machine-client-secret
+              mountPath: /var/run/secrets/gardenio-machine
+              readOnly: true
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            {{- include "gardenio.keycloakRuntime.caVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.agents.lands.provisioner.enabled }}
+            - name: lands-keycloak-client-secret
+              mountPath: {{ .Values.agents.lands.provisioner.keycloak.mountPath }}
+              readOnly: true
+            - name: lands-github-app-private-key
+              mountPath: {{ .Values.agents.lands.provisioner.githubApp.mountPath }}
+              readOnly: true
+            {{- if include "gardenio.keycloakRuntime.tlsEnabled" . }}
+            - name: lands-keycloak-ca
+              mountPath: {{ .Values.agents.lands.provisioner.keycloak.caMountPath }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- if and .Values.agents.mailer.enabled .Values.agents.mailer.credentialsSecret.name }}
+            - name: mailer-ses-credentials
+              mountPath: /var/run/secrets/gardenio-mailer-ses
+              readOnly: true
+            {{- end }}
+            {{- if .Values.releases.box.name }}
+            - name: release-home-client-secret
+              mountPath: /var/run/secrets/gardenio-release-home
+              readOnly: true
+            {{- if .Values.releases.box.homeCA.name }}
+            - name: release-home-ca
+              mountPath: /var/run/secrets/gardenio-release-home-ca
+              readOnly: true
+            {{- end }}
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.global.coverage.enabled .Values.agents.githubApp.enabled (and .Values.agents.zitiAccess.enabled .Values.agents.zitiAccess.revokeOnExit) .Values.agents.machinePrincipal.enabled .Values.agents.lands.provisioner.enabled (and .Values.agents.mailer.enabled .Values.agents.mailer.credentialsSecret.name) .Values.releases.box.name (and .Values.nats.auth.subjectIsolation.enabled .Values.nats.auth.subjectIsolation.landCallout.enabled) .Values.coopmux.landTokens.enabled }}
+      volumes:
+        {{- if .Values.coopmux.landTokens.enabled }}
+        # Land coopmux token key, shared with coopmux (gd-ApgYe740ps).
+        - name: coopmux-land-token-key
+          secret:
+            secretName: {{ include "gardenio.coopmux.landTokenKeySecretName" . }}
+            defaultMode: 0440
+            items:
+              - key: key
+                path: key
+        {{- end }}
+        {{- if and .Values.nats.auth.subjectIsolation.enabled .Values.nats.auth.subjectIsolation.landCallout.enabled }}
+        # The land callout's issuer seed alone, not its public half.
+        - name: nats-land-callout
+          secret:
+            secretName: {{ required "nats.auth.subjectIsolation.landCallout.issuerSecret is required with landCallout.enabled" .Values.nats.auth.subjectIsolation.landCallout.issuerSecret }}
+            defaultMode: 0400
+            items:
+              - key: seed
+                path: seed
+        {{- end }}
+        {{- if .Values.agents.githubApp.enabled }}
+        # App private key (controller-only, file projection per the W6 precedent).
+        - name: github-app-private-key
+          secret:
+            secretName: {{ .Values.agents.githubApp.privateKeySecret }}
+            defaultMode: 0440
+            items:
+              - key: private-key
+                path: private-key
+        {{- end }}
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+        {{- if and .Values.agents.zitiAccess.enabled .Values.agents.zitiAccess.revokeOnExit }}
+        # Controller's own projected broker-audience token for lease revocation.
+        - name: ziti-broker-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ .Values.agents.zitiAccess.tokenAudience | default "gardenio-ziti-broker" | quote }}
+                  expirationSeconds: 600
+        {{- end }}
+        {{- if .Values.agents.machinePrincipal.enabled }}
+        # Machine-principal client secret (gd-s7aPIf0Bgp). optional: the operator
+        # creates the Secret by hand; without it the pod still starts and account
+        # writes fail closed with auth_unavailable in the log.
+        - name: machine-client-secret
+          secret:
+            secretName: {{ .Values.agents.machinePrincipal.secretName | quote }}
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: clientSecret
+                path: clientSecret
+        {{- if include "gardenio.keycloak.inClusterCA" . }}
+        # The same ca.crt as lands-keycloak-ca below, at the path every
+        # machine-principal client uses (gd-lYPZlslOM7).
+        {{- include "gardenio.keycloakRuntime.caVolume" . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.agents.lands.provisioner.enabled }}
+        # Lands provisioner secrets (step 8.6). optional, like the machine
+        # principal's: a missing Secret still starts the pod, and the
+        # provisioner logs the unreadable file and stays off.
+        - name: lands-keycloak-client-secret
+          secret:
+            secretName: {{ .Values.agents.lands.provisioner.keycloak.clientSecretSecret | quote }}
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: clientSecret
+                path: clientSecret
+        - name: lands-github-app-private-key
+          secret:
+            secretName: {{ .Values.agents.lands.provisioner.githubApp.privateKeySecret | quote }}
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: private-key
+                path: private-key
+        {{- if include "gardenio.keycloakRuntime.tlsEnabled" . }}
+        # The in-cluster Keycloak CA (gd-XRsosVFAau): ca.crt ONLY from the
+        # keycloak-runtime leaf Secret, never its tls.key. optional so the
+        # pod starts before cert-manager has issued; the provisioner then
+        # logs the unreadable CA file and stays off.
+        - name: lands-keycloak-ca
+          secret:
+            secretName: {{ include "gardenio.keycloakRuntime.tlsSecretName" . | quote }}
+            optional: true
+            defaultMode: 0444
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+        {{- end }}
+        {{- with .Values.agents.mailer.credentialsSecret }}
+        {{- if and $.Values.agents.mailer.enabled .name }}
+        # The mailer's own SES keys (gd-kSLbp23ekV). optional, like the
+        # provisioner's: a missing Secret still starts the pod, and the mailer
+        # logs the unreadable keys and stays off.
+        - name: mailer-ses-credentials
+          secret:
+            secretName: {{ .name | quote }}
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: {{ required "agents.mailer.credentialsSecret.accessKeyIdKey is required when credentialsSecret.name is set" .accessKeyIdKey | quote }}
+                path: accessKeyId
+              - key: {{ required "agents.mailer.credentialsSecret.secretAccessKeyKey is required when credentialsSecret.name is set" .secretAccessKeyKey | quote }}
+                path: secretAccessKey
+        {{- end }}
+        {{- end }}
+        {{- with .Values.releases.box }}
+        {{- if .name }}
+        # The box's home-realm client secret (plan gd-UZKZ9H25UD step 4d).
+        # optional, like the machine principal's: a missing Secret still starts
+        # the pod, and the release reporter logs its token fetch failures.
+        - name: release-home-client-secret
+          secret:
+            secretName: {{ required "releases.box.homeClientSecret.name is required when releases.box.name is set" .homeClientSecret.name | quote }}
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: {{ required "releases.box.homeClientSecret.key is required when releases.box.name is set" .homeClientSecret.key | quote }}
+                path: clientSecret
+        {{- if .homeCA.name }}
+        - name: release-home-ca
+          secret:
+            secretName: {{ .homeCA.name | quote }}
+            optional: true
+            defaultMode: 0444
+            items:
+              - key: {{ .homeCA.key | default "ca.crt" | quote }}
+                path: ca.crt
+        {{- end }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.agents.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- /* HA spread (gd-27vcHmrurh). Only rendered at replicaCount > 1 — see
+             templates/litellm/deployment.yaml for the rationale this mirrors. */}}
+      {{- if gt (int (.Values.agents.replicaCount | default 1)) 1 }}
+      {{- with .Values.agents.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew | default 1 }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable | default "ScheduleAnyway" }}
+          labelSelector:
+            matchLabels:
+              {{- include "gardenio.agents.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- if .Values.agents.affinity }}
+      affinity:
+        {{- toYaml .Values.agents.affinity | nindent 8 }}
+      {{- else if and (gt (int (.Values.agents.replicaCount | default 1)) 1) .Values.agents.podAntiAffinity.enabled }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: {{ .Values.agents.podAntiAffinity.weight | default 100 }}
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "gardenio.agents.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.agents.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- /* Same class as the interactive (thread/dm/gardener) agent pods the
+      controller stamps: agents depend on this pod, so they must not be able
+      to preempt it (gd-cTobdw0kAL). */}}
+      {{- if .Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ .Values.global.systemPriorityClass.name }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,112 @@
+# rule_files is rewritten at runtime by TestFSMCompositeAlert_SyntheticOOMRestartFires
+# (fsm_composite_alert_test.go): the placeholder below is replaced with the
+# path to the helm-rendered PrometheusRule spec. To run this proof by hand:
+#   helm template test gardenio/helm/gardenio --show-only templates/fsm-composite-alert.yaml \
+#     --set fsmCompositeAlert.enabled=true \
+#     --set fsmCompositeAlert.grafanaBaseURL=https://gardenio.app.e2e.dev.acme.example/grafana \
+#     --set agents.s3.bucket=gardenio-sessions | yq eval '.spec' - > /tmp/fsm_rules.yaml
+#   sed 's#__RULES_FILE__#/tmp/fsm_rules.yaml#' this-file > /tmp/fsm_test.yaml
+#   promtool test rules /tmp/fsm_test.yaml
+rule_files:
+  - __RULES_FILE__
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------
+  # POSITIVE: synthetic OOM + ECS task restart in the SAME (env,cluster,service)
+  # window must fire FSMAgentOOMWithECSRestart with both deep links resolved.
+  # ---------------------------------------------------------------------------
+  - name: oom_and_restart_same_window_fires
+    interval: 1m
+    input_series:
+      # gardenio-owned pivot: project "acme" -> cluster/service "acme-ecs"/"acme-api"
+      - series: 'gardenio_resource_mapping{project="acme", env="prod", cluster="acme-ecs", service="acme-api", db_instance="acme-db"}'
+        values: '1x10'
+      # An OOM kill on project acme in prod at ~t=3m (counter steps from 0 to 1).
+      - series: 'gardenio_agent_lifecycle_events_total{event="oom_killed", env="prod", project="acme", session_id="11111111-1111-4111-8111-111111111111"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1'
+      # An ECS task restart on the SAME cluster/service in the same window.
+      - series: 'aws_ecs_task_restart_total{env="prod", cluster_name="acme-ecs", service_name="acme-api"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FSMAgentOOMWithECSRestart
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: gardenio-fsm
+              subsystem: composite-correlation
+              env: prod
+              project: acme
+              cluster: acme-ecs
+              service: acme-api
+              db_instance: acme-db
+            exp_annotations:
+              summary: "Agent OOM correlated with ECS task restart (prod/acme-ecs/acme-api)"
+              dashboard_agent_url: "https://gardenio.app.e2e.dev.acme.example/grafana/d/gardenio-cost-overview?var-env=prod&var-project=acme&from=now-1h&to=now"
+              dashboard_acme_url: "https://gardenio.app.e2e.dev.acme.example/grafana/d/fsm-correlation?var-env=prod&var-cluster=acme-ecs&var-service=acme-api&from=now-1h&to=now"
+              session_recording_s3: "s3://gardenio-sessions/coop/sessions/11111111-1111-4111-8111-111111111111"
+              runbook_url: "https://github.com/mattbakerconsulting/gardenio/blob/main/gardenio/docs/FSM_CORRELATION_CONTRACT.md#5-supported-metric-pairs-v1"
+              description: |
+                A gardenio agent in project acme (env
+                prod) was OOM-killed AND ECS service
+                acme-api on cluster acme-ecs
+                restarted at least one task within the same 5m window.
+                This is the FSM composite signal (epic ka-0000000741, plan §5.7):
+                an agent memory failure that coincides with infra churn on the
+                site resource that project exercises. Pivot from the agent
+                incident to the site infra panels using the links below.
+
+  # ---------------------------------------------------------------------------
+  # NEGATIVE: OOM but NO ECS restart -> must NOT fire.
+  # ---------------------------------------------------------------------------
+  - name: oom_only_does_not_fire
+    interval: 1m
+    input_series:
+      - series: 'gardenio_resource_mapping{project="acme", env="prod", cluster="acme-ecs", service="acme-api", db_instance="acme-db"}'
+        values: '1x10'
+      - series: 'gardenio_agent_lifecycle_events_total{event="oom_killed", env="prod", project="acme", session_id="22222222-2222-4222-8222-222222222222"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1'
+      - series: 'aws_ecs_task_restart_total{env="prod", cluster_name="acme-ecs", service_name="acme-api"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FSMAgentOOMWithECSRestart
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # NEGATIVE: ECS restart but NO OOM -> must NOT fire.
+  # ---------------------------------------------------------------------------
+  - name: restart_only_does_not_fire
+    interval: 1m
+    input_series:
+      - series: 'gardenio_resource_mapping{project="acme", env="prod", cluster="acme-ecs", service="acme-api", db_instance="acme-db"}'
+        values: '1x10'
+      - series: 'gardenio_agent_lifecycle_events_total{event="oom_killed", env="prod", project="acme", session_id="33333333-3333-4333-8333-333333333333"}'
+        values: '0x10'
+      - series: 'aws_ecs_task_restart_total{env="prod", cluster_name="acme-ecs", service_name="acme-api"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FSMAgentOOMWithECSRestart
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # NEGATIVE: OOM on project acme, restart on a DIFFERENT service the project
+  # does not map to -> must NOT fire (the (cluster,service) join excludes it).
+  # ---------------------------------------------------------------------------
+  - name: restart_on_unmapped_service_does_not_fire
+    interval: 1m
+    input_series:
+      - series: 'gardenio_resource_mapping{project="acme", env="prod", cluster="acme-ecs", service="acme-api", db_instance="acme-db"}'
+        values: '1x10'
+      - series: 'gardenio_agent_lifecycle_events_total{event="oom_killed", env="prod", project="acme", session_id="44444444-4444-4444-8444-444444444444"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1'
+      # restart is on bystander-svc, which project acme does not map to.
+      - series: 'aws_ecs_task_restart_total{env="prod", cluster_name="acme-ecs", service_name="bystander-svc"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FSMAgentOOMWithECSRestart
+        exp_alerts: []

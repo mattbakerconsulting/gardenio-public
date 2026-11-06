@@ -1,0 +1,311 @@
+{{/*
+Lands land namespaces (Track B spec §5.2, B-D9, step 10.2 gd-NH44mohWlL).
+
+The Lands provisioner (internal/lands/landns) gives every tenant land its own
+namespace land-<name>: Namespace, ResourceQuota, LimitRange, a default-deny
+NetworkPolicy, an RBAC-less ServiceAccount land-agent, and a RoleBinding that
+binds the controller's ServiceAccount to ONE ClusterRole,
+gardenio-land-agent-manager, in that namespace only. Kubernetes RBAC cannot
+select namespaces by label, so a per-namespace binding to one reviewed
+ClusterRole is the narrowest grant that lets one controller run pods in many
+tenant namespaces.
+
+This file renders, when landNamespaces.enabled:
+
+  1. ClusterRole gardenio-land-agent-manager: what the controller does to an
+     agent pod in a land namespace (pods, pods/log, secrets, configmaps,
+     persistentvolumeclaims for the workspace, events). It is bound only by the
+     per-land RoleBindings the provisioner makes, never cluster-wide.
+  2. ClusterRole + ClusterRoleBinding <agents>-lands-namespaces: what the
+     provisioner needs to make and delete a land namespace (namespaces,
+     resourcequotas, limitranges, networkpolicies, serviceaccounts,
+     rolebindings) and `bind` on gardenio-land-agent-manager ONLY
+     (resourceNames), so the RoleBindings it creates can name nothing else.
+  3. ValidatingAdmissionPolicy <agents>-lands-namespaces, which holds the
+     controller ServiceAccount's writes under (2) to land namespaces: a
+     Namespace it creates, updates or deletes must be named land-<x> and carry
+     gardenio.io/land=<x> and app.kubernetes.io/managed-by=gardenio-controller,
+     and the namespaced objects must live in a land-* namespace. Its
+     RoleBindings may only name gardenio-land-agent-manager. The cluster-wide
+     grant in (2) is otherwise unavoidable: the namespaces do not exist until
+     the provisioner makes them.
+  4. ValidatingAdmissionPolicy <agents>-land-agent-manager-binding, for every
+     principal: gardenio-land-agent-manager is never bound by a
+     ClusterRoleBinding, and a RoleBinding to it lives in a land-* namespace
+     and names one subject, the controller ServiceAccount (gd-pXik57wZA9).
+     `bind` in (2) is granted cluster-wide, and the controller ServiceAccount
+     also holds unscoped `create` on clusterrolebindings when
+     agents.clusterAdmin.enabled (cluster-rbac.yaml), so without this policy
+     it could bind the agent manager role cluster-wide: pods and secrets in
+     every namespace.
+  5. ValidatingAdmissionPolicy <agents>-land-pods, for every principal: a pod
+     created or updated in a land namespace (labelled gardenio.io/land) runs
+     under landNamespaces.runtimeClassName (when "", the default, it names no
+     RuntimeClass and runs on the node's default runtime; gd-iyZom5u11A;
+     checked on CREATE only, as the field is immutable), as the land-agent
+     ServiceAccount, with no API token, no projected serviceAccountToken
+     volume (which mounts a token whatever automountServiceAccountToken says,
+     gd-pXik57wZA9) and no hostPath. The controller's land fence builds
+     tenant pods this way; this holds it at admission whatever the pod spec
+     builders do.
+
+None of the policies can be turned off while landNamespaces.enabled: (2) is
+only as narrow as (3) and (4) make it, and (5) is the tenant isolation.
+
+Set landNamespaces.enabled together with the controller env it renders in
+deployment.yaml (LANDS_NAMESPACES_ENABLED, LANDS_CONTROLLER_SERVICE_ACCOUNT);
+the controller's provisioner fails every land at its namespace step while it
+is off. ROLLOUT is an operator change (gb escalation on gd-NH44mohWlL), as is
+a check that the CNI enforces NetworkPolicy, and, only when
+landNamespaces.runtimeClassName is runsc, gVisor on the nodes tenant pods
+schedule to.
+
+Requires Kubernetes 1.30+ for the admission policies.
+*/}}
+{{- if and .Values.agents.enabled .Values.landNamespaces.enabled }}
+{{- $sa := include "gardenio.agents.serviceAccountName" . }}
+{{- $rc := .Values.landNamespaces.runtimeClassName | default "" }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gardenio-land-agent-manager
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-lands-namespaces
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The only role the controller may bind: without `bind` RBAC would refuse a
+  # RoleBinding granting permissions the controller does not hold itself.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames: ["gardenio-land-agent-manager"]
+    verbs: ["bind"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-lands-namespaces
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.agents.fullname" . }}-lands-namespaces
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-lands-namespaces
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["namespaces", "resourcequotas", "limitranges", "serviceaccounts"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["networkpolicies"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["rolebindings"]
+  matchConditions:
+    - name: only-controller-sa
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:{{ .Release.Namespace }}:{{ $sa }}'
+  variables:
+    # The object the request is about: the old one on DELETE.
+    - name: obj
+      expression: "request.operation == 'DELETE' ? oldObject : object"
+    - name: labels
+      expression: "has(variables.obj.metadata.labels) ? variables.obj.metadata.labels : {}"
+  validations:
+    - expression: >-
+        request.resource.resource != 'namespaces' ||
+        (variables.obj.metadata.name.startsWith('land-') &&
+         'gardenio.io/land' in variables.labels &&
+         variables.obj.metadata.name == 'land-' + variables.labels['gardenio.io/land'] &&
+         'app.kubernetes.io/managed-by' in variables.labels &&
+         variables.labels['app.kubernetes.io/managed-by'] == 'gardenio-controller')
+      message: >-
+        the gardenio controller may only create, update or delete land
+        namespaces: named land-<land>, labelled gardenio.io/land=<land> and
+        app.kubernetes.io/managed-by=gardenio-controller (Lands step 10.2).
+    - expression: >-
+        request.resource.resource == 'namespaces' ||
+        request.namespace.startsWith('land-')
+      message: >-
+        the gardenio controller's land namespace grant only writes inside
+        land-* namespaces (Lands step 10.2).
+    - expression: >-
+        request.resource.resource != 'rolebindings' || request.operation == 'DELETE' ||
+        (object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'gardenio-land-agent-manager')
+      message: >-
+        the gardenio controller may only bind gardenio-land-agent-manager in a
+        land namespace (Lands step 10.2).
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-lands-namespaces
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "gardenio.agents.fullname" . }}-lands-namespaces
+  validationActions: ["Deny"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-land-agent-manager-binding
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["rolebindings", "clusterrolebindings"]
+  matchConditions:
+    - name: binds-land-agent-manager
+      expression: >-
+        object.roleRef.kind == 'ClusterRole' &&
+        object.roleRef.name == 'gardenio-land-agent-manager'
+  validations:
+    - expression: "request.resource.resource == 'rolebindings'"
+      message: >-
+        gardenio-land-agent-manager is never bound cluster-wide; only a
+        RoleBinding in a land namespace binds it (Lands step 10.2).
+    - expression: >-
+        request.resource.resource != 'rolebindings' ||
+        request.namespace.startsWith('land-')
+      message: >-
+        gardenio-land-agent-manager may only be bound inside a land-*
+        namespace (Lands step 10.2).
+    - expression: >-
+        request.resource.resource != 'rolebindings' ||
+        (has(object.subjects) && size(object.subjects) == 1 &&
+         object.subjects[0].kind == 'ServiceAccount' &&
+         object.subjects[0].name == '{{ $sa }}' &&
+         has(object.subjects[0].namespace) &&
+         object.subjects[0].namespace == '{{ .Release.Namespace }}')
+      message: >-
+        gardenio-land-agent-manager is bound only to the gardenio controller's
+        ServiceAccount (gd-pXik57wZA9).
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-land-agent-manager-binding
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "gardenio.agents.fullname" . }}-land-agent-manager-binding
+  validationActions: ["Deny"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-land-pods
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - key: gardenio.io/land
+          operator: Exists
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    {{- if $rc }}
+    - expression: "request.operation != 'CREATE' || (has(object.spec.runtimeClassName) && object.spec.runtimeClassName == {{ $rc | squote }})"
+      message: >-
+        a pod in a land namespace runs under the {{ $rc }} RuntimeClass
+        (landNamespaces.runtimeClassName; Lands step 10.2).
+    {{- else }}
+    - expression: "request.operation != 'CREATE' || !has(object.spec.runtimeClassName) || object.spec.runtimeClassName == ''"
+      message: >-
+        a pod in a land namespace names no RuntimeClass and runs on the
+        node's default runtime (landNamespaces.runtimeClassName is empty;
+        Lands step 10.2).
+    {{- end }}
+    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == 'land-agent'"
+      message: >-
+        a pod in a land namespace runs as the land-agent ServiceAccount (Lands
+        step 10.2).
+    - expression: >-
+        has(object.spec.automountServiceAccountToken) &&
+        object.spec.automountServiceAccountToken == false
+      message: >-
+        a pod in a land namespace mounts no Kubernetes API token (Lands step
+        10.2).
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(v, !has(v.hostPath))
+      message: >-
+        a pod in a land namespace has no hostPath volume (Lands step 10.2).
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(v, !has(v.projected) || !has(v.projected.sources) ||
+          v.projected.sources.all(s, !has(s.serviceAccountToken)))
+      message: >-
+        a pod in a land namespace mounts no projected serviceAccountToken
+        (gd-pXik57wZA9).
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-land-pods
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "gardenio.agents.fullname" . }}-land-pods
+  validationActions: ["Deny"]
+{{- end }}

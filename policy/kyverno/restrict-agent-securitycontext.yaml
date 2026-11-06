@@ -1,0 +1,64 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-agent-securitycontext
+  annotations:
+    policies.kyverno.io/title: Require a restricted securityContext on agent pods
+    policies.kyverno.io/category: gardenio-admission-starter
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Agent pods run untrusted, LLM-generated workloads and are already built
+      restricted-conformant by the controller (runAsNonRoot, drop ALL caps,
+      allowPrivilegeEscalation=false, RuntimeDefault seccomp). PSA "restricted"
+      enforces this on fleet namespaces, but the gardenio-system namespace runs
+      at PSA "baseline" (the in-namespace litellm/DinD workloads need it), which
+      leaves a gap: an agent pod scheduled into a baseline namespace could be
+      crafted to escalate privilege or run as root (attacker path A3, audit
+      finding F5, ka-0000002606). This ClusterPolicy re-asserts the core
+      restricted controls on AGENT pods specifically (selected by the
+      gardenio.io/agent label), independent of the namespace PSA profile, so the
+      guarantee holds wherever an agent lands. It requires, on every container
+      and initContainer: allowPrivilegeEscalation=false and privileged=false,
+      and on the pod: runAsNonRoot=true. Scoped to agent pods only — the
+      privileged DinD sidecar and root-running litellm/postgres spine pods do
+      NOT carry the gardenio.io/agent label and are unaffected. Part of the
+      admission starter set: default OFF, roll out Audit -> Enforce. The Helm
+      chart renders a values-parameterized copy at
+      templates/kyverno/restrict-agent-securitycontext.yaml (gated behind
+      global.admissionPolicies.restrictSecurityContext.enabled). See
+      gardenio/docs/admission-policies.md.
+spec:
+  # Audit = report-only (starter posture). Agent pods are already
+  # restricted-conformant, so Audit should report zero violations on the happy
+  # path; flip to Enforce once the PolicyReport confirms that.
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: agent-restricted-securitycontext
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              selector:
+                matchExpressions:
+                  - key: gardenio.io/agent
+                    operator: Exists
+      validate:
+        message: >-
+          Agent pods must run as non-root and every container must set
+          allowPrivilegeEscalation=false and privileged=false. See
+          policy/kyverno/restrict-agent-securitycontext.yaml.
+        pattern:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+            =(initContainers):
+              - securityContext:
+                  allowPrivilegeEscalation: false
+                  =(privileged): false
+            containers:
+              - securityContext:
+                  allowPrivilegeEscalation: false
+                  =(privileged): false

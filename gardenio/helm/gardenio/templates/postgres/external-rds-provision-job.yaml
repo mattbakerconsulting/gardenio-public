@@ -1,0 +1,205 @@
+{{- /*
+External-RDS per-instance provisioning hook.
+
+Runs as a pre-install + pre-upgrade Helm hook BEFORE the beads deployment is
+applied, so the database/role/extension are guaranteed to exist by the time
+the daemon starts.
+
+Idempotent semantics:
+  - Role: created with the password from the per-instance K8s Secret. On
+    upgrade the Secret password is reused (preserved by lookup), so
+    `ALTER ROLE ... PASSWORD` is a no-op write.
+  - Database: created OWNER = role if it does not exist; otherwise skipped.
+  - Extension `vector`: `CREATE EXTENSION IF NOT EXISTS` inside the
+    per-instance database.
+  - Privileges: GRANT ALL re-runs harmlessly.
+
+Teardown (DROP DATABASE / DROP ROLE) is intentionally out of scope here —
+that lives in E4 (reaper). On `helm uninstall`, the per-instance database
+and role remain on RDS and must be cleaned by the reaper or a manual
+operator step. The K8s password Secret is preserved
+(helm.sh/resource-policy: keep) so a re-install reuses the same role.
+
+Refs: D2 (ka-0000005090), E3 (ka-0000006535), umbrella ka-0000002007.
+*/ -}}
+{{- if .Values.beads.externalRDS.enabled -}}
+{{- $name := printf "%s-rds-provision" (include "gardenio.fullname" .) -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-scripts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+    app.kubernetes.io/component: external-rds-provisioner
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+data:
+  provision.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    : "${PGHOST:?PGHOST required}"
+    : "${PGADMIN_USER:?PGADMIN_USER required}"
+    : "${PGADMIN_PASSWORD:?PGADMIN_PASSWORD required}"
+    : "${TARGET_DB:?TARGET_DB required}"
+    : "${TARGET_ROLE:?TARGET_ROLE required}"
+    : "${TARGET_PASSWORD:?TARGET_PASSWORD required}"
+
+    export PGPORT="${PGPORT:-5432}"
+    export PGSSLMODE="${PGSSLMODE:-require}"
+    export PGUSER="${PGADMIN_USER}"
+    export PGPASSWORD="${PGADMIN_PASSWORD}"
+    ADMIN_DB="${PGADMIN_DB:-postgres}"
+
+    # Reject identifiers that aren't safe to interpolate. Postgres identifiers
+    # may legally contain quotes/backslashes when double-quoted, but those open
+    # SQL-injection holes via the password / role-name path. Restrict to
+    # alphanumerics + underscore (the chart's default helper output).
+    valid='^[a-z_][a-z0-9_]{0,62}$'
+    [[ "$TARGET_DB"   =~ $valid ]] || { echo "invalid TARGET_DB: $TARGET_DB"   >&2; exit 2; }
+    [[ "$TARGET_ROLE" =~ $valid ]] || { echo "invalid TARGET_ROLE: $TARGET_ROLE" >&2; exit 2; }
+
+    # Disallow single-quote in password to avoid breaking the SQL literal.
+    case "$TARGET_PASSWORD" in
+      *"'"*) echo "TARGET_PASSWORD contains a single quote — refuse" >&2; exit 2 ;;
+    esac
+
+    psql_admin() { psql -d "$ADMIN_DB" -v ON_ERROR_STOP=1 "$@"; }
+    psql_target() { psql -d "$TARGET_DB" -v ON_ERROR_STOP=1 "$@"; }
+
+    echo "[provision] host=$PGHOST db=$TARGET_DB role=$TARGET_ROLE"
+
+    # Role: create or align password.
+    role_exists=$(psql_admin -t -A -c "SELECT 1 FROM pg_roles WHERE rolname='${TARGET_ROLE}'" || true)
+    if [[ "$role_exists" != "1" ]]; then
+      echo "[provision] creating role $TARGET_ROLE"
+      psql_admin -c "CREATE ROLE \"${TARGET_ROLE}\" WITH LOGIN PASSWORD '${TARGET_PASSWORD}'"
+    else
+      echo "[provision] role $TARGET_ROLE exists; aligning password"
+      psql_admin -c "ALTER ROLE \"${TARGET_ROLE}\" WITH LOGIN PASSWORD '${TARGET_PASSWORD}'"
+    fi
+
+    # Database: create if missing, owned by role.
+    db_exists=$(psql_admin -t -A -c "SELECT 1 FROM pg_database WHERE datname='${TARGET_DB}'" || true)
+    if [[ "$db_exists" != "1" ]]; then
+      echo "[provision] creating database $TARGET_DB owned by $TARGET_ROLE"
+      psql_admin -c "CREATE DATABASE \"${TARGET_DB}\" OWNER \"${TARGET_ROLE}\""
+    else
+      echo "[provision] database $TARGET_DB exists"
+    fi
+
+    # Privileges (idempotent).
+    psql_admin -c "GRANT ALL PRIVILEGES ON DATABASE \"${TARGET_DB}\" TO \"${TARGET_ROLE}\""
+
+    # pgvector inside the per-instance database. RDS exposes the extension
+    # in the standard rds_extensions allow-list (Postgres 15+).
+    echo "[provision] ensuring pgvector extension"
+    psql_target -c "CREATE EXTENSION IF NOT EXISTS vector"
+    # Postgres 15 revokes default CREATE on schema public; re-grant for the role.
+    psql_target -c "GRANT ALL ON SCHEMA public TO \"${TARGET_ROLE}\""
+
+    echo "[provision] done"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+    app.kubernetes.io/component: external-rds-provisioner
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.beads.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: external-rds-provisioner
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.beads.externalRDS.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.beads.externalRDS.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.beads.externalRDS.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with include "gardenio.hookPriorityClassName" $ }}
+      {{ . }}
+      {{- end }}
+      containers:
+        - name: provision
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.beads.externalRDS.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.beads.externalRDS.image.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          command: ["/bin/bash", "/scripts/provision.sh"]
+          env:
+            - name: PGHOST
+              value: {{ .Values.beads.externalRDS.host | quote }}
+            - name: PGPORT
+              value: {{ .Values.beads.externalRDS.port | default 5432 | quote }}
+            - name: PGSSLMODE
+              value: {{ .Values.beads.externalRDS.sslmode | default "require" | quote }}
+            - name: PGADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.beads.externalRDS.adminSecret.name | quote }}
+                  key: {{ .Values.beads.externalRDS.adminSecret.userKey | default "username" | quote }}
+            - name: PGADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.beads.externalRDS.adminSecret.name | quote }}
+                  key: {{ .Values.beads.externalRDS.adminSecret.passwordKey | default "password" | quote }}
+            - name: TARGET_DB
+              value: {{ include "gardenio.beads.externalRDS.databaseName" . | quote }}
+            - name: TARGET_ROLE
+              value: {{ include "gardenio.beads.externalRDS.roleName" . | quote }}
+            # Inline rather than secretKeyRef: the per-instance password Secret
+            # is rendered alongside the main release manifests, which are
+            # applied AFTER pre-install hooks. Both this env var and the
+            # Secret resolve through `gardenio.beads.externalRDS.password` at
+            # the same template instant, so the values agree. The hook Job
+            # is short-lived (ttlSecondsAfterFinished + hook-succeeded delete).
+            - name: TARGET_PASSWORD
+              value: {{ include "gardenio.beads.externalRDS.password" . | quote }}
+          resources:
+            {{- toYaml .Values.beads.externalRDS.resources | nindent 12 }}
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $name }}-scripts
+            defaultMode: 0755
+        - name: tmp
+          emptyDir: {}
+{{- end }}

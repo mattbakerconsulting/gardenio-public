@@ -1,0 +1,414 @@
+# Patch-coverage RWX status check (W2b-2, ka-0000006156).
+#
+# Spec: docs/research/coverage-phase2b-design.md §4. This workflow:
+#
+#   1. Clones gardenio at the MR HEAD commit.
+#   2. Computes the merge-base against the MR target branch and writes
+#      a unified diff (git diff --unified=0 <merge-base>...HEAD).
+#   3. Dispatches `gardenio-coverage-merge` (W3 / 2a) for the same SHA
+#      and downloads `coverage.merged.lcov`.
+#   4. Fetches `baselines.json` from the GitLab Generic Package Registry
+#      (W2b-6 storage at `coverage-baselines/latest/baselines.json`).
+#   5. Reads MR commits via the GitLab API and feeds them to the
+#      `coverage-patch` Go binary, which parses Coverage-Bypass trailers
+#      (W2b-5) and runs the patch-cov library (W2b-1) to produce a
+#      `Coverage / Patch` exit code (0/1) plus a `patch-cov-result.json`
+#      artifact for the bot comment (W2b-3) to consume.
+#
+# §4.5 failure-mode handling: each "couldn't compute" branch invokes the
+# binary with `--synthetic-bypass=tooling-broken` so the gate exits 0
+# while still surfacing the failure in the result.json — operator must
+# never see a green check that came from instrumentation that silently
+# broke. Missing baselines.json is the one case that hard-fails (the
+# operator can re-dispatch once W2b-6 backfills).
+#
+# Phase-1 advisory rollout (§4.4): the named status check is wired in
+# `.rwx/ci.yml`'s `gitlab.merge-request.status-checks` block, but the
+# operator owns the GitLab branch-protection toggle that turns it from
+# advisory into required. No allow-fail wiring at the YAML level.
+#
+# Run manually for debugging:
+#   rwx run .rwx/coverage-patch.yml \
+#     --init commit-sha=$(git rev-parse HEAD) \
+#     --init mr-iid=<iid> \
+#     --init target-branch=main \
+#     --wait
+#
+# Or via dispatch:
+#   rwx dispatch gardenio-coverage-patch \
+#     --param commit-sha=<sha> \
+#     --param mr-iid=<iid> \
+#     --param target-branch=main
+
+on:
+  dispatch:
+    - key: gardenio-coverage-patch
+      init:
+        commit-sha: ${{ event.dispatch.params.commit-sha }}
+        mr-iid: ${{ event.dispatch.params.mr-iid }}
+        target-branch: ${{ event.dispatch.params.target-branch }}
+      params:
+        - key: commit-sha
+          name: Commit SHA
+          description: "Full MR HEAD commit SHA. Required."
+          required: true
+        - key: mr-iid
+          name: MR IID
+          description: "GitLab merge-request iid for fetching commits + MR metadata. Required."
+          required: true
+        - key: target-branch
+          name: Target branch
+          description: "MR target branch (e.g. main) — used to compute the merge-base."
+          default: main
+          required: false
+      title: Coverage / Patch
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      mr-iid: ""
+      target-branch: main
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  # ── Clone gardenio monorepo at MR HEAD ──────────────────────────────
+  # We need full history (fetch-full-depth) and the .git directory
+  # (preserve-git-dir) so `git merge-base` and `git diff` can resolve
+  # against the target branch.
+  - key: code
+    # ── Retry-wrapped FULL clone, preserve .git (ka-0000001787 / ka-0000004454)
+    # Hand-rolled full-history clone with a bounded retry loop instead of
+    # `call: git/clone ... fetch-full-depth+preserve-git-dir` — the retry
+    # pattern proven in docker.yml (ka-0000007550). The stock package (through
+    # 2.0.8) has NO retry, so a single transient gitlab.com blip (exit 128)
+    # fails the whole run.
+    #
+    # Parity with `git/clone` fetch-full-depth:true + preserve-git-dir:true:
+    # NON-shallow fetch of the exact SHA (full ancestry, so `git merge-base`
+    # against origin/<target> resolves) and `.git` KEPT (consumers self-fetch
+    # origin/<target> and run merge-base/diff — ka-0000002355). No submodules/LFS.
+    run: |
+      set -eu
+      : "${GITLAB_CLONE_TOKEN:?GITLAB_CLONE_TOKEN is required}"
+      REPO="https://oauth2:${GITLAB_CLONE_TOKEN}@gitlab.com/Acme/Platform/gardenio.git"
+      SHA="${COMMIT_SHA}"
+      MAX_ATTEMPTS=5
+
+      # Redact the token from any tracing/output; never echo $REPO.
+      git init -q -b main
+      git remote add origin "$REPO"
+      git config --local maintenance.auto false
+      git config --local gc.auto 0
+
+      attempt=1
+      while :; do
+        echo "git-clone attempt ${attempt}/${MAX_ATTEMPTS} for ${SHA}"
+        if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 fetch --no-auto-gc origin "+${SHA}:refs/rwx/git-clone/checkout"; then
+          echo "git-clone: fetch succeeded on attempt ${attempt}"
+          break
+        else
+          rc=$?
+          if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+            echo "git-clone: fetch FAILED after ${MAX_ATTEMPTS} attempts (last exit ${rc})" >&2
+            exit "$rc"
+          fi
+          # Exponential backoff: 5s, 10s, 20s, 40s.
+          sleep_s=$((5 * (1 << (attempt - 1))))
+          echo "git-clone: fetch failed (exit ${rc}); retrying in ${sleep_s}s" >&2
+          sleep "$sleep_s"
+          attempt=$((attempt + 1))
+        fi
+      done
+
+      git checkout -q --detach "$(git rev-parse refs/rwx/git-clone/checkout^{commit})"
+      git clean -fdq
+      echo "Checked out git repository at $(git rev-parse HEAD)"
+
+      # preserve-git-dir parity: KEEP .git so downstream `git merge-base` /
+      # `git diff` against the MR target branch resolve (ka-0000002355).
+    env:
+      GITLAB_CLONE_TOKEN:
+        value: ${{ secrets.GITLAB_CLONE_TOKEN }}
+        cache-key: excluded
+      COMMIT_SHA: ${{ init.commit-sha }}
+
+  # ── Go toolchain (build + run coverage-patch binary) ────────────────
+  - key: go
+    call: golang/install 1.2.1
+    with:
+      go-version: "1.25"
+
+  # ── Build the coverage-patch binary ─────────────────────────────────
+  # Cached on coverage source + go.sum; rebuilt only when the library or
+  # the binary itself changes.
+  - key: build-coverage-patch
+    use: [code, go]
+    filter:
+      - gardenio/controller/cmd/coverage-patch/**
+      - gardenio/controller/internal/coverage/**
+      - gardenio/controller/go.mod
+      - gardenio/controller/go.sum
+    run: |
+      set -euo pipefail
+      cd gardenio/controller
+      GOWORK=off go build -o "$PWD/../../coverage-patch-bin" ./cmd/coverage-patch/
+    outputs:
+      filesystem: false
+      artifacts:
+        - key: coverage-patch-bin
+          path: coverage-patch-bin
+
+  # ── Fetch merge-base + diff against MR target branch ────────────────
+  # Writes `mr.diff` (unified=0, post-change-only) consumed by the
+  # binary's --diff flag. Failure here triggers a synthetic bypass so we
+  # never block on an orphan branch / missing target-ref.
+  - key: compute-diff
+    use: code
+    cache: false
+    env:
+      TARGET_BRANCH: ${{ init.target-branch }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+    run: |
+      set -euo pipefail
+      cd $(git rev-parse --show-toplevel) 2>/dev/null || cd .
+
+      # The clone task lands the repo at $PWD; ensure target ref exists.
+      git fetch --no-tags origin "$TARGET_BRANCH" || true
+
+      MERGE_BASE=$(git merge-base "origin/${TARGET_BRANCH}" "$COMMIT_SHA" 2>/dev/null || true)
+      if [ -z "$MERGE_BASE" ]; then
+        echo "compute-diff: merge-base empty (orphan branch or fetch failed)" | tee mb-failure.txt
+        : > mr.diff
+        echo "TOOLING_BROKEN_REASON=missing-merge-base" > diff-status.env
+        exit 0
+      fi
+
+      echo "merge-base: $MERGE_BASE"
+      git diff --unified=0 "${MERGE_BASE}...${COMMIT_SHA}" > mr.diff
+      wc -l mr.diff
+      echo "TOOLING_BROKEN_REASON=" > diff-status.env
+    outputs:
+      artifacts:
+        - key: mr-diff
+          path: mr.diff
+        - key: diff-status
+          path: diff-status.env
+
+  # ── Fetch MR commits via GitLab API ─────────────────────────────────
+  # Writes commits.json: an array of {id, author_name, message} that
+  # the bypass parser reads. mr-iid="" (CLI dry-run) → empty array.
+  - key: fetch-commits
+    use: code
+    cache: false
+    env:
+      MR_IID: ${{ init.mr-iid }}
+      GITLAB_TOKEN: ${{ secrets.GITLAB_CLONE_TOKEN }}
+      GITLAB_PROJECT_ID: "12345678"
+    run: |
+      set -euo pipefail
+      if [ -z "$MR_IID" ]; then
+        echo "[]" > commits.json
+        exit 0
+      fi
+
+      API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}"
+      curl -sf -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        "${API}/merge_requests/${MR_IID}/commits?per_page=100" \
+        > commits.json || {
+          echo "fetch-commits: GitLab API failed; treating as empty commit list"
+          echo "[]" > commits.json
+        }
+      echo "fetched $(jq 'length' commits.json) commit(s)"
+    outputs:
+      artifacts:
+        - key: mr-commits
+          path: commits.json
+
+  # ── Fetch baselines.json from GitLab Generic Package Registry ───────
+  # W2b-6 publishes to `coverage-baselines/latest/baselines.json`. A
+  # 404 here is a hard-fail per §4.5 (operator must re-run W2b-6) — we
+  # do NOT synthetic-bypass for missing baselines because that would
+  # mask the operator obligation.
+  - key: fetch-baselines
+    use: code
+    cache: false
+    env:
+      GITLAB_TOKEN: ${{ secrets.GITLAB_CLONE_TOKEN }}
+      GITLAB_PROJECT_ID: "12345678"
+    run: |
+      set -euo pipefail
+      API="https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}"
+      URL="${API}/packages/generic/coverage-baselines/latest/baselines.json"
+      http_code=$(curl -sS -o baselines.json -w "%{http_code}" \
+        -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        "$URL")
+      if [ "$http_code" != "200" ]; then
+        echo "ERROR: baselines.json missing at $URL (HTTP $http_code)"
+        echo "       W2b-6 (.rwx/coverage-baselines.yml) must run first."
+        rm -f baselines.json
+        exit 1
+      fi
+      echo "fetched baselines.json ($(wc -c < baselines.json) bytes)"
+    outputs:
+      artifacts:
+        - key: baselines-json
+          path: baselines.json
+
+  # ── Dispatch coverage-merge (W3 / 2a) for the MR HEAD commit ────────
+  # Reuses the existing dispatch helper for the same SHA, downloads the
+  # merged LCOV. Failure here → synthetic bypass per §4.5.
+  - key: fetch-merged-lcov
+    use: code
+    cache: false
+    env:
+      GITLAB_TOKEN: ${{ secrets.GITLAB_CLONE_TOKEN }}
+      GITLAB_PROJECT_ID: "12345678"
+      RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+      TARGET_BRANCH: ${{ init.target-branch }}
+    run: |
+      set -euo pipefail
+
+      # If RWX dispatch token isn't wired, skip directly to the synthetic
+      # path — this is the same shape the bot expects from a true
+      # tooling-broken event.
+      if [ -z "${RWX_ACCESS_TOKEN:-}" ]; then
+        echo "fetch-merged-lcov: RWX_ACCESS_TOKEN unavailable; emitting synthetic bypass"
+        : > coverage.merged.lcov
+        echo "TOOLING_BROKEN_REASON=no-rwx-token" > lcov-status.env
+        exit 0
+      fi
+
+      if ! command -v rwx >/dev/null 2>&1; then
+        # rwx CLI moved rwx-cloud/cli -> rwx-cloud/rwx and now ships a raw
+        # static binary, not a tarball; the old tar.gz URL 404s (ka-0000003839).
+        # Pin the version to match the .gitlab-ci.yml bootstrap, and verify the
+        # exact bytes before install (ka-0000001204 / F3). Digest source +
+        # update procedure: docs/ci-toolchain-checksums.md.
+        RWX_SHA256=ef4afcad5ed9a6e7d24190050753f35cf1a6d609f07b949a1caa83074c16507e
+        curl -fsSL --retry 3 --retry-delay 3 \
+          "https://github.com/rwx-cloud/rwx/releases/download/v3.13.2/rwx-linux-x86_64-static" \
+          -o /tmp/rwx
+        echo "${RWX_SHA256}  /tmp/rwx" | sha256sum -c -
+        sudo install -m 0755 /tmp/rwx /usr/local/bin/rwx
+        rm -f /tmp/rwx
+      fi
+
+      # Dispatch + wait. rwx dispatch returns the run id on stdout.
+      run_id=$(rwx dispatch gardenio-coverage-merge \
+        --param "commit-sha=${COMMIT_SHA}" \
+        --param "ref-name=refs/heads/${TARGET_BRANCH}" 2>&1 | tail -1)
+      if [ -z "$run_id" ]; then
+        echo "fetch-merged-lcov: dispatch returned empty run id; synthetic bypass"
+        : > coverage.merged.lcov
+        echo "TOOLING_BROKEN_REASON=dispatch-empty" > lcov-status.env
+        exit 0
+      fi
+
+      if ! rwx results "$run_id" --wait >/tmp/rwx-results.txt 2>&1; then
+        echo "fetch-merged-lcov: dispatch run $run_id failed; synthetic bypass"
+        cat /tmp/rwx-results.txt
+        : > coverage.merged.lcov
+        echo "TOOLING_BROKEN_REASON=dispatch-failed" > lcov-status.env
+        exit 0
+      fi
+
+      # Pull the merged LCOV artifact from the dispatch run.
+      # rwx artifacts download takes the run id as a POSITIONAL arg with
+      # `--task <key>`, the artifact key as a POSITIONAL arg, and
+      # `--output-file` for the destination — there is NO `--run-id`,
+      # `--key`, or `--output` flag (verified on the CI-pinned v3.13.2 and
+      # pod v3.20.0). The old `--run-id/--key/--output` form errored
+      # "unknown flag" on every run, so this `if !` branch ALWAYS fell
+      # through to the synthetic bypass, silently disabling the fetch
+      # (ka-0000006580). `coverage-merged-lcov` is produced by the
+      # `coverage-merge` task in gardenio-coverage-merge (.rwx/coverage-merge.yml).
+      if ! rwx artifacts download "$run_id" --task coverage-merge coverage-merged-lcov --output-file coverage.merged.lcov 2>/tmp/rwx-art.txt; then
+        echo "fetch-merged-lcov: artifact download failed; synthetic bypass"
+        cat /tmp/rwx-art.txt
+        : > coverage.merged.lcov
+        echo "TOOLING_BROKEN_REASON=artifact-missing" > lcov-status.env
+        exit 0
+      fi
+
+      if [ ! -s coverage.merged.lcov ] || ! grep -q '^SF:' coverage.merged.lcov; then
+        echo "fetch-merged-lcov: empty/invalid LCOV; synthetic bypass"
+        : > coverage.merged.lcov
+        echo "TOOLING_BROKEN_REASON=empty-lcov" > lcov-status.env
+        exit 0
+      fi
+
+      echo "fetched coverage.merged.lcov ($(wc -l < coverage.merged.lcov) lines)"
+      echo "TOOLING_BROKEN_REASON=" > lcov-status.env
+    outputs:
+      artifacts:
+        - key: merged-lcov
+          path: coverage.merged.lcov
+        - key: lcov-status
+          path: lcov-status.env
+
+  # ── Run patch-cov gate ─────────────────────────────────────────────
+  # Composes the four upstream artifacts and runs the binary. Honours
+  # the synthetic-bypass markers from compute-diff and fetch-merged-lcov.
+  # Exit 0 = pass, exit 1 = fail, exit 2 = library panic.
+  #
+  # The named status check `Coverage / Patch` (in .rwx/ci.yml) keys off
+  # this task's exit code.
+  - key: coverage-patch
+    use: code
+    after: [build-coverage-patch, compute-diff, fetch-commits, fetch-baselines, fetch-merged-lcov]
+    cache: false
+    env:
+      BIN: ${{ tasks.build-coverage-patch.artifacts.coverage-patch-bin }}
+      DIFF: ${{ tasks.compute-diff.artifacts.mr-diff }}
+      DIFF_STATUS: ${{ tasks.compute-diff.artifacts.diff-status }}
+      COMMITS: ${{ tasks.fetch-commits.artifacts.mr-commits }}
+      BASELINES: ${{ tasks.fetch-baselines.artifacts.baselines-json }}
+      LCOV: ${{ tasks.fetch-merged-lcov.artifacts.merged-lcov }}
+      LCOV_STATUS: ${{ tasks.fetch-merged-lcov.artifacts.lcov-status }}
+    run: |
+      set -euo pipefail
+      # $BIN is an artifact on a READ-ONLY mount (/var/mint-artifacts); an
+      # in-place chmod fails with "Read-only file system". Copy into the
+      # writable workspace and make the copy executable (ka-0000004694).
+      BIN_RUN="$PWD/coverage-patch-run-bin"
+      cp "$BIN" "$BIN_RUN"
+      chmod +x "$BIN_RUN"
+      BIN="$BIN_RUN"
+
+      # Load tooling-broken markers from upstream tasks.
+      DIFF_REASON=""
+      LCOV_REASON=""
+      if [ -f "$DIFF_STATUS" ]; then
+        # shellcheck disable=SC1090
+        . "$DIFF_STATUS"
+        DIFF_REASON="${TOOLING_BROKEN_REASON:-}"
+      fi
+      if [ -f "$LCOV_STATUS" ]; then
+        # shellcheck disable=SC1090
+        . "$LCOV_STATUS"
+        LCOV_REASON="${TOOLING_BROKEN_REASON:-}"
+      fi
+
+      if [ -n "$DIFF_REASON" ] || [ -n "$LCOV_REASON" ]; then
+        DETAIL="diff=${DIFF_REASON:-ok} lcov=${LCOV_REASON:-ok}"
+        echo "coverage-patch: synthetic bypass — $DETAIL"
+        "$BIN" \
+          --synthetic-bypass tooling-broken \
+          --synthetic-detail "$DETAIL" \
+          --output patch-cov-result.json
+        exit 0
+      fi
+
+      "$BIN" \
+        --lcov "$LCOV" \
+        --diff "$DIFF" \
+        --baselines "$BASELINES" \
+        --commits-json "$COMMITS" \
+        --output patch-cov-result.json
+    outputs:
+      artifacts:
+        - key: patch-cov-result
+          path: patch-cov-result.json

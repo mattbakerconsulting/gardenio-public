@@ -1,0 +1,89 @@
+{{- if .Values.agents.metrics.prometheusRule.schemaDrift.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.schemaDrift }}
+# PrometheusRule for the runtime bridge/daemon schema-drift alarm (epic
+# ka-0000002054 "G4", task ka-0000007249).
+#
+# The class of outage this exists to catch (ka-0000003673, 2026-08-21): the
+# bridge began writing a field on type=agent beads (`owner`/`resolved_by`)
+# before the daemon's builtinConfigs declared it. type:agent is a strict,
+# closed schema, so every trigger-engine spawn write 400'd "owner: unknown
+# field" and ALL trigger-spawned agents went dark for ~5h. The daemon emitted 53
+# `type=event outcome=error` beads and advanced past them — nothing paged; an
+# operator finally noticed via a Slack question about an un-triaged ticket.
+#
+# kbeads now emits gardenio_beads_writes_rejected_total{reason,bead_type} on
+# every create/update refused at the per-type field-schema choke point
+# (schema_drift_metrics.go). reason="unknown_field" is the precise fingerprint
+# of drift — a field the writer sends that the daemon does not know. This rule
+# pages on its rate so the next occurrence pages in ~1 minute instead of five
+# hours.
+#
+# Threshold rationale (ka-0000007249): 0.05 writes/sec = 3/min. On a real drift
+# the trigger engine + gardeners + bridges retry the same rejected write
+# continuously, so the rate clears this within ~1 min; it is high enough that a
+# single operator's one-off manual typo (one 400) never trips it. The `for:`
+# hold rides out a lone transient without delaying a genuine drift beyond a few
+# minutes.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}-schema-drift
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: kbeads.schema_drift
+      interval: 1m
+      rules:
+        - alert: BeadsSchemaDriftUnknownField
+          # A sustained rate of writes rejected for an UNDECLARED field — the
+          # bridge/daemon field-registration drift signature. bead_type is
+          # carried through so the page names the affected type (agent/trigger/…)
+          # and the responder knows which side to re-align.
+          expr: |
+            sum by (bead_type) (
+              rate(gardenio_beads_writes_rejected_total{reason="unknown_field"}[5m])
+            ) > {{ $cfg.unknownFieldRatePerSec }}
+          for: {{ $cfg.for | default "5m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: kbeads
+            subsystem: schema_validation
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "kbeads is rejecting {{`{{ $labels.bead_type }}`}} writes with 'unknown field' — likely bridge/daemon schema drift"
+            description: |
+              The kbeads daemon is rejecting writes to
+              {{`{{ $labels.bead_type }}`}} beads at
+              {{`{{ printf "%.2f" $value }}`}}/sec with reason=unknown_field for
+              more than {{ $cfg.for | default "5m" }}. This is the runtime
+              signature of bridge/daemon schema drift: a writer (bridge,
+              controller, trigger engine, or scheduler) is sending a field the
+              daemon's per-type builtin config does not declare, and the strict,
+              closed schema 400s the ENTIRE write — often silently killing a
+              spawn/PATCH the way the 2026-08-21 outage darkened all
+              trigger-spawned agents for ~5h (ka-0000003673).
+
+              What to do:
+              1. Find the offending field — grep the daemon logs for
+                 "invalid fields: unknown field" around the alert time; the
+                 rejected field name is in the message.
+              2. Confirm the two sides: the bridge-side registration
+                 (gardenio/controller/internal/bridge/init.go configs()) declares
+                 the field but the daemon builtin
+                 (kbeads/internal/server/config.go builtinConfigs["type:{{`{{ $labels.bead_type }}`}}"])
+                 does not — or a stored type:{{`{{ $labels.bead_type }}`}} config
+                 row shadows the builtin (advice ka-0000000061).
+              3. Ship the daemon-side field declaration and roll the daemon, or
+                 revert the writer.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000002054)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

@@ -1,0 +1,85 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+  annotations:
+    policies.kyverno.io/title: Require cosign keyless signature on gardenio release images
+    policies.kyverno.io/category: gardenio
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Every gardenio release image (<account>.dkr.ecr.<region>.amazonaws.com/gardenio/<name>:<tag>)
+      must carry a valid cosign keyless signature made by the GitHub Actions
+      images.yml workflow on a calver tag push (gd-oHQrFnsQ39). That job signs
+      each image it pushes BY DIGEST with its GitHub OIDC identity (Fulcio
+      certificate, Rekor entry), so the signature covers every tag that points
+      at the same digest. This ClusterPolicy is the admission-time enforcement:
+      it denies any Pod running a gardenio release image that is not signed by
+      that workflow identity, closing attacker path A6 (a registry-write
+      compromise pushes a malicious controller image and the cluster runs it
+      unverified). Only OUR release repos are gated; third-party images
+      (postgres, nats, kyverno itself) are not signed by our CI and are
+      deliberately not matched, and neither are the mirror/* and cache/* repos
+      under our registry. The E2E namespaces (which run unsigned -cover
+      variants) are excluded, mirroring disallow-cover-images.
+      This is the cluster-agnostic canonical source; the Helm chart renders a
+      values-parameterized copy at templates/kyverno/verify-image-signatures.yaml
+      (gated behind global.imageSigning.verify.enabled, default off). See
+      gardenio/docs/image-signing.md.
+spec:
+  validationFailureAction: Enforce
+  webhookConfiguration:
+    failurePolicy: Fail
+  background: false
+  rules:
+    - name: verify-gardenio-release-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          # The E2E coverage shard legitimately runs unsigned -cover pods in
+          # these namespaces (and their per-instance ephemeral variants). Without
+          # the `-*` globs this policy would wrongly DENY those pods.
+          - resources:
+              namespaces:
+                - gardenio-e2e
+                - gardenio-e2e-*
+      verifyImages:
+        # Scope tightly to OUR release repos — third-party images are not signed
+        # by our CI and must not be caught here, or the policy would deny every
+        # dependency. 123456789012 stands for the account that hosts the
+        # registry; the chart copy takes the real one from global.imageRegistry.
+        - imageReferences:
+            - "123456789012.dkr.ecr.us-east-1.amazonaws.com/gardenio/*"
+          # Exempt repos that co-locate under our registry but images.yml never
+          # signs. Kyverno "*" matches "/", so the imageReferences glob above
+          # ALSO catches these; without this skip an Enforce rollout would DENY
+          # them:
+          #  - mirror/*: the pull-through mirror (postgres, nats, vmagent,
+          #    victoria-*, oauth2-proxy, …), third-party upstreams
+          #    (ka-0000008191);
+          #  - cache/*: build caches and the controller-base build stage,
+          #    which nothing deploys.
+          skipImageReferences:
+            - "123456789012.dkr.ecr.us-east-1.amazonaws.com/gardenio/mirror/*"
+            - "123456789012.dkr.ecr.us-east-1.amazonaws.com/gardenio/cache/*"
+          # Rewrite the admitted tag to its resolved digest and require a digest,
+          # so a moved tag cannot swap bytes after verification (TOCTOU).
+          mutateDigest: true
+          verifyDigest: true
+          required: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    # The images.yml workflow identity on a calver tag push.
+                    # GitHub's OIDC issuer is in the public Fulcio trust root;
+                    # the subject is the workflow file at the tag ref, so a
+                    # branch run, a PR run or another workflow never matches.
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: "^https://github\\.com/mattbakerconsulting/gardenio/\\.github/workflows/images\\.yml@refs/tags/20.*$"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"

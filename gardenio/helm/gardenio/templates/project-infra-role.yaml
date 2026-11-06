@@ -1,0 +1,370 @@
+{{- /*
+Per-project INFRA ROLE: the guardrails around an agent-operated Role in a
+project namespace (task gd-IYY1dxukfR / P9, plan gd-xiV5hyhPrG; design:
+gardenio/docs/project-infra-role-design.md, sections 4.1, 5 and 6).
+
+templates/project-namespace-rbac.yaml renders the Role and RoleBinding for a
+grant. This file renders everything that makes handing that Role to an AGENT
+safe, from the SAME grant entry, so removing the grant removes the fence with
+the Role:
+
+  - ResourceQuota and LimitRange in the project namespace (any grant that sets
+    `resourceQuota.hard` / `limitRange.limits`),
+  - for a grant with `agentInfra.enabled`: two egress NetworkPolicies and the
+    ValidatingAdmissionPolicy set that closes "pod create == Secret read",
+  - the infra ServiceAccount in the RELEASE namespace (where agent pods run),
+    from the separate top-level `projectInfraServiceAccounts` map.
+
+DEFAULT OFF. Every object here is gated on a grant that is itself behind
+`projectNamespaceRbac.enabled`, or on `projectInfraServiceAccounts`, and the
+chart ships both empty, so the default render is byte-identical to before this
+file existed.
+
+GUARDS (a half-configured infra grant fails the render, never ships):
+  - `agentInfra.enabled` needs `resourceQuota.hard`, `limitRange.limits` and the
+    grant's `project`;
+  - a grant whose rules can create or change a pod-bearing workload needs
+    `agentInfra.admissionPolicy.enabled: true`. Pod create implies a Secret read
+    in the namespace (secretKeyRef, secret volume, serviceAccountName) and RBAC
+    cannot express that, so the Secret read cannot be shipped by omission.
+
+NETWORK POLICY. NetworkPolicies are additive per pod, so an "IMDS deny" cannot
+be a policy of its own: a policy that allows 0.0.0.0/0 except IMDS would OPEN
+every destination the other policies close. The deny is by omission. The egress
+allow-set is split over two policies that together select every pod in the
+namespace, so nothing else is reachable:
+  - <name>-egress-internal: DNS, the Keycloak runtime Service in the release
+    namespace (when `egress.keycloakRuntime`), and pod-to-pod inside the
+    namespace;
+  - <name>-egress-https: TCP 443 to the internet, with RFC1918, link-local
+    (169.254.0.0/16 includes IMDS) and CGNAT excluded. The exclusion is what
+    keeps the pod and service CIDRs (10.42/16, 10.43/16) and the apiserver out.
+The project's own INGRESS policies are not touched or named here.
+*/ -}}
+{{- /* ---- the infra ServiceAccount, in the release namespace ---- */ -}}
+{{- range $key, $sa := (.Values.projectInfraServiceAccounts | default dict) }}
+{{- if $sa.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa.name | default $key }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    gardenio.io/access-boundary: project-infra
+    {{- with $sa.project }}
+    gardenio.io/project: {{ . | quote }}
+    {{- end }}
+# The token is mounted only into a pod whose ROLE bead sets needs_k8s_api=true
+# (podmanager: automount := spec.NeedsK8sAPI). Every other pod stays token-less.
+automountServiceAccountToken: false
+{{- end }}
+{{- end }}
+{{- /* ---- per-grant guardrails in the project namespace ---- */ -}}
+{{- if and .Values.projectNamespaceRbac.enabled .Values.projectNamespaceRbac.grants }}
+{{- range $key, $g := .Values.projectNamespaceRbac.grants }}
+{{- if $g.enabled }}
+{{- $ns := $g.namespace | default "" }}
+{{- $base := $g.name | default $key }}
+{{- $infra := $g.agentInfra | default dict }}
+{{- $quota := (($g.resourceQuota | default dict).hard | default dict) }}
+{{- $lr := (($g.limitRange | default dict).limits | default list) }}
+{{- /* Can this grant create or change a pod, or a workload that makes pods? */ -}}
+{{- $podBearing := false }}
+{{- /* Can it create or change a Service? The Services VAP lives in the same admissionPolicy block. */ -}}
+{{- $svcWriting := false }}
+{{- range $r := ($g.rules | default list) }}
+{{- $writes := or (has "create" $r.verbs) (has "update" $r.verbs) (has "patch" $r.verbs) (has "*" $r.verbs) }}
+{{- $pods := false }}
+{{- range $res := $r.resources }}
+{{- if has $res (list "pods" "pods/ephemeralcontainers" "deployments" "replicasets" "statefulsets" "daemonsets" "jobs" "cronjobs" "replicationcontrollers" "*") }}{{ $pods = true }}{{ end }}
+{{- end }}
+{{- if and $writes $pods }}{{ $podBearing = true }}{{ end }}
+{{- if and $writes (or (has "services" $r.resources) (has "*" $r.resources)) }}{{ $svcWriting = true }}{{ end }}
+{{- end }}
+{{- if $infra.enabled }}
+{{- if not $g.project }}
+{{- fail (printf "projectNamespaceRbac.grants.%s has agentInfra.enabled but no `project`. The gardenio.io/project label is the inventory key for an agent-operated grant." $key) }}
+{{- end }}
+{{- if not $quota }}
+{{- fail (printf "projectNamespaceRbac.grants.%s has agentInfra.enabled but no `resourceQuota.hard`. The quota is what bounds what a compromised infra agent can schedule." $key) }}
+{{- end }}
+{{- if not $lr }}
+{{- fail (printf "projectNamespaceRbac.grants.%s has agentInfra.enabled but no `limitRange.limits`. A ResourceQuota on limits.memory rejects pods that set no limit; the LimitRange fills the defaults." $key) }}
+{{- end }}
+{{- if and $podBearing (not (($infra.admissionPolicy | default dict).enabled)) }}
+{{- fail (printf "projectNamespaceRbac.grants.%s lets the agent create or change pods or pod-bearing workloads but agentInfra.admissionPolicy.enabled is not true. Pod create is a Secret read in the namespace (secretKeyRef, secret volume, serviceAccountName); RBAC cannot express that, so the ValidatingAdmissionPolicy is required (design s4.1)." $key) }}
+{{- end }}
+{{- if and $svcWriting (not (($infra.admissionPolicy | default dict).enabled)) }}
+{{- fail (printf "projectNamespaceRbac.grants.%s lets the agent create or change Services but agentInfra.admissionPolicy.enabled is not true. A Service with externalIPs, LoadBalancer, NodePort or ExternalName can hijack cluster traffic (CVE-2020-8554); RBAC cannot express that, so the %s-service-exposure ValidatingAdmissionPolicy is required (design s4.1)." $key $base) }}
+{{- end }}
+{{- end }}
+{{- if $quota }}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ $base }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    {{- with $g.project }}
+    gardenio.io/project: {{ . | quote }}
+    {{- end }}
+spec:
+  hard:
+    {{- toYaml $quota | nindent 4 }}
+{{- end }}
+{{- if $lr }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ $base }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    {{- with $g.project }}
+    gardenio.io/project: {{ . | quote }}
+    {{- end }}
+spec:
+  limits:
+    {{- toYaml $lr | nindent 4 }}
+{{- end }}
+{{- if $infra.enabled }}
+{{- $egress := $infra.egress | default dict }}
+{{- $except := $egress.exceptCidrs | default (list "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "169.254.0.0/16" "100.64.0.0/10") }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $base }}-egress-internal
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    gardenio.io/project: {{ $g.project | quote }}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    # DNS: the kube-dns pods in kube-system (the Service is 10.43.0.10).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    {{- if or (not (hasKey $egress "keycloakRuntime")) $egress.keycloakRuntime }}
+    # The Keycloak runtime Service: oauth2-proxy redeems, fetches jwks and
+    # userinfo from it. A namespace+pod selector pair, never a CIDR.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $.Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "gardenio.keycloakRuntime.selectorLabels" $ | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: 8080}
+    {{- end }}
+    # Pod-to-pod inside the project namespace only (oauth2-proxy -> the app).
+    - to:
+        - podSelector: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $base }}-egress-https
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    gardenio.io/project: {{ $g.project | quote }}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    # HTTPS out. The exclusions deny IMDS (169.254.0.0/16) and keep the pod and
+    # service CIDRs and the apiserver unreachable; same list as the controller
+    # egress policy.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- toYaml $except | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: 443}
+{{- end }}
+{{- if and $infra.enabled ($infra.admissionPolicy | default dict).enabled }}
+{{- $ap := $infra.admissionPolicy }}
+{{- $saName := $infra.serviceAccount | default $base }}
+{{- $user := printf "system:serviceaccount:%s:%s" $.Release.Namespace $saName }}
+{{- $allowedSAs := $ap.workloadServiceAccounts | default (list "default") }}
+{{- /* One policy per pod-spec shape keeps each CEL expression under the
+       apiserver cost budget. `ps` is the pod spec for that shape. */ -}}
+{{- $shapes := list
+      (dict "id" "pod" "ps" "object.spec"
+            "rules" (list (dict "group" "" "resources" (list "pods" "pods/ephemeralcontainers"))))
+      (dict "id" "workload" "ps" "object.spec.template.spec"
+            "rules" (list (dict "group" "apps" "resources" (list "deployments" "replicasets" "statefulsets"))
+                          (dict "group" "batch" "resources" (list "jobs"))))
+      (dict "id" "cronjob" "ps" "object.spec.jobTemplate.spec.template.spec"
+            "rules" (list (dict "group" "batch" "resources" (list "cronjobs")))) }}
+{{- range $shape := $shapes }}
+{{- $polName := printf "%s-no-secrets-%s" $base $shape.id }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $polName }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    gardenio.io/project: {{ $g.project | quote }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      {{- range $rule := $shape.rules }}
+      - apiGroups: [{{ $rule.group | quote }}]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: {{ toJson $rule.resources }}
+      {{- end }}
+  matchConditions:
+    - name: only-{{ $saName }}
+      expression: >-
+        request.userInfo.username == {{ $user | squote }}
+  variables:
+    - name: ps
+      expression: {{ $shape.ps | quote }}
+    - name: containers
+      expression: >-
+        variables.ps.containers + variables.ps.?initContainers.orValue([])
+    - name: sa
+      expression: >-
+        variables.ps.?serviceAccountName.orValue('default')
+  validations:
+    - expression: >-
+        !variables.containers.exists(c,
+          c.?env.orValue([]).exists(e, e.?valueFrom.?secretKeyRef.hasValue()) ||
+          c.?envFrom.orValue([]).exists(e, e.?secretRef.hasValue()))
+      message: >-
+        The {{ $saName }} agent may not reference a Secret from a container
+        (env secretKeyRef or envFrom secretRef). A workload that needs a Secret
+        is changed by the project's own deploy.
+    {{- if eq $shape.id "pod" }}
+    - expression: >-
+        !variables.ps.?ephemeralContainers.orValue([]).exists(c,
+          c.?env.orValue([]).exists(e, e.?valueFrom.?secretKeyRef.hasValue()) ||
+          c.?envFrom.orValue([]).exists(e, e.?secretRef.hasValue()))
+      message: >-
+        The {{ $saName }} agent may not reference a Secret from an ephemeral
+        container.
+    {{- end }}
+    - expression: >-
+        variables.ps.?volumes.orValue([]).all(v,
+          has(v.emptyDir) || has(v.configMap) || has(v.downwardAPI) ||
+          (has(v.projected) &&
+           v.projected.sources.all(s, has(s.configMap) || has(s.downwardAPI))))
+      message: >-
+        The {{ $saName }} agent may only use emptyDir, configMap, downwardAPI
+        and projected(configMap, downwardAPI) volumes. secret, projected
+        secret, projected serviceAccountToken, csi, persistentVolumeClaim and
+        hostPath volumes are denied.
+    - expression: >-
+        variables.sa in {{ toJson $allowedSAs }} &&
+        variables.ps.?serviceAccount.orValue(variables.sa) == variables.sa
+      message: >-
+        The {{ $saName }} agent may only run workloads as one of
+        {{ join ", " $allowedSAs }}. Other ServiceAccounts in the namespace
+        carry tokens and are the project's own.
+    - expression: >-
+        variables.ps.?automountServiceAccountToken.orValue(true) == false
+      message: >-
+        The {{ $saName }} agent's workloads must set
+        automountServiceAccountToken: false explicitly (unset falls back to the
+        ServiceAccount's own setting).
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $polName }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    gardenio.io/project: {{ $g.project | quote }}
+spec:
+  policyName: {{ $polName }}
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        # The automatic label, not gardenio.io/project: a missing operator
+        # label can neither disable nor widen the fence.
+        kubernetes.io/metadata.name: {{ $ns }}
+{{- end }}
+{{- /* Services: CVE-2020-8554. A Service with spec.externalIPs (or type
+       LoadBalancer / NodePort / ExternalName) that selects the agent's own pod
+       makes kube-proxy on every node route that IP:port to the pod, which hijacks
+       traffic cluster-wide. RBAC cannot express it, so the Service write is
+       fenced to plain ClusterIP the same way pod create is fenced above. */ -}}
+{{- $svcPolName := printf "%s-service-exposure" $base }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $svcPolName }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    gardenio.io/project: {{ $g.project | quote }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["services"]
+  matchConditions:
+    - name: only-{{ $saName }}
+      expression: >-
+        request.userInfo.username == {{ $user | squote }}
+  validations:
+    - expression: >-
+        object.spec.?type.orValue('ClusterIP') == 'ClusterIP'
+      message: >-
+        The {{ $saName }} agent may only create Services of type ClusterIP.
+        LoadBalancer and NodePort open host ports on the nodes, and
+        ExternalName redirects cluster DNS.
+    - expression: >-
+        object.spec.?externalIPs.orValue([]).size() == 0
+      message: >-
+        The {{ $saName }} agent may not set spec.externalIPs on a Service
+        (CVE-2020-8554: it would route any IP to the agent's own pod on every
+        node).
+    - expression: >-
+        object.spec.?externalName.orValue('') == ''
+      message: >-
+        The {{ $saName }} agent may not set spec.externalName on a Service.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $svcPolName }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    gardenio.io/project: {{ $g.project | quote }}
+spec:
+  policyName: {{ $svcPolName }}
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $ns }}
+{{- end }}
+{{- end }}{{/* end if grant enabled */}}
+{{- end }}{{/* end range grants */}}
+{{- end }}{{/* end if projectNamespaceRbac.enabled and grants */}}

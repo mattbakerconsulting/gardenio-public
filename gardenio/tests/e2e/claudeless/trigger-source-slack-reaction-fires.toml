@@ -1,0 +1,160 @@
+# trigger-source-slack-reaction-fires.toml
+#
+# Claudeless scenario: a trigger:slack-reaction bead fires once when a matching
+# reaction_added event is buffered → notify action → audit bead with
+# outcome=allow.
+#
+# Epic ka-0000004568 / task ka-0000003167:
+#   "claudeless coverage for slack-reaction source fire."
+#
+# The slack-reaction source is EVENT-DRIVEN: the Slack Bot pushes reaction_added
+# events into an in-process buffer, and Evaluate drains that buffer matching
+# against loaded trigger beads. It is not registered in the standalone
+# `trigger-engine` binary (and has no HTTP surface to poll), so this scenario
+# drives it through the `trigger-probe` test binary, which registers the REAL
+# SlackReactionTriggerSource on a REAL TriggerEngine, buffers one synthetic
+# reaction event via the exported BufferReaction helper, and runs one
+# EvaluateSource. Because the source opts out of the runtime-bootstrap guard
+# (SkipRuntimeBootstrap=true — every buffered event is genuinely fresh), the
+# single buffered reaction fires immediately on the first pass.
+#
+# Steps:
+#   1. Create a trigger:slack-reaction bead (emoji=runner, action=notify) via
+#      `kd create --type=trigger` (no `gb trigger create slack-reaction` exists).
+#   2. Run `trigger-probe --source=slack-reaction --trigger=<id>
+#      --reaction-emoji=runner` against $BEADS_HTTP_URL.
+#   3. Assert an audit bead (type=event, label=trigger:<id>, outcome=allow,
+#      source=slack-reaction) exists.
+#
+# Skips gracefully when go / sources / daemon env are unavailable.
+
+[claude]
+session_id = "e2e00000-000a-4000-a000-000000000013"
+username = "e2e-trigger-slack-reaction-fires"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 60000
+
+[[responses]]
+on = "*"
+say = "Running trigger-source-slack-reaction-fires: reaction event → notify action observed."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-probe ─────────────────────
+PROBE_BIN=""
+if command -v trigger-probe >/dev/null 2>&1; then
+  PROBE_BIN=$(command -v trigger-probe)
+elif [ -x /usr/local/bin/trigger-probe ]; then
+  PROBE_BIN=/usr/local/bin/trigger-probe
+elif [ -x /tmp/trigger-probe ]; then
+  PROBE_BIN=/tmp/trigger-probe
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-probe from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-probe ./cmd/trigger-probe/ ) || {
+    echo "SKIP: trigger-probe build failed"; exit 0;
+  }
+  PROBE_BIN=/tmp/trigger-probe
+else
+  echo "SKIP: trigger-probe binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-probe: $PROBE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then echo "SKIP: BEADS_HTTP_URL not set"; exit 0; fi
+if [ -z "${BEADS_TOKEN:-}" ]; then echo "SKIP: BEADS_TOKEN not set"; exit 0; fi
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+
+# ── Setup ──────────────────────────────────────────────────────────
+TAG="e2e-react-$$-$(date +%s)"
+EMOJI="runner"
+echo "tag: $TAG  emoji: $EMOJI"
+
+# Create the trigger:slack-reaction bead. No `gb trigger create slack-reaction`
+# subcommand exists, so build it directly with the field schema
+# SlackReactionTriggerSource.LoadTriggers parses (emoji required).
+TRIG_OUT=$(kd create "$TAG" \
+  --type=trigger --kind=data \
+  --http-url "$BEADS_HTTP_URL" \
+  -f "action=notify" \
+  -f "emoji=$EMOJI" \
+  -f "prompt=reaction :{{emoji}}: by {{user}}" \
+  -l "trigger:slack-reaction" -l "e2e:claudeless" -l "e2e-tag:$TAG" \
+  --json 2>&1) || { fail "kd create trigger:slack-reaction" "$TRIG_OUT"; exit 1; }
+TRIG_ID=$(echo "$TRIG_OUT" | jq -r '.id // .ID // empty')
+if [ -z "$TRIG_ID" ]; then fail "extract trigger id" "out=$TRIG_OUT"; exit 1; fi
+echo "trigger: $TRIG_ID"
+
+cleanup() {
+  for bid in $(kd list --type=event -l "trigger:$TRIG_ID" --json 2>/dev/null | jq -r '.[].id'); do
+    kd close "$bid" >/dev/null 2>&1 || true
+  done
+  kd close "$TRIG_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ── Fire the source via the probe ──────────────────────────────────
+PROBE_LOG=/tmp/trigger-probe-slack-reaction-$$.log
+if ! "$PROBE_BIN" \
+    --source=slack-reaction \
+    --trigger="$TRIG_ID" \
+    --http-url="$BEADS_HTTP_URL" \
+    --token="$BEADS_TOKEN" \
+    --reaction-emoji="$EMOJI" \
+    --reaction-channel="C_PROBE_$$" \
+    --reaction-text="probe reaction $TAG" >"$PROBE_LOG" 2>&1; then
+  fail "trigger-probe exited non-zero"
+  echo "--- probe log ---"; cat "$PROBE_LOG"; echo "--- end ---"
+  exit 1
+fi
+pass "trigger-probe ran one slack-reaction EvaluateSource cycle"
+
+# ── Assert: audit bead recorded with outcome=allow ─────────────────
+DEADLINE=$(( $(date +%s) + 20 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  AUDIT=$(kd list --type=event -l "trigger:$TRIG_ID" --json 2>/dev/null | \
+    jq -c '[.[] | select(.fields.outcome=="allow" and .fields.source=="slack-reaction")][0] // empty' 2>/dev/null)
+  if [ -n "$AUDIT" ] && [ "$AUDIT" != "null" ]; then
+    FIRED=1
+    pass "slack-reaction audit bead recorded with outcome=allow"
+    echo "  audit: $(echo "$AUDIT" | jq -c '{id, fields: {source: .fields.source, action: .fields.action, outcome: .fields.outcome, match_key: .fields.match_key}}')"
+    # reaction match key shape: reaction:<emoji>:<channel>:<ts>
+    MK=$(echo "$AUDIT" | jq -r '.fields.match_key')
+    case "$MK" in
+      reaction:${EMOJI}:*) pass "audit match_key is the reaction key ($MK)" ;;
+      *) fail "unexpected match_key" "got=$MK" ;;
+    esac
+    break
+  fi
+  sleep 1
+done
+
+if [ "$FIRED" = "0" ]; then
+  fail "slack-reaction trigger fired within 20s"
+  echo "--- probe log ---"; cat "$PROBE_LOG"; echo "--- end ---"
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "trigger-source-slack-reaction-fires: reaction event → notify action observed OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "trigger-source-slack-reaction-fires scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

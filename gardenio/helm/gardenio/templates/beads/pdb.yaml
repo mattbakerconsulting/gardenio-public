@@ -1,0 +1,28 @@
+{{- /*
+  WHY maxUnavailable, NOT minAvailable (ka-0000001453, gd-27vcHmrurh): on a
+  1-replica Deployment minAvailable:1 == maxUnavailable:0, which makes the
+  eviction API refuse the pod forever — a managed-nodegroup drain then hits
+  PodEvictionFailure and wedges. maxUnavailable:1 only blocks eviction while
+  the pod is currently unhealthy, so it is a safe drain guard at
+  replicaCount=1 (the beads daemon's common deployment shape today) and
+  upgrades to real quorum protection the moment beads.replicaCount is scaled
+  past 1. Renders unconditionally — see templates/pdb-singletons.yaml.
+
+  fleet.enabled note: when the fleet (per-project daemon) mode is on, beads
+  runs as a StatefulSet elsewhere, not this Deployment — this PDB only
+  covers the single shared-daemon Deployment path, matching deployment.yaml.
+*/}}
+{{- if and (not .Values.fleet.enabled) .Values.beads.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.beads.pdb.maxUnavailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.beads.selectorLabels" . | nindent 6 }}
+{{- end }}

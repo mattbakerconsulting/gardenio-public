@@ -1,0 +1,38 @@
+{{- if and .Values.keycloak.enabled .Values.keycloak.runtime.enabled }}
+{{- $runtime := .Values.keycloak.runtime -}}
+{{- $svc := include "gardenio.keycloakRuntime.fullname" . -}}
+{{- if and $runtime.clusterKeycloak.tls (not (include "gardenio.keycloakRuntime.tlsEnabled" .)) }}
+{{- fail "keycloak.runtime.clusterKeycloak.tls needs keycloak.runtime.tls.enabled: the ClusterKeycloak can only dial https when the runtime serves it" }}
+{{- end }}
+# ── ClusterKeycloak (EDP keycloak-operator CR) ───────────────────────────────
+# Points the EDP realm-management operator at the in-cluster Keycloak Service.
+# Coexists with the externally-managed ClusterKeycloak — flip
+# `keycloak.realm.clusterKeycloakRef` in per-env deploy-values to this CR's
+# name to migrate a realm onto the in-cluster server (a staging env first; see
+# docs/research/keycloak-in-cluster-from-ecs.md §7).
+#
+# With clusterKeycloak.tls (gd-PhU6jPtSxa) it dials the https port and trusts
+# the runtime's CA from a ConfigMap. The operator resolves spec.caCert in ITS
+# namespace (operatorNamespace), like spec.secret, so the ConfigMap is rendered
+# there (cluster-keycloak-ca.yaml). Without it, plain http.
+apiVersion: v1.edp.epam.com/v1alpha1
+kind: ClusterKeycloak
+metadata:
+  name: {{ $runtime.clusterKeycloak.name | quote }}
+  labels:
+    {{- include "gardenio.keycloakRuntime.labels" . | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  {{- if include "gardenio.keycloakRuntime.clusterKeycloakTLS" . }}
+  url: {{ printf "https://%s.%s.svc.cluster.local:%v%s" $svc .Release.Namespace ($runtime.service.httpsPort | default 8443) ($runtime.httpRelativePath | default "/auth") | quote }}
+  caCert:
+    configMapKeyRef:
+      name: {{ include "gardenio.keycloakRuntime.caConfigMapName" . | quote }}
+      key: ca.crt
+  {{- else }}
+  url: {{ printf "http://%s.%s.svc.cluster.local:%v%s" $svc .Release.Namespace ($runtime.service.httpPort | default 8080) ($runtime.httpRelativePath | default "/auth") | quote }}
+  {{- end }}
+  secret: {{ $runtime.clusterKeycloak.adminSecret | quote }}
+  adminType: "user"
+{{- end }}

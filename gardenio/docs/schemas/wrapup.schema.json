@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gardenio.acme.example/schemas/wrapup.schema.json",
+  "title": "Agent / Gardener Wrap-Up",
+  "description": "Structured wrap-up message stored as a JSON string in an agent bead's fields[\"wrapup\"] at gb stop / gb done time. This schema formalizes the WrapUp struct in gardenio/controller/cmd/gb/wrapup.go so that both old and new gardeners conform to a single machine-parseable contract, and so the gardener-effectiveness scorer (D1-D6, gardenio/docs/gardener-effectiveness-rubric.md) can read the fields it depends on without guessing. Producer: gb stop --wrapup. Consumers: the progress engine (D1 self-report layer), the meta-gardener scorer, the Slack agent card, beads-viewer, and successor agents. See gardenio/docs/wrapup-specification.md for the audit + rationale.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tldr", "accomplishments"],
+  "properties": {
+    "tldr": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "One-line outcome summary featured at the top of the Slack agent card. Hard-required by DefaultWrapUpRequirements (enforce=hard). Server-side normalized at gb stop: collapsed to a single line and angle-brackets escaped for Slack-mrkdwn safety; rejected if it exceeds the hard cap. Lead with the KPI delta or the MR number, not the process.",
+      "examples": ["Merged MR 3286; spawned 2 crew on unblocked epic children; merged_today 0->1"]
+    },
+    "accomplishments": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the agent actually changed/merged/closed/spawned this session. Hard-required. Lead with the outcome (KPI deltas, MR numbers, beads closed). This is prose today; it is NOT machine-parsed by the scorer, which reads structured fields + the bead graph instead."
+    },
+    "blockers": {
+      "type": "string",
+      "description": "ONLY a real thing stopping further progress, stated as a concrete next-action someone must take. Omit the field entirely when nothing blocks (do NOT write \"none\"/\"n/a\"). A non-empty value stamps the Slack card as blocked."
+    },
+    "handoff_notes": {
+      "type": "string",
+      "description": "Context the next agent/human needs to pick up where this run left off. Omit when there is nothing to hand off. Present handoff with no blockers renders as handed-off; a fully clean run renders as done."
+    },
+    "beads_closed": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^kd-[A-Za-z0-9]+$" },
+      "description": "OPTIONAL, agent-supplied IDs of beads the agent closed this session. It was historically documented as auto-populated by gb stop, but no code path ever derived it from the session's close activity (audit finding F3; 0/23 recent gardener runs carried it). Resolved (ka-0000005070) by re-documenting it as optional/agent-supplied rather than wiring auto-populate: gb stop round-trips whatever the agent passes but never fabricates it. D2 throughput is derived from the bead graph, not this field, so its presence or absence never affects scoring; it only makes a wrap-up more self-describing when the agent chooses to include it.",
+      "x-status": "optional-agent-supplied"
+    },
+    "pull_requests": {
+      "type": "array",
+      "items": { "type": "string", "format": "uri" },
+      "description": "URLs of MRs/PRs opened or advanced this run. Auto-linked to beads at stop. Always an array even for one URL."
+    },
+    "progress_score": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "The run's self-assessment of material progress: 0 = nothing material, 1 = incremental, >=2 = substantive. This is the D1 (progress-yield) SELF-REPORT layer. Hard-required at gb stop ONLY when the agent's schedule bead sets progress.surface.in_wrapup=true (enforced by wrapup_progress.go). D1 credits a run as a progress_run when progress_score>=1 OR the progress engine credited a graph event (child_closed/mr_merged/decision_resolved) in the run's window — so an honest progress_score:0 on a pure crew-dispatch run is expected and MUST NOT be read as spin (rubric §D1 'OR credited' clause).",
+      "examples": [0, 1, 2]
+    },
+    "progress_summary": {
+      "type": "string",
+      "description": "One-line free-text justification of progress_score. Required together with progress_score when the schedule sets progress.surface.in_wrapup=true."
+    },
+    "goal_satisfied": {
+      "type": "string",
+      "enum": ["", "yes", "no"],
+      "description": "y/n self-assessment of whether the agent bead's terminal_goal was met this run. Empty = not answered. Required (Phase 2+) when the agent bead has terminal_goal set. goal_satisfied=\"no\" with successor=\"none\" is reconciled to a terminal stop with a warning (reconcileSuccessorGoal). As of the audit this is emitted by 0/23 gardener runs — gardeners are spawned in crew mode without terminal_goal, so the field is inert for them today."
+    },
+    "goal_report": {
+      "type": "string",
+      "description": "One-to-three-line free-text justification of goal_satisfied. Required (Phase 2+) when goal_satisfied is set."
+    },
+    "respawn_after": {
+      "type": "string",
+      "description": "Go duration (\"10m\", \"1h\") the agent requests before respawn when goal_satisfied==\"no\"; the literal \"immediate\" means 0. Ignored when the goal is satisfied.",
+      "examples": ["10m", "1h", "immediate"]
+    },
+    "restart_when": {
+      "type": "string",
+      "description": "Free-text declaration of the ONE condition under which the agent expects to resume, ideally naming the bead that wakes it. Rendered verbatim as the 'Wakes when ...' line on the Slack card and counted as a progressing signal. Empty = a plain terminal stop.",
+      "examples": ["when ka-X merges", "when the operator resolves decision ka-Y"]
+    },
+    "successor": {
+      "type": "string",
+      "enum": ["", "none", "same", "new"],
+      "description": "Succession intent. none/empty (default) = terminal. same = recreate this identity after a wake (records intent only today). new = mint a fresh successor agent that carries the work forward, retiring the predecessor. Validated at the gb stop boundary; any other value is rejected.",
+      "default": "none"
+    },
+    "harness_gaps": {
+      "type": "string",
+      "description": "OPTIONAL telemetry: what the harness ITSELF lacked this run — a missing tool, a guard that fired wrongly, context the agent had to reconstruct by hand, a capability it wished for (the MLD sensor pattern: Mistakes/Learnings/Desires; ref lopopolo/harness-engineering). STRICTLY telemetry, not policy (plan ka-0000001183 W6): a harness_gaps note never auto-becomes advice, a graduation candidate, or an enforced rule — a downstream groomer/CED pass corroborates it against the session transcript before anything acts on it, so self-report can never become self-fulfilling. Free text; empty = nothing to report. Route an operator ACTION through gb escalation/gb decision instead.",
+      "examples": ["no gb command to diff two agent beads; had to hand-jq both", "the fetch-once advice is prose but there's no CLI guard that catches a re-run"]
+    },
+    "custom": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Advice-driven extension fields. A wrapup-category advice bead may declare custom required/optional fields (WrapUpRequirements.custom_fields); their values live here as name->value string pairs."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Set automatically when the wrap-up is created. RFC3339."
+    }
+  }
+}

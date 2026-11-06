@@ -1,0 +1,89 @@
+{{- /*
+Kyverno ClusterPolicy — deny coverage-instrumented (*-cover) images outside the
+E2E namespaces. The load-bearing isolation layer of W2 §6.2 (ka-0000003442),
+coupled in the same MR as the -cover image variants + promote refusal
+(ka-0000001728).
+
+Coverage-instrumented image variants (<binary>-cover:<tag>) exist for E2E
+runtime coverage collection. The pre-Actions CI built them; no workflow builds
+them today, and the coverage ratchet work (gd-d29n0m678l) may bring them back. They
+carry instrumentation overhead, write counters to a host volume, and are stamped
+with the OCI label org.gardenio.cover=1. They MUST NEVER run in production. Three
+lines of defense keep them out:
+  1. Tag scheme — main -> <bin>-cover:main-<sha7>; tag -> <bin>-cover:<calver>-rc.
+     -cover variants are never promoted past -rc.
+  2. Promote refusal gate — refused to tag any org.gardenio.cover=1 / -cover
+     image to a final calver/latest (pre-Actions CI; images.yml builds no
+     -cover variant, so nothing promotes one today).
+  3. THIS ClusterPolicy — admission-time deny of any Pod whose container image
+     repository ends in `-cover` outside the allowlisted E2E namespaces.
+
+DEFAULT OFF. This is a Kyverno CRD (kyverno.io/v1 ClusterPolicy); it renders
+nothing unless the operator sets global.coverage.disallowCoverImages.enabled AND
+Kyverno is installed in the cluster. prod-gardenio-eks does not run Kyverno today,
+so an unconditional render would break `helm upgrade` on a missing CRD — mirrors
+the fleet-manager VAP's admissionPolicy.enabled gate. The canonical
+cluster-agnostic source of this policy is policy/kyverno/disallow-cover-images.yaml.
+*/}}
+{{- if .Values.global.coverage.disallowCoverImages.enabled }}
+{{- $dci := .Values.global.coverage.disallowCoverImages }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ include "gardenio.fullname" . }}-disallow-cover-images
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coverage
+  annotations:
+    policies.kyverno.io/title: Disallow coverage-instrumented images outside E2E namespaces
+    policies.kyverno.io/category: gardenio
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Coverage-instrumented image variants (registry.../gardenio/<name>-cover:<tag>,
+      labelled org.gardenio.cover=1) exist for runtime coverage collection during
+      E2E runs. They carry instrumentation overhead
+      and MUST NEVER run in production. This policy denies any Pod whose container
+      image repository ends with `-cover` outside the allowlisted E2E namespaces
+      (singleton gardenio-e2e and every gardenio-e2e-<id> namespace, including
+      the live lane's gardenio-e2e-0/1 pool). See policy/kyverno/disallow-cover-images.yaml.
+spec:
+  validationFailureAction: {{ $dci.validationFailureAction | default "Enforce" }}
+  background: true
+  rules:
+    - name: block-cover-images-outside-e2e
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          # Kyverno namespace selectors accept `*`/`?` globs. The `-*` entries
+          # match the per-instance namespaces (gardenio-e2e-<id>, including the
+          # gardenio-e2e-0/1 lane pool) where the E2E coverage shard runs -cover pods —
+          # without them this policy would wrongly DENY the pods it must permit.
+          - resources:
+              namespaces:
+                {{- toYaml $dci.allowedNamespaces | nindent 16 }}
+      validate:
+        message: >-
+          Coverage-instrumented images (*-cover) are forbidden outside the
+          gardenio-e2e E2E namespaces (gardenio-e2e and gardenio-e2e-*). See
+          policy/kyverno/disallow-cover-images.yaml.
+        foreach:
+          - list: request.object.spec.containers
+            deny:
+              conditions:
+                any:
+                  - key: "{{ `{{ regex_match('^.*/[^/]+-cover(:[^/@]+)?(@sha256:[a-f0-9]+)?$', '{{ element.image }}') }}` }}"
+                    operator: Equals
+                    value: true
+          - list: request.object.spec.initContainers || []
+            deny:
+              conditions:
+                any:
+                  - key: "{{ `{{ regex_match('^.*/[^/]+-cover(:[^/@]+)?(@sha256:[a-f0-9]+)?$', '{{ element.image }}') }}` }}"
+                    operator: Equals
+                    value: true
+{{- end }}

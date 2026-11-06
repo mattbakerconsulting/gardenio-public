@@ -1,0 +1,154 @@
+{{- if .Values.jiraBridge.metrics.prometheusRule.webhookDeadman.enabled }}
+{{- $cfg := .Values.jiraBridge.metrics.prometheusRule.webhookDeadman }}
+# PrometheusRule for the jira-bridge INBOUND-WEBHOOK deadman alert
+# (bug ka-0000000426, parent epic ka-0000007401).
+#
+# THE THIRD LEG. The jira-bridge has a poller-stall alert
+# (poller-stall-alert.yaml, gardenio_jira_poller_stalled) guarding INGESTION and
+# a trigger-starved alert (trigger-starved-alert.yaml, gardenio_trigger_starved)
+# guarding TRIGGERS. The inbound WEBHOOK receive path — @gardenio mentions,
+# follow-up nudges, F3 re-spawn, comment mirroring onto beads — had NO metric
+# and NO alert, so "receiving nothing, ever" was indistinguishable from "healthy
+# and quiet." The Jira webhook was in fact unregistered in prod for 8 days while
+# 67 real comments were created on PE/DEVOPS and every dashboard stayed green.
+# This is the residual DETECTION net so that state pages instead of staying dark
+# (the root cause — registering/re-secreting the hook — is operator-only
+# escalation ka-0000004344; this alert does not depend on it).
+#
+# THE UNFIREABLE-ALERT TRAP (see poller-stall-alert.yaml for the sibling
+# lesson). The alert must stay QUIET when upstream is genuinely quiet — no
+# comments in the window => no page — and fire only on "matter existed upstream
+# and we received nothing." So the jira-bridge Go-computes the whole verdict into
+# a single 0/1 gauge on its :9093 /metrics endpoint (jira_webhook_deadman.go):
+#   gardenio_jira_webhook_dark — 1 while NO authenticated, well-formed inbound
+#     delivery has arrived within the deadman window AND an independent
+#     approximate-count of the webhook JQL scope (project in (PE,DEVOPS) updated
+#     in the window) still reports activity. The "authenticated" keying is what
+#     makes the wrong-Secret case page: a bad Secret produces only hmac_failed
+#     deliveries, which never refresh the liveness clock, so a live-but-
+#     mis-secreted hook reads as dark, not healthy.
+#   gardenio_jira_webhook_deliveries_total{outcome} — receive-path liveness by
+#     terminal outcome (processed|ignored|hmac_failed|bad_request); a still-
+#     arriving-but-rejected stream is visible here rather than as silence.
+#   gardenio_jira_webhook_evaluations_total{result} — completed monitor cycles;
+#     the deadman signal for the monitor loop itself.
+#   gardenio_jira_webhook_upstream_matches — context/observability, not paged on.
+#
+# The verdict is folded entirely into the gauge (not a multi-term PromQL join)
+# so the dark expr is a trivial ==1 — a set-per-cycle gauge cannot silently
+# suppress the page via an absent series inside an `and`, the failure mode the
+# sibling trigger-starved Helm test explicitly guards against. A companion
+# deadman leg catches the OTHER failure shape — the monitor not evaluating at
+# all (pod down / hung goroutine), which would freeze the dark gauge at its last
+# value — via increase()==0 or absent() on the evaluation heartbeat. Both OFF by
+# default; per-env overlays opt in. Requires the monitoring.coreos.com/v1
+# PrometheusRule CRD.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-jira-bridge-webhook-deadman
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jira-bridge
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.jira_webhook_deadman
+      interval: 1m
+      rules:
+        - alert: JiraWebhookDark
+          # The monitor Go-computes the full verdict (no authenticated delivery
+          # in the window + upstream approximate-count > 0) into the gauge, so
+          # the expr is a plain ==1 with a max_over_time window so a single
+          # flapping scrape does not clear it prematurely; the `for:` hold rides
+          # out scrape gaps. window and for are configurable via values.
+          expr: |
+            max_over_time(gardenio_jira_webhook_dark[{{ $cfg.window | default "15m" }}]) == 1
+          for: {{ $cfg.for | default "10m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: jira-bridge
+            subsystem: inbound_webhook
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "JIRA inbound webhook is dark — 0 authenticated deliveries received while comment/edit activity exists upstream"
+            description: |
+              The jira-bridge received NO authenticated, well-formed inbound
+              webhook delivery within the deadman window while an independent
+              approximate-count of the webhook JQL scope
+              (gardenio_jira_webhook_upstream_matches) still reports recent
+              comment/issue activity on PE/DEVOPS. The whole conversational
+              surface — @gardenio mentions, follow-up nudges, F3 re-spawn, comment
+              mirroring onto beads — is silently dark: matter is happening in
+              JIRA that the bridge is not receiving. This is the third-leg
+              prevention net alongside the ingestion poller-stall and trigger-
+              starved alerts (the webhook path previously had NO metric and NO
+              alert, so it went 100% dark in prod for 8 days while every
+              dashboard stayed green).
+
+              IMPORTANT: HMAC failures do NOT clear this alert — a wrong Secret
+              in the Jira console looks like a working hook from Jira's side but
+              only ever produces hmac_failed deliveries, which never refresh the
+              receive-liveness clock. So this fires on both "hook unregistered"
+              and "hook registered but mis-secreted."
+
+              Triage: check gardenio_jira_webhook_deliveries_total{outcome} — a
+              nonzero hmac_failed with zero processed means a wrong Secret
+              (rotate/realign JIRA_WEBHOOK_SECRET vs the Jira console); all
+              outcomes flat at zero means the webhook is not registered at all
+              (register it: Jira Settings -> System -> Webhooks, URL
+              https://<jiraBridge.webhook.host>/webhook). Confirm the traefik
+              webhooks entryPoint + DNS + route are healthy (the sibling
+              gitlab-bridge receives on the same entryPoint). Full runbook on the
+              bead; root-cause escalation ka-0000004344.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000000426)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        - alert: JiraWebhookMonitorDeadman
+          # The dark gauge only speaks when the monitor is RUNNING. This leg
+          # catches the opposite shape — the monitor loop not evaluating at all
+          # (pod down, hung goroutine, crash-loop) — which would otherwise freeze
+          # the dark gauge at its last value and silently suppress the page.
+          # evaluations_total is incremented on every monitor cycle (ok|
+          # count_error) and baselined to 0 at startup, so a live-but-erroring
+          # monitor keeps this quiet while a dead/absent monitor fires. absent()
+          # covers the never-scraped / crash-before-first-scrape case an
+          # increase() alone would miss.
+          expr: |
+            increase(gardenio_jira_webhook_evaluations_total[{{ $cfg.deadmanWindow | default "15m" }}]) == 0
+            or absent(gardenio_jira_webhook_evaluations_total)
+          for: {{ $cfg.deadmanFor | default "10m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: jira-bridge
+            subsystem: inbound_webhook
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "JIRA webhook deadman monitor is not evaluating — the dark detector itself is down"
+            description: |
+              gardenio_jira_webhook_evaluations_total has not increased over the
+              deadman window (or the series is absent) — the jira-bridge inbound-
+              webhook deadman monitor is not completing evaluation cycles. This
+              is the dead/hung-monitor shape the dark gauge cannot see (the gauge
+              only updates while the monitor runs): a down pod, a hung goroutine,
+              or a crash-loop. While this fires, the JiraWebhookDark detector is
+              blind — treat it as "webhook liveness is unmonitored," not "webhook
+              is healthy."
+
+              Triage: check the jira-bridge pod is Running and not crash-looping
+              (kubectl get pods -l app.kubernetes.io/component=jira-bridge);
+              check its logs for a panic; confirm the :9093 /metrics endpoint is
+              scrapeable. Full runbook on the bead.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000000426)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

@@ -1,0 +1,636 @@
+# Re-run jobs whose runner was reclaimed out from under them.
+#
+# ── WHY ─────────────────────────────────────────────────────────────────────
+# The ci pool is 100% spot. When an instance is reclaimed mid-job the runner
+# process dies, GitHub marks the job `failure`, and the work is simply lost:
+# the PR goes red for a reason that has nothing to do with the code, and
+# someone has to notice and type `gh run rerun <id> --failed`. Nobody does
+# that promptly, so the run sits red and the next push re-queues everything
+# anyway -- which is congestion, not just noise.
+#
+# aws-ccm-values.yaml / nth-values.yaml (2026-09-21) fixed the *slot* leak:
+# a dead node's Node object is now deleted, so its Terminating runner pod
+# stops counting against maxRunners. They do nothing for the *job*. This is
+# the other half.
+#
+# Measured 2026-09-21 over 40 recent failed runs (42 failed jobs): 7 jobs had
+# lost their runner, 35 were genuine. All 7 were heavy jobs -- build + test
+# (kbeads/coop/controller) and cargo audit + deny (coop) -- i.e. the most
+# expensive work in the repo is what spot reclaims eat.
+#
+# ── THE TWO SIGNATURES ──────────────────────────────────────────────────────
+# A runner can be taken away ABRUPTLY or GRACEFULLY, and the two look nothing
+# alike from the API. This workflow originally knew only the first.
+#
+# 1. ABRUPT -- the instance vanishes and the runner stops heartbeating. The
+#    Actions service notices and writes a job-level failure ANNOTATION:
+#      "The self-hosted runner lost communication with the server. ..."
+#    Note its own wording: it also fires when the runner is "starved for
+#    CPU/Memory", so an OOM-killed runner is indistinguishable from a reclaim
+#    at this layer. That is why the attempt cap below is not optional.
+#
+# 2. GRACEFUL -- the runner POD gets SIGTERM (node drain ahead of a spot
+#    reclaim, an ARC scale-down, an eviction). The runner has time to say so,
+#    and what it writes goes to the LOG, not to an annotation:
+#      "##[error]The runner has received a shutdown signal. ..."
+#    The annotations show "The operation was canceled." and/or "Process
+#    completed with exit code 130." (SIGINT forwarded to the step's child).
+#    Nothing in the annotations, the steps array, or the timings distinguishes
+#    this from a job that genuinely timed out or that a human cancelled -- the
+#    step that was running is marked `cancelled` in every one of those cases.
+#    So for this class the classifier has to read the log, and it does, but
+#    only when an annotation matches CANCELED or INTERRUPTED. Genuine failures
+#    never carry either: in a census of 114 failed jobs across ci/checks/e2e
+#    (2026-09-22) exactly 4 carried the cancellation annotation, so the log
+#    fetch happens on ~3% of failed jobs and costs one request each (job logs
+#    here are 60-370 KB).
+#
+# ── THE EXIT-130-ONLY SHAPE (2026-09-23) ────────────────────────────────────
+# The sentence above used to read "All the annotations show is 'The operation
+# was canceled.', SOMETIMES PRECEDED BY 'Process completed with exit code
+# 130.'" -- i.e. exit-130 was described as an optional extra that always came
+# with the cancellation annotation. THAT IS WRONG, and gating on CANCELED
+# alone therefore missed a whole class of reclaims. Exit-130 can be the ONLY
+# failure annotation on the job:
+#
+#   job 107375983294  run 35918405782 att 1  build + test (controller)
+#   job 107319672783  run 35901753507 att 1  build + test (controller)
+#   job 107374096449  run 35917870753 att 1  build + test (controller)
+#
+# All three carry exactly one failure annotation, "Process completed with exit
+# code 130.", no cancellation annotation at all -- and all three have the
+# shutdown line in their log. The detector read `genuine` on every one.
+#
+# The first is a CONTROLLED A/B, because the same job was re-run 8 minutes
+# later inside the same run and took the other shape:
+#
+#   attempt 1  job 107375983294  annotation: "exit code 130."  -> SKIP, never retried
+#   attempt 2  job 107379790953  annotation: "operation was canceled." -> RETRY -> attempt 3 green
+#
+# Same workflow, same job, same cluster, opposite verdicts. Which annotation
+# the service writes is a race between the job finishing and the cancellation
+# propagating, not a property of the failure. A human re-ran attempt 1 by hand
+# at 20:59:26Z; runs 35901753507 and 35917870753 were never retried at all and
+# are still red -- and 35901753507 is a PUSH TO MAIN.
+#
+# Timeline for the first, from the cluster side:
+#   20:49:19Z  job starts on runner ...-5zcvk
+#   20:51:49Z  spot ITN on ip-10-90-12-231
+#   20:51:50Z  NTH names ...-5zcvk as a pod on that node
+#   20:51:50.57Z  log: "##[error]The runner has received a shutdown signal."
+#   20:51:51Z  job completes FAILURE, annotation "exit code 130."
+#   20:51:54Z  node drained (111s before the 20:53:45Z interruption)
+#   20:52:01Z  this workflow: "genuine  build + test (controller)" -> SKIP
+#
+# NOTE THE INTERACTION, because it is counter-intuitive: deploying
+# aws-node-termination-handler made this detector BLINDER. An abrupt loss
+# leaves "lost communication with the server", which signature 1 catches. NTH's
+# graceful drain converts that into a clean SIGINT and an exit-130 annotation,
+# which nothing caught. Each mechanism is individually correct; the failure is
+# in the seam.
+#
+# Cost of widening the gate, measured on the last 40 runs each of ci, checks,
+# e2e and images (14 failed/cancelled jobs): 2 carry an exit-code annotation
+# without a cancellation annotation, and BOTH have the shutdown line. So the
+# widening adds log fetches on 14% of failed jobs and, in this sample, zero of
+# them were wasted. Precision is unchanged by construction -- the log is still
+# the only verdict, and the 24-genuine-failure sample above found the shutdown
+# line in none of them.
+#
+# 143 (SIGTERM) is in the pattern on mechanism, not measurement: the runner
+# escalates from SIGINT if the child ignores it. Zero jobs in the census above
+# carried 143, so it costs nothing today. If it ever starts matching genuine
+# failures, that is the half to drop first.
+#
+# Census, same 114 jobs: 10 abrupt (already retried), 4 graceful (silently
+# dropped until this change), 100 genuine. So roughly 29% of all lost runners
+# were going unretried.
+#
+# DO NOT SCOPE A FIX TO A TIER OR A LANGUAGE. An earlier draft of this note
+# said "all 4 were heavy-tier Rust jobs ... the same bias the abrupt sample
+# showed". A 5th case then arrived that is neither: job 106625698447, run
+# 35690309004, `gitleaks + govulncheck + osv`, Go tooling, 43 seconds long.
+# Two explanations were checked and both fail:
+#
+#   * tier. All three ARC scale sets -- gardenio-k3s, -medium and -light --
+#     carry the SAME nodeSelector (gardenio.io/role: ci) and the SAME ci
+#     toleration, so they land on one pool. A spot reclaim takes the node and
+#     everything on it; nothing about being heavy makes a pod more reclaimable.
+#   * duration ("a long job gives a reclaim more window"). The six known cases
+#     run 10s / 43s / 133s / 220s / 305s / 645s -- two orders of magnitude, and
+#     the two most recent are the two SHORTEST. A reclaim does not need a
+#     window; it takes the node out from under whatever is standing on it.
+#
+# What is left is exposure: heavy is 272 of the 477 jobs in the last 30 runs of
+# ci.yml + checks.yml, so 6/6 landing there has p ~= 0.03 under a null of no
+# bias at all. Suggestive, not a finding. Treat runner loss as tier-blind.
+#
+# Precision of the log signature, measured rather than assumed: 24 genuine
+# failed jobs sampled at random from the same census, zero contained the
+# shutdown line. The only sampled job that did was one of the 4 above.
+#
+# A gracefully-lost job may also carry failure annotations that are DOWNSTREAM
+# of the interrupt: 106625698447 has both "The operation was canceled." and
+# "gitleaks history coverage failure", the latter because an interrupted
+# gitleaks emits no "N commits scanned" line and tripped its coverage gate.
+# That is why the annotation test below is `.some(CANCELED)` and not "every
+# failure annotation is a cancellation" -- the shutdown line in the log is the
+# discriminator, and a real failure cannot produce it. DO NOT "simplify" that
+# predicate: the stricter form is ruled out by evidence, not by taste, and
+# 106625698447 is the job it would have dropped.
+#
+# CORRECTION to the note this section replaces. It claimed job 106303301612
+# (`cargo audit + deny (coop)`, run 35589296068) was a TIMEOUT -- "ran 10m45s
+# against checks.yml's `timeout-minutes: 10`" -- and used it as the false
+# positive that ruled out the cheaper "no step marked failure" heuristic. That
+# job did run 10m45s, but its timeout-minutes is 30, not 10, and a job that
+# really does exceed its limit gets an explicit
+#   "The job running on runner X has exceeded the maximum execution time of N minutes."
+# error, which is absent from its log. Its log carries the shutdown line
+# instead. It was a gracefully-lost runner, and it is one of the 4. The
+# heuristic it was cited against is still not used here -- reading the log is
+# strictly better evidence than counting failed steps -- but the reason given
+# was wrong, and a wrong reason left the whole graceful class unretried.
+#
+# Precision still matters more than recall: a missed retry costs one manual
+# rerun, a false retry costs a heavy runner slot during exactly the churn
+# storm that caused the reclaim.
+#
+# ── SAFETY RAILS ────────────────────────────────────────────────────────────
+#  1. ALL-or-nothing. `rerun --failed` re-runs every failed job in the run, so
+#     this fires only when *every* failed job lost its runner. One genuine
+#     failure alongside a lost one means no retry: a human is looking at that
+#     run regardless, and re-running the genuine job is wasted capacity.
+#  2. Attempt cap. `rerun --failed` creates a new ATTEMPT of the same run,
+#     which re-fires `workflow_run: completed` -- this workflow can trigger
+#     itself. run_attempt < 3 bounds it at two retries, so the worst case for
+#     a job that fails this way deterministically (OOM, a sick node) is 3x,
+#     not unbounded. Two independent reclaims on one run is rare but real in
+#     this cluster (5 reclaims in 2.5h has been observed), so one retry is not
+#     quite enough.
+#  3. Staleness guard, with two exemptions. If the run's branch has moved past
+#     its head sha, a newer run already covers the same tests and retrying this
+#     one is pure queue load -- which is worst precisely during the churn
+#     storms that cause the reclaims. Only push and pull_request runs are
+#     checked; every other event (schedule, workflow_dispatch) has no newer
+#     run to supersede it. `images` is exempt too: it filters paths
+#     per-commit, so an older sha's image build is NOT superseded by a newer
+#     one and is lost forever if it isn't retried (gd-R1kL4sUECV). `schedule`
+#     runs are exempt for the same reason: nothing supersedes a nightly --
+#     there is no newer run until tomorrow, so a dropped one costs a day of
+#     coverage. The exemption is NOT justified by "main always moves":
+#     simulating a 09:17Z start over the last 7 days, main had moved by the
+#     time the retry check ran on 2 of 7 nights for a 30-minute run and 3 of
+#     7 for a 60-minute one -- lower bounds, since the tip is read at
+#     retry-check time, not at run end, so the window is the run plus
+#     reclaim-detection latency. A minority, but a correlated one: the
+#     nights main moves are the churn-heavy nights the nightly most needs to
+#     cover, and those are exactly the ones the guard would silently drop.
+#     This applies to push runs too, not just PRs -- three of the six
+#     runner-lost runs in the 2026-09-21 sample were pushes to main.
+#
+# ── THE 'cancelled' CONCLUSION GAP (2026-09-22) ─────────────────────────────
+# Everything above assumes the RUN's overall conclusion is `failure`. It does
+# not have to be: a job that dies gracefully (the exact SIGTERM signature
+# documented above) can end up with its OWN conclusion reported as `cancelled`
+# rather than `failure`, and when nothing else in the run fails outright,
+# GitHub rolls the run's overall conclusion up to `cancelled` too -- same
+# mechanism, different label. The old trigger (`conclusion == 'failure'`
+# only) never fired on these, so the classifier -- already proven safe on the
+# failure path -- never even ran.
+#
+# LIVE CASE: PR #89's checks run 35721001796 attempt 1, job 106723747240
+# (golangci-lint (kbeads)) concluded `cancelled` while the other eight
+# real jobs of the run passed; the run's overall conclusion was `cancelled`.
+# The job's log carries the identical "runner has received a shutdown
+# signal" line as every graceful case in the corpus below. It sat red ~20
+# minutes until fimba-91 re-ran it by hand (attempt 2, success). Added to the
+# corpus below as the first `cancelled`-conclusion entry.
+#
+# HOW OFTEN IS THIS A REAL LOSS VS. A GENUINE MASS CANCEL, measured 2026-09-22
+# via `gh api` over the last ~100 runs each of ci/checks/images (e2e had none
+# in that window): 45 runs concluded `cancelled`. 44 of the 45 were mass
+# cancels -- every queued or running job in the run went `cancelled` together,
+# most with no job log at all (cancelled before a runner ever picked them up
+# -- the log endpoint 404s BlobNotFound), the rest cancelled mid-run with no
+# shutdown line in the log -- consistent with PR-push supersession
+# (`cancel-in-progress: true` on pull_request) or a manual `gh run cancel`,
+# never a single job dying alone. 14 of those 44 were one specific job,
+# `gitleaks + govulncheck + osv` on `checks`, cancelled every time before it
+# ever got a runner -- a scheduling artifact, not a reclaim; the classifier
+# already reads an unfetchable log as genuine, so this costs one annotation
+# call and nothing else. Exactly 1 of the 45 was a genuine single-job
+# graceful loss: the PR #89 case above. So widening the trigger costs on the
+# order of one extra light-tier invocation per `cancelled`-conclusion run --
+# ~45 over the roughly two days of push+PR traffic this sample covers -- to
+# correctly reclassify what was, on this sample, a 1-in-45 hit rate. Cheap,
+# per the COST section below: no checkout, a few seconds, only charged when
+# the `if:` is true.
+#
+# THE FIX HAS TWO PARTS, not one, because widening the job-level `if:`
+# trigger alone is a no-op. A run whose conclusion is `cancelled` has, by
+# construction, no job whose own conclusion is `failure` (GitHub rolls any
+# job failure up to a run conclusion of `failure`, never `cancelled`), so the
+# `failed = jobs.filter(conclusion === 'failure')` line below would stay
+# empty for every `cancelled`-conclusion run and dead-end at "run failed but
+# no job did" every time. The job filter now also picks up jobs whose OWN
+# conclusion is `cancelled`, but ONLY when the RUN's conclusion is
+# `cancelled` -- not unconditionally. That gating matters: on the `failure`
+# path (the corpus-tested one) a matrix job can be marked `cancelled` as a
+# side effect of a sibling's real `failure` (fail-fast), and folding that
+# into `failed` unconditionally would let one genuinely-cancelled,
+# not-lost sibling flip an existing correct RETRY into a SKIP via the
+# ALL-or-nothing rail above. Gating the extra `cancelled` jobs on
+# `run.conclusion === 'cancelled'` keeps the failure path byte-for-byte
+# unchanged and adds only the new case.
+#
+# ── THE JUDGE JOB (2026-11-01, gd-RiDlMItXQq) ────────────────────────────────
+# ci.yml and checks.yml each end in one aggregate job (`ci`, `checks`; a
+# draft run's were `ci (draft)` / `checks (draft)` until gd-19ECZxvFQw)
+# whose single step, "every job passed or skipped", reads `needs` and fails
+# when any job it needs did not pass. It
+# runs `if: always()`, so whenever a real job loses its runner the judge
+# fails TOO, on its own healthy light runner, with only "<job> ended failure"
+# and "exit code 1." to show for it. The classifier read that as genuine and,
+# by the ALL-or-nothing rule, SKIPped every lost-runner run of ci and checks
+# since the judges landed:
+#
+#   run 41258589808  draft: build + vet + changed-package tests  (exit 130)
+#                    + ci (draft)    -> retry run 41259381771 SKIP
+#   run 41261316936  gardenhub browser (chromium)  (shutdown signal)
+#                    + ci            -> retry run 41263164488 SKIP
+#
+# The judge's failure is derived from its needs, so it carries no verdict of
+# its own: when any other job failed, the judge is left out of the count and
+# the other jobs decide. reRunWorkflowFailedJobs re-runs it with them (it
+# failed, and it depends on them). A judge that failed ALONE is classified
+# like any other job: nothing it needs failed, so either its own runner was
+# lost or it failed closed on purpose. It is recognised by its step name,
+# not its job name: the job name differs per workflow (and followed draft
+# state until gd-19ECZxvFQw), the step name is the same in both. check-retry-lost-runners-gate
+# _test.py pins that the step name here still matches both workflows.
+#
+# ── THE EXIT-1 SHAPE (2026-11-02, gd-m0SzimA103) ────────────────────────────
+# The forwarded SIGINT can make the step's child exit with its OWN status, not
+# 130: `go test` prints "signal: interrupt", FAILs the package and exits 1. The
+# job's only failure annotation is then "Process completed with exit code 1.",
+# which neither CANCELED nor INTERRUPTED matches -- and must not, because it is
+# also every ordinary test failure. What gives it away is the job's own
+# conclusion: `cancelled`, although its step concluded `failure`.
+#
+#   run 41395002610 att 1  helm lint + chart tests  job 125114628608
+#     log: "FAIL gardenio/helm/tests 330.646s" (timeout 18m), "exit code 1.",
+#     then the shutdown line. Run concluded `cancelled`; run 41396669965 read
+#     it `genuine` without fetching the log -> SKIP.
+#
+# So a job whose own conclusion is `cancelled` and that had a runner is put
+# through the log test whatever its annotations say. Cancelled jobs are only
+# in `failed` on a `cancelled` run, so the failure path is unchanged. A job
+# cancelled while still queued has no runner_name and skips the fetch; a job
+# cancelled mid-run by supersession already carries "The operation was
+# canceled." and was already fetched. The added cost is the remainder, which
+# is this shape.
+#
+# ── COST ────────────────────────────────────────────────────────────────────
+# Runs on gardenio-k3s-light (250m/512Mi, no dind) because it is a single
+# API-only step of a few seconds, and because the account has exhausted its
+# included hosted-Linux minutes -- `ubuntu-latest` will not start before
+# October. No checkout: nothing here reads the repo. Jobs whose `if` is false
+# are skipped by the service and never allocate a runner at all, so the
+# common case (a run that failed for real) costs nothing.
+#
+# ── TESTING ─────────────────────────────────────────────────────────────────
+# workflow_dispatch classifies any run without acting:
+#   gh workflow run retry-lost-runners.yml -f run_id=<id>            # dry run
+#   gh workflow run retry-lost-runners.yml -f run_id=<id> -f apply=true
+# The decision and its reasoning land in the job summary.
+#
+# Regression corpus for the graceful class -- every one of these must classify
+# `runner-lost (graceful)`, and each is a run the old annotation-only test
+# called genuine:
+#   35589296068  cargo audit + deny (coop)   job 106303301612
+#   35667563888  build + test (coop)         job 106556588877   (exit 130)
+#   35676786944  build + test (coop)         job 106584871443   (exit 130)
+#   35690165743  build + test (coop)         job 106625299900
+#   35690309004  gitleaks + govulncheck + osv  job 106625698447
+#     ^ the tier/language counterexample above, and the only one in the corpus
+#       with a SECOND, downstream failure annotation alongside the cancellation.
+#   35691625078  build + test (coop)         job 106629697486   (exit 130, 10s)
+#     ^ CAUGHT AND RETRIED IN PRODUCTION, unprompted, ~2h after this classifier
+#       shipped: retry-lost-runners run 35691818467 classified it
+#       `runner-lost (graceful)` and re-ran the run to attempt 2 with nobody
+#       typing `gh run rerun`. It is also the shortest case on record at 10
+#       seconds -- lost during `apt deps`, i.e. before the job had done any
+#       work at all.
+# Abrupt-class runs must still classify `runner-lost (abrupt)` with no log
+# fetch: jobs 104686843555, 104866460570, 106168172434.
+# Genuine failures must stay genuine: jobs 106625259513, 106599728423,
+# 106567425777, 106028462450.
+# Note 35667563888 also shows the staleness guard firing ahead of the
+# annotation test (35669237327 SKIPped it as superseded), so a dispatch
+# re-classification of it is the only way to see the job verdict.
+#
+# `cancelled`-conclusion corpus (2026-09-22): must classify the same way as
+# every graceful entry above -- the log signature is identical, only the run
+# and job's own conclusion field differs:
+#   35721001796  golangci-lint (kbeads)      job 106723747240   (attempt 1;
+#     run concluded `cancelled`, not `failure` -- the other 8 real jobs of
+#     the run passed. Verified against the code in this PR with a harness
+#     replaying the real recorded run/job/log data: RETRY. A genuine mass
+#     cancel (images run 35634461925, 3 jobs cancelled together, no job
+#     logs) replayed the same way: SKIP.)
+#   41395002610  helm lint + chart tests     job 125114628608   (exit 1, the
+#     EXIT-1 SHAPE above; the `checks` judge also failed and follows it)
+# Note dispatch cannot re-classify 35721001796 by run_id any more: attempt 2
+# (the hand rerun) succeeded, so the run's current conclusion is `success`
+# and getWorkflowRun no longer returns the attempt-1 state above.
+#
+# `workflow_run` workflows only ever run from the DEFAULT BRANCH copy of this
+# file. Editing it on a branch changes nothing until it is on main.
+name: retry-lost-runners
+
+on:
+  workflow_run:
+    # Every workflow with a job on a gardenio-k3s* (spot) runner, by `name:`.
+    # Adding one? Add it here too, or its lost runners go unretried: until
+    # 2026-11-05 only the first four were listed, and a reclaimed bless-goldens
+    # run (42104114600) sat red with nobody to re-run it. The list is explicit
+    # rather than omitted-to-match-everything because an unfiltered
+    # workflow_run would include this workflow's own completions and could
+    # self-trigger.
+    workflows:
+      - ci
+      - checks
+      - images
+      - e2e
+      - bless-goldens
+      - daily-full-run
+      - release-binaries
+      - reachability
+      - lands-perf
+      - pages
+      - oidc-sub-probe
+      - keycloak-operator-compat
+      - keycloak-runbook-verify
+      - keycloak-upgrade-preflight
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Run ID to classify
+        required: true
+        type: string
+      apply:
+        description: Actually re-run failed jobs (false = classify only)
+        required: false
+        default: false
+        type: boolean
+
+# Least privilege: actions:write to re-run, checks:read for the annotations
+# that carry the signature, contents:read for the branch-tip lookup. Naming
+# any permission sets every unnamed one to none.
+permissions:
+  actions: write
+  checks: read
+  contents: read
+
+# One retrier per run. Never cancel in progress: the decision is cheap but
+# cancelling it halfway could drop a retry that should have happened.
+concurrency:
+  group: retry-lost-runners-${{ github.event.workflow_run.id || inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    name: retry lost runners
+    # Evaluated by the service before any runner is allocated.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      ((github.event.workflow_run.conclusion == 'failure' ||
+        github.event.workflow_run.conclusion == 'cancelled') &&
+       github.event.workflow_run.run_attempt < 3)
+    runs-on: gardenio-k3s-light
+    timeout-minutes: 5
+    steps:
+      - name: classify failed jobs and re-run if every one lost its runner
+        uses: actions/github-script@v7
+        env:
+          # github-script does not hand the token to the script, and the log
+          # fetch below deliberately bypasses octokit (see downloadLog).
+          GH_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            // Signature 1: an annotation, written by the service. Signature 2:
+            // a line in the job log, written by the runner on its way out.
+            const LOST = /lost communication with the server/i;
+            const SHUTDOWN = /runner has received a shutdown signal/i;
+            // The annotations a gracefully-killed runner leaves behind. Both
+            // are also what a real timeout and a human cancel leave, so they
+            // are a GATE for reading the log, never a verdict on their own.
+            // INTERRUPTED is the one that fires when the shutdown reaches the
+            // step's child but the job ends before the service writes the
+            // cancellation annotation -- see THE EXIT-130-ONLY SHAPE above.
+            const CANCELED = /operation was canceled/i;
+            const INTERRUPTED = /exit code (?:130|143)\b/i;
+            // The one step of the ci / checks aggregate job. See THE JUDGE JOB.
+            const JUDGE_STEP = 'every job passed or skipped';
+            const LOG_CAP = 32 * 1024 * 1024;  // refuse to buffer more on a 512Mi pod
+            const MAX_ATTEMPT = 3;            // allow retries on attempts 1 and 2
+            const { owner, repo } = context.repo;
+            const dispatch = context.eventName === 'workflow_dispatch';
+
+            // workflow_dispatch inputs reach github-script through the event
+            // payload, not core.getInput (which reads the action's own inputs).
+            const run = dispatch
+              ? (await github.rest.actions.getWorkflowRun({
+                  owner, repo, run_id: Number(context.payload.inputs.run_id),
+                })).data
+              : context.payload.workflow_run;
+
+            // Anything but an explicit true is a dry run.
+            const apply = dispatch
+              ? String(context.payload.inputs.apply) === 'true'
+              : true;
+
+            const lines = [];
+            const say = (m) => { core.info(m); lines.push(m); };
+            // `path` is logged because the images exemption below keys on it:
+            // if it is ever absent from the workflow_run payload it reads as
+            // undefined and images silently loses its exemption.
+            say(`run ${run.id} (${run.name}, path=${run.path}) attempt ${run.run_attempt} ` +
+                `event=${run.event} conclusion=${run.conclusion} sha=${run.head_sha.slice(0, 8)}`);
+
+            const finish = async (decision, why) => {
+              say(`decision: ${decision} -- ${why}`);
+              await core.summary
+                .addHeading(`retry-lost-runners: ${decision}`, 3)
+                .addRaw('\n\n')
+                .addList(lines)
+                .write();
+              if (decision === 'RETRY' && !apply) core.notice('dry run: not re-running');
+            };
+
+            if (run.conclusion !== 'failure' && run.conclusion !== 'cancelled') {
+              return finish('SKIP', `run conclusion is ${run.conclusion}, not failure or cancelled`);
+            }
+            if (run.run_attempt >= MAX_ATTEMPT) {
+              return finish('SKIP', `attempt ${run.run_attempt} has reached the cap of ${MAX_ATTEMPT}`);
+            }
+
+            // Staleness guard, with two exemptions.
+            //
+            // `images`: its per-commit path filtering means an older sha's
+            // build is never redone by a newer run, so it must be retried
+            // even when the branch has moved on. Keyed on `path`, not `name`:
+            // a future `run-name:` in a workflow would change `name` and
+            // silently break the exemption.
+            //
+            // `schedule`: a nightly's head_branch is `main`, so this guard
+            // can SKIP a reclaimed nightly as "superseded" -- the same
+            // failure mode the guard already hit on a push run (35669237327
+            // classified 35667563888 this way at 23:48Z on 2026-09-21).
+            // How often: simulating a 09:17Z start over the 7 days to
+            // 2026-09-22, main had moved by retry-check time on 2 of 7
+            // nights for a 30-minute run, 3 of 7 for 60 minutes -- lower
+            // bounds, as the tip is read when the retry check runs, not at
+            // run end. Not "always", and deliberately not argued that way:
+            // the 03-08Z band averaged 3.7 commits/hour with a median of 2
+            // and 43% of hours empty, and that mean is unstable enough
+            // across adjacent windows (3.7 / 2.1 / 1.5) that it is not a
+            // rate worth citing. The argument is the correlation, not the
+            // frequency: main moves on churn-heavy nights, which are the
+            // nights the nightly most needs to cover. And nothing
+            // supersedes a nightly: there is no newer run until tomorrow,
+            // so a reclaimed one is lost for a day. Same argument as
+            // `images`. The
+            // nightly is the only thing keeping the e2e suite from rotting
+            // again (see docs/superpowers/specs/2026-09-21-e2e-optional-ci-jobs-design.md D3),
+            // so losing it silently defeats the point.
+            //
+            // Only a push or a pull_request run is superseded: a newer push
+            // re-runs the same workflow on the newer sha. A dispatched run
+            // (a bless, a probe, a perf run) has no newer run behind it, the
+            // same as a nightly; 42104114600, a bless dispatched on main,
+            // would have been SKIPped because main moved during its 10 minutes.
+            const exemptFromStaleness =
+              run.path === '.github/workflows/images.yml' ||
+              (run.event !== 'push' && run.event !== 'pull_request');
+            if (!exemptFromStaleness) {
+              try {
+                const tip = (await github.rest.repos.getCommit({
+                  owner, repo, ref: run.head_branch,
+                })).data.sha;
+                if (tip !== run.head_sha) {
+                  return finish('SKIP',
+                    `branch ${run.head_branch} has moved to ${tip.slice(0, 8)}; a newer run supersedes this one`);
+                }
+              } catch (e) {
+                return finish('SKIP',
+                  `branch ${run.head_branch} no longer resolves (${e.status || e.message}); PR is closed or merged`);
+              }
+            }
+
+            const jobs = await github.paginate(
+              github.rest.actions.listJobsForWorkflowRunAttempt,
+              { owner, repo, run_id: run.id, attempt_number: run.run_attempt, per_page: 100 },
+            );
+            // A `cancelled`-conclusion run has, by construction, no job whose
+            // OWN conclusion is `failure` -- GitHub rolls any job failure up
+            // to a run conclusion of `failure`, never `cancelled`. So when a
+            // single job dies gracefully (SIGTERM) and nothing else in the
+            // run fails outright, the run concludes `cancelled` and the dead
+            // job's own conclusion is `cancelled` too -- catching that means
+            // widening this filter, not just the trigger above it. The extra
+            // `cancelled` jobs are pulled in ONLY when the RUN's conclusion
+            // is `cancelled`, not unconditionally: on the `failure` path a
+            // matrix job can be marked `cancelled` as a side effect of a
+            // sibling's real failure (fail-fast), and folding that into
+            // `failed` unconditionally would let one genuinely-cancelled,
+            // not-lost sibling flip an existing correct RETRY to a SKIP via
+            // the ALL-or-nothing rule below. Gating on `run.conclusion`
+            // keeps the failure path (corpus-tested) byte-for-byte unchanged.
+            const failed = jobs.filter((j) =>
+              j.conclusion === 'failure' ||
+              (run.conclusion === 'cancelled' && j.conclusion === 'cancelled'));
+            say(`${jobs.length} jobs on this attempt, ${failed.length} failed/cancelled`);
+
+            if (failed.length === 0) {
+              return finish('SKIP', 'run failed but no job did (startup failure or cancellation)');
+            }
+
+            // The job-logs endpoint 302s to a pre-signed blob URL. Follow it by
+            // hand with two plain fetches rather than through octokit: octokit
+            // re-sends the Authorization header across the redirect, which the
+            // blob store rejects, and it wants to parse the body as JSON.
+            // Returns '' on any failure -- an unreadable log must read as
+            // genuine, never as a free retry.
+            const downloadLog = async (jobId) => {
+              const api = `https://api.github.com/repos/${owner}/${repo}/actions/jobs/${jobId}/logs`;
+              try {
+                const head = await fetch(api, {
+                  redirect: 'manual',
+                  headers: {
+                    authorization: `Bearer ${process.env.GH_TOKEN}`,
+                    accept: 'application/vnd.github+json',
+                    'x-github-api-version': '2022-11-28',
+                  },
+                });
+                const loc = head.headers.get('location');
+                const res = loc ? await fetch(loc) : head;   // signed URL: no auth header
+                if (!res.ok) { say(`    log fetch: HTTP ${res.status}`); return ''; }
+                const len = Number(res.headers.get('content-length') || 0);
+                if (len > LOG_CAP) { say(`    log fetch: ${len} bytes exceeds cap`); return ''; }
+                return await res.text();
+              } catch (e) {
+                say(`    log fetch failed: ${e.message}`);
+                return '';
+              }
+            };
+
+            // A judge fails because something it needs did; when anything
+            // else failed, that decides. See THE JUDGE JOB.
+            const isJudge = (j) => (j.steps || []).some((s) => s.name === JUDGE_STEP);
+            const workers = failed.filter((j) => !isJudge(j));
+            const judges = failed.filter(isJudge);
+            const judged = workers.length > 0 ? workers : judges;
+            if (workers.length > 0) {
+              for (const j of judges) say(`  judge      ${j.name} (follows the jobs it needs)`);
+            }
+
+            const genuine = [];
+            for (const job of judged) {
+              // For an Actions job the job id IS its check-run id.
+              const anns = await github.paginate(github.rest.checks.listAnnotations, {
+                owner, repo, check_run_id: job.id, per_page: 100,
+              });
+              const failures = anns.filter((a) => a.annotation_level === 'failure')
+                                   .map((a) => a.message || '');
+
+              let lost = failures.some((m) => LOST.test(m));
+              let how = 'abrupt';
+              // A job cancelled after a runner took it is ambiguous whatever
+              // its annotations say. See THE EXIT-1 SHAPE. Only reachable on
+              // a `cancelled` run; a job cancelled while queued has no runner.
+              const cancelledOnRunner = job.conclusion === 'cancelled' && !!job.runner_name;
+              if (!lost && (cancelledOnRunner ||
+                            failures.some((m) => CANCELED.test(m) || INTERRUPTED.test(m)))) {
+                // Ambiguous: gracefully-lost runner, real timeout, or human
+                // cancel. Only the log tells them apart.
+                lost = SHUTDOWN.test(await downloadLog(job.id));
+                how = lost ? 'graceful' : 'cancelled-but-not-lost';
+              }
+              say(`  ${lost ? `runner-lost (${how})` : 'genuine'}  ${job.name} (${job.runner_name || 'no runner'})`);
+              if (!lost) genuine.push(job.name);
+            }
+
+            if (genuine.length > 0) {
+              return finish('SKIP',
+                `${genuine.length} of ${judged.length} failed/cancelled job(s) did not lose their runner: ${genuine.join(', ')}`);
+            }
+
+            await finish('RETRY', `all ${judged.length} failed/cancelled job(s) lost their runner` +
+              (workers.length > 0 && judges.length > 0 ? ` (and ${judges.length} judge job(s) failed on them)` : ''));
+            if (apply) {
+              await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: run.id });
+              core.notice(`re-ran ${failed.length} failed/cancelled job(s) of run ${run.id}`);
+            }

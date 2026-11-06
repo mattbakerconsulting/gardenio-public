@@ -1,0 +1,83 @@
+{{- if and .Values.vtsingle.enabled .Values.vtsingle.relay.enabled }}
+{{- $relay := .Values.vtsingle.relay }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.vtsingle.relay.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vtsingle.relay.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.vtsingle.relay.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.vtsingle.relay.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: relay
+          image: {{ include "gardenio.vtsingle.relay.image" . | quote }}
+          imagePullPolicy: {{ $relay.image.pullPolicy }}
+          args: ["perf-traces-relay"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: PERF_TRACES_SOURCE_URL
+              value: {{ $relay.sourceURL | quote }}
+            - name: PERF_TRACES_DEST_URL
+              value: {{ $relay.destURL | default (include "gardenio.vtsingle.baseURL" .) | quote }}
+            - name: PERF_TRACES_SERVICES
+              value: {{ join "," $relay.services | quote }}
+            - name: PERF_TRACES_INTERVAL
+              value: {{ $relay.interval | quote }}
+            - name: PERF_TRACES_LOOKBACK_OVERLAP
+              value: {{ $relay.lookbackOverlap | quote }}
+            - name: PERF_TRACES_INITIAL_LOOKBACK
+              value: {{ $relay.initialLookback | quote }}
+            - name: PERF_TRACES_MAX_TRACES_PER_SERVICE
+              value: {{ $relay.maxTracesPerService | quote }}
+            - name: PERF_TRACES_HTTP_TIMEOUT
+              value: {{ $relay.httpTimeout | quote }}
+            - name: PERF_TRACES_SOURCE_USERNAME_FILE
+              value: /etc/perf-traces/{{ $relay.auth.usernameKey }}
+            - name: PERF_TRACES_SOURCE_PASSWORD_FILE
+              value: /etc/perf-traces/{{ $relay.auth.passwordKey }}
+            - name: LOG_LEVEL
+              value: {{ .Values.agents.logLevel | default "info" | quote }}
+          resources:
+            {{- toYaml $relay.resources | nindent 12 }}
+          volumeMounts:
+            - name: perf-traces-auth
+              mountPath: /etc/perf-traces
+              readOnly: true
+      volumes:
+        - name: perf-traces-auth
+          secret:
+            secretName: {{ $relay.auth.secretName }}
+      {{- include "gardenio.nodeSelector" (dict "local" $relay.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with $relay.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" $relay.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

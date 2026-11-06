@@ -1,0 +1,157 @@
+{{- /*
+gVisor (runsc) installer for k3s platform nodes (Lands gate 3, gd-VtHRlD6gvB).
+
+On EKS the runsc handler is baked into the Karpenter node pool's nodeadm
+userdata (templates/gvisor.yaml). k3s has no such hook for the platform pool,
+so this DaemonSet installs it: one privileged hostPID pod per node labelled
+gardenio.io/role=platform. It enters the host's namespaces (nsenter -t 1) and
+runs files/gvisor/k3s-install.sh, which is idempotent:
+
+  - skip when runsc --version reports the pinned release, the containerd
+    drop-in matches, and the marker says this release was installed and
+    k3s-agent restarted for it;
+  - otherwise download the pinned gvisor.tar.bz2, verify its sha512, unpack it
+    with python3 (Ubuntu 24.04 nodes have no bzip2), install every file under
+    /usr/local/bin with the tarball's layout (runsc stats
+    /usr/local/bin/gvisor-bin/gvisor_sentry), write the containerd drop-in
+    (k3s's generated config.toml imports config-v3.toml.d), restart k3s-agent
+    once and write the marker.
+
+k3s-agent runs with KillMode=process, so running pods survive the restart.
+The DaemonSet rolls one node at a time and a pod is Ready only after its run of
+install.sh succeeded, so a version bump restarts one k3s-agent at a time.
+
+Never runs on a k3s server: the platform label is set only on the agent pool,
+a required node affinity excludes node-role.kubernetes.io/control-plane, and
+install.sh refuses a node whose k3s (server) unit is active.
+
+Lives in k3sInstaller.namespace (kube-system), not .Release.Namespace: the
+release namespace enforces PodSecurity baseline (podSecurityAdmission), which
+rejects a privileged hostPID pod.
+
+Gated on gvisor.enabled AND gvisor.k3sInstaller.enabled. With the installer on,
+the runsc RuntimeClass (templates/gvisor.yaml) takes its scheduling from the
+installer's nodeSelector and tolerations, so runsc pods land only where runsc
+is installed.
+*/ -}}
+{{- $inst := .Values.gvisor.k3sInstaller }}
+{{- if $inst.enabled }}
+{{- if not .Values.gvisor.enabled }}
+{{- fail "gvisor.k3sInstaller.enabled=true requires gvisor.enabled=true (the runsc RuntimeClass)" }}
+{{- end }}
+{{- if .Values.gvisor.nodePool.create }}
+{{- fail "gvisor.k3sInstaller.enabled=true and gvisor.nodePool.create=true are exclusive: the installer is the k3s path, the Karpenter node pool the EKS one" }}
+{{- end }}
+{{- if not (regexMatch "^[0-9a-f]{128}$" ($inst.sha512 | default "")) }}
+{{- fail "gvisor.k3sInstaller.sha512 must be the 128-hex sha512 of the pinned gvisor.tar.bz2" }}
+{{- end }}
+{{- if not $inst.version }}
+{{- fail "gvisor.k3sInstaller.version is required (a gVisor release, e.g. 20261026.0)" }}
+{{- end }}
+{{- $ns := $inst.namespace | default "kube-system" }}
+{{- $script := .Files.Get "files/gvisor/k3s-install.sh" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gvisor-k3s-installer
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app: gvisor-k3s-installer
+data:
+  install.sh: |
+    {{- $script | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gvisor-k3s-installer
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app: gvisor-k3s-installer
+spec:
+  selector:
+    matchLabels:
+      app: gvisor-k3s-installer
+  # One node at a time, and only after the previous node's pod is Ready (its
+  # install.sh finished): a release bump never restarts two k3s-agents at once.
+  minReadySeconds: 30
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.labels" . | nindent 8 }}
+        app: gvisor-k3s-installer
+      annotations:
+        checksum/install-script: {{ $script | sha256sum }}
+    spec:
+      hostPID: true
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        {{- toYaml $inst.nodeSelector | nindent 8 }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64"]
+      {{- with $inst.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: installer
+          {{- $image := $inst.image | default "public.ecr.aws/docker/library/ubuntu:22.04" }}
+          {{- if $inst.digest }}
+          image: {{ printf "%s@%s" $image $inst.digest | quote }}
+          {{- else }}
+          image: {{ $image | quote }}
+          {{- end }}
+          env:
+            - name: GVISOR_VERSION
+              value: {{ $inst.version | quote }}
+            - name: GVISOR_SHA512
+              value: {{ $inst.sha512 | quote }}
+            - name: GVISOR_URL
+              value: {{ printf "%s/%s/x86_64/gvisor.tar.bz2" (trimSuffix "/" $inst.baseURL) $inst.version | quote }}
+          # nsenter keeps the environment, so install.sh sees GVISOR_*. It runs
+          # in the host's mount, UTS, IPC and network namespaces: host python3,
+          # host DNS, host systemctl.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              nsenter -t 1 -m -u -i -n -- /bin/bash -c "$(cat /scripts/install.sh)" install.sh
+              touch /tmp/installed
+              exec sleep infinity
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -f /tmp/installed && test -x /proc/1/root/usr/local/bin/runsc"]
+            periodSeconds: 10
+          securityContext:
+            privileged: true
+          {{- with $inst.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: gvisor-k3s-installer
+{{- end }}

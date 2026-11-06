@@ -1,0 +1,312 @@
+# gardener-mode-flip-event-fires-once.toml
+#
+# Live-flow scenario for the gardener-mode-flip design (spec §L3, task
+# gd-BvYhL4uRfu): a mode-flipped (event) gardener fires EXACTLY ONCE on a
+# subtree bead event via the real trigger engine, driven end-to-end through
+# the real Task 9 verb `gb gardener mode` against the live daemon.
+#
+# Spec: gardenio/docs/superpowers/specs/2026-07-13-gardener-mode-flip-design.md
+#   §L3 (claudeless e2e), §Component 1 (gardenermode.Set ordered writes).
+# Go-level analogue: internal/bridge/trigger_source_multi_test.go
+#   (TestMultiSource_FlippedPlanGardener_FiresOnSubtreeEvent, Task 5) — this is
+#   the live-daemon claudeless counterpart of that unit test.
+#
+# Engine + verb code covered:
+#   - gardenio/controller/internal/gardenermode/mode.go — Set() ordered writes
+#     (timed→event: cron cleared FIRST, then trigger:multi added, then
+#      trigger:schedule removed; timed_cron backup; triggers[] JSON with a
+#      bead_event in_subtree_of entry + a fallback-watchdog cron entry).
+#   - gardenio/controller/cmd/gb/gardener_mode.go — the `gb gardener mode
+#     <epic> --event|--timed` verb (real CLI → daemon round-trip).
+#   - gardenio/controller/internal/scheduler/triggers.go — EvaluateEventEntry
+#     + matchesEventType + the in_subtree_of ancestor walk.
+#   - gardenio/controller/internal/bridge/trigger_source_multi.go — the
+#     MultiTriggerSource loads the flipped (trigger:multi) bead; the schedule
+#     loader (trigger_source_schedule.go) can NO LONGER claim it (label moved),
+#     which is the double-fire guard this scenario proves live.
+#   - gardenio/controller/internal/bridge/gardener_evaluator.go — gardenerPostFire
+#     bumps runs_spawned on the fired trigger bead itself.
+#
+# Why live-flow (not shape): gardener-conditions-fan-in.toml already asserts the
+# persisted triggers[] SHAPE the verb writes. This scenario additionally drives
+# a REAL subtree close through the running engine and asserts the flipped
+# gardener actually FIRES once (runs_spawned +1) and does not double-claim via
+# the schedule loader — a silent regression in in_subtree_of matching, the
+# label-move guard, or the multi-source fire path is invisible to shape checks.
+#
+# Timing note: the verb bakes a debounce=10m / throttle=15m onto the event
+# entry (§Component 1 self-echo bound), far longer than a reconcile-bound e2e
+# window. After asserting the VERB's real persisted shape (steps 1-2, the part
+# the spec pins), this scenario shortens ONLY the debounce/throttle durations
+# and neuters the never-fire watchdog cron so the fire is observable in ~150s —
+# the in_subtree_of match value and the flipped trigger:multi label state (the
+# things under test) are left exactly as the verb produced them.
+
+[claude]
+session_id = "e2e00000-000d-4000-a000-000000000001"
+username = "e2e-gardener-mode-flip"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 300000
+
+[[responses]]
+on = "*"
+say = "Running gardener-mode-flip-event-fires-once: flip via gb gardener mode --event → subtree close fires once → flip back."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight ────────────────────────────────────────────────────
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if [ -z "${BEADS_HTTP_URL:-}" ] || [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL/BEADS_TOKEN unset (must run inside e2e shard)"; exit 0
+fi
+# The Task 9 verb under test. Skip loud on a pre-T9 gb that lacks `mode`
+# (the deployed binary falls through to `gb gardener` parent help, which does
+# not mention the mode long-help phrase).
+if ! gb gardener mode --help 2>&1 | grep -q "firing mode"; then
+  echo "SKIP: gb gardener mode subcommand not present (pre-T9 binary)"; exit 0
+fi
+
+TAG="e2e-cmf-$$-$(date +%s)"
+echo "tag: $TAG"
+
+# ── 1. Epic + gardener trigger bead in TIMED mode via the real verb ─
+EPIC_ID=$(kd create "gardener-mode-flip-epic-$TAG" --type=epic \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+echo "epic: $EPIC_ID"
+
+# gb gardener start emits the real trigger:schedule / role:gardener /
+# gardener-epic:<epic> shape (Phase 3b/D10). A distinctive NEVER-FIRE cron
+# (Jan 1 00:00) lets step 5 prove timed_cron round-trips back exactly while
+# guaranteeing the timed gardener cannot spawn a real agent during setup
+# before we flip it to event mode.
+TIMED_CRON="0 0 1 1 *"
+if ! gb gardener start "$EPIC_ID" --project gardenio --cron "$TIMED_CRON" \
+     --i-read-the-gardener-instructions --max-runs 1 >/dev/null 2>&1; then
+  fail "gb gardener start"; kd close "$EPIC_ID" >/dev/null 2>&1; exit 1
+fi
+
+# Resolve the gardener trigger bead id from the epic.
+SCHED_ID=$(gb gardener status "$EPIC_ID" --json 2>/dev/null | jq -r '.id // empty')
+if [ -z "$SCHED_ID" ]; then fail "resolve gardener schedule id"; kd close "$EPIC_ID" >/dev/null 2>&1; exit 1; fi
+echo "gardener: $SCHED_ID (timed cron=$TIMED_CRON)"
+
+cleanup() {
+  # Force the gardener down so a fire mid-test never leaves a live loop, then
+  # close the whole subtree. Best-effort; every step is idempotent.
+  kd update "$SCHED_ID" -f "enabled=false" -f "force_close=true" >/dev/null 2>&1 || true
+  gb gardener force-close "$EPIC_ID" --reason "e2e cleanup" >/dev/null 2>&1 || true
+  AGENT=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.last_agent_id // empty')
+  [ -n "$AGENT" ] && kd close "$AGENT" >/dev/null 2>&1 || true
+  for id in "$SCHED_ID" "${CHILD_ID:-}" "${OUT_ID:-}" "$EPIC_ID"; do
+    [ -n "$id" ] && kd close "$id" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+# Sanity: the freshly-started gardener is in TIMED mode per the verb's own view.
+MODE0=$(gb gardener mode "$SCHED_ID" --json 2>/dev/null | jq -r '.mode // empty')
+if [ "$MODE0" = "timed" ]; then pass "fresh gardener reports mode=timed"; else fail "fresh gardener mode=timed" "got=[$MODE0]"; fi
+
+# Create + link the in-subtree child NOW, while the gardener is still timed
+# (trigger:schedule → the multi source has not loaded this bead yet, so the
+# create + parent-child dep-add events are buffered and drained without
+# firing). Doing this BEFORE the event window means the ONLY fresh subtree
+# event during step 3 is the child's CLOSE — so runs_spawned can advance by
+# exactly one. (in_subtree_of is reflexive and dep-add stamps `updated` on
+# both child and epic, so linking inside the fire window would risk a second,
+# spurious fire under the 1s throttle.)
+CHILD_ID=$(kd create "flip-child-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$CHILD_ID" ]; then fail "create child"; exit 1; fi
+kd dep add "$CHILD_ID" "$EPIC_ID" --type parent-child >/dev/null 2>&1 || true
+echo "in-subtree child (pre-created): $CHILD_ID"
+
+# ── 2. Flip to EVENT via the real verb; assert persisted shape ─────
+FLIP=$(gb gardener mode "$SCHED_ID" --event --json 2>&1)
+if ! echo "$FLIP" | jq -e '.mode=="event" and .changed==true' >/dev/null 2>&1; then
+  fail "gb gardener mode --event returned mode=event changed=true" "got=[$FLIP]"; exit 1
+fi
+pass "gb gardener mode --event flipped (mode=event changed=true)"
+
+RAW=$(kd show "$SCHED_ID" --json 2>/dev/null)
+LABELS=$(echo "$RAW" | jq -c '.labels')
+# trigger:multi present, trigger:schedule gone (the double-fire label move).
+if echo "$LABELS" | jq -e 'index("trigger:multi") != null' >/dev/null 2>&1; then
+  pass "label trigger:multi present after flip"
+else fail "label trigger:multi present after flip" "labels=$LABELS"; fi
+if echo "$LABELS" | jq -e 'index("trigger:schedule") == null' >/dev/null 2>&1; then
+  pass "label trigger:schedule removed after flip"
+else fail "label trigger:schedule removed after flip" "labels=$LABELS"; fi
+# gardener-epic label survives the flip (the subtree scope anchor).
+if echo "$LABELS" | jq -e --arg e "gardener-epic:$EPIC_ID" 'index($e) != null' >/dev/null 2>&1; then
+  pass "gardener-epic:$EPIC_ID label survives flip"
+else fail "gardener-epic label survives flip" "labels=$LABELS"; fi
+
+# cron cleared, timed_cron backs up the old cron.
+CRON_NOW=$(echo "$RAW" | jq -r '.fields.cron // ""')
+TIMED_BAK=$(echo "$RAW" | jq -r '.fields.timed_cron // ""')
+if [ -z "$CRON_NOW" ]; then pass "flat cron cleared in event mode"; else fail "flat cron cleared" "got=[$CRON_NOW]"; fi
+if [ "$TIMED_BAK" = "$TIMED_CRON" ]; then pass "timed_cron backs up old cron ($TIMED_BAK)"; else fail "timed_cron backup" "got=[$TIMED_BAK] want=[$TIMED_CRON]"; fi
+
+# triggers[] shape: a bead_event entry scoped in_subtree_of=<epic> + a cron
+# fallback-watchdog entry.
+TRIGGERS=$(echo "$RAW" | jq -r '.fields.triggers // ""')
+if echo "$TRIGGERS" | jq -e --arg e "$EPIC_ID" \
+    '.[] | select(.kind=="bead_event") | select(.match.op=="in_subtree_of" and .match.value==$e)' \
+    >/dev/null 2>&1; then
+  pass "triggers[] has bead_event in_subtree_of=$EPIC_ID"
+else fail "triggers[] bead_event in_subtree_of" "triggers=$TRIGGERS"; fi
+if echo "$TRIGGERS" | jq -e '.[] | select(.kind=="cron" and .label=="fallback-watchdog") | .cron' >/dev/null 2>&1; then
+  pass "triggers[] has cron fallback-watchdog entry"
+else fail "triggers[] cron fallback-watchdog" "triggers=$TRIGGERS"; fi
+
+# ── Accelerate the event entry for the fire window ─────────────────
+# The verb bakes debounce=10m / throttle=15m (§Component 1 self-echo bound)
+# — too long for a reconcile-bound e2e. Preserve the verb's real
+# in_subtree_of match and the flipped trigger:multi label; shorten only the
+# debounce/throttle and neuter the 6h watchdog cron so the bead_event fire is
+# the ONLY thing that can spawn and it is observable within one reconcile.
+FAST_TRIGGERS=$(jq -c --arg e "$EPIC_ID" '
+  map(
+    if .kind=="bead_event" then .debounce="1s" | .throttle="1s"
+    elif .kind=="cron" then .cron="0 0 1 1 *" | .timezone="UTC"
+    else . end)' <<<"$TRIGGERS")
+if [ -z "$FAST_TRIGGERS" ] || [ "$FAST_TRIGGERS" = "null" ]; then
+  fail "accelerate triggers[] (jq rewrite)"; exit 1
+fi
+kd update "$SCHED_ID" -f "triggers=$FAST_TRIGGERS" >/dev/null 2>&1 || { fail "persist fast triggers[]"; exit 1; }
+# Re-assert the match survived the acceleration (nothing under test moved).
+# kd renders `triggers` as a JSON string when written via the typed verb path
+# but as a parsed array when written via `kd update -f`; `jq -r` then re-parse
+# handles both.
+RAW2=$(kd show "$SCHED_ID" --json 2>/dev/null)
+if echo "$RAW2" | jq -r '.fields.triggers // ""' | jq -e --arg e "$EPIC_ID" \
+    '.[] | select(.kind=="bead_event") | select(.match.op=="in_subtree_of" and .match.value==$e)' \
+    >/dev/null 2>&1; then
+  pass "accelerated triggers[] keeps in_subtree_of=$EPIC_ID match"
+else fail "accelerated triggers[] keeps in_subtree_of match"; fi
+
+RS_BEFORE=$(echo "$RAW2" | jq -r '.fields.runs_spawned // "0"')
+echo "runs_spawned before fire: $RS_BEFORE"
+
+# Give the scheduler one reconcile tick to load the flipped (trigger:multi)
+# bead before the event fires — otherwise the close-event is buffered before
+# the trigger registers.
+sleep 5
+
+# ── 3. Close the (pre-linked) in-subtree child → fire EXACTLY ONCE ─
+# The child was created + linked before the event window (above); closing it
+# now is the single fresh subtree event the flipped gardener must fire on.
+kd close "$CHILD_ID" >/dev/null 2>&1 || { fail "kd close child"; exit 1; }
+echo "closed in-subtree child $CHILD_ID at $(date -u +%FT%TZ)"
+
+# Wait for the fire: runs_spawned advances past RS_BEFORE (or last_agent_id set).
+# trigger poll ~30s, reconcile ~60s → allow 150s for load + fire.
+DEADLINE=$(( $(date +%s) + 150 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  RAW3=$(kd show "$SCHED_ID" --json 2>/dev/null)
+  RS=$(echo "$RAW3" | jq -r '.fields.runs_spawned // "0"')
+  LA=$(echo "$RAW3" | jq -r '.fields.last_agent_id // empty')
+  if [ "${RS:-0}" -gt "${RS_BEFORE:-0}" ] 2>/dev/null || [ -n "$LA" ]; then
+    FIRED=1
+    pass "flipped gardener fired on in-subtree close (runs_spawned=$RS last_agent_id=$LA)"
+    break
+  fi
+  sleep 5
+done
+if [ "$FIRED" = "0" ]; then
+  fail "flipped gardener did not fire within 150s of in-subtree close"
+  echo "--- schedule snapshot ---"; kd show "$SCHED_ID" 2>/dev/null | head -40 || true
+  exit 1
+fi
+
+# Disable further firing now that we've observed the one fire — this proves
+# "exactly once" without waiting out another whole reconcile, and stops the
+# gardener from spawning again while step 4 runs.
+kd update "$SCHED_ID" -f "enabled=false" >/dev/null 2>&1 || true
+RS_AT_FIRE=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.runs_spawned // "0"')
+
+# EXACTLY ONCE: a single subtree close must bump runs_spawned by exactly 1.
+# +2 would mean the schedule loader ALSO claimed the bead (the double-fire the
+# label move is designed to prevent) or the event fired twice.
+if [ "$(( ${RS_AT_FIRE:-0} - ${RS_BEFORE:-0} ))" -eq 1 ] 2>/dev/null; then
+  pass "fired EXACTLY once ($RS_BEFORE -> $RS_AT_FIRE; schedule loader did not double-claim)"
+else
+  fail "fired exactly once" "runs_spawned $RS_BEFORE -> $RS_AT_FIRE (want +1)"
+fi
+
+# ── 4. Mutate a bead OUTSIDE the subtree → NO additional fire ──────
+# Re-enable so the engine WOULD fire if the out-of-subtree event matched; the
+# in_subtree_of guard must reject it. Keep the fast throttle irrelevant here:
+# the point is the match, not the throttle — an unmatched event never fires.
+kd update "$SCHED_ID" -f "enabled=true" >/dev/null 2>&1 || true
+OUT_ID=$(kd create "flip-outside-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$OUT_ID" ]; then fail "create outside bead"; else
+  # No parent-child link → OUT_ID is NOT under EPIC_ID's subtree.
+  kd close "$OUT_ID" >/dev/null 2>&1 || true
+  echo "closed out-of-subtree bead $OUT_ID at $(date -u +%FT%TZ)"
+  # Hold two reconcile ticks; runs_spawned must NOT advance past the one fire.
+  echo "holding 130s to confirm the out-of-subtree close does not fire..."
+  sleep 130
+  RS_AFTER=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.fields.runs_spawned // "0"')
+  if [ "${RS_AFTER:-0}" -le "${RS_AT_FIRE:-0}" ] 2>/dev/null; then
+    pass "out-of-subtree close did NOT fire (runs_spawned held at $RS_AFTER)"
+  else
+    fail "out-of-subtree close fired" "runs_spawned $RS_AT_FIRE -> $RS_AFTER (in_subtree_of guard leaked)"
+  fi
+fi
+# Quiesce before the flip-back so no in-flight fire races the label swap.
+kd update "$SCHED_ID" -f "enabled=false" >/dev/null 2>&1 || true
+
+# ── 5. Flip back to TIMED via the real verb; assert restore ───────
+BACK=$(gb gardener mode "$SCHED_ID" --timed --json 2>&1)
+if echo "$BACK" | jq -e '.mode=="timed" and .changed==true' >/dev/null 2>&1; then
+  pass "gb gardener mode --timed flipped back (mode=timed changed=true)"
+else fail "gb gardener mode --timed back" "got=[$BACK]"; fi
+
+RAWB=$(kd show "$SCHED_ID" --json 2>/dev/null)
+LABELSB=$(echo "$RAWB" | jq -c '.labels')
+if echo "$LABELSB" | jq -e 'index("trigger:schedule") != null' >/dev/null 2>&1; then
+  pass "label trigger:schedule restored after flip-back"
+else fail "label trigger:schedule restored" "labels=$LABELSB"; fi
+if echo "$LABELSB" | jq -e 'index("trigger:multi") == null' >/dev/null 2>&1; then
+  pass "label trigger:multi removed after flip-back"
+else fail "label trigger:multi removed" "labels=$LABELSB"; fi
+CRON_BACK=$(echo "$RAWB" | jq -r '.fields.cron // ""')
+if [ "$CRON_BACK" = "$TIMED_CRON" ]; then
+  pass "cron restored from timed_cron ($CRON_BACK)"
+else fail "cron restored from timed_cron" "got=[$CRON_BACK] want=[$TIMED_CRON]"; fi
+TRIGGERS_BACK=$(echo "$RAWB" | jq -r '.fields.triggers // ""')
+if [ -z "$TRIGGERS_BACK" ] || [ "$TRIGGERS_BACK" = "null" ]; then
+  pass "triggers[] cleared after flip-back"
+else fail "triggers[] cleared after flip-back" "got=[$TRIGGERS_BACK]"; fi
+
+# ── Summary ────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "gardener-mode-flip-event-fires-once OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-mode-flip-event-fires-once scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

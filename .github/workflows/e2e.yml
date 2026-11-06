@@ -1,0 +1,1257 @@
+# Optional e2e jobs. Never a required check.
+#
+# ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+# gardenio has ~225 e2e shell modules, 68 Playwright viewer specs, 8 coop
+# specs and 7 `//go:build e2e` Go files, and NONE of them has run in GitHub
+# Actions since 8a3eb29e (2026-09-16) deleted the RWX pipelines that drove
+# them. The scripts survived; the orchestration did not. Green CI has meant
+# "unit and build level correctness" ever since, which is not what people read
+# it as. Spec: docs/superpowers/specs/2026-09-21-e2e-optional-ci-jobs-design.md
+#
+# ── TWO DOORS ───────────────────────────────────────────────────────────────
+#  1. workflow_dispatch, with a suite filter, on main or on a PR's branch.
+#     Same jq-narrowing shape as images.yml's `changes` job, so a typo yields
+#     an empty selection and a visible no-op rather than a surprise full run.
+#  2. A nightly cron on main -- the anti-rot mechanism. A dispatch-only job is
+#     green the day it lands and untested three weeks later, which is exactly
+#     how the suite rotted the first time.
+# There is no pull_request door. Until Task 7.3 part B (gd-19ECZxvFQw) an
+# `e2e` label on a PR ran every suite on every push to it (11 runs and ~490
+# wall-minutes in the week to 11-01). Pull requests run the light tier only
+# (owner rule 2026-10-31, root CLAUDE.md "CI on pull requests"); a crew that
+# needs a suite on its branch dispatches it once, with `suites` narrowed:
+#   gh workflow run e2e.yml --ref <branch> -f suites="viewer"
+#
+# Plus `push: agent/e2e-ci/**`, which is load-bearing rather than convenient:
+# a new workflow's dispatch and schedule triggers do not exist until the file
+# is on the default branch, and the crew PAT is Contents-only so a crew cannot
+# label its own PR. The push trigger is how each job is proven green on its own
+# branch. It is self-limiting and costs nothing when no such branch exists.
+name: e2e
+
+on:
+  push:
+    branches: ['agent/e2e-ci/**']
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: >-
+          Space- or comma-separated suite names to run (e.g. "viewer" or
+          "viewer coop"). Leave EMPTY to run all. Unknown names are dropped,
+          so a typo selects nothing instead of running everything.
+        required: false
+        default: ""
+      image_tag:
+        description: >-
+          Calver image tag the live lane installs (e.g. "2026.286.7"). EMPTY =
+          the newest calver tag in the checkout. Test scripts, kd and gb are
+          always HEAD; this is only the deployed daemon/controller/viewer.
+        required: false
+        default: ""
+  # The anti-rot mechanism. A dispatch-only job is green the day it lands and
+  # untested three weeks later, which is exactly how this suite rotted the
+  # first time. Hour chosen by operator decision O3 (capacity-shaped: the pool
+  # is shared with ci/checks/images and a full nightly can take 5 of 6 slots).
+  # An odd minute, because on-the-hour crons queue behind every other repo's.
+  schedule:
+    - cron: '17 9 * * *'
+
+# github.event_name MUST be in the group key. GitHub evicts the *pending* run
+# whenever a new run joins a group, regardless of cancel-in-progress -- learned
+# on images.yml (gd-R1kL4sUECV). Without the event split, a push to main at
+# 07:05 silently kills the nightly, and the nightly is the whole point.
+concurrency:
+  group: e2e-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+env:
+  # go.work pins 1.25.12; keep CI on the same minor as the Dockerfiles.
+  GO_VERSION: "1.25"
+
+jobs:
+  select:
+    name: select suites
+    runs-on: gardenio-k3s-light # light ARC scale set (gardenio/helm/ci) -- adversarially verified safe 2026-09-21, see arc-runners-light-values.yaml
+    timeout-minutes: 5
+    outputs:
+      suites: ${{ steps.pick.outputs.suites }}
+    # No checkout: this job reads the event context and the dispatch inputs
+    # and nothing else.
+    steps:
+      - name: pick suites
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          WANT: ${{ inputs.suites }}
+        run: |
+          set -euo pipefail
+          ALL='["wiring","viewer","coop","shell-hermetic","go-e2e","go-integration","landgate","live-smoke"]'
+          # Dispatch-only until the shards PR promotes it into ALL: the live
+          # lane is proven on the five-module smoke first (gd-WBz2qt9ADZ).
+          DISPATCH_ONLY='["live-shards"]'
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "${WANT:-}" ]; then
+            want_json=$(printf '%s' "$WANT" | tr ',' ' ' | tr -s ' ' '\n' | sed '/^$/d' | jq -R . | jq -sc .)
+            sel=$(jq -cn --argjson all "$ALL" --argjson extra "$DISPATCH_ONLY" --argjson want "$want_json" \
+                  '[($all + $extra)[] | select(. as $s | $want | index($s))]')
+            echo "narrowed dispatch -> $(echo "$want_json" | jq -r 'join(" ")')"
+          else
+            sel="$ALL"
+          fi
+          echo "suites=$sel" >> "$GITHUB_OUTPUT"
+          echo "selected: $(echo "$sel" | jq -r 'join(" ")')"
+
+  wiring:
+    name: wiring (select self-check)
+    needs: select
+    if: contains(fromJSON(needs.select.outputs.suites), 'wiring')
+    runs-on: gardenio-k3s-light # light ARC scale set (gardenio/helm/ci) -- adversarially verified safe 2026-09-21, see arc-runners-light-values.yaml
+    timeout-minutes: 5
+    # Permanent, and ~10 seconds. It is the cheapest possible proof that the
+    # triggers, the guard, the output plumbing and the `contains(fromJSON(...))`
+    # gate all still work -- which matters most on the dispatch and schedule
+    # paths, where nobody is watching.
+    steps:
+      - name: assert the selection is a non-empty JSON array
+        env:
+          SUITES: ${{ needs.select.outputs.suites }}
+        run: |
+          set -euo pipefail
+          echo "$SUITES" | jq -e 'type == "array" and length > 0' >/dev/null
+          echo "e2e wiring OK on ${{ github.event_name }}: $(echo "$SUITES" | jq -r 'join(" ")')"
+
+  coop:
+    name: coop-e2e (mux + fidelity)
+    needs: select
+    if: contains(fromJSON(needs.select.outputs.suites), 'coop')
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci)
+    # ~20 min expected: a cold cargo build with no cache, plus ~8 min of specs
+    # (the RWX history). 45 leaves room for a slow node without masking a hang.
+    # This is the most reclaim-exposed job in the repo; see retry-lost-runners.yml.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # TEMPORARY DIAGNOSTIC (gd-iW6lkpTi7W) -- baseline + end probes size
+      # heavy's 1900m CPU and 12Gi memory REQUESTS. CPU is the binding axis,
+      # not memory: measured 2026-09-22 18:0xZ across 8 ci nodes, 3 had CPU
+      # free for another heavy runner and 5 had memory, and the memory-short
+      # set was a strict subset of the CPU-short set. The baseline is
+      # load-bearing: it starts the anon sampler, and an end probe alone
+      # reports its own seed. Delete both once the ruling is in
+      # gardenio/helm/ci/README.md.
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "coop-baseline" }
+
+      - name: apt deps
+        # Same list as ci.yml's `rust` job -- protoc is for tonic-build in
+        # crates/cli/build.rs -- plus unzip (bun ships a .zip) and xz-utils
+        # (the Node tarball is .tar.xz).
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends build-essential protobuf-compiler libprotobuf-dev pkg-config libssl-dev tmux unzip xz-utils
+
+      - name: rustup
+        # coop/rust-toolchain.toml (channel + components) is only read on
+        # first use if this step runs INSIDE coop/. ci.yml's `rust` job gets
+        # that from a job-level `defaults.run.working-directory: coop`.
+        # THIS job cannot use a job-level default, because the apt/node/bun
+        # steps source gardenio/images/agent/install/*.env relative to the
+        # repo ROOT -- hence the per-step working-directory here.
+        #
+        # Do not drop the `coop` working-directory. There is no
+        # rust-toolchain.toml and no Cargo.toml at the repo root, so with
+        # `--default-toolchain none` BOTH halves of the last line fail there:
+        # `rustup show active-toolchain` exits 1 ("no active toolchain") and
+        # the `rustup toolchain install` fallback exits 1 ("could not choose
+        # a version of rustup to run ... no default is configured"), killing
+        # the job before it builds anything. Reproduced against rustup 1.29.1.
+        #
+        # CARGO_HOME/RUSTUP_HOME point into the node-local hostPath cache
+        # (gardenio/helm/ci/arc-runners-values.yaml) on this runner pool, so
+        # rustup installs to $CARGO_HOME/bin, NOT $HOME/.cargo/bin -- a
+        # hardcoded $HOME/.cargo/bin looks fine and then finds nothing
+        # (confirmed live: 35681380046 job 106598883785, "No such file or
+        # directory"). Same derivation and skip-if-present guard as ci.yml's
+        # `rust` job, so the toolchain also survives between jobs on a node.
+        working-directory: coop
+        run: |
+          set -euo pipefail
+          CH="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CH/bin/rustup" ]; then
+            # DO NOT collapse this back to `curl -sSf https://sh.rustup.rs | sh`.
+            # That pipeline CANNOT FAIL CORRECTLY: on a transient fetch error
+            # curl writes nothing, `sh` reads EOF and exits 0, so the install
+            # "succeeds" and the job dies much later at exit 127 -- after it has
+            # held a heavy runner for minutes. `set -o pipefail` does not save
+            # it either: a TRUNCATED body is still fed to `sh` and partly run.
+            # Download to a file, prove it is non-empty, then execute it.
+            init="$(mktemp)"
+            curl -sSfL --retry 5 --retry-delay 2 --retry-connrefused \
+                 --max-time 180 -o "$init" https://sh.rustup.rs
+            [ -s "$init" ] || { echo "::error::rustup-init downloaded empty"; exit 1; }
+            sh "$init" -y --no-modify-path --profile minimal --default-toolchain none
+            rm -f "$init"
+          fi
+          echo "$CH/bin" >> "$GITHUB_PATH"
+          "$CH/bin/rustup" show active-toolchain || "$CH/bin/rustup" toolchain install
+
+      - name: node (pinned tarball, sha256-verified)
+        run: |
+          set -euo pipefail
+          scripts/ci-fetch-node.sh tar.xz /tmp/node.tar.xz
+          sudo tar -xJ --strip-components=1 -C /usr/local -f /tmp/node.tar.xz
+          node --version
+
+      - name: bun (pinned zip, sha256-verified)
+        # Hard requirement, not a preference: lib/fidelity-server.ts:141-148
+        # calls execSync("bun build ...") from start(), unconditionally.
+        # run.sh's "bun if available, else npm" fallback covers the RUNNER only
+        # and obscures this. Same pins as images/agent/install/clis.sh.
+        run: |
+          set -euo pipefail
+          . gardenio/images/agent/install/versions.env
+          . gardenio/images/agent/install/checksums.env
+          curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" -o /tmp/bun.zip
+          echo "${BUN_SHA256_X86_64}  /tmp/bun.zip" | sha256sum -c --status -
+          sudo unzip -q -j /tmp/bun.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/bun
+          sudo ln -sf /usr/local/bin/bun /usr/local/bin/bunx
+          bun --version
+
+      - name: build coopmux (debug)
+        # DEBUG, not release: playwright.config.ts:11-14 defaults MUX_BIN to
+        # ../../target/debug/coopmux and Playwright's webServer launches it.
+        working-directory: coop
+        run: cargo build -p coopmux
+
+      - name: locate coopmux binary
+        # CARGO_TARGET_DIR points into the node-local hostPath cache
+        # (gardenio/helm/ci/arc-runners-values.yaml: /cache/cargo-target), so
+        # the binary does NOT land at coop/target/debug/coopmux -- playwright
+        # test's webServer then shells out to a path that doesn't exist
+        # (confirmed live: 35681511189 job 106599308656, "not found", exit
+        # 127). Mirrors ci.yml's `rust` job "locate coop binary" step. The
+        # guard is shell, not `if:`, because the `env` context only sees vars
+        # declared in the workflow, not ones the runner container was started
+        # with -- that condition would read empty and silently never run.
+        run: |
+          if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+            echo "MUX_BIN=$CARGO_TARGET_DIR/debug/coopmux" >> "$GITHUB_ENV"
+          fi
+
+      - name: web deps for the fidelity server
+        # fidelity-server.ts serves @xterm/xterm out of crates/web/node_modules
+        # at request time (:35-40, :88-104). crates/web has bun.lock only.
+        working-directory: coop/crates/web
+        run: bun install --frozen-lockfile
+
+      - name: playwright install (chromium)
+        # run.sh omits --with-deps, so the system libs must come from here.
+        working-directory: coop/tests/e2e
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          DEBIAN_FRONTEND=noninteractive node_modules/.bin/playwright install-deps chromium
+          node_modules/.bin/playwright install chromium
+
+      - name: playwright test
+        # CI=1 -> retries:1 and the json reporter (playwright.config.ts:20-25).
+        working-directory: coop/tests/e2e
+        env:
+          CI: "1"
+        run: node_modules/.bin/playwright test
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coop-e2e-report
+          path: coop/tests/e2e/results/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "coop-end" }
+
+  shell-hermetic:
+    name: shell-hermetic (run-shard.sh subset)
+    needs: select
+    if: contains(fromJSON(needs.select.outputs.suites), 'shell-hermetic')
+    runs-on: gardenio-k3s-medium # no dind: this job has no `services:` block. Measured peak 2039Mi against a 4Gi limit (gardenio/helm/ci/arc-runners-medium-values.yaml).
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # TEMPORARY DIAGNOSTIC (4 probes, .github/actions/peak-memory) -- delete
+      # these once the tier decision below is recorded in
+      # gardenio/helm/ci/README.md, per that action's own standing instruction.
+      #
+      # WHY THIS JOB. Measured 2026-09-22 16:53Z, the heavy set was pinned at
+      # 10/10 while light sat at 0/10 and medium at 2/6 with nodes free. EIGHT
+      # of the ten heavy slots were e2e, from just two concurrent e2e runs, and
+      # golangci-lint + four `build + test` jobs were starved behind them. Each
+      # e2e run claims FOUR heavy slots, and this is one of the four.
+      #
+      # It is the only one of the four that has no structural claim on heavy:
+      # it declares no `services:`, needs no dind and touches no cluster (the
+      # lint step below enforces exactly that). viewer-e2e and go-e2e use
+      # service containers and can never leave. So if this job fits medium,
+      # that is 1 slot in every 4 an e2e run takes -- 25% of e2e's heavy
+      # footprint -- recovered without touching any maxRunners.
+      #
+      # WHY MEASURE RATHER THAN JUST MOVE IT. Medium limits at 4Gi, and an
+      # exceeded limit is indistinguishable from a spot reclaim to
+      # retry-lost-runners.yml, so an undersized job fails three times before
+      # it goes red. The same "obvious" demotion was guessed wrong once already
+      # in the expensive direction: the `security` job looked like a lock and
+      # measured 7967Mi. Read `anonmax`, NOT `peak` -- peak includes
+      # reclaimable page cache, and both Go builds below generate plenty.
+      #
+      # WHY FOUR PROBES AND NOT ONE. The suspected driver is not the shell
+      # modules at all, it is the two Go builds; a single end-of-job number
+      # cannot tell those apart, and picking the wrong one would mean "cache
+      # the build" when the answer was "this job cannot leave heavy". The
+      # baseline is deliberately its own probe because a seeded floor has
+      # misread this exact way before -- a baseline moved lint-go from 63Mi to
+      # 5889Mi -- so treat a `samp=started` line as a seed, not a high-water
+      # mark, and take two runs before ruling.
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: hermetic-baseline, reset: "true" }
+
+      - name: apt deps
+        # The modules build and run Go probes; several shell out to python3.
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends build-essential python3
+
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: after-apt, reset: "true" }
+
+      - name: lint the hermetic set
+        # Runs first and takes <1s. If a module in HERMETIC_MODULES has
+        # acquired a cluster dependency, fail here with the module named rather
+        # than 15 minutes later with an opaque module failure.
+        run: ./gardenio/tests/e2e/scripts/test-hermetic-set-lint.sh
+
+      - name: build gb and kd
+        # No module in the hermetic set calls them (the lint enforces that), but
+        # the driver's own banner and several modules' preludes resolve them,
+        # and a missing binary turns a clean run into a confusing one.
+        run: |
+          set -euo pipefail
+          (cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/gb ./cmd/gb/)
+          (cd kbeads && GOWORK=off CGO_ENABLED=0 go build -o /tmp/kd ./cmd/kd/)
+          sudo install /tmp/gb /usr/local/bin/gb
+          sudo install /tmp/kd /usr/local/bin/kd
+
+      # The probe that decides this: two full Go builds against medium's 4Gi.
+      # If anonmax clears here, the shard itself is shell and is not going to
+      # be what blocks the move.
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: after-go-builds, reset: "true" }
+
+      - name: run the hermetic shard
+        # cwd MUST be the repo root: run-shard.sh's registry entries are
+        # repo-relative (./gardenio/tests/e2e/scripts/test-*.sh).
+        env:
+          HERMETIC_ONLY: "1"
+        run: ./gardenio/tests/e2e/scripts/run-shard.sh
+
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: after-shard }
+
+      - name: summarise
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f junit-results-0/e2e-results.jsonl ]; then
+            echo "### shell-hermetic results" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            jq -r '"\(.status)\t\(.duration_s)s\t\(.name)\(if .skip_reason then "  -- " + .skip_reason else "" end)"' \
+              junit-results-0/e2e-results.jsonl >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shell-hermetic-junit
+          path: junit-results-0/
+          retention-days: 7
+          if-no-files-found: warn
+
+  viewer:
+    name: viewer-e2e (playwright)
+    needs: select
+    if: contains(fromJSON(needs.select.outputs.suites), 'viewer')
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci)
+    timeout-minutes: 25
+    # Recipe ported from the deleted RWX pipeline, preserved byte-identical at
+    # docs/archive/rwx/root/ci.yml:2757-2947 (`test-beads-viewer-e2e`).
+    # Postgres mechanism decided by the T1 spike: docs/ci-e2e-postgres-recipe.md
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: beads
+          POSTGRES_PASSWORD: beads
+          POSTGRES_DB: beads
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U beads"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # TEMPORARY DIAGNOSTIC (gd-iW6lkpTi7W) -- baseline + end probes size
+      # heavy's 1900m CPU and 12Gi memory REQUESTS. CPU is the binding axis,
+      # not memory: measured 2026-09-22 18:0xZ across 8 ci nodes, 3 had CPU
+      # free for another heavy runner and 5 had memory, and the memory-short
+      # set was a strict subset of the CPU-short set. The baseline is
+      # load-bearing: it starts the anon sampler, and an end probe alone
+      # reports its own seed. Delete both once the ruling is in
+      # gardenio/helm/ci/README.md.
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "viewer-baseline" }
+
+      # cache: false -- an Actions cache upload once took 18 minutes over the
+      # home uplink and timed out an otherwise green job (ci.yml:59-62).
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: apt deps
+        # xz-utils: the runner image has no xz and the Node tarball is .tar.xz.
+        # postgresql-client: for the CREATE EXTENSION below.
+        #
+        # NO build-essential. It was here and nothing in this job compiles C:
+        #   * both Go builds below set CGO_ENABLED=0 explicitly;
+        #   * `npm ci` has exactly one package with an install script,
+        #     fsevents, which is darwin-only and optional, so it is never
+        #     built on this runner;
+        #   * `playwright install-deps` apt-installs a fixed list of browser
+        #     RUNTIME libraries (libnss3 and friends). It does not build
+        #     anything and does not want a toolchain.
+        # apt reports ~252 MB for build-essential, on a heavy-tier node, for
+        # nothing. The same finding removed the `apt deps` step from ci.yml's
+        # `go` matrix entirely (2eccf604) -- see the long note there.
+        #
+        # coop-e2e above DOES need it: rustc shells out to `cc` as its linker.
+        # Do not "unify" the two apt lines.
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends xz-utils postgresql-client
+
+      - name: node (pinned tarball, sha256-verified)
+        # Same pins the agent image uses (images/agent/install/node.sh), sourced
+        # from the same two files, so CI and the image cannot drift apart.
+        run: |
+          set -euo pipefail
+          scripts/ci-fetch-node.sh tar.xz /tmp/node.tar.xz
+          sudo tar -xJ --strip-components=1 -C /usr/local -f /tmp/node.tar.xz
+          node --version
+          npm --version
+
+      - name: create the vector extension
+        # migrate_preflight.go:44-69 queries pg_available_extensions and refuses
+        # to migrate without it; 005_bead_embeddings is the consumer.
+        env:
+          PGPASSWORD: beads
+        run: |
+          set -euo pipefail
+          psql -h localhost -U beads -d beads -v ON_ERROR_STOP=1 \
+            -c "CREATE EXTENSION IF NOT EXISTS vector;"
+          psql -h localhost -U beads -d beads -tAc \
+            "SELECT extversion FROM pg_extension WHERE extname='vector';"
+
+      - name: build kd and put it on PATH
+        # seed/seed.mjs shells out to a bare `kd` (seed.mjs:41-55) -- there is
+        # no KD_BIN override -- so it must be installed, not just built.
+        run: |
+          set -euo pipefail
+          (cd kbeads && GOWORK=off CGO_ENABLED=0 go build -o /tmp/kd ./cmd/kd/)
+          sudo install /tmp/kd /usr/local/bin/kd
+          kd --version || true
+
+      - name: build beads-viewer
+        # Without BEADS_VIEWER_BIN, playwright.config.js's webServer.command
+        # falls back to `go run ./gardenio/controller/cmd/beads-viewer` and
+        # compiles inside the 120s webServer timeout.
+        # fetch-vendored.sh first: mermaid.min.js and echarts.min.js are not in
+        # git (gd-wNQzR9ptZI), and the binary embeds whatever is on disk.
+        run: |
+          set -euo pipefail
+          gardenio/controller/cmd/beads-viewer/fetch-vendored.sh
+          GOWORK="$(pwd)/go.work" CGO_ENABLED=0 \
+            go build -o /tmp/beads-viewer ./gardenio/controller/cmd/beads-viewer
+          test -x /tmp/beads-viewer
+
+      - name: playwright install (chromium + firefox)
+        # PLAYWRIGHT_BROWSERS_PATH=0 puts browsers inside node_modules; it must
+        # match between install and run or every spec dies at browserType.launch.
+        # firefox is not optional: popover_constellation.spec.js is the sole
+        # firefox project in playwright.config.js.
+        working-directory: gardenio/tests/beads-viewer-e2e
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          DEBIAN_FRONTEND=noninteractive node_modules/.bin/playwright install-deps chromium firefox
+          node_modules/.bin/playwright install chromium firefox
+          shell="$(find node_modules/playwright-core/.local-browsers \
+            -name chrome-headless-shell -type f 2>/dev/null | head -1 || true)"
+          if [ -z "$shell" ] || [ ! -x "$shell" ]; then
+            echo "FATAL: playwright install did not place an executable chrome-headless-shell" >&2
+            ls -la node_modules/playwright-core/.local-browsers >&2 || true
+            exit 1
+          fi
+          echo "OK: chrome-headless-shell at $shell"
+
+      - name: start kd serve, seed fixtures, restart authenticated
+        # TWO-PHASE DAEMON (gd-VePVNUxf0y). The seed creates type:user beads
+        # carrying identity fields (email, ...). Since #246/#252 the daemon
+        # refuses those from a static token (user_identity_authz.go
+        # denyUserIdentityFields: 403 "requires gardenio-admin") -- the
+        # take-over hole that gate closes. The gate is deliberately left
+        # alone; the suite instead uses the one mode it legitimately admits:
+        # a daemon with NO auth configured (authMethodNone, "dev/test mode").
+        #
+        #   phase 1: BEADS_AUTH_TOKEN unset -> seed.mjs creates every fixture.
+        #   phase 2: restart with auth ON. The shared static token is retired
+        #            (gd-ke6PC7bRto), so the specs authenticate with a
+        #            privileged FLEET token (BEADS_FLEET_MAP +
+        #            BEADS_PRIVILEGED_FLEETS) and exercise the real write
+        #            gates. A fleet token takes its identity from the
+        #            credential: the viewer's X-Actor override (ka-0000006262)
+        #            is no longer honoured. A spec that writes as an agent
+        #            mints that agent's own per-agent token (tests/_oidc.js
+        #            mintAgentToken) as the token-mint machine principal
+        #            BEADS_MACHINE_CLIENTS registers, the way the controller
+        #            does in prod.
+        #
+        # State is in Postgres, so the restart loses nothing. The playwright
+        # step sets BEADS_VIEWER_E2E_SKIP_SEED=1: re-running the seed under
+        # the token would only echo back the same identity values, but it adds
+        # nothing and the token path is exactly what must not be depended on.
+        #
+        # BEADS_HTTP_ADDR is a LISTEN SPEC here (":8080") and a URL later for
+        # the seed -- same variable, two meanings. BEADS_NATS_URL must be unset:
+        # kd serve fails closed against an unreachable NATS (cmd/kd/serve.go).
+        # BEADS_OPERATED_BY is required for the seed: without it the first kd
+        # create returns HTTP 400 "operator could not be resolved".
+        working-directory: gardenio/tests/beads-viewer-e2e
+        env:
+          OIDC_STUB_DIR: /tmp/oidc-stub
+        run: |
+          set -euo pipefail
+          export BEADS_DATABASE_URL="postgres://beads:beads@localhost:5432/beads?sslmode=disable"
+          export BEADS_GRPC_ADDR=":9090"
+          export BEADS_METRICS_ADDR=":9091"
+          export BEADS_RATE_LIMIT_ENABLED=false
+          unset BEADS_NATS_URL || true
+
+          start_daemon() { # $1 = log file
+            BEADS_HTTP_ADDR=":8080" nohup kd serve > "$1" 2>&1 &
+            echo $! > /tmp/kd.pid
+            # The daemon serves /v1/health/live. It has NO /healthz -- the old
+            # RWX poll silently ran all 60 iterations against one (ci.yml:2873-2878).
+            for i in $(seq 1 60); do
+              if curl -sf http://localhost:8080/v1/health/live >/dev/null 2>&1; then
+                echo "kd serve live after ${i}s"
+                return 0
+              fi
+              if ! kill -0 "$(cat /tmp/kd.pid)" 2>/dev/null; then
+                echo "kd serve exited early; log:" >&2
+                cat "$1" >&2
+                return 1
+              fi
+              sleep 1
+            done
+            echo "kd serve never became live; log:" >&2
+            cat "$1" >&2
+            return 1
+          }
+
+          echo "=== phase 1: auth-disabled daemon, seed ==="
+          unset BEADS_AUTH_TOKEN BEADS_FLEET_MAP BEADS_PRIVILEGED_FLEETS BEADS_MACHINE_CLIENTS || true
+          start_daemon /tmp/kd-serve-seed.log
+          BEADS_HTTP_ADDR=http://localhost:8080 \
+          BEADS_OPERATED_BY=oidc:e2e-fixture@example.com \
+            node seed/seed.mjs
+          kill "$(cat /tmp/kd.pid)"
+          for i in $(seq 1 30); do
+            kill -0 "$(cat /tmp/kd.pid)" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$(cat /tmp/kd.pid)" 2>/dev/null; then
+            echo "kd serve (phase 1) did not stop; log:" >&2
+            cat /tmp/kd-serve-seed.log >&2
+            exit 1
+          fi
+
+          # Harness OIDC issuer (gd-ZTu68qjfEC): stands in for Keycloak so the
+          # specs that need a human principal (answering a decision, gardener
+          # admin writes) take the prod path, a verified user bearer, instead
+          # of the e2e fleet token, which kbeads refuses for those writes. It must be up
+          # before phase 2: the daemon discovers it at start. The daemon and
+          # the OIDC-mode viewer trust its self-signed cert via SSL_CERT_FILE
+          # (a bundle of the system roots plus that cert). playwright.config.js
+          # boots the OIDC viewer when it finds $OIDC_STUB_DIR/state.json.
+          echo "=== OIDC stub issuer ==="
+          rm -rf "$OIDC_STUB_DIR"
+          nohup node oidc-stub/server.mjs > /tmp/oidc-stub.log 2>&1 &
+          echo $! > /tmp/oidc-stub.pid
+          for i in $(seq 1 30); do
+            [ -f "$OIDC_STUB_DIR/state.json" ] && break
+            if ! kill -0 "$(cat /tmp/oidc-stub.pid)" 2>/dev/null; then
+              echo "oidc stub exited early; log:" >&2
+              cat /tmp/oidc-stub.log >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          cat /tmp/oidc-stub.log
+          stub() { node -p "require('$OIDC_STUB_DIR/state.json').$1"; }
+          issuer="$(stub issuer)"
+          curl -sf --cacert "$OIDC_STUB_DIR/tls.crt" "$issuer/.well-known/openid-configuration" >/dev/null
+
+          echo "=== phase 2: authenticated daemon for the specs ==="
+          export BEADS_FLEET_MAP="e2e-fleet-token:e2e-admin"
+          export BEADS_PRIVILEGED_FLEETS="e2e-admin"
+          # oidc-stub/mint.mjs TOKEN_MINT_CLIENT: the specs mint per-agent
+          # tokens with its service-account bearer.
+          export BEADS_MACHINE_CLIENTS="gardenio-e2e-token-mint"
+          BEADS_OIDC_AUDIENCE="$(stub audience)"
+          SSL_CERT_FILE="$(stub caBundleFile)"
+          export BEADS_OIDC_ISSUER_URL="$issuer" BEADS_OIDC_AUDIENCE SSL_CERT_FILE
+          start_daemon /tmp/kd-serve.log
+          if ! grep -q "OIDC auth enabled" /tmp/kd-serve.log; then
+            echo "kd serve did not enable OIDC against the stub; log:" >&2
+            cat /tmp/kd-serve.log >&2
+            exit 1
+          fi
+
+      - name: playwright test
+        # CI=1 makes playwright.config.js set forbidOnly, retries:1, workers:2.
+        # BEADS_OPERATED_BY is required: without it seed.mjs's first kd create
+        # returns HTTP 400 "operator could not be resolved".
+        #
+        # BEADS_VIEWER_DEV_AUTH_BYPASS_ACK_AGENT_POD=1: the runner IS a K8s pod
+        # (gardenio-k3s ARC), so it always has a SA token mounted at
+        # /var/run/secrets/kubernetes.io/serviceaccount/token. Without this ack,
+        # beads-viewer's dev_auth.go refuses the config's
+        # BEADS_VIEWER_DEV_AUTH_BYPASS=1 as a prod-like environment and the
+        # webServer process exits 1 before Playwright can reach it (discovered
+        # on the first CI run of this job -- run 35681235219). Playwright's
+        # webServer.env merges onto process.env, so setting it here reaches the
+        # spawned beads-viewer despite playwright.config.js being unchanged.
+        # Also forces beads-viewer's LISTEN_ADDR to loopback, which matches how
+        # the config already reaches it (baseURL is http://localhost:$PORT).
+        working-directory: gardenio/tests/beads-viewer-e2e
+        env:
+          BEADS_HTTP_ADDR: http://localhost:8080
+          BEADS_AUTH_TOKEN: e2e-fleet-token
+          BEADS_DAEMON_TOKEN: e2e-fleet-token
+          BEADS_OPERATED_BY: oidc:e2e-fixture@example.com
+          # Fixtures were seeded by the previous step (auth-disabled daemon).
+          BEADS_VIEWER_E2E_SKIP_SEED: "1"
+          BEADS_VIEWER_BIN: /tmp/beads-viewer
+          BEADS_VIEWER_DEV_AUTH_BYPASS_ACK_AGENT_POD: "1"
+          # The stub the previous step started; its state.json makes
+          # playwright.config.js boot the OIDC-mode viewer (gd-ZTu68qjfEC).
+          OIDC_STUB_DIR: /tmp/oidc-stub
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+          CI: "1"
+        run: npm test
+
+      - name: kd serve log
+        if: always()
+        run: |
+          mkdir -p gardenio/tests/beads-viewer-e2e/test-results
+          cp -f /tmp/kd-serve.log gardenio/tests/beads-viewer-e2e/test-results/kd-serve.log 2>/dev/null || true
+          cp -f /tmp/kd-serve-seed.log gardenio/tests/beads-viewer-e2e/test-results/kd-serve-seed.log 2>/dev/null || true
+          cp -f /tmp/oidc-stub.log gardenio/tests/beads-viewer-e2e/test-results/oidc-stub.log 2>/dev/null || true
+          echo "=== kd-serve-seed.log ==="
+          cat /tmp/kd-serve-seed.log 2>/dev/null || true
+          echo "=== kd-serve.log ==="
+          cat /tmp/kd-serve.log 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: viewer-e2e-report
+          path: gardenio/tests/beads-viewer-e2e/test-results/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "viewer-end" }
+
+  go-integration:
+    name: go-integration (-tags integration)
+    needs: select
+    if: contains(fromJSON(needs.select.outputs.suites), 'go-integration')
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci)
+    timeout-minutes: 30
+    # Match what we ship, exactly as ci.yml's go matrix does: every production
+    # build of both modules is CGO_ENABLED=0, and neither has a third-party cgo
+    # dependency, so building with cgo here would test a variant of
+    # `net`/`os/user` that no release contains.
+    env:
+      CGO_ENABLED: 0
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: beads
+          POSTGRES_PASSWORD: beads
+          POSTGRES_DB: beads
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U beads"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: apt deps
+        # postgresql-client ONLY: for the CREATE EXTENSION below.
+        #
+        # This step used to install `build-essential` and `libicu-dev` on the
+        # theory that the kbeads test suite needs ICU for unicode
+        # normalization. It does not. `go list -tags integration -deps
+        # ./internal/store/postgres/...` pulls no ICU package and no
+        # third-party cgo dependency at all -- the only cgo-implicated
+        # packages are stdlib (`runtime/cgo`, `net`, `os/user`), and the
+        # third-party deps are pure Go. ci.yml's matrix was cited as saying
+        # the same; it says the opposite as of 2eccf604, which deleted the
+        # identical install and left a DO-NOT-ADD-ONE-BACK banner where it
+        # used to be. 252 MB of packages that bought nothing.
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends postgresql-client
+
+      - name: create the vector extension
+        env:
+          PGPASSWORD: beads
+        run: |
+          set -euo pipefail
+          psql -h localhost -U beads -d beads -v ON_ERROR_STOP=1 \
+            -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+      - name: go test -tags integration (kbeads)
+        # Scoped to ./internal/store/postgres/... on purpose. `-tags integration`
+        # is ADDITIVE -- it lets the constrained files into the build, it does
+        # NOT narrow what `./...` expands to. `-tags integration ./...` would run
+        # all 21 kbeads test packages (506 _test.go files), not the 24 tagged
+        # ones this job exists for. Do not "simplify" this back to ./...
+        #
+        # NO continue-on-error here, job- or step-level (gd-Ai6ekNov28): a
+        # step-level one turns this step's failure into success, so the job
+        # would stay green with kbeads integration tests failing. The
+        # controller step below uses `if: !cancelled()` instead, so it still
+        # runs (and its skip stays visible) after a failure here.
+        working-directory: kbeads
+        env:
+          BEADS_TEST_DATABASE_URL: postgres://beads:beads@localhost:5432/beads?sslmode=disable
+        run: |
+          set -o pipefail
+          go test -tags integration -v ./internal/store/postgres/... -count=1 2>&1 | tee /tmp/go-integration-kbeads.log
+
+      - name: go test -tags integration (controller)
+        # One file: cmd/edge-auth/pat_integration_test.go, gated on
+        # GITLAB_TEST_URL/GITLAB_TEST_GROUP. It skips, and skipping is correct
+        # -- it needs a real GitLab instance. Run it anyway so the skip is
+        # visible rather than assumed.
+        #
+        # Scoped to ./cmd/edge-auth/... for the same additive-tag reason as the
+        # kbeads step above, and for a second one: a module-wide run pulls in
+        # cmd/gb/real_catalog_budget_test.go (plain `package main`, no build
+        # constraint), whose TestRealCatalogSnapshotFreshness HARD-fails once the
+        # pinned advice-catalog snapshot passes hardSnapshotAge = 14d. It is
+        # already past that, which is why ci.yml:145 runs
+        # `-skip 'TestRealCatalogSnapshotFreshness'`. Scoping avoids it outright;
+        # if you ever do widen this step, carry that -skip across.
+        if: ${{ !cancelled() }}
+        working-directory: gardenio/controller
+        run: |
+          set -o pipefail
+          go test -tags integration -v ./cmd/edge-auth/... -count=1 2>&1 | tee /tmp/go-integration-controller.log
+
+      - name: failure census
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "### go-integration" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -hE '^\s*---\s+(FAIL|SKIP)' /tmp/go-integration-*.log >> "$GITHUB_STEP_SUMMARY" || echo "(no failures or skips)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-integration-log
+          path: /tmp/go-integration-*.log
+          retention-days: 14
+          if-no-files-found: warn
+
+  go-e2e:
+    name: go-e2e (-tags e2e, controller)
+    needs: select
+    if: contains(fromJSON(needs.select.outputs.suites), 'go-e2e')
+    runs-on: gardenio-k3s-medium # no dind: this job has no `services:` block. Measured anonmax 2109Mi against a 4Gi limit (gardenio/helm/ci/arc-runners-medium-values.yaml).
+    timeout-minutes: 20
+    # No matrix: all seven //go:build e2e files are in gardenio/controller.
+    # kbeads has none -- its *_e2e_test.go files are untagged httptest tests
+    # that ci.yml already runs -- so a kbeads leg here would re-run 506 test
+    # files, with cgo and libicu, to assert nothing. The `tagged set` guard
+    # below is what catches the day that stops being true.
+    #
+    # Appended at the end of the file, not "after shell-hermetic" as the T7
+    # task doc says: Task 6 (shell-hermetic) has not landed on main yet, so
+    # that job doesn't exist here to append after. Job order in this file has
+    # no functional effect -- only `needs:` does, and this job's only need is
+    # `select` -- so there is nothing to fix up once shell-hermetic lands.
+    defaults:
+      run:
+        working-directory: gardenio/controller
+    steps:
+      - uses: actions/checkout@v4
+
+      # TEMPORARY DIAGNOSTIC (gd-iW6lkpTi7W) -- baseline + end probes size
+      # heavy's 1900m CPU and 12Gi memory REQUESTS. CPU is the binding axis,
+      # not memory: measured 2026-09-22 18:0xZ across 8 ci nodes, 3 had CPU
+      # free for another heavy runner and 5 had memory, and the memory-short
+      # set was a strict subset of the CPU-short set. The baseline is
+      # load-bearing: it starts the anon sampler, and an end probe alone
+      # reports its own seed. Delete both once the ruling is in
+      # gardenio/helm/ci/README.md.
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "go-e2e-baseline" }
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: apt deps
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends build-essential
+
+      - name: tagged set has not drifted
+        # The test step runs an explicit PACKAGE LIST, not ./..., because
+        # `-tags e2e` is ADDITIVE -- it admits the constrained files, it does
+        # not narrow what ./... expands to (see the T7 task doc, Step 1). A
+        # hand-written list can go stale silently, and silent coverage loss is
+        # the exact failure this whole plan is repairing, so assert it instead.
+        working-directory: .
+        run: |
+          set -euo pipefail
+          expected='gardenio/controller/cmd/controller
+          gardenio/controller/cmd/landgate
+          gardenio/controller/internal/bridge
+          gardenio/controller/internal/claudemore'
+          actual="$(grep -rln '^//go:build.*\be2e\b' --include='*.go' \
+            --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.worktrees --exclude-dir=archive . \
+            | xargs -r -n1 dirname | sed 's|^\./||' | sort -u)"
+          if [ "$(echo "$expected" | sed 's/^ *//')" != "$actual" ]; then
+            echo "::error::the set of packages holding //go:build e2e files has changed" >&2
+            diff <(echo "$expected" | sed 's/^ *//') <(echo "$actual") >&2 || true
+            echo "Update BOTH this guard and the package list in the test step below." >&2
+            exit 1
+          fi
+
+      - name: build gb and put it on PATH
+        # subagentstop_e2e_test.go and hooks_natsrelay_e2e_test.go LookPath
+        # $GB_BIN (default "gb") and skip without it. They embed their own NATS
+        # server, so once gb exists they run for free -- and a silent skip here
+        # would be two of the five runnable files quietly doing nothing.
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build -o /tmp/gb ./cmd/gb/
+          sudo install /tmp/gb /usr/local/bin/gb
+
+      - name: go test -tags e2e
+        # The other tagged files gate on a live cluster, a live daemon,
+        # Postgres or GARDENER_EMIT_BEAD_ID and skip LOUDLY without
+        # them. -v so those skips are visible: a silent skip is how this
+        # coverage disappeared in the first place.
+        #
+        # The package list is the packages that hold the tagged files,
+        # asserted by the guard above. cmd/landgate's two-tenant test skips
+        # here (no Postgres); the `landgate` job below runs it. NOT ./... -- see the T7 task
+        # doc, Step 1. Tee the log so the census below reads it instead of
+        # running the whole tier a second time.
+        run: |
+          set -o pipefail
+          go test -tags e2e -v -count=1 \
+            ./cmd/controller/... ./cmd/landgate/... ./internal/bridge/... ./internal/claudemore/... \
+            2>&1 | tee /tmp/go-e2e-controller.log
+
+      - name: skip census
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "### go-e2e skips (controller)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^\s*---\s+SKIP' /tmp/go-e2e-controller.log >> "$GITHUB_STEP_SUMMARY" || echo "(none)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: ./.github/actions/peak-memory
+        if: always()
+        with: { label: "go-e2e-end" }
+
+  landgate:
+    name: landgate (two-tenant mutual invisibility)
+    needs: select
+    if: contains(fromJSON(needs.select.outputs.suites), 'landgate')
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci); `services:` needs dind
+    timeout-minutes: 20
+    # Lands boundary gd-uYNbyW4a9Z §6 step 11 (gd-ParwLpmgID), the live twin of
+    # 10.6's cross-land matrix: a real `kd serve` on Postgres trusting a
+    # Keycloak-shaped test issuer, a landgate per land in front of it, and one
+    # tenant per land. Each tenant must never read, change or create in the
+    # other's land, through either gate or straight at the daemon. Nightly via
+    # ALL. LANDGATE_E2E_REQUIRED=1 turns a missing rig into a failure, not a
+    # skip.
+    env:
+      CGO_ENABLED: 0
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: beads
+          POSTGRES_PASSWORD: beads
+          POSTGRES_DB: beads
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U beads"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: apt deps
+        # postgresql-client only, for the CREATE EXTENSION below.
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends postgresql-client
+
+      - name: create the vector extension
+        env:
+          PGPASSWORD: beads
+        run: |
+          set -euo pipefail
+          psql -h localhost -U beads -d beads -v ON_ERROR_STOP=1 \
+            -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+      - name: build kd
+        working-directory: kbeads
+        run: go build -o /tmp/kd ./cmd/kd/
+
+      - name: go test -tags e2e (two tenants)
+        working-directory: gardenio/controller
+        env:
+          LANDGATE_E2E_KD: /tmp/kd
+          LANDGATE_E2E_DATABASE_URL: postgres://beads:beads@localhost:5432/beads?sslmode=disable
+          LANDGATE_E2E_REQUIRED: "1"
+        run: go test -tags e2e -v -count=1 -run TestTwoTenantMutualInvisibility ./cmd/landgate/
+
+  # ── Live-namespace lane (gd-WBz2qt9ADZ) ─────────────────────────────────────
+  # The first thing since 8a3eb29e (2026-09-16) to run run-shard.sh against a
+  # cluster. Design: docs/superpowers/specs/2026-10-13-e2e-live-namespace-lane-design.md.
+  #
+  #   live-setup ──┬── live-smoke ──────────┐
+  #                └── live-shard [0..3] ───┴── live-report ── live-teardown (always)
+  #
+  # Every lane job runs on `gardenio-k3s-e2e`: the medium tier's shape with the
+  # `gardenio-e2e-runner` ServiceAccount, which holds ONE namespaced Role in
+  # each pool namespace (gardenio-e2e-0/1) and nothing cluster-scoped
+  # (gardenio/tests/e2e/lane/rbac/namespace-pool.yaml). The medium/heavy sets
+  # carry no cluster credential, which is why this is a fourth scale set rather
+  # than a `runs-on: gardenio-k3s-medium`. Zero heavy slots are claimed.
+  #
+  # The namespace is LEASED from a fixed pool, not created per run (RBAC cannot
+  # restrict `create namespaces` by name), and wiped on both ends; lane.sh
+  # sweeps a lease whose run died (spot reclaim) before reusing it. The chart
+  # is installed at the newest calver tag with HEAD test scripts and HEAD
+  # kd/gb; run-shard.sh's context banner prints the skew on every shard.
+  live-setup:
+    name: live-setup (lease a pool namespace, install the chart)
+    needs: select
+    if: >-
+      contains(fromJSON(needs.select.outputs.suites), 'live-smoke') ||
+      contains(fromJSON(needs.select.outputs.suites), 'live-shards')
+    runs-on: gardenio-k3s-e2e # e2e ARC scale set: medium shape + gardenio-e2e-runner SA (gardenio/tests/e2e/lane/arc-runners-e2e-values.yaml)
+    # acquire polls up to 20m when both pool namespaces are held, helm --wait
+    # is 12m, wait-for-stack-ready.sh is 7m. 45 fails a wedged install well
+    # before the shards would have started on it.
+    timeout-minutes: 45
+    outputs:
+      namespace: ${{ steps.acquire.outputs.namespace }}
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags: lane.sh newest-tag picks the newest calver tag in the checkout.
+          # Tags are refs, so a blobless clone has them all (scripts/check-ci-blobless.py).
+          fetch-depth: 0
+          filter: blob:none
+      - uses: ./.github/actions/lane-tools
+      - name: resolve the image tag
+        id: tag
+        env:
+          E2E_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          tag="$(./gardenio/tests/e2e/scripts/lane.sh newest-tag)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "deploying image tag $tag; test scripts + kd/gb are HEAD ($GITHUB_SHA)"
+      - name: acquire a pool namespace
+        id: acquire
+        run: |
+          set -euo pipefail
+          ns="$(./gardenio/tests/e2e/scripts/lane.sh acquire)"
+          echo "namespace=$ns" >> "$GITHUB_OUTPUT"
+          echo "leased $ns"
+      # kubectl auth can-i from the runner's own token: every ceiling verb
+      # (resourcequotas, limitranges, namespaces, cluster RBAC) and the
+      # escalate/bind verbs on roles (the way around the ceiling: write a Role
+      # that grants them, bind it to yourself) must be "no" before anything is
+      # installed (gd-LXD71HHC8n, gd-LvbhX557UD). Then the positive control:
+      # create a Role granting update resourcequotas as the runner (server-side
+      # dry run) and demand Forbidden from the API's escalation check. install
+      # re-runs all of it too.
+      - name: prove the runner cannot touch the quota ceiling, the namespace, or escalate/bind RBAC
+        run: ./gardenio/tests/e2e/scripts/lane.sh assert-tenant "${{ steps.acquire.outputs.namespace }}"
+      - name: install the chart and wait for the stack
+        run: ./gardenio/tests/e2e/scripts/lane.sh install "${{ steps.acquire.outputs.namespace }}" "${{ steps.tag.outputs.tag }}"
+      - name: seed e2e fixtures
+        run: ./gardenio/tests/e2e/scripts/lane.sh seed "${{ steps.acquire.outputs.namespace }}"
+      - name: stack state on failure
+        if: failure() && steps.acquire.outputs.namespace != ''
+        run: |
+          kubectl -n "${{ steps.acquire.outputs.namespace }}" get pods,deploy,sts,pvc -o wide || true
+          kubectl -n "${{ steps.acquire.outputs.namespace }}" get events --sort-by=.lastTimestamp | tail -40 || true
+      # live-teardown also runs on failure (if: always()), but a setup that died
+      # before its outputs were read must not hold the lease for 2h either.
+      - name: release the namespace (setup failed)
+        if: failure() && steps.acquire.outputs.namespace != ''
+        run: ./gardenio/tests/e2e/scripts/lane.sh teardown "${{ steps.acquire.outputs.namespace }}"
+
+  live-smoke:
+    name: live-smoke (run-shard.sh smoke subset)
+    needs: [select, live-setup]
+    if: contains(fromJSON(needs.select.outputs.suites), 'live-smoke')
+    runs-on: gardenio-k3s-e2e # e2e ARC scale set: medium shape + gardenio-e2e-runner SA (gardenio/tests/e2e/lane/arc-runners-e2e-values.yaml)
+    timeout-minutes: 30
+    env:
+      NAMESPACE: ${{ needs.live-setup.outputs.namespace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/lane-tools
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: apt deps
+        # Same list as shell-hermetic: the modules build and run Go probes and
+        # shell out to python3.
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends build-essential python3
+      - name: build gb and kd (HEAD)
+        run: |
+          set -euo pipefail
+          (cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/gb ./cmd/gb/)
+          (cd kbeads && GOWORK=off CGO_ENABLED=0 go build -o /tmp/kd ./cmd/kd/)
+          sudo install /tmp/gb /usr/local/bin/gb
+          sudo install /tmp/kd /usr/local/bin/kd
+      - name: claudeless (pinned tarball, sha256-verified)
+        # Same pins as the agent image (images/agent/install/clis.sh), sourced
+        # from the same two files. agent-crew-lifecycle, claudeless, local-mode,
+        # coop-local-mode, coop-live-usage and mail-nudge-delivery need it.
+        run: |
+          set -euo pipefail
+          . gardenio/images/agent/install/versions.env
+          . gardenio/images/agent/install/checksums.env
+          curl -fsSL --retry 5 --max-time 180 -o /tmp/claudeless.tgz \
+            "https://github.com/alfredjeanlab/claudeless/releases/download/${CLAUDELESS_VERSION}/claudeless-linux-x86_64.tar.gz"
+          echo "${CLAUDELESS_SHA256_X86_64}  /tmp/claudeless.tgz" | sha256sum -c --status -
+          sudo tar -xzf /tmp/claudeless.tgz -C /usr/local/bin claudeless
+          claudeless --version || true
+      - name: run the smoke subset
+        # SMOKE_MODULES minus tls-certs (cert-manager; tls.enabled=false in the
+        # lane). SMOKE_ONLY=1 disables shard gating; ONLY intersects with it.
+        env:
+          SMOKE_ONLY: "1"
+          ONLY: stack-health,agent-crew-lifecycle,beads-crud,mail-ready,trigger-engine-smoke
+          SHARD_BUDGET_SECONDS: "1200"
+        run: |
+          set -euo pipefail
+          BEADS_TOKEN="$(./gardenio/tests/e2e/scripts/lane.sh token "$NAMESPACE")"
+          echo "::add-mask::$BEADS_TOKEN"
+          export BEADS_TOKEN
+          ./gardenio/tests/e2e/scripts/run-shard.sh
+      - name: summarise
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "### live-smoke ($NAMESPACE, image ${{ needs.live-setup.outputs.image_tag }})" >> "$GITHUB_STEP_SUMMARY"
+          ./gardenio/tests/e2e/scripts/lane.sh report junit-results-0/e2e-results.jsonl >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-smoke-junit
+          path: junit-results-0/
+          retention-days: 14
+          if-no-files-found: warn
+
+  live-shard:
+    name: live-shard ${{ matrix.shard }}/4
+    needs: [select, live-setup]
+    if: contains(fromJSON(needs.select.outputs.suites), 'live-shards')
+    runs-on: gardenio-k3s-e2e # e2e ARC scale set: medium shape + gardenio-e2e-runner SA (gardenio/tests/e2e/lane/arc-runners-e2e-values.yaml)
+    # SHARD_BUDGET_SECONDS defaults to 1500 (25m) inside run-shard.sh; the job
+    # wall must stay above it so the budget guard, not the runner, ends a slow
+    # shard -- with per-module attribution instead of exit 137.
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      NAMESPACE: ${{ needs.live-setup.outputs.namespace }}
+      E2E_SHARD: ${{ matrix.shard }}
+      TOTAL_SHARDS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/lane-tools
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: apt deps
+        run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends build-essential python3
+      - name: build gb and kd (HEAD)
+        run: |
+          set -euo pipefail
+          (cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/gb ./cmd/gb/)
+          (cd kbeads && GOWORK=off CGO_ENABLED=0 go build -o /tmp/kd ./cmd/kd/)
+          sudo install /tmp/gb /usr/local/bin/gb
+          sudo install /tmp/kd /usr/local/bin/kd
+      - name: claudeless (pinned tarball, sha256-verified)
+        run: |
+          set -euo pipefail
+          . gardenio/images/agent/install/versions.env
+          . gardenio/images/agent/install/checksums.env
+          curl -fsSL --retry 5 --max-time 180 -o /tmp/claudeless.tgz \
+            "https://github.com/alfredjeanlab/claudeless/releases/download/${CLAUDELESS_VERSION}/claudeless-linux-x86_64.tar.gz"
+          echo "${CLAUDELESS_SHA256_X86_64}  /tmp/claudeless.tgz" | sha256sum -c --status -
+          sudo tar -xzf /tmp/claudeless.tgz -C /usr/local/bin claudeless
+          claudeless --version || true
+      - name: run the shard
+        # SKIP= the HERMETIC_MODULES: they already ran in shell-hermetic, and a
+        # second run here would double-count their time and their verdicts.
+        # The partition is shard_for()'s, guarded by test-shard-isolation.sh.
+        run: |
+          set -euo pipefail
+          SKIP="$(./gardenio/tests/e2e/scripts/lane.sh skip-list)"
+          export SKIP
+          BEADS_TOKEN="$(./gardenio/tests/e2e/scripts/lane.sh token "$NAMESPACE")"
+          echo "::add-mask::$BEADS_TOKEN"
+          export BEADS_TOKEN
+          ./gardenio/tests/e2e/scripts/run-shard.sh
+      - name: summarise
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "### live-shard $E2E_SHARD ($NAMESPACE, image ${{ needs.live-setup.outputs.image_tag }})" >> "$GITHUB_STEP_SUMMARY"
+          ./gardenio/tests/e2e/scripts/lane.sh report "junit-results-${E2E_SHARD}/e2e-results.jsonl" >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-shard-${{ matrix.shard }}-junit
+          path: junit-results-${{ matrix.shard }}/
+          retention-days: 14
+          if-no-files-found: warn
+
+  live-report:
+    name: live-report (pass/fail per module)
+    needs: [select, live-setup, live-smoke, live-shard]
+    # Runs after the shards whatever they concluded, but not when setup never
+    # produced a namespace (nothing to report) or the lane was not selected.
+    if: >-
+      always() && needs.live-setup.result == 'success' &&
+      (contains(fromJSON(needs.select.outputs.suites), 'live-smoke') ||
+       contains(fromJSON(needs.select.outputs.suites), 'live-shards'))
+    runs-on: gardenio-k3s-light # light ARC scale set (gardenio/helm/ci): jq over a few jsonl files
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: live-*-junit
+          path: live-results
+      - name: one table over every module
+        # This is the "pass/fail per module" the lane exists to produce. A
+        # known-failing module stays red here and gets its own bug bead; it is
+        # never hidden behind a skip (gd-WBz2qt9ADZ rules).
+        run: |
+          set -euo pipefail
+          files=$(find live-results -name e2e-results.jsonl | sort)
+          echo "### live lane: ${{ needs.live-setup.outputs.namespace }} @ image ${{ needs.live-setup.outputs.image_tag }}, scripts $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$files" ]; then
+            echo "no e2e-results.jsonl artifacts found (did every shard die before writing results?)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          ./gardenio/tests/e2e/scripts/lane.sh report $files | tee -a "$GITHUB_STEP_SUMMARY"
+
+  live-teardown:
+    name: live-teardown (uninstall, wipe, release)
+    needs: [live-setup, live-smoke, live-shard, live-report]
+    # ALWAYS, as long as a namespace was leased: a skipped or failed shard must
+    # not leave the chart (and the controller's agent pods) running in the pool.
+    if: always() && needs.live-setup.outputs.namespace != ''
+    runs-on: gardenio-k3s-e2e # e2e ARC scale set: medium shape + gardenio-e2e-runner SA (gardenio/tests/e2e/lane/arc-runners-e2e-values.yaml)
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/lane-tools
+      - name: pod logs before the wipe (failure forensics)
+        run: |
+          ns="${{ needs.live-setup.outputs.namespace }}"
+          mkdir -p lane-logs
+          for d in beads agents coopmux beads-viewer trigger-engine; do
+            kubectl -n "$ns" logs "deploy/${ns}-${d}" --all-containers --tail=2000 > "lane-logs/${d}.log" 2>&1 || true
+          done
+          kubectl -n "$ns" get pods -o wide > lane-logs/pods.txt 2>&1 || true
+          kubectl -n "$ns" get events --sort-by=.lastTimestamp > lane-logs/events.txt 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: live-namespace-logs
+          path: lane-logs/
+          retention-days: 7
+          if-no-files-found: warn
+      - name: uninstall, wipe, release the lease
+        run: ./gardenio/tests/e2e/scripts/lane.sh teardown "${{ needs.live-setup.outputs.namespace }}"

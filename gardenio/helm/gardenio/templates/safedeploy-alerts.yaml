@@ -1,0 +1,92 @@
+{{- if .Values.safeDeployAlerts.enabled }}
+{{- $cfg := .Values.safeDeployAlerts }}
+# PrometheusRule for the Stage 3 / Safe-deploy rollout (ka-0000002544).
+# Two alerts:
+#   - EdgeAuth5xxRate: edge-auth 5xx rate > .edgeAuth5xxRatio over 5m → page
+#   - DaemonHmacMismatch: any non-zero daemon HMAC mismatch counter
+#     increment when daemonHmacVerify.enforce=true → page
+#
+# Severity is configurable per env via .Values.safeDeployAlerts.severity
+# (page in prod, ticket in e2e, silenced in dev).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-safedeploy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: gardenio.safedeploy
+      interval: 30s
+      rules:
+        - alert: EdgeAuth5xxRate
+          # Ratio of 5xx responses to total over a 5m window. Triggers
+          # when the rate exceeds the configured threshold AND we have
+          # observed at least one request in that window (avoids
+          # division-by-zero pages on idle staging envs).
+          expr: |
+            (
+              sum(rate(edge_auth_http_responses_total{status=~"5.."}[5m]))
+              /
+              clamp_min(sum(rate(edge_auth_http_responses_total[5m])), 1)
+            ) > {{ $cfg.edgeAuth5xxRatio }}
+            and
+            sum(rate(edge_auth_http_responses_total[5m])) > 0
+          for: 5m
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: edge-auth
+            subsystem: safedeploy
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "edge-auth 5xx rate above {{ $cfg.edgeAuth5xxRatio }} for 5m"
+            description: |
+              The 5xx response rate from the edge-auth proxy exceeded
+              {{ $cfg.edgeAuth5xxRatio }} of total responses for 5m. This is
+              the Stage 3 rollback signal per the Safe-deploy plan
+              (ka-0000002544). Investigate the edge-auth pod logs and
+              consider `helm upgrade --set edgeAuth.dryRun=true` to
+              return the route to dry-run without taking it down.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/plans/stage3-ava-cli-eb-rollout.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: DaemonHmacMismatch
+          # Pages on any non-zero daemon HMAC mismatch counter
+          # increment in the last 15m. The counter is only meaningful
+          # when daemonHmacVerify.enforce=true; the clause
+          # `daemon_hmac_verify_total{outcome!="ok",enforce="true"} > 0`
+          # gates this on the flag actually being on so we don't
+          # page on burn-in noise.
+          expr: |
+            sum(increase(daemon_hmac_verify_total{outcome!="ok",enforce="true"}[15m])) > 0
+          for: 0m
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: daemon-hmac-verify
+            subsystem: safedeploy
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "daemon HMAC mismatch in enforce mode"
+            description: |
+              A daemon (kbeads / coopmux / ...) saw an X-Operator
+              header whose X-Edge-Auth-Sig envelope was missing or
+              invalid while daemonHmacVerify.enforce=true. The
+              header was DROPPED — operator attribution falls back to
+              the pre-edge-auth path. Investigate the source: either
+              edge-auth regressed, or an unsigned caller is reaching
+              the daemon directly (unexpected post-Stage-3 flip).
+              Breakdown by outcome:
+              {{`{{ with printf "sum by (outcome) (increase(daemon_hmac_verify_total{outcome!=\"ok\",enforce=\"true\"}[15m]))" | query }}{{ range . }}  - {{ .Labels.outcome }}: {{ .Value | printf "%.0f" }}
+              {{ end }}{{ end }}`}}
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/plans/stage3-ava-cli-eb-rollout.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

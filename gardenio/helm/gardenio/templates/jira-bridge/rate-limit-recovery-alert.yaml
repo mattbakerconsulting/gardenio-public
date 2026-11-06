@@ -1,0 +1,97 @@
+{{- if .Values.jiraBridge.metrics.prometheusRule.rateLimitRecovery.enabled }}
+{{- $cfg := .Values.jiraBridge.metrics.prometheusRule.rateLimitRecovery }}
+# PrometheusRule for the JQL-count collector's JIRA RATE-LIMIT recovery monitor
+# (task ka-0000002481, tuning of the FSM Jira Triage gardener ka-0000005655,
+# which was graded C for being rate-limited on its first run).
+#
+# The JQL-count collector (jira_metrics.go) already detects an HTTP 429 and backs
+# off for the Retry-After duration. But that was UNOBSERVABLE: a 429 was folded
+# into gardenio_jira_scrape_errors_total with every other error class, and nothing
+# marked the RECOVERY — the moment Jira's cooldown expired and normal throughput
+# resumed. The collector now Go-computes the full rate-limit lifecycle into
+# dedicated series on the jira-bridge internal :9093 /metrics endpoint:
+#   gardenio_jira_rate_limited{query} — 1 while a query is in 429 backoff, 0 once
+#     it next scrapes cleanly. The 1->0 EDGE is the recovery signal (cooldown
+#     expired, throughput resumed); this alert RESOLVES on it.
+#   gardenio_jira_rate_limit_events_total{query} — 429 onsets (each scrape that
+#     entered backoff); a sustained throttle counts repeatedly.
+#   gardenio_jira_rate_limit_recoveries_total{query} — observed recoveries, the
+#     durable/countable form of the 1->0 edge (survives after the gauge is 0).
+#   gardenio_jira_rate_limit_backoff_seconds{query} — backoff of the most recent
+#     429 (parsed Retry-After, or the default fallback when Jira sent none).
+#
+# The verdict is folded into the 0/1 gauge (like the sibling pollerStall /
+# trigger-starved rules), so the stuck-throttled expr is a trivial max_over_time
+# ==1 rather than a fragile multi-term join — a set-per-cycle gauge cannot
+# silently suppress the alert via an absent series inside an `and`. The alert
+# fires while a query stays throttled past the window+hold and CLEARS the moment
+# a clean scrape drops the gauge to 0, so the recovery is monitored both as a
+# firing/resolving alert and as scrapeable recovery series. Off by default;
+# per-env overlays opt in. Requires the monitoring.coreos.com/v1 PrometheusRule
+# CRD.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-jira-bridge-rate-limit-recovery
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jira-bridge
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.jira_rate_limit_recovery
+      interval: 1m
+      rules:
+        - alert: JiraRateLimitStuck
+          # The collector Go-computes the rate-limited verdict into the 0/1
+          # gauge, so the expr is a plain max_over_time(...)==1: the query has
+          # been in 429 backoff across the whole window with no clean scrape to
+          # clear it. A single successful scrape inside the window drops the
+          # gauge to 0 (the recovery edge) and the max_over_time falls to 0 —
+          # that IS the recovery detection, so the alert auto-resolves on
+          # recovery. The `for:` hold rides out a single-cycle 429 blip that
+          # self-heals on the next scrape.
+          expr: |
+            max by (query) (max_over_time(gardenio_jira_rate_limited[{{ $cfg.window | default "15m" }}])) == 1
+          for: {{ $cfg.for | default "15m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: jira-bridge
+            subsystem: jql_metrics_collector
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "JIRA JQL-count query {{`{{ $labels.query }}`}} is stuck rate-limited — in HTTP 429 backoff with no recovery in {{ $cfg.window | default "15m" }}+"
+            description: |
+              The jira-bridge JQL-count collector query
+              {{`{{ $labels.query }}`}} has been in HTTP 429 rate-limit backoff
+              across the whole window with no clean scrape to clear it
+              (gardenio_jira_rate_limited == 1). Its backlog gauge
+              (gardenio_jira_issues) is going stale while Jira throttles the
+              approximate-count calls; gardenio_jira_rate_limit_backoff_seconds
+              shows how hard Jira is pushing back. This is the exact failure that
+              graded the FSM Jira Triage gardener C on its first run — now it
+              pages instead of degrading silently.
+
+              This alert RESOLVES automatically the moment recovery is observed:
+              the next clean scrape drops gardenio_jira_rate_limited to 0 (and
+              bumps gardenio_jira_rate_limit_recoveries_total), which is the
+              cooldown-expired / throughput-resumed signal.
+
+              Triage: check the "jira-metrics: rate limited, backing off" WARN
+              logs on the jira-bridge for the offending query and its backoff;
+              confirm the collector cadence (JIRA_METRICS interval, default 120s)
+              is within the Jira Cloud points budget (x-ratelimit-limit ~300/
+              window); if a single query is expensive, give it a longer per-query
+              Interval so the fleet stays under budget. A persistent throttle
+              usually means too many queries at too tight a cadence, or another
+              client sharing the same Jira account's budget.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000002481)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

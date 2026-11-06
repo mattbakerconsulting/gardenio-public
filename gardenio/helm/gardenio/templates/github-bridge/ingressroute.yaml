@@ -1,0 +1,88 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.githubBridge.enabled .Values.githubBridge.ingress.enabled }}
+{{- if empty .Values.githubBridge.ingress.host }}
+{{- fail "githubBridge.ingress.enabled is true but githubBridge.ingress.host is empty: set the external webhook hostname (e.g. github-webhook.<domain>)." }}
+{{- end }}
+{{- if and .Values.githubBridge.ingress.ipWhitelist.enabled (empty .Values.githubBridge.ingress.ipWhitelist.sourceRange) }}
+{{- fail "githubBridge.ingress.ipWhitelist.enabled is true but githubBridge.ingress.ipWhitelist.sourceRange is empty: set GitHub's `hooks` CIDRs (https://api.github.com/meta) or set ipWhitelist.enabled=false." }}
+{{- end }}
+{{- $fullname := printf "%s-github-bridge" (include "gardenio.fullname" .) -}}
+{{- $port := .Values.githubBridge.service.port | default 8101 -}}
+# Public route for GitHub's webhook deliveries. Only Path(`/webhook`) is routed,
+# so the health and metrics endpoints are not reachable from the internet. HMAC
+# verification in the bridge is the authentication; the whitelist and rate limit
+# are defense in depth.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: github-bridge
+spec:
+  entryPoints:
+    {{- range .Values.githubBridge.ingress.entryPoints | default (list "web" "websecure") }}
+    - {{ . }}
+    {{- end }}
+  routes:
+    - match: Host(`{{ .Values.githubBridge.ingress.host }}`) && Path(`/webhook`)
+      kind: Rule
+      priority: 100
+      services:
+        - name: {{ $fullname }}
+          port: {{ $port }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if .Values.githubBridge.ingress.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ipwhitelist
+        {{- end }}
+        {{- if .Values.githubBridge.ingress.rateLimit.enabled }}
+        - name: {{ $fullname }}-ratelimit
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if .Values.githubBridge.ingress.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: github-bridge
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.githubBridge.ingress.ipWhitelist.sourceRange | nindent 6 }}
+    {{- if gt (int .Values.githubBridge.ingress.ipWhitelist.depth) 0 }}
+    ipStrategy:
+      depth: {{ .Values.githubBridge.ingress.ipWhitelist.depth }}
+    {{- end }}
+{{- end }}
+{{- if .Values.githubBridge.ingress.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: github-bridge
+spec:
+  rateLimit:
+    average: {{ .Values.githubBridge.ingress.rateLimit.average }}
+    burst: {{ .Values.githubBridge.ingress.rateLimit.burst }}
+{{- end }}
+{{- end }}

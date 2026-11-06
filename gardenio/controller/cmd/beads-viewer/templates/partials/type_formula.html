@@ -1,0 +1,203 @@
+{{define "type_formula"}}
+<style>
+  /* Formula structure DAG — scoped styles (formula-legibility plan
+     ka-0000007376, step S2 ka-0000005735). The graph markup + its shared
+     styles live in formula_dag_svg.html (also embedded by the molecule
+     execution view); this block keeps only the recipe-page layout chrome. */
+  .formula-structure { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-start; margin: 0.5rem 0 1rem; }
+  /* grow:1 so the pane FILLS the row beside the Variables side-rail. The two
+     earlier fixes shrank the pieces around a linear DAG: ka-0000002500 / MR
+     !5855 hugged the .formula-dag-scroll BOX (width:max-content ~204px), then
+     ka-0000005917 / MR !5873 hugged the PANE (flex:0 1 auto) so the rail slid
+     left beside the thin graph. But hugging only RELOCATED the void: with the
+     step-list stacked BELOW the ~222px graph ribbon, a ~555×690px 100%-white
+     band survived to the ribbon's RIGHT (ka-0000006902, near_white 0.873 flat).
+     The density fix is to lay the graph and the step-list SIDE-BY-SIDE inside
+     the pane (see .formula-dag-body below) and let the pane GROW so the
+     step-list has a band to fill — mirroring the molecule-page treatment
+     (ka-0000006510) that made that page the densest of the three. shrink:1 +
+     min-width:0 keep the pane collapsing below its content at narrow widths so
+     flex-wrap can stack the rail without page-level overflow at 375px. The
+     480px basis keeps the pane and the 260px rail side-by-side on one desktop
+     row (grow:1 then expands the pane to fill the band the rail leaves) while
+     still wrapping the rail below at narrow widths — a bare grow:1 with an
+     `auto` (content-max) basis instead ballooned the pane to the full row and
+     pushed the rail below even on desktop (ka-0000006902). */
+  .formula-dag-pane { flex: 1 1 480px; min-width: 0; }
+  /* Two-column inner body: the shrink-to-fit graph on the left, the step-list
+     filling the band on the right. Stacked (column) by default so narrow
+     (375px) keeps its full-width single-column layout — no void there, and no
+     regression. The row layout only engages at >=1024px, where there IS a wide
+     band to fill (ka-0000006902; molecule-page analogue ka-0000006510). */
+  .formula-dag-body { display: flex; flex-direction: column; gap: 0.75rem; }
+  @media (min-width: 1024px) {
+    .formula-dag-body { flex-direction: row; flex-wrap: wrap; gap: 1rem; align-items: flex-start; }
+    /* Graph left: hug its own rendered width (grow:0), never overflow. */
+    .formula-dag-col { flex: 0 1 auto; min-width: 0; max-width: 100%; }
+    /* Step-list right: grow to fill the band the thin graph leaves; min-width:0
+       lets its rows wrap rather than forcing the pane wider. */
+    .formula-step-list { flex: 1 1 340px; min-width: 0; margin-top: 0; }
+  }
+  /* The "graph too large to draw" fallback note must span the full width and
+     sit ABOVE the step-list, not become a skinny left column beside it. */
+  .formula-dag-body > .formula-dag-note { flex: 1 1 100%; }
+  .formula-side-rail { flex: 0 1 260px; min-width: 220px; display: flex; flex-direction: column; gap: 0.75rem; }
+  .formula-side-rail h4 { margin: 0 0 0.3rem; }
+  .formula-rail-box { border: 1px solid var(--border, #ddd); border-radius: 8px; padding: 0.6rem 0.75rem; }
+  .formula-actions { display: flex; flex-direction: column; gap: 0.45rem; font-size: 0.85em; }
+  .formula-actions .formula-action-row { display: flex; align-items: center; gap: 0.5rem; }
+  .formula-actions code { overflow-wrap: anywhere; font-size: 0.9em; }
+  .formula-raw-json pre { max-height: 24rem; overflow: auto; font-size: 0.78em; }
+  /* Unbound recipe-variable placeholders in step titles (a bare-name var token
+     the recipe declares) — styled as a fill-in-at-pour token so they read as
+     variables, not literal prose or a live run value (ka-0000003537). */
+  .formula-var-token { font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.9em; padding: 0 0.25em; border-radius: 4px;
+    background: var(--bg-raised, rgba(127,127,127,0.12)); color: var(--text-subtle, #666); }
+
+  /* Step list — the recipe's primary content, surfaced as always-open designed
+     rows rather than a collapsed one-line disclosure (ka-0000003420). The old
+     collapsed <details> left the DAG pane a thin graph strip over a tall white
+     void while the side-rail towered beside it (near_white 0.9615); rendering
+     the steps fills that band with real density and balances the two columns.
+     Kept as <details open> so very long recipes can still be collapsed. */
+  /* Spacing between the graph and the step-list is now the .formula-dag-body
+     flex gap (column at narrow, row at >=1024px), so no own margin-top here —
+     it would double the gap (ka-0000006902). */
+  .formula-step-list { margin-top: 0; }
+  .formula-step-list > summary { cursor: pointer; font-size: 0.9em; font-weight: 600;
+    color: var(--text-subtle, #666); margin-bottom: 0.45rem; }
+  .formula-step-list > summary::marker { color: var(--text-subtle, #999); }
+  .formula-steps { list-style: none; margin: 0; padding: 0;
+    display: flex; flex-direction: column; gap: 0.35rem; counter-reset: fstep; }
+  .formula-steps li.step { display: flex; align-items: baseline; gap: 0.5rem;
+    padding: 0.4rem 0.55rem; border: 1px solid var(--border, #e3e3e3);
+    border-left-width: 3px; border-radius: 8px;
+    background: var(--bg-raised, rgba(127,127,127,0.035)); }
+  .formula-steps li.step::before { counter-increment: fstep; content: counter(fstep);
+    flex: 0 0 auto; min-width: 1.4em; height: 1.4em; line-height: 1.4em; text-align: center;
+    border-radius: 999px; font-size: 0.72em; font-variant-numeric: tabular-nums;
+    color: var(--text-subtle, #666); background: rgba(127,127,127,0.14); }
+  .formula-steps .step-id { font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.82em; color: var(--text-subtle, #666); white-space: nowrap; }
+  .formula-steps .step-title { flex: 1 1 auto; overflow-wrap: anywhere; font-size: 0.92em; }
+  /* Run-status badge — deliberately NOT named "step-status": a pristine recipe
+     renders no run chrome, and its style block must stay free of that substring
+     (TestBeadShow_FormulaRecipe_NoExecutionChrome). */
+  .formula-steps .formula-step-run { flex: 0 0 auto; font-size: 0.72em; text-transform: uppercase;
+    letter-spacing: 0.03em; color: var(--text-subtle, #888); }
+  .formula-steps .step-id + a { font-size: 0.8em; white-space: nowrap; text-decoration: none; }
+  /* Status tints (executing formula only) — mirror the DAG node palette so the
+     step list and the graph read alike. A pristine recipe carries no status
+     class, so it keeps the neutral left border. */
+  .formula-steps li.step-completed, .formula-steps li.step-done { border-left-color: #43a047; }
+  .formula-steps li.step-in_progress, .formula-steps li.step-running { border-left-color: #f9a825; }
+  .formula-steps li.step-failed, .formula-steps li.step-partial { border-left-color: #e53935; }
+  .formula-steps li.step-ready { border-left-color: #1e88e5; }
+  .formula-steps li.step-blocked, .formula-steps li.step-deferred { border-left-color: #8e24aa; }
+</style>
+
+<section class="formula-card">
+  <h3>Formula</h3>
+
+  {{with .Formula}}
+    <dl class="field-list">
+      <dt>Steps</dt>
+      {{/* A recipe (no run state) shows its definition count — "N steps" — not
+           run progress. Only once the formula is executing (a step carries a
+           real status) does "X / N completed" + a "Current step" make sense; on
+           a pristine template both read as a stalled molecule run (ka-0000003537). */}}
+      <dd>{{if .Steps}}{{if .HasRunState}}{{.CompletedSteps}} / {{len .Steps}} completed{{else}}{{len .Steps}} step{{if ne (len .Steps) 1}}s{{end}}{{end}}{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+      {{if .CurrentStep}}<dt>Current step</dt><dd><code>{{.CurrentStep.ID}}</code> &mdash; {{.CurrentStep.TitleHTML}}</dd>{{end}}
+      {{if .PourStatus}}<dt>Pour status</dt><dd>{{.PourStatus}}</dd>{{end}}
+      {{if .Extends}}<dt>Extends</dt><dd>{{range $i, $e := .Extends}}{{if $i}} · {{end}}<a href="{{$.BasePath}}/{{$e}}"><code>{{$e}}</code></a>{{end}}</dd>{{end}}
+    </dl>
+
+    <div class="formula-structure">
+      <div class="formula-dag-pane">
+        {{/* Graph LEFT, step-list RIGHT on desktop (>=1024px); stacked at
+             narrow. The thin ribbon a linear DAG draws (~222px) leaves a wide
+             band to its right — the step-list fills it instead of stacking
+             below into a whitespace void (ka-0000006902; molecule-page analogue
+             ka-0000006510). See .formula-dag-body in the style block above. */}}
+        <div class="formula-dag-body">
+          {{with .DAG}}
+          <div class="formula-dag-col">
+            <h4>Structure</h4>
+            {{template "formula_dag_svg" (dict "DAG" . "BasePath" $.BasePath)}}
+          </div>
+          {{else}}
+            {{if .Steps}}
+            <p class="formula-dag-note">Step graph too large to draw &mdash; see the step list.</p>
+            {{end}}
+          {{end}}
+
+          {{if .Steps}}
+          {{$hasRunState := .HasRunState}}
+          {{/* Open by default: the step list IS the recipe's content, so it fills
+               the band beside the thin DAG ribbon instead of leaving a whitespace
+               void (ka-0000003420, ka-0000006902). Still a <details> so a very
+               long recipe can be collapsed. */}}
+          <details class="formula-step-list" open>
+            <summary>Steps ({{len .Steps}})</summary>
+            <ol class="formula-steps">
+              {{range .Steps}}
+              <li class="step step-{{.Status}}">
+                <code class="step-id">{{.ID}}</code>
+                <span class="step-title">{{.TitleHTML}}</span>
+                {{/* Show a per-step run-status badge only for an EXECUTING formula.
+                     On a recipe, a "pending" badge on every step reads as a stalled
+                     run rather than a template step list (ka-0000003537). */}}
+                {{if $hasRunState}}<span class="formula-step-run">{{if .Status}}{{.Status}}{{else}}pending{{end}}</span>{{end}}
+                {{if .BeadID}}<a href="{{$.BasePath}}/{{.BeadID}}"><code>{{.BeadID}}</code></a>{{end}}
+              </li>
+              {{end}}
+            </ol>
+          </details>
+          {{end}}
+        </div>
+      </div>
+
+      <aside class="formula-side-rail">
+        {{if .Vars}}
+        <div class="formula-rail-box">
+          <h4>Variables</h4>
+          <dl class="field-list">
+            {{range .Vars}}
+              <dt><code>{{.Name}}</code></dt>
+              <dd>{{if .Value}}<code>{{.Value}}</code>{{else if .Description}}<span class="empty">{{.Description}}</span>{{else}}<span class="empty">&mdash;</span>{{end}}</dd>
+            {{end}}
+          </dl>
+        </div>
+        {{end}}
+
+        <div class="formula-rail-box">
+          <h4>Actions</h4>
+          <div class="formula-actions">
+            {{/* Pour is CLI-only today (no daemon formula-apply endpoint —
+                 deferred on ka-0000007376), so hand the operator a
+                 copy-pasteable command instead of a dead button. */}}
+            <div class="formula-action-row">
+              <button type="button" class="copy-btn" data-copy="pour" data-value="{{.PourCommand}}" title="Copy the kd command to instantiate this formula as a persistent molecule">Copy pour command</button>
+            </div>
+            <code>{{.PourCommand}}</code>
+            <div class="formula-action-row">
+              <button type="button" class="copy-btn" data-copy="cook" data-value="{{.CookCommand}}" title="Copy the kd command to preview this formula's expansion (dry-run, no beads created)">Copy cook command</button>
+            </div>
+            <code>{{.CookCommand}}</code>
+          </div>
+        </div>
+
+        {{if .StepsJSON}}
+        <details class="formula-raw-json">
+          <summary>View raw steps JSON</summary>
+          <pre><code>{{.StepsJSON}}</code></pre>
+        </details>
+        {{end}}
+      </aside>
+    </div>
+  {{else}}
+    <p class="empty">Formula metadata unavailable.</p>
+  {{end}}
+</section>
+{{end}}

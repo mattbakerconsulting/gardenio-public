@@ -1,0 +1,2564 @@
+name: checks
+
+# Ports the load-bearing checks that used to run in .rwx/ci.yml (archived under
+# docs/archive/rwx/). Every job is a B row from the RWX proof table: a check on
+# this repo's own code or config that ci.yml / images.yml do not already run.
+# Jobs marked continue-on-error carry known pre-existing debt (red on the
+# pristine snapshot too); they report, they do not block. golangci-lint is not
+# one of them: a red golangci-lint fails `checks`. Like every heavy job it runs
+# on a release tag push, the nightly and dispatch, never on a pull request (gd-19ECZxvFQw);
+# the merge desk re-runs it on a PR's trial merge only for GUARD DRIFT
+# (docs/merge-desk.md). `if: false` jobs are D rows: real checks we cannot run
+# yet (need a live cluster, a beads daemon, or a tool we do not build). All run
+# on the k3s ARC runner pool (gardenio/helm/ci).
+
+on:
+  push:
+    # THE RELEASE TAG, NOT MAIN (owner 2026-11-03), as in ci.yml; read the
+    # note on its `on.push`. Of the last 15 checks.yml main push runs, 10 were
+    # cancelled by the next merge. This run of the tag is one of the three
+    # release-deploy.sh rule 4 requires green before it rolls the tag, and
+    # a tag push is a full run below (every gate open, its own concurrency
+    # group). The nightly `schedule` is the one full main-head run a day.
+    tags: ['20*'] # calver release tags, e.g. 2026.307.1, as images.yml
+  pull_request:
+    # PULL REQUESTS RUN THE LIGHT TIER ONLY (owner rule 2026-10-31; Task 7.3
+    # part B, gd-19ECZxvFQw; root CLAUDE.md "CI on pull requests"). Every
+    # heavy job below ANDs `github.event_name != 'pull_request'` into its
+    # `if:`, so a PR push, draft or ready, runs only the gate jobs.
+    # The heavy jobs run on a release tag push, the nightly and dispatch.
+    # `ready_for_review` and `converted_to_draft` are deliberately absent: a
+    # PR's draft state no longer changes what runs, so flipping it needs no
+    # run, and the head's synchronize run is the one the merge desk reads.
+    # scripts/check-ci-draft-gate.py guards all of this.
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+  # NIGHTLY FULL RUN (gd-2kZxn16TaS): where everything the PR-side gates of
+  # gd-WFMvg9sDKE skip still runs, once a day, on main. `schedule` is treated
+  # exactly like `workflow_dispatch` everywhere below (concurrency keys, the
+  # `gate` and `lint` steps, every path gate's `if:`); see the same block in
+  # ci.yml for the time. scripts/check-ci-draft-gate.py guards it.
+  schedule:
+    - cron: '43 10 * * *'
+
+# ONE GROUP PER RUN FOR A RELEASE TAG (owner 2026-11-03). Main pushes no
+# longer run this workflow (see `on.push`), so the shared "<workflow>-main"
+# group of gd-RZopn9lf5I, which batched them by letting the newest push
+# replace the waiting one, is gone with them. That batching is why most
+# main runs never finished: under a steady stream of merges the waiting run
+# was usually replaced (10 of the last 15 checks.yml main push runs cancelled).
+#
+# How a group behaves: it holds at most one RUNNING and one PENDING run, and a
+# new run always replaces the PENDING one (GitHub cancels it) whatever
+# cancel-in-progress says; cancel-in-progress governs only the RUNNING one.
+#
+# Keys, per event:
+#   pull_request        per PR (github.ref): a newer push cancels the older
+#                       run. From gd-gw9mSq9Qtm to part B (gd-19ECZxvFQw) the
+#                       key was split by draft state, because a draft run and
+#                       a ready_for_review run did different work and, with
+#                       one slot, the draft run cancelled the ready one on PR
+#                       #1503. Every PR run is now the light tier and
+#                       `ready_for_review` starts none, so one slot per PR is
+#                       right again. scripts/check-ci-draft-gate.py guards
+#                       the PR arm.
+#   workflow_dispatch / schedule / a tag push
+#                       per run (github.run_id): a deliberate run, the nightly
+#                       and a release tag are never evicted, nor evict one.
+#                       The tag used to fall through to per-commit
+#                       (github.sha), so a second tag on the same commit could
+#                       share its slot; release-deploy.sh reads this run, so
+#                       nothing may replace it.
+#   anything else       per commit (github.sha). No other event reaches it.
+#
+# cancel-in-progress is TRUE only for pull_request; a tag run is never
+# cancelled. scripts/check-main-concurrency.py evaluates this block for each
+# event.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')) && github.run_id || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Exact patch, and the same one ci.yml pins -- see the note there. A bare
+  # "1.25" lets setup-go drift to the newest patch, which invalidates GOCACHE
+  # on every CI node simultaneously. Bump both files together.
+  GO_VERSION: "1.25.14"
+
+jobs:
+  # ── Is this run already obsolete? (gd-BCyDxqofKe) ──────────────────────────
+  # ci.yml's supersession check (now its `gate` job), ported. Read ci.yml's
+  # note above that job and .github/actions/superseded/action.yml first; this
+  # records only what is DIFFERENT here. The Task 0.2 baseline
+  # (gardenio/docs/ci-minutes/baseline-2026-10-28.json, 2026-10-26..28) has
+  # 263 checks.yml push runs at
+  # 23.8 runner-minutes each, ~2,090 a day, and the per-sha concurrency group
+  # of the time never superseded a main push -- so a burst of N merges paid for N
+  # full suites of which one mattered.
+  #
+  # ── THE DIFFERENCE: THREE JOBS HERE ARE PATH-GATED PER PUSH ─────────────────
+  # The rule "any newer push run covers me" holds only for a job that every
+  # newer run runs, like ci.yml's `go` matrix. Here lint-go, helm and
+  # cargo-security run only when THEIR push touched their paths (`changes`).
+  # Push A edits the chart, push B edits only docs: B's `helm` is skipped by
+  # B's own gate, so if A's `helm` deferred to B, nothing would ever lint A's
+  # chart change and main would look green. So the two halves split:
+  #
+  #   ungated jobs (gitleaks, security, terraform, script-selftests, quench,
+  #   dictation-corpus, wer-eval, lands-contract, lands-gl)
+  #       every newer run runs them, so the run-wide verdict below is sound.
+  #       They AND `needs.supersession.outputs.superseded != 'true'` into
+  #       their `if:`, like ci.yml's `go`.
+  #   path-gated jobs (lint-go, helm, cargo-security)
+  #       do NOT read this job's verdict. Their in-job re-check passes its own
+  #       `job:` name, and the composite then counts a newer run only if that
+  #       run's job of the same name is pending, queued, running, or finished
+  #       success/failure -- i.e. its path gate said yes. At run creation that
+  #       job usually does not exist yet, so a job-aware gate here would almost
+  #       always answer false; the in-job check is where it pays. ci.yml's
+  #       rust, gardenhub-browser and lands-conformance work the same way
+  #       (gd-025MCE7PhK).
+  #
+  # The in-job re-check runs in EVERY heavy job, gated or not, and always with
+  # `job:` set -- stricter than needed for the ungated ones, but it means a
+  # later path gate on any of them cannot silently turn this unsound.
+  #
+  # ── THE SENTINEL ────────────────────────────────────────────────────────────
+  # Every heavy job has a `heavy work starting` step, first after the check,
+  # with ci.yml's contract: `success` means the job did its work, `skipped`
+  # means the in-job check fired, and a gate-skipped job has no steps at all.
+  # gardenio/scripts/release-cut.sh read it for every workflow until
+  # 2026-11-03, when it stopped reading CI (the tag's own runs gate the deploy
+  # now, release-deploy.sh rule 4, which reads ci.yml's): a success run with
+  # any sentinel `skipped` was not green, and neither was a run that had THIS
+  # job but no sentinel `success` (the gate-skipped shape), nor a run in which
+  # this job's `superseded -- run-wide skip` step succeeded (the gate fired,
+  # yet a path-gated job built). Keep both names (the draft-gate guard pins
+  # them): ci.yml's step of that name is still read by release-deploy.sh.
+  #
+  # Fail-open as in ci.yml: the dependants use `!cancelled()`, so this job
+  # failing leaves `superseded` empty and every job runs. Unlike ci.yml, it
+  # runs on BRANCH pushes only: the composite answers false for every other
+  # event (pull_request, tag, schedule, workflow_dispatch), so elsewhere it
+  # was a light pod and a scheduling delay in front of the ungated jobs, for nothing.
+  # Skipped, it leaves `superseded` empty too. Since 2026-11-03 no branch push
+  # runs this workflow (owner: test the release tag, not main), so today it
+  # never runs; a release tag's run does not wait on it.
+  # scripts/check-ci-draft-gate.py guards all of the above.
+  supersession:
+    name: superseded by a newer push?
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+    runs-on: gardenio-k3s-light # never heavy: the point is to not claim a node
+    timeout-minutes: 5
+    permissions:
+      actions: read # list this workflow's runs
+      contents: read # compare two commits
+    outputs:
+      superseded: ${{ steps.check.outputs.superseded }}
+    steps:
+      # Sparse + no cone mode: just the action directory, as in ci.yml.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions/superseded
+          sparse-checkout-cone-mode: false
+      - id: check
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+      # Makes "the gate fired" visible in the jobs API: this step concludes
+      # `success` only when the run-wide verdict skipped the ungated jobs.
+      # A path-gated job (lint-go, helm, cargo-security, ...) can still build in
+      # such a run and leave a sentinel `success`, so that alone does not prove
+      # the run tested its commit. release-cut.sh refused any run in which this
+      # step succeeded (SUPERSESSION_FIRED_STEP) until 2026-11-03; do not
+      # rename it.
+      - name: superseded -- run-wide skip
+        if: steps.check.outputs.superseded == 'true'
+        run: echo "a newer checks.yml push run covers this one; the ungated heavy jobs are skipped"
+
+  # ── Which of the EXPENSIVE jobs below can this event actually change? ──────
+  #
+  # ci.yml solved the same problem with a workflow-level `paths-ignore`, which
+  # costs nothing and adds no latency. checks.yml cannot use that: some of its
+  # jobs genuinely read the whole tree (quench runs a docs-TOC and docs-link
+  # pass, and the conflict-marker guard scans every tracked file), so a
+  # workflow-level skip would silently disable real coverage. The filtering
+  # therefore has to be per-job, which needs a gate job -- the same
+  # `dorny/paths-filter` pattern images.yml already uses.
+  #
+  # This said "three of its jobs" and counted the internal-strings audit as the
+  # third until 2026-09-22, when that job turned out to have never run at all
+  # (see the D rows at the bottom of this file). The conclusion is unchanged --
+  # quench and the conflict-marker guard still read the whole tree on their own
+  # -- but the count was load-bearing-looking and was wrong, so it is fixed here
+  # rather than left to be re-cited. (That guard stopped being its own job on
+  # 2026-09-23 and ran inside script-selftests until that job was path-gated on
+  # PRs (gd-is2Nts83Ai); it now runs inside quench, which is ungated, so the
+  # whole-tree reasoning is unaffected.)
+  #
+  # Measured over the 253 first-parent commits on main in the 14 days to
+  # 2026-09-22, the share of commits that CANNOT change each job's result:
+  #
+  #   lint-go (gardenio/controller)   80 %      helm              84 %
+  #   lint-go (kbeads)                75 %      cargo-security    87 %
+  #
+  # 60 % of main commits need none of the four. That is ~59 heavy runner
+  # slot-claims per day given back, on top of the ~42 ci.yml's path filter
+  # already recovered -- and slot-claims, not node-minutes, are what the queue
+  # wait on this pool is made of (gardenio/helm/ci/README.md).
+  #
+  # WHY IT IS SAFE TO FILTER THESE FOUR AND NOT THE OTHERS. A positive path
+  # list normally fails CLOSED: add a new source tree and it silently stops
+  # being covered. That risk vanishes exactly when the job's own scope is
+  # ALREADY hardcoded to the same paths, because then the filter cannot be
+  # narrower than the job. Each gated job is hardcoded:
+  #
+  #   lint-go         `cd <matrix.dir> && GOWORK=off golangci-lint run ./...`
+  #                   (gardenio/controller, kbeads, gardenio/clicreds)
+  #   helm            `helm lint gardenio/helm/gardenio/` + tests in that tree
+  #   cargo-security  `defaults.run.working-directory: coop`
+  #
+  # A new Go module or Rust workspace appearing elsewhere would not be linted
+  # or audited by these jobs today either, filter or no filter. The filters
+  # below add the files each job reads from OUTSIDE its hardcoded directory,
+  # which is the part that does not follow from the scope and had to be
+  # audited by hand:
+  #
+  #   gardenio/clicreds/**   both Go modules `replace` it (controller
+  #                          go.mod:230 -> ../clicreds, kbeads go.mod:166 ->
+  #                          ../gardenio/clicreds), so with GOWORK=off it is
+  #                          still compiled into both lint runs.
+  #   gardenio/locks/security-tools.lock
+  #                          cargo-security sources its cargo-audit and
+  #                          cargo-deny pins from it.
+  #
+  # NOT gated, deliberately:
+  #   security, terraform, script-selftests -- they never run on a PR
+  #     (gd-19ECZxvFQw), and every other event runs them whole, so a path
+  #     gate would save nothing (gd-whdmfznixO).
+  #   quench -- a whole-repo scan. A secret committed
+  #     in a markdown file is precisely what they exist to catch, so a docs-only
+  #     commit is not a commit they can skip. (internal-strings-audit was listed
+  #     here too until 2026-09-22; it is gone -- see the D rows. conflict-markers
+  #     was listed until 2026-09-23, when it was folded into script-selftests.
+  #     Since gd-is2Nts83Ai, quench also runs the four whole-tree guards that
+  #     script-selftests hosted: conflict markers, large files, Go module
+  #     coverage, kubectl apply of Secrets.)
+  #   dictation-corpus -- on the medium tier, where queue wait is currently
+  #     5-9 s. Adding `needs: changes` would roughly double its wall time to
+  #     reclaim a few uncontended medium slot-claims a day.
+  #
+  # FAILING OPEN IS THE POINT. Every gate below is written so the job RUNS
+  # when the gate did not succeed, and on workflow_dispatch and schedule
+  # (where paths-filter has no meaningful base to diff against and would
+  # report no changes at all). A broken gate must cost runner time, never coverage.
+  # A release tag push runs everything too (owner 2026-11-03): the gated
+  # jobs' `if:` let it through beside dispatch and schedule, and `gate` and
+  # `lint` force every output on it.
+  changes:
+    name: changed-path gate
+    runs-on: gardenio-k3s-light # light ARC scale set (gardenio/helm/ci) -- same shape as images.yml's `changes`; see arc-runners-light-values.yaml
+    timeout-minutes: 10
+    permissions:
+      actions: read # the `base` step lists this workflow's push runs
+      contents: read
+      pull-requests: read # dorny/paths-filter reads the PR's changed files via the API; without this the job fails with "Resource not accessible by integration" on every PR
+    outputs:
+      # These come from the `gate` step, not `filter`: gate ORs the path
+      # verdict together with the per-job-block verdict. See the `gate` step.
+      helm: ${{ steps.gate.outputs.helm }}
+      coop: ${{ steps.gate.outputs.coop }}
+      lint_matrix: ${{ steps.lint.outputs.matrix }}
+      lint_count: ${{ steps.lint.outputs.count }}
+    steps:
+      # SPARSE, DEPTH 1, NO BLOBS (gd-LjoM6ipXQX). This used to be a
+      # `fetch-depth: 0` clone of the whole history: 69 s at the median and
+      # ~580 of this job's ~700 runner-min/day (Task 4.1, gd-WFMvg9sDKE).
+      # Nothing here needs it. paths-filter reads a PR's files through the
+      # API, and on a push it fetches its base at depth 1 itself when the clone
+      # lacks it (dorny/paths-filter src/git.ts, ensureRefAvailable). The
+      # `gate` step reads only the two files below, plus checks.yml at the base
+      # commit, which the next step fetches. Do not go back to fetch-depth: 0;
+      # scripts/check-ci-draft-gate.py refuses it.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/workflows/checks.yml
+            scripts/workflow-changed-jobs.py
+            .github/actions/last-run-base
+          sparse-checkout-cone-mode: false
+      # What a push diffs against (gd-RZopn9lf5I). Main pushes share one
+      # concurrency group (see `concurrency:` above), so a waiting run can be
+      # evicted by a newer push. Diffing only `before..after` would then drop
+      # the evicted push's changes from lint-go, helm and cargo-security for
+      # good. The base is the newest earlier push run that actually ran; see
+      # .github/actions/last-run-base. Empty on a push means fail open: the
+      # `gate` step gets no BASE_SHA and sets scope=ALL.
+      - id: base
+        continue-on-error: true
+        uses: ./.github/actions/last-run-base
+        with:
+          workflow: checks.yml
+      # One commit, trees only (the clone's blob:none filter carries over);
+      # `git show` below then fetches the one blob it reads. Fails open: if the
+      # fetch fails, `gate` finds no base commit and sets scope=ALL.
+      - name: fetch the base commit
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || steps.base.outputs.base }}
+        run: |
+          case "${BASE_SHA:-}" in
+            ''|0000000000000000000000000000000000000000) echo "no base sha; gate fails open" ;;
+            *) git fetch -q --depth=1 --no-tags origin "$BASE_SHA" \
+                 || echo "::warning::could not fetch base ${BASE_SHA}; gate fails open" ;;
+          esac
+      # Not on a tag push: `gate` forces every output true there anyway, and
+      # with no base paths-filter would diff main against the tag in this
+      # depth-1 sparse clone; a failure would fail the release's run. As ci.yml.
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          # Empty (every event but a push, or no proven base) keeps
+          # paths-filter's own default; `gate` then fails open on a push.
+          base: ${{ steps.base.outputs.base }}
+          filters: |
+            controller:
+              - 'gardenio/controller/**'
+              - 'gardenio/clicreds/**'
+              - 'testdata/role-parse-cases.json'
+              - 'scripts/ratchets/deadcode-ratchet.sh' # lint-go's deadcode ratchet
+            kbeads:
+              - 'kbeads/**'
+              - 'gardenio/clicreds/**'
+              - 'lands/contract/**' # kbeads/go.mod replaces it (internal/landmap, D.6)
+              - 'testdata/role-parse-cases.json'
+              - 'scripts/ratchets/deadcode-ratchet.sh' # lint-go's deadcode ratchet
+            # clicreds' OWN lint arm (gd-9DycTnzUo3). The two arms above
+            # compile it through their `replace`, but golangci-lint reports
+            # only the packages under the dir it runs in, so nothing linted
+            # clicreds itself until it got this arm.
+            clicreds:
+              - 'gardenio/clicreds/**'
+            helm:
+              - 'gardenio/helm/gardenio/**'
+              # The release-record size guard packs the chart with these and
+              # the chart tests run the theme generator (gd-qiUiXvTX0k).
+              - 'scripts/pack-gardenio-chart.sh'
+              - 'scripts/pack-gardenio-chart_test.sh'
+              - 'scripts/strip-helm-template-comments.py'
+              - 'scripts/strip-helm-yaml-comments.py'
+              - 'scripts/strip-helm-yaml-comments_test.py'
+              - 'scripts/check-helm-release-size.sh'
+              - 'gardenio/scripts/keycloak-theme-configmap.py'
+              - 'gardenio/scripts/keycloak-theme-configmap_test.py'
+              - 'gardenio/keycloak-theme/**'
+              # The opt-in OpenZiti overlay chart (tests/render_test.sh).
+              - 'gardenio/helm/ziti/**'
+              # The duplicate-key guard (values_duplicate_keys_test.go) also
+              # reads these two non-chart values locations.
+              - 'gardenio/helm/values/**'
+              - 'gardenio/helm/values*.yaml'
+              - 'deploy-values/**'
+              # e2e_lane_namespace_pool_test.go renders the lane overlay and
+              # checks the operator's pool manifest against it.
+              - 'gardenio/tests/e2e/lane/**'
+              # runner_ingress_test.go holds the public runner route to the
+              # daemon's runnerAllowedPatterns (gd-lNbLtKuWoq).
+              - 'kbeads/internal/server/runner_auth.go'
+              # The helm job sources its helm and promtool pins from these, so
+              # a pin or sha bump re-runs the chart tests (gd-hZl1cKiELM,
+              # gd-POfKpGi6Kj). scripts/check-ci-path-gates.py proves every
+              # file it sources matches.
+              - 'gardenio/images/agent/install/versions.env'
+              - 'gardenio/images/agent/install/checksums.env'
+            coop:
+              - 'coop/**'
+              - 'gardenio/locks/security-tools.lock'
+      # ── "this workflow changed" used to mean "run everything" ─────────────
+      #
+      # Each filter above used to open with `- '.github/workflows/checks.yml'`.
+      # The INTENT was right -- if you change how golangci-lint runs,
+      # golangci-lint must run -- but checks.yml is ONE file defining twelve
+      # jobs, so editing a comment on `security` re-ran `helm lint + chart
+      # tests` and `cargo audit + deny` too.
+      #
+      # Measured on main, 2026-09-22: 40 of the 408 non-merge commits in the
+      # last 7 days touch checks.yml (~6/day), and replaying the last 25 of
+      # them through the splitter below, 14 touched no gated path AND changed
+      # no gated job block -- so they fanned out four heavy jobs
+      # (cargo audit + deny 347.2 s, golangci-lint controller 250.2 s, helm
+      # 236.7 s, golangci-lint kbeads 110.0 s = 944 s of heavy-tier slot claim)
+      # for nothing. That is ~3.7 heavy-runner-hours over the window, on a tier
+      # measured pinned at its cap 65% of the time. Slot-claims are what this
+      # pool's queue wait is made of, so this is a BURST-SHAPE fix -- the
+      # recorded lever for this pool -- not a capacity one.
+      #
+      # So: the self-reference is NARROWED, not removed. A checks.yml edit
+      # still triggers exactly the jobs whose own block changed. The splitter
+      # fails open (scope=ALL, everything true) on a base it cannot resolve, a
+      # file it cannot parse, a job added/renamed/removed, any change outside
+      # the jobs mapping (`on`, top-level `env`, `concurrency`), and any change
+      # to `changes` itself, because every gated job reads its outputs.
+      # In the replay, 4 of 25 commits failed open that way. FAILING OPEN IS
+      # THE POINT, as everywhere else in this job.
+      - id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          # push gives the commit of the newest earlier push run that ran (the
+          # `base` step); PR gives the base branch tip. An older base only ever
+          # over-reports changed jobs, which is the safe side.
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || steps.base.outputs.base }}
+          F_CONTROLLER: ${{ steps.filter.outputs.controller }}
+          F_KBEADS: ${{ steps.filter.outputs.kbeads }}
+          F_CLICREDS: ${{ steps.filter.outputs.clicreds }}
+          F_HELM: ${{ steps.filter.outputs.helm }}
+          F_COOP: ${{ steps.filter.outputs.coop }}
+        run: |
+          # Deliberately NOT `set -e`: every failure path below must fall
+          # through to scope=ALL rather than fail the gate job.
+          set -uo pipefail
+          wf=.github/workflows/checks.yml
+          base_yml="$RUNNER_TEMP/checks-base.yml"
+          scope=ALL
+          reason=""
+          changed=""
+
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "$EVENT" = "schedule" ]; then
+            reason="${EVENT} has no base to diff against"
+          elif [[ "${REF:-}" == refs/tags/* ]]; then
+            # A release tag (owner 2026-11-03): release-deploy.sh rolls it
+            # only on this run, so it runs every job.
+            reason="tag push ${REF#refs/tags/} is a full run"
+          elif [ -z "${BASE_SHA:-}" ]; then
+            reason="empty base sha"
+          elif [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            reason="null base sha (first push of a new branch)"
+          elif ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            reason="base ${BASE_SHA} is not present in this checkout"
+          elif ! git show "${BASE_SHA}:${wf}" > "$base_yml" 2>/dev/null; then
+            reason="${wf} does not exist at ${BASE_SHA}"
+          # -S -E proves the splitter is stdlib-only and env-independent: this
+          # job has no pip step, and `import yaml` has killed a guard here
+          # before.
+          elif ! out=$(python3 -S -E scripts/workflow-changed-jobs.py --fail-open-on changes "$base_yml" "$wf" 2>&1); then
+            reason="splitter exited non-zero: ${out}"
+          else
+            printf '%s\n' "$out"
+            scope=$(printf '%s\n' "$out" | sed -n 's/^scope=//p' | head -1)
+            case "$scope" in
+              JOBS) changed=$(printf '%s\n' "$out" | sed -n 's/^changed=//p') ;;
+              ALL) reason=$(printf '%s\n' "$out" | sed -n 's/^reason=//p' | head -1) ;;
+              *) scope=ALL; reason="splitter printed no recognisable scope" ;;
+            esac
+          fi
+
+          c=${F_CONTROLLER:-false}; k=${F_KBEADS:-false}
+          l=${F_CLICREDS:-false}
+          h=${F_HELM:-false}; p=${F_COOP:-false}
+          if [ "$scope" = "ALL" ]; then
+            echo "::notice::checks.yml job gate failing open: ${reason}"
+            c=true; k=true; l=true; h=true; p=true
+          elif [ -n "$changed" ]; then
+            echo "checks.yml job blocks changed: $(printf '%s' "$changed" | tr '\n' ' ')"
+            # Only the GATED jobs are mapped. A change to an ungated job
+            # (quench, dictation-corpus, ...) correctly turns nothing
+            # on here -- those jobs run unconditionally anyway.
+            for j in $changed; do
+              case "$j" in
+                lint-go) c=true; k=true; l=true ;; # one matrix job over every module
+                helm) h=true ;;
+                cargo-security) p=true ;;
+              esac
+            done
+          else
+            echo "checks.yml: no job block changed; paths alone decide"
+          fi
+
+          printf 'controller=%s\n' "$c" >> "$GITHUB_OUTPUT"
+          printf 'kbeads=%s\n' "$k" >> "$GITHUB_OUTPUT"
+          printf 'clicreds=%s\n' "$l" >> "$GITHUB_OUTPUT"
+          printf 'helm=%s\n' "$h" >> "$GITHUB_OUTPUT"
+          printf 'coop=%s\n' "$p" >> "$GITHUB_OUTPUT"
+          echo "gate: controller=$c kbeads=$k clicreds=$l helm=$h coop=$p"
+      # lint-go is a matrix over three independent modules, and `if:` is
+      # job-level -- it cannot skip one matrix entry and keep the others. So
+      # the matrix itself is built here. Keeping it a matrix (rather than
+      # splitting lint-go into separate jobs) preserves the check NAMES
+      # "golangci-lint (gardenio/controller)" and "golangci-lint (kbeads)",
+      # which history, dashboards and any future required-check config key on.
+      - id: lint
+        run: |
+          set -euo pipefail
+          sel='[]'
+          # workflow_dispatch and schedule force every arm: paths-filter diffs
+          # against the default branch on either, so on main it sees an empty
+          # changeset and would report every filter false. A release tag push
+          # forces every arm too (owner 2026-11-03).
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "schedule" ] || [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
+            sel='["gardenio/controller","kbeads","gardenio/clicreds"]'
+          else
+            if [ "${{ steps.gate.outputs.controller }}" = "true" ]; then
+              sel=$(printf '%s' "$sel" | jq -c '. + ["gardenio/controller"]')
+            fi
+            if [ "${{ steps.gate.outputs.kbeads }}" = "true" ]; then
+              sel=$(printf '%s' "$sel" | jq -c '. + ["kbeads"]')
+            fi
+            if [ "${{ steps.gate.outputs.clicreds }}" = "true" ]; then
+              sel=$(printf '%s' "$sel" | jq -c '. + ["gardenio/clicreds"]')
+            fi
+          fi
+          printf 'matrix=%s\n' "$sel" >> "$GITHUB_OUTPUT"
+          printf 'count=%s\n' "$(printf '%s' "$sel" | jq 'length')" >> "$GITHUB_OUTPUT"
+          echo "lint-go will run for: $(printf '%s' "$sel" | jq -r 'if length == 0 then "(nothing)" else join(" ") end')"
+
+  lint-go:
+    name: golangci-lint (${{ matrix.dir }})
+    needs: changes
+    # Fail open: run unless the gate SUCCEEDED and said there is nothing to
+    # lint. A failed or errored gate leaves needs.changes.result != 'success'
+    # and every module gets linted.
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
+       startsWith(github.ref, 'refs/tags/') ||
+       needs.changes.result != 'success' ||
+       needs.changes.outputs.lint_count != '0')
+    # No run-wide supersession conjunct here, deliberately: this job is
+    # path-gated per push, so a newer run need not run it. Its in-job
+    # re-check passes `job:` instead -- see the `supersession` job.
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    # PER-ARM TIERS. The baseline probe below was added on 2026-09-22
+    # specifically to decide this job's tier, and it decided the two arms
+    # DIFFERENTLY:
+    #
+    #   arm                      peak      ANONMAX   vs medium limit 4096Mi
+    #   lint-go kbeads          3042Mi     2021Mi    fits, 2.0x headroom
+    #   lint-go controller     10096Mi     5889Mi    1.4x OVER -- OOM
+    #
+    # Had the demotion been taken on the kbeads number alone -- the arm that
+    # finishes first and is easiest to sample -- the controller arm would have
+    # been OOM-killed on medium, and an OOM-killed runner is indistinguishable
+    # from a spot reclaim here (same "lost communication" annotation), so it
+    # would have burned three retry-lost-runners attempts before going red.
+    # Measure every arm.
+    #
+    # ^^^ "BOTH ARMS SHARE THIS ONE `runs-on`. The matrix cannot split tiers,
+    # so the controller arm sets the tier for both." IS STRUCK (2026-09-23).
+    # The measurements above stand; the premise that pinned BOTH arms to the
+    # scarcest tier does not. `runs-on` accepts matrix context -- and
+    # `continue-on-error` six lines below has keyed off `matrix.dir` in this
+    # very job all along, so the capability was already demonstrated in place.
+    #
+    # Measured 01:44-02:49Z on 2026-09-23 (n=275 jobs across three tiers):
+    # heavy ran at 75% utilisation with peak concurrency pinned at 10/10 =
+    # maxRunners and a p90 queue wait of 605s (max 1306s), while medium sat at
+    # 21.4% and p90 69s. This arm is 1167s of 29251 heavy runner-seconds
+    # (4.0%), and it needs no dind: there is no docker, buildx, kind, k3d,
+    # `services:` or job `container:` anywhere in the steps below. It wanted
+    # heavy for MEMORY, never for docker -- so it moves to the tier that is
+    # 79% idle and keeps a 2x memory margin.
+    #
+    # A module added to the matrix later falls to the `||` branch and lands on
+    # heavy. That is the fail-safe direction: more memory, never less. Do not
+    # invert this test to an allow-list of heavy modules.
+    #
+    # `gardenio/clicreds` (gd-9DycTnzUo3) is a stdlib + go-keyring module of
+    # four packages, a fraction of kbeads' type-check footprint, so it joins
+    # kbeads on medium -- the same call ci.yml's `go` job makes for it.
+    runs-on: ${{ (matrix.dir == 'kbeads' || matrix.dir == 'gardenio/clicreds') && 'gardenio-k3s-medium' || 'gardenio-k3s' }}
+    timeout-minutes: 25
+    # RWX: lint-gardenio, lint-kbeads, kbeads/.rwx lint. No continue-on-error:
+    # the controller arm carried it for a SA4023 finding that is long fixed, and
+    # it let a SA1019 land on main red (2026-10-14, PRs #376/#382) while the run
+    # still concluded success. A lint failure now fails the run.
+    strategy:
+      fail-fast: false
+      matrix:
+        # Built by the gate job. The `||` fallback is the fail-open half: if
+        # the gate errored, lint_matrix is the empty string, fromJSON('')
+        # would abort the job, and an aborted job is lost coverage -- so an
+        # absent value expands to EVERY module instead.
+        dir: ${{ fromJSON(needs.changes.outputs.lint_matrix || '["gardenio/controller","kbeads","gardenio/clicreds"]') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: golangci-lint (${{ matrix.dir }})
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running golangci-lint (${{ matrix.dir }})"
+      # Baseline probe. NOT redundant with the one at the end of this job: the
+      # anon sampler is started by the FIRST probe, so a job with only a final
+      # probe reports the seed that probe just wrote and `anonmax` degenerates
+      # to the instantaneous `anon`. That is why every reading this job has
+      # produced says `samp=started` with anonmax == anon (63-99Mi) while peak
+      # said 4821-11755Mi -- not a broken sampler, an unstarted one.
+      #
+      # Proof the mechanism is sound, from the jobs that DO have two probes:
+      # `security` reads anonmax 6874-7325Mi against anon 90-119Mi, and its
+      # later probes say `samp=running`. So this one line is the difference
+      # between an undecidable tier question and a decided one.
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: "lint-go-${{ matrix.dir }}-baseline" }
+      - uses: actions/setup-go@v5
+        if: steps.superseded.outputs.superseded != 'true'
+        with: { go-version: "${{ env.GO_VERSION }}", cache: false }
+      # Install into the pool's node-local bindir when the runner offers one
+      # (GOTOOLS_BIN, see gardenio/helm/ci/arc-runners-values.yaml), otherwise
+      # into GOPATH/bin exactly as before. Measured: this `go install` cost
+      # 60-68 s on every one of six consecutive runs and never less, because
+      # `go install pkg@version` re-links a ~150 MB binary outside any module
+      # and GOCACHE does not spare it.
+      #
+      # The version guard is not optional once the bindir is shared. A bare
+      # `command -v golangci-lint || install` would pin nothing: the node
+      # would keep whatever version some earlier job left there and lint
+      # silently with it, which is the same class of drift
+      # scripts/check-golangci-pin.sh exists to stop. So compare the exact
+      # version the binary REPORTS, not its presence, and reinstall on any
+      # mismatch -- including a missing binary, where `have` is empty.
+      - name: golangci-lint (pinned)
+        if: steps.superseded.outputs.superseded != 'true'
+        env:
+          GOLANGCI_LINT_VERSION: 2.13.2
+        run: |
+          set -euo pipefail
+          BIN="${GOTOOLS_BIN:-$(go env GOPATH)/bin}"
+          mkdir -p "$BIN"
+          echo "$BIN" >> "$GITHUB_PATH"
+          # `|| true` is load-bearing: under `set -euo pipefail` a missing
+          # binary makes the pipeline exit 127 and aborts the step -- which is
+          # precisely the cold-node first run this whole guard exists to serve.
+          have=$("$BIN/golangci-lint" version 2>/dev/null \
+                 | sed -n 's/.*has version \([0-9][0-9.]*\).*/\1/p') || true
+          if [ "$have" != "$GOLANGCI_LINT_VERSION" ]; then
+            echo "installing golangci-lint $GOLANGCI_LINT_VERSION into $BIN (found: ${have:-none})"
+            GOBIN="$BIN" go install \
+              "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v${GOLANGCI_LINT_VERSION}"
+          else
+            echo "golangci-lint $have already present in $BIN"
+          fi
+      # golangci-lint also holds every func to the function caps (funlen,
+      # gocyclo; gd-d29n0m678l). The funcs over a cap when that ratchet landed
+      # are listed in the module's .golangci.yml, each with its own cap, by
+      # scripts/ratchets/func-baseline.py; that list may only shrink.
+      - run: cd ${{ matrix.dir }} && GOWORK=off golangci-lint run --timeout=15m ./...
+        if: steps.superseded.outputs.superseded != 'true'
+      # DEADCODE RATCHET (gd-d29n0m678l): no new func that no shipped main
+      # reaches. One deadcode run, no -test, with every shipped main of the
+      # module as a root, against <module>/.deadcode-baseline.tsv, which may
+      # only shrink (deleting dead code never reds it). Same tool and pin as
+      # reachability.yml (gd-Nd2ciHTvTE); bump both together. It rides this
+      # job rather than one of its own because the module is already checked
+      # out here on a runner sized to type-check it: about a minute for the
+      # controller's seven mains on heavy, and kbeads' cmd/kd peaks near
+      # 2.1 GB, inside medium's limit. clicreds has no main.
+      - name: deadcode ratchet
+        if: steps.superseded.outputs.superseded != 'true' && matrix.dir != 'gardenio/clicreds'
+        env:
+          DEADCODE_VERSION: v0.49.0
+        run: |
+          set -euo pipefail
+          BIN="${GOTOOLS_BIN:-$(go env GOPATH)/bin}"
+          # Same reasoning as the golangci-lint pin above: a shared bindir
+          # must be checked for the exact version, not for presence.
+          have=$(go version -m "$BIN/deadcode" 2>/dev/null | awk '$1 == "mod" { print $3 }') || true
+          if [ "$have" != "$DEADCODE_VERSION" ]; then
+            echo "installing deadcode $DEADCODE_VERSION into $BIN (found: ${have:-none})"
+            GOTOOLCHAIN=local GOBIN="$BIN" go install "golang.org/x/tools/cmd/deadcode@${DEADCODE_VERSION}"
+          fi
+          DEADCODE="$BIN/deadcode" scripts/ratchets/deadcode-ratchet.sh check "${{ matrix.dir }}"
+      # TEMPORARY DIAGNOSTIC -- see .github/actions/peak-memory. This is the
+      # largest single consumer of the saturated heavy tier (3460s of slot time
+      # over 40 runs on gardenio/controller, 1341s on kbeads) so it is the most
+      # valuable thing to size, but also the least likely to fit a 4Gi limit:
+      # golangci-lint type-checks the whole module and holds the result. The
+      # matrix label matters here -- controller and kbeads are different
+      # modules and there is no reason to assume they peak alike.
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: "lint-go-${{ matrix.dir }}" }
+
+  script-selftests:
+    name: shell guards + script self-tests
+    # Drafts skip this job; see `on.pull_request` at the top of this file.
+    # `!cancelled()` so a failed or unschedulable gate still runs this job;
+    # see the `supersession` job for why the run-wide verdict is sound here.
+    # The whole-tree guards it used to host moved to `quench`.
+    needs: supersession
+    if: >-
+      !cancelled() &&
+      needs.supersession.outputs.superseded != 'true' &&
+      github.event_name != 'pull_request'
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    runs-on: gardenio-k3s-light # light ARC scale set (gardenio/helm/ci) -- adversarially verified safe 2026-09-21, see arc-runners-light-values.yaml
+    # 20 cancelled green runs on a busy node (gd-EkMsUldjkA); the parallel
+    # runner below is the fix, this is headroom for a node with no spare CPU.
+    timeout-minutes: 25
+    # RWX: test-scripts, test-outbox-shape, test-gvisor-*, test-shard-*,
+    # test-skip-visibility, test-terraform-prewarm-contract, lint-large-files,
+    # lint-merge-conflict-markers,
+    # lint-golangci-pin, lint-go-module-coverage, lint-claude-code-currency-guard,
+    # test-security-scripts, security-poison,
+    # test-verify-image-signatures.
+    # shellcheck is a static binary pinned here because apt's lags.
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: shell guards + script self-tests
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running shell guards + script self-tests"
+      # The runner image has no xz and the shellcheck release is a .tar.xz;
+      # python3's tarfile reads it, where apt-get install xz-utils cost ~75s
+      # of this job on a busy node (gd-zVb2CwXaE7).
+      - name: shellcheck
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -e
+          mkdir -p "$HOME/.local/bin"
+          if ! command -v shellcheck >/dev/null; then
+            curl -fsSL --retry 3 -o /tmp/shellcheck.tar.xz https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+            python3 - /tmp/shellcheck.tar.xz "$HOME/.local/bin/shellcheck" <<'EOF'
+          import os, sys, tarfile
+          with tarfile.open(sys.argv[1]) as t:
+              data = t.extractfile("shellcheck-v0.11.0/shellcheck").read()
+          with open(sys.argv[2], "wb") as f:
+              f.write(data)
+          os.chmod(sys.argv[2], 0o755)
+          EOF
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          PATH="$HOME/.local/bin:$PATH" shellcheck --version
+      # The runner the next two steps feed their lists to: a runner that lost
+      # a failure would turn both green, so it is proved first.
+      - name: the self-test runner reports every failure
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/run-selftests_test.py
+      - name: shellcheck every guarded script
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -e
+          python3 scripts/run-selftests.py --jobs 4 <<'EOF'
+          shellcheck -x scripts/check-large-tracked-files.sh scripts/check-golangci-pin.sh scripts/check-go-module-coverage.sh scripts/check-claude-code-currency.sh scripts/check-merge-conflict-markers.sh scripts/check-no-curl-pipe-shell.sh scripts/check-no-curl-pipe-shell_test.sh scripts/ci-fetch-verified.sh scripts/ci-fetch-verified_test.sh scripts/ci-fetch-node.sh scripts/security/check-secret-last-applied.sh scripts/security/check-secret-last-applied_test.sh scripts/k3s/kubectl-ssm.sh scripts/k3s/kubectl-ssm_test.sh scripts/lint-public-strings.sh scripts/lint-public-strings_test.sh scripts/public-readiness-inventory.sh scripts/quarantine.sh scripts/quarantine_test.sh
+          shellcheck -x scripts/gvisor/freeze-thaw-rungs.sh scripts/gvisor/sentry-egress-check.sh scripts/gvisor/discriminating-restore-check.sh
+          shellcheck -x gardenio/tests/e2e/scripts/lib-gvisor-node.sh gardenio/tests/e2e/scripts/lib-gvisor-forensics.sh
+          shellcheck -x gardenio/tests/e2e/scripts/lib-kd-create.sh gardenio/tests/e2e/scripts/test-lib-kd-create.sh
+          shellcheck -x gardenio/helm/ziti/tests/render_test.sh
+          shellcheck -x policy/kyverno/verify-image-signatures_test.sh
+          shellcheck -x scripts/check-tf-tree-freshness.sh scripts/check-tf-tree-freshness_test.sh scripts/tf-gardenio.sh scripts/tf-gardenio_test.sh scripts/check-tf-no-secret-version-data.sh scripts/check-tf-no-secret-version-data_test.sh
+          shellcheck -x gardenio/scripts/machine-principal-canary.sh gardenio/scripts/machine-principal-canary_test.sh
+          shellcheck -x gardenio/scripts/ha-drill-drain.sh
+          shellcheck -x gardenio/scripts/lands-fence-matrix.sh gardenio/scripts/lands-fence-matrix_test.sh
+          shellcheck -x gardenio/scripts/land-door-verify.sh gardenio/scripts/land-door-verify_test.sh
+          shellcheck -x gardenio/scripts/release-cut.sh gardenio/scripts/release-cut_test.sh gardenio/scripts/release.sh gardenio/scripts/release-role-guard.sh
+          shellcheck -x gardenio/scripts/release-deploy_test.sh gardenio/scripts/release-deploy-record_test.sh gardenio/scripts/release-deploy-edge_test.sh gardenio/scripts/release-deploy_test_harness.sh
+          shellcheck -x scripts/security/probe-imds-unreachable.sh scripts/security/probe-imds-unreachable_test.sh
+          shellcheck -x gardenio/images/agent/install/codex.sh gardenio/images/agent/install/codex_test.sh
+          shellcheck -x gardenio/images/agent/install/go-warm.sh
+          shellcheck -x gardenio/images/agent/install/gemini.sh gardenio/images/agent/install/gemini_test.sh
+          shellcheck -x gardenio/images/agent/smoke.sh gardenio/images/agent/smoke_test.sh
+          shellcheck -x gardenio/images/agent/pg-scratch.sh gardenio/images/agent/pg-scratch_test.sh
+          shellcheck -x scripts/onboard.sh scripts/onboard_test.sh scripts/onboard-mac.sh scripts/gardenio-doctor.sh
+          shellcheck -x scripts/reachability/deadcode.sh scripts/reachability/coverage-by-package.sh scripts/reachability/summarize.sh scripts/reachability/code-size.sh scripts/reachability/reachability_test.sh
+          shellcheck -x scripts/metrics/one-pager.sh scripts/metrics/one-pager_test.sh
+          shellcheck -x scripts/ratchets/line-budget.sh scripts/ratchets/line-budget_test.sh scripts/ratchets/deadcode-ratchet.sh scripts/ratchets/deadcode-ratchet_test.sh
+          shellcheck -x scripts/coverage/regen-baselines.sh scripts/coverage/regen-baselines_test.sh
+          EOF
+      # An image that compiles controller/ itself when images/_controller-base/
+      # already built that binary still produces a correct image -- it just puts
+      # a ~150s job where a ~50s one belongs, on a whole node, and the only
+      # symptom is queue wait in some other workflow. That is exactly what
+      # happened: phase 2 built all 20 binaries in the shared base and wired six
+      # images onto it, and the other fourteen went un-migrated until 2026-09-22.
+      - name: images are wired to the shared controller-base
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/check-controller-base.py
+      # Fixtures for the build-policy guards (gd-kCs3VDmMWR); the live checks
+      # run in quench. A cmd/ dir nothing builds must fail.
+      - name: build-policy guard self-tests
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -e
+          python3 scripts/check-cmd-shipped_test.py
+          python3 scripts/check-guard-provenance_test.py
+      # Pull requests run the light tier only, draft or not (gd-JGkmjFfv3B,
+      # gd-19ECZxvFQw). Guards the pull_request trigger types, the
+      # `github.event_name != 'pull_request'` conjunct on every heavy job,
+      # draft-light, and the nightly that runs everything a PR skips.
+      - name: ci, checks and images run no heavy job on a pull request
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/check-ci-draft-gate.py
+      # Blobless is mandatory (owner 2026-11-03): every full-history checkout
+      # sets `filter:` with blob:none. The full clone still works, so dropping
+      # the filter costs minutes per job and fails nothing else.
+      - name: full-history checkouts are blobless
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/check-ci-blobless.py
+      # `ci` and `checks` are the checks the main ruleset requires
+      # (gd-UqzOTRj6cX). Guards that each aggregator needs every other job,
+      # reports under its own name only on a ready run, and that its step
+      # really fails on a failed or cancelled job (run on fixtures).
+      - name: ci and checks aggregate every job under the required names
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/check-ci-required-checks.py
+      # Main pushes share one concurrency group per workflow, and the path
+      # gates diff a push against the newest earlier run that ran
+      # (gd-RZopn9lf5I). Both halves fail silently: a per-sha key just costs
+      # a full run per push again, and a lost base drops an evicted push's
+      # changes from every path-gated job.
+      - name: main pushes batch per workflow, and path gates cover evicted pushes
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 -S -E scripts/check-main-concurrency.py
+      # controller-base costs 0.308 GB of paid egress per push (measured
+      # 2026-10-20); a PR may push it only when a leaf in that run pulls it.
+      - name: images.yml pushes only what is consumed
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/check-image-registry.py
+      # The ci runner pods seed Go into the node-local GitHub tool cache, so
+      # `setup-go` finds it instead of re-downloading 243 MB per job -- it was
+      # 8.8% of all pool cpu-seconds, the 4th largest consumer, measured over
+      # 99 steps. Both ways that stops working are SILENT: the pin drifting
+      # away from GO_VERSION, and the RUNNER_TOOL_CACHE env being dropped so
+      # the seed is written and then ignored. Neither reds anything; CI just
+      # quietly costs 8.8% more, which is the same shape as the bug it fixes.
+      # It also holds every go.work/go.mod go line at or below the agent
+      # image's Go: the image sets GOTOOLCHAIN=local, so a line above it fails
+      # every go command on every crew pod (gd-auZ6V08nR1).
+      - name: the Go tool-cache seed matches GO_VERSION
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/check-go-toolcache-pin.py
+      # The security-poison self-test hard-requires gitleaks on PATH
+      # (POISON_REQUIRE_GITLEAKS=1); same pin as the security job.
+      - name: gitleaks (for the poison self-test)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -e; . gardenio/locks/security-tools.lock; mkdir -p "$HOME/.local/bin"; echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -fsSL -o /tmp/gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256_X86_64}  /tmp/gitleaks.tgz" | sha256sum -c - || { echo "::error::bump GITLEAKS_SHA256_* in gardenio/locks/security-tools.lock with GITLEAKS_VERSION"; exit 1; }
+          tar -xzf /tmp/gitleaks.tgz -C "$HOME/.local/bin" gitleaks
+      - name: script self-tests
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -e
+          # One command per line, comments skipped; run four at a time and each
+          # test's output printed whole when it ends (gd-EkMsUldjkA). Serially the
+          # list hit the 20-minute job timeout on main with every test green.
+          # The tests are independent: each builds its fixtures under mktemp.
+          python3 scripts/run-selftests.py --jobs 4 <<'EOF'
+          # A GREEN SELF-TEST IS NOT COVERAGE: a *_test* file builds its own
+          # fixture, so it proves a guard's logic, not that the guard is applied
+          # to this tree. check-advice-snapshot-freshness works and fails on main
+          # (fixture past its 14d ceiling); it is unwired here and its in-tree
+          # twin is `-skip`ped in ci.yml (gd-ucK8JnJAXZ).
+          bash scripts/bootstrap-ec2_test.sh
+          python3 scripts/build-geo-table_test.py
+          python3 scripts/check-advice-snapshot-freshness_test.py
+          python3 scripts/check-gardener-prompt-drift_test.py
+          python3 scripts/check-controller-base_test.py
+          python3 scripts/check-k3s-audit-policy-order_test.py
+          python3 scripts/check-sigpipe-producers_test.py
+          bash scripts/ci-fetch-verified_test.sh
+          bash scripts/quarantine_test.sh
+          python3 scripts/coverage/normalize-paths_test.py
+          python3 scripts/edge-probe/edge_probe_test.py
+          python3 scripts/support-forward/support_forward_test.py
+          python3 scripts/uptime-probe/uptime_probe_test.py
+          python3 scripts/grade_staleness_probe_test.py
+          bash scripts/inbox/acceptance-smoke_test.sh
+          bash scripts/k3s/kubectl-ssm_test.sh
+          python3 scripts/inbox/build-oci-archive_test.py
+          python3 scripts/inbox/refresh-airgap-pins_test.py
+          bash scripts/inbox/tarboat-file-regressions_test.sh
+          bash scripts/inbox/tarboat-provision-box_test.sh
+          bash scripts/inbox/tarboat-validate_test.sh
+          bash scripts/lint-deploy-values-deletion_test.sh
+          bash scripts/lint-mr-proof_test.sh
+          bash scripts/lint-public-strings_test.sh
+          bash scripts/lint-trust-dossier_test.sh
+          bash scripts/metrics/one-pager_test.sh
+          python3 scripts/model-ab-compare_test.py
+          python3 scripts/opus5-ab_test.py
+          python3 scripts/plan-badge-backfill_test.py
+          python3 scripts/plan-badge-legibility_test.py
+          python3 scripts/plan-badge-tier0_test.py
+          bash scripts/security/gitleaks-history_test.sh
+          bash scripts/security/check-secret-last-applied_test.sh
+          python3 scripts/security/lint-kubectl-apply-secret_test.py
+          bash scripts/security/probe-imds-unreachable_test.sh
+          python3 scripts/security/check-security-md_test.py
+          bash scripts/tarboat/assemble-tarboat_test.sh
+          python3 scripts/worker-epoch_test.py
+          python3 scripts/workflow-changed-jobs_test.py
+          bash gardenio/scripts/machine-principal-canary_test.sh
+          bash gardenio/scripts/lands-fence-matrix_test.sh
+          bash gardenio/scripts/land-door-verify_test.sh
+          bash gardenio/scripts/release-cut_test.sh
+          bash gardenio/scripts/release-deploy_test.sh
+          bash gardenio/scripts/release-deploy-record_test.sh
+          bash gardenio/scripts/release-deploy-edge_test.sh
+          bash gardenio/tests/e2e/scripts/run-shard_test.sh
+          # Onboarding: hermetic (stubbed kd/gb/go, temp HOME), plus the old
+          # skew tests and the syntax/hooks lint (gd-9pgoX3eeEN).
+          bash scripts/onboard_test.sh
+          bash scripts/gardenio-version_test.sh
+          bash scripts/lint-onboarding.sh
+          # Reachability tooling (gd-Nd2ciHTvTE). Its deadcode.sh fixture skips
+          # here (nothing installs deadcode on this job); reachability.yml runs
+          # the real thing.
+          bash scripts/reachability/reachability_test.sh
+          # The ratchets (gd-d29n0m678l). Fixtures only; the live checks run in
+          # quench (line budget) and lint-go (func caps, deadcode). Their real
+          # golangci-lint and deadcode cases skip here: neither is installed.
+          bash scripts/ratchets/line-budget_test.sh
+          bash scripts/ratchets/deadcode-ratchet_test.sh
+          python3 scripts/ratchets/func-baseline_test.py
+          bash scripts/coverage/regen-baselines_test.sh
+          # nullglob: the e2e scripts dir currently has no *_test.sh; without it
+          # bash runs the literal pattern and exits 127.
+          #
+          # That glob has never matched anything and never will: this repo names
+          # its e2e scripts `test-<thing>.sh`, not `<thing>_test.sh`. So the
+          # ~220 scripts in that directory were reached by exactly one thing --
+          # run-shard.sh, on the heavy pool, against a live cluster -- and the
+          # 19 that run-shard.sh does NOT dispatch were reached by nothing at
+          # all once 8a3eb29e deleted the RWX tasks their headers still name.
+          # Censused 2026-09-22 (gd-xg0uQhRE0G); ten of them are hermetic,
+          # green, and total 22.5s, so they are listed explicitly here. They run
+          # in THIS job on the light pool: no new job, no new runner, no added
+          # queue pressure.
+          #
+          # Four of them protect the CI cost machinery itself and had no CI
+          # coverage while doing it: shard-isolation and shard-budget-guard hold
+          # the shard partitioning and time budget the heavy pool spends against,
+          # skip-visibility-lint is what stops a self-skipping module counting as
+          # a pass (green-by-skip drives the re-runs), and hermetic-set-lint
+          # keeps HERMETIC_MODULES hermetic so the shell-hermetic job can stay
+          # off the heavy pool.
+          #
+          # NOT added, with reasons, so the omissions are not read as an
+          # oversight: test-gvisor-{abort-races-completion,freeze-interrupt,
+          # renudge-thaw,substrate-ready} exit 0 in under a second with no
+          # cluster because they self-skip -- wiring them would manufacture
+          # precisely the green-by-skip that skip-visibility-lint exists to
+          # catch. test-claudeless-{scenario,multi-nudge}-isolated need a
+          # `claudeless` binary this runner has no step to install.
+          # test-litellm-budget-cap dies on an unbound LITELLM_URL instead of
+          # skipping cleanly. test-concurrency-isolation is hermetic but RED on
+          # main right now (18 e2e scripts invoke kubectl without declaring
+          # NAMESPACE, which is the cross-namespace stomp it exists to prevent);
+          # it gets wired by whoever fixes those 18, not before (gd-xg0uQhRE0G).
+          # test-terraform-prewarm-cache passes but takes 39s and pulls
+          # providers over the network.
+          bash gardenio/tests/e2e/scripts/test-hermetic-set-lint.sh
+          bash gardenio/tests/e2e/scripts/test-shard-isolation.sh
+          bash gardenio/tests/e2e/scripts/test-shard-budget-guard.sh
+          bash gardenio/tests/e2e/scripts/test-skip-visibility-lint.sh
+          bash gardenio/tests/e2e/scripts/test-pf-supervisor.sh
+          bash gardenio/tests/e2e/scripts/test-lib-retry.sh
+          bash gardenio/tests/e2e/scripts/test-lib-kd-create.sh
+          bash gardenio/tests/e2e/scripts/test-lib-outbox-rig.sh
+          bash gardenio/tests/e2e/scripts/test-outbox-shape-selftest.sh
+          bash gardenio/tests/e2e/scripts/test-lib-gvisor-forensics.sh
+          bash gardenio/tests/e2e/scripts/test-lib-gvisor-node.sh
+          bash gardenio/tests/e2e/scripts/test-lane-lib.sh
+          # Not appended to the RWX list above: that list is provenance ("the
+          # exact list the RWX test-scripts task ran"), so new tests go here.
+          bash scripts/check-no-curl-pipe-shell_test.sh
+          python3 scripts/check-ci-draft-gate_test.py
+          python3 scripts/check-ci-blobless_test.py
+          python3 scripts/check-no-pr-goldens_test.py
+          python3 scripts/check-ci-required-checks_test.py
+          python3 scripts/check-main-concurrency_test.py
+          python3 scripts/check-ci-path-gates_test.py
+          python3 scripts/check-image-registry_test.py
+          python3 scripts/check-viewer-edge-groups_test.py
+          python3 scripts/check-viewer-edge-groups.py
+          # The >3MiB tracked-blob guard. It WAS wired under RWX (archive
+          # ci.yml:3123-3124 runs both the self-test and the live guard) and
+          # the Actions migration dropped it: until now line 427 above
+          # shellcheck'd it and nothing executed it, so the thing it exists to
+          # prevent -- a 1.55GB tip tree that crash-looped every agent pod on
+          # the cold-start clone (ka-0000000431) -- had no gate at all.
+          # Wiring it here rather than as its own job is deliberate: it runs on
+          # this light-pool job, so no new job, no new runner, no added queue
+          # pressure. It is affordable only as of this commit -- the live scan
+          # was 19.5s of fork-per-file and is now 0.5s (self-test 1.1s); at the
+          # old cost this step would have grown by ~40s.
+          # The live scan moved to `quench` (gd-is2Nts83Ai): any file can trip
+          # it, and this job is path-gated on PRs now.
+          bash scripts/check-large-tracked-files_test.sh
+          # The merge-conflict-marker guard (ka-0000001064), folded in from its
+          # own `conflict-markers` job. That job claimed a MEDIUM runner on
+          # every checks run -- measured over 40 runs: queue wait p50 9s / p90
+          # 40s, job wall p50 63s / p90 106s / max 206s -- to run a scan that is
+          # now 1s. Its last run before this change was 12s of job for 1s of
+          # work: ~11s of set-up + checkout overhead on a 0.770-cpu tier. Here
+          # it is ~1s on an 0.260-cpu job that is already checked out, and
+          # `checks` claims one fewer medium runner per run.
+          # The live guard was previously applied ONLY through case 8 of its
+          # own self-test (the live-tree regression case), so trimming that
+          # case as "redundant" would have silently ended the whole-tree scan
+          # with nothing going red. It is invoked directly in `quench` now
+          # (gd-is2Nts83Ai), which no path gate skips, so the coverage stays
+          # explicit rather than incidental.
+          bash scripts/check-merge-conflict-markers_test.sh
+          # Every Go module is in go.work or has a make target (ka-0000008045).
+          # Third guard in this file that RWX ran (archive ci.yml:3163-3164) and
+          # the Actions migration left behind in the shellcheck list at line 428
+          # without ever executing. It was recorded on 2026-09-23 as "reds on
+          # main, cannot simply be wired" -- WRONG, and the way it was wrong is
+          # the point: it walks the working DIRECTORY, so a nested git worktree
+          # (.worktrees/, gitignored) made it report 8 real-looking FAILs naming
+          # real module paths, while the same commit exported clean passed. CI
+          # checks out a clean tree and would never have seen it. The guard now
+          # prunes git-ignored paths and the pair costs 0.05s + 0.56s. The live
+          # guard runs in `quench` (gd-is2Nts83Ai): a new go.mod anywhere can
+          # red it.
+          bash scripts/check-go-module-coverage_test.sh
+          bash scripts/gvisor/freeze-thaw-rungs_test.sh
+          bash scripts/gvisor/sentry-egress-check_test.sh
+          bash scripts/gvisor/discriminating-restore-check_test.sh
+          bash policy/kyverno/verify-image-signatures_test.sh
+          # Terraform tree-freshness guard and its wrapper (gd-F0DwR8UEtV).
+          # Both build real git fixtures under mktemp: no network, no AWS, and
+          # no terraform -- the wrapper test stubs terraform on PATH precisely
+          # so it can assert terraform is NEVER invoked when the guard refuses,
+          # which is the wiring bug (`guard || true`) that the guard's own
+          # tests cannot see.
+          bash scripts/check-tf-tree-freshness_test.sh
+          bash scripts/tf-gardenio_test.sh
+          bash scripts/check-tf-no-secret-version-data_test.sh
+          # GitHub App manifest/JWT/SSM helper. Guards the D4 two-App split: if the
+          # agents App ever acquires `administration`, this reds CI rather than
+          # shipping a credential every agent pod mounts that can also delete
+          # runners and manage collaborators. Needs openssl; no network, no AWS.
+          python3 gardenio/scripts/github-app-register_test.py
+          # The runner-loss classifier in retry-lost-runners.yml. It is inline
+          # JS in a github-script step, so it has no harness of its own, and it
+          # has been wrong about the annotation shape twice -- most recently by
+          # assuming a drained runner always leaves "The operation was
+          # canceled.", which dropped three real reclaims including one on a
+          # push to main. Fixtures are real API annotation text; no network.
+          python3 scripts/check-retry-lost-runners-gate_test.py
+          # The Go tool-cache pin guard. Fixtures are synthetic trees under
+          # GARDENIO_ROOT; the last cases run it against the REAL tree, which
+          # is what proves its two file lists still name files that exist --
+          # a guard whose inputs were all renamed reports "no problems" in the
+          # same words as a clean one unless it counts what it read.
+          python3 scripts/check-go-toolcache-pin_test.py
+          # The CI minutes meter (gd-90WJgUqpz1). Every phase of the CI minutes
+          # plan (gd-WFMvg9sDKE) quotes its saving from this script, so the
+          # test pins the arithmetic with fixtures, including a positive
+          # control day whose total must come out exactly. No network.
+          python3 scripts/ci-minutes_test.py
+          # The Codex CLI installer for the agent image (gd-HaGrzg53TS). This is
+          # the ONLY pull-request execution install/codex.sh ever gets: the
+          # `agent` image is dropped from the images.yml matrix on
+          # `pull_request` (release-only, gd-9mtwbE3hoK), so without this a
+          # wrong arch mapping, a mis-wired digest variable or a wrong tar
+          # member name would first surface while cutting a release tag. The
+          # tests stub `curl` and build a synthetic release tarball, so there is
+          # no network and no 100MB download; ~1s.
+          bash gardenio/images/agent/install/codex_test.sh
+          # Same for the Gemini CLI bundle installer (ADR 0005 phase 0).
+          bash gardenio/images/agent/install/gemini_test.sh
+          # And the agent image's post-build tool + TMPDIR check (gd-hZl1cKiELM).
+          bash gardenio/images/agent/smoke_test.sh
+          # And pg-scratch, the agent's throwaway pgvector Postgres
+          # (gd-ELlwvze8G3). Runners have no Postgres server, so only the
+          # refusal cases run here; the live cases skip. <1s.
+          bash gardenio/images/agent/pg-scratch_test.sh
+          POISON_REQUIRE_GITLEAKS=1 bash scripts/security/security-poison-selftest.sh
+          EOF
+      - name: IMDS is unreachable from a runner pod (P7 Task 7)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: bash scripts/security/probe-imds-unreachable.sh
+      - name: SECURITY.md wording (P7 Task 8)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/security/check-security-md.py SECURITY.md
+
+  # REMOVED 2026-09-23: `conflict-markers` (RWX: lint-merge-conflict-markers).
+  # The self-test runs in `script-selftests` above -- see the comment there for
+  # the measurement -- and the live guard in `quench` (gd-is2Nts83Ai). A dedicated MEDIUM job made sense while
+  # the scan cost 21-185s; at 1s it was ~11s of set-up + checkout overhead and
+  # a whole runner claim per checks run for one second of work.
+  # NOTE for anyone restoring it: the guard's own help text used to begin a
+  # line with the opener sigils and tripped its own scan; it is reworded, so do
+  # not reintroduce that shape.
+
+  terraform:
+    name: terraform fmt + validate + module tests
+    # Drafts skip this job; see `on.pull_request` at the top of this file.
+    # `!cancelled()` so a failed or unschedulable gate still runs this job;
+    # see the `supersession` job for why the run-wide verdict is sound here.
+    needs: supersession
+    if: >-
+      !cancelled() &&
+      needs.supersession.outputs.superseded != 'true' &&
+      github.event_name != 'pull_request'
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    runs-on: gardenio-k3s-medium # medium ARC scale set (gardenio/helm/ci) -- short CPU-bound jobs, no docker; see arc-runners-medium-values.yaml
+    timeout-minutes: 20
+    # RWX: test-terraform-roots (fmt -check + validate). The composition tests
+    # that needed canonical-prod / monorepo-protect roots are D rows below.
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: terraform fmt + validate + module tests
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running terraform fmt + validate + module tests"
+      # setup-terraform unzips the release; the runner image has no unzip.
+      - run: sudo apt-get update -q >/dev/null && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends unzip
+        if: steps.superseded.outputs.superseded != 'true'
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.superseded.outputs.superseded != 'true'
+        # wrapper off: the node wrapper it installs was not found on PATH in the
+        # runner pod (exit 127); the plain binary in the tool cache is enough.
+        with: { terraform_version: "1.16.2", terraform_wrapper: false }
+      - run: terraform fmt -check -recursive gardenio/terraform
+        if: steps.superseded.outputs.superseded != 'true'
+      # INV-4 of the deleted edge-auth secret guard (PR #1681): no
+      # `data "aws_secretsmanager_secret_version"` anywhere under the tree,
+      # which would put the decrypted secret in state (ka-0000002892). Its
+      # self-test runs in script-selftests.
+      - name: no Secrets Manager version data source in terraform
+        if: steps.superseded.outputs.superseded != 'true'
+        run: bash scripts/check-tf-no-secret-version-data.sh
+      - if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -e
+          for d in gardenio/terraform/composition/gardenio gardenio/terraform/modules/k3s gardenio/terraform/modules/network gardenio/terraform/modules/finops gardenio/terraform/modules/edge-probes gardenio/terraform/modules/infra-aws-readonly gardenio/terraform/modules/ses-identity gardenio/terraform/modules/ses-support-inbound; do
+            echo "== $d"; (cd "$d" && terraform init -backend=false -input=false >/dev/null && terraform validate)
+          done
+      # Mock-provider tests (command = plan): no cloud credentials, no apply.
+      - name: edge-probes module tests
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cd gardenio/terraform/modules/edge-probes && terraform init -backend=false -input=false >/dev/null && terraform test
+      - name: infra-aws-readonly module tests
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cd gardenio/terraform/modules/infra-aws-readonly && terraform init -backend=false -input=false >/dev/null && terraform test
+      - name: ses-identity module tests
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cd gardenio/terraform/modules/ses-identity && terraform init -backend=false -input=false >/dev/null && terraform test
+      - name: ses-support-inbound module tests
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cd gardenio/terraform/modules/ses-support-inbound && terraform init -backend=false -input=false >/dev/null && terraform test
+      - name: k3s module tests (edge / ziti flag split, ECR read grant, node policy free of launch templates)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cd gardenio/terraform/modules/k3s && terraform init -backend=false -input=false >/dev/null && terraform test
+      - name: network module tests (NAT placement, route flip)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cd gardenio/terraform/modules/network && terraform init -backend=false -input=false >/dev/null && terraform test
+      - name: composition tests (ECR CI roles trust the immutable OIDC subject)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cd gardenio/terraform/composition/gardenio && terraform init -backend=false -input=false >/dev/null && terraform test
+
+  helm:
+    name: helm lint + chart tests
+    needs: changes
+    # Fail open -- see the `changes` job header.
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
+       startsWith(github.ref, 'refs/tags/') ||
+       needs.changes.result != 'success' ||
+       needs.changes.outputs.helm == 'true')
+    # No run-wide supersession conjunct here, deliberately: this job is
+    # path-gated per push, so a newer run need not run it. Its in-job
+    # re-check passes `job:` instead -- see the `supersession` job.
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    # DEMOTED to the medium tier 2026-09-22, on the measurement its own probe
+    # was added to take (see the TEMPORARY DIAGNOSTIC note below, which
+    # pre-registered "if the memory fits, moving this down is both a slot
+    # freed and a step made faster"). It fits, with room:
+    #
+    #   helm-after-chart-tests   peak 2367Mi   ANONMAX 971Mi   limit 4096Mi
+    #
+    # anonmax is the decision number, not peak -- peak counts reclaimable page
+    # cache, and most of this job's peak IS page cache from untarring three
+    # tool releases. 4.2x headroom on the number that can actually OOM.
+    # It needs no dind (no docker/buildx/kind/k3d/services: anywhere in the
+    # job), and medium carries GOCACHE/GOMODCACHE on /cache, which is what the
+    # 214s `GOWORK=off go test ./...` step wants.
+    runs-on: gardenio-k3s-medium # ARC scale set on the k3s CI pool (gardenio/helm/ci)
+    timeout-minutes: 20
+    # RWX: lint-helm, test-helm. The old "64 chart tests fail" debt
+    # (gd-Il0jwnzCMT, gd-wzxRDryYsR) is gone: both the dead-deploy-values-
+    # overlay tests and the canonical-prod-Terraform-dependent tests were
+    # deleted, not skipped — see .github/known-failures.md and
+    # gardenio/helm/gardenio/tests/README.md.
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: helm lint + chart tests
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running helm lint + chart tests"
+      - uses: actions/setup-go@v5
+        if: steps.superseded.outputs.superseded != 'true'
+        with: { go-version: "${{ env.GO_VERSION }}", cache: false }
+      # A duplicate mapping key in a values file is last-key-wins in helm, with
+      # no error: PR #308 (branched before #324) merged a second top-level
+      # `beads:` into deploy-values/gardenio-k3s.yaml without a git conflict and
+      # would have dropped beads.machineClients, breaking the live /costs fix.
+      # yaml.v3 keeps both key nodes, so this test names every repeat as
+      # file:line at any depth, over deploy-values/*.yaml and the chart values
+      # files, and carries a planted-duplicate positive control. It also runs in
+      # `chart tests` below; it is first here so a bad merge fails in seconds,
+      # before the helm/yq/promtool installs. Gated by the `helm` path filter.
+      - name: values files have no duplicate keys
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          cd gardenio/helm/gardenio/tests
+          GOWORK=off go test -count=1 -run 'TestValuesFilesHaveNoDuplicateKeys|TestFindDuplicateKeys|TestValuesDuplicateKeyCheckFailsOnPlantedFile' .
+      # NOTHING IS PREINSTALLED on the ARC runner pod. This job used to die at
+      # `helm: command not found` in under 20 seconds, and because the repo has
+      # no branch protection that never blocked a merge — it just made the
+      # check permanently red, which is worse than blocking: a real helm-lint
+      # regression is indistinguishable from the tool being absent.
+      # The chart tests additionally shell out to yq and promtool
+      # (gardenio/helm/gardenio/tests), so all three have to be here.
+      - name: install helm, yq, promtool
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -euo pipefail
+          # helm's and promtool's pins are shared with the agent image, so a
+          # crew's local `make test-helm` runs the versions this job does.
+          . gardenio/images/agent/install/versions.env
+          . gardenio/images/agent/install/checksums.env
+          HELM_VER="v${HELM_VERSION}"; YQ_VER=v4.44.3; PROM_VER="${PROMTOOL_VERSION}"
+          curl -fsSL --retry 5 --retry-all-errors -o /tmp/helm.tgz \
+            "https://get.helm.sh/helm-${HELM_VER}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256_AMD64}  /tmp/helm.tgz" | sha256sum -c -
+          tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm
+          sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+          sudo curl -fsSL -o /usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VER}/yq_linux_amd64"
+          sudo chmod 0755 /usr/local/bin/yq
+          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VER}/prometheus-${PROM_VER}.linux-amd64.tar.gz" \
+            | tar -xz -C /tmp "prometheus-${PROM_VER}.linux-amd64/promtool"
+          sudo install -m 0755 "/tmp/prometheus-${PROM_VER}.linux-amd64/promtool" /usr/local/bin/promtool
+          helm version --short && yq --version && promtool --version
+      # The land door's real-nginx tests (TestPublicEdgeNginx_*, D.18a
+      # gd-WTyoLCSMUp) run public-edge.yaml's api.clonk.tv block in nginx, and
+      # under GitHub Actions fail rather than skip without one. The debs are
+      # unpacked, not installed, so no nginx service starts on the runner.
+      # nginx-core carries the binary on Ubuntu 22.04, nginx on 24.04.
+      - name: install nginx (land door edge tests)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          cd /tmp
+          apt-get download nginx
+          apt-get download nginx-core 2>/dev/null || true
+          for d in /tmp/nginx*.deb; do dpkg-deb -x "$d" /tmp/nginx-root; done
+          /tmp/nginx-root/usr/sbin/nginx -V 2>&1 | grep http_auth_request_module >/dev/null
+          echo "EDGE_NGINX=/tmp/nginx-root/usr/sbin/nginx" >> "$GITHUB_ENV"
+      # TEMPORARY DIAGNOSTIC -- see .github/actions/peak-memory. This job is
+      # the strongest demotion candidate after `security`: 2316s of heavy slot
+      # time over 40 runs, and 214s of its 232s average is the ONE step below,
+      # a `GOWORK=off go test ./...`.
+      #
+      # HALF OF THIS PREDICTION WAS WRONG, and the demotion was taken anyway.
+      # The sentence that stood here claimed the move would be "both a slot
+      # freed and a step made faster", because `go test` "is precisely the
+      # workload the medium tier's node-local GOCACHE now serves (it gained
+      # /cache in b689d995)". The slot is freed. The step is NOT faster:
+      #
+      #   tier     total   chart-test step
+      #   medium    296s       272s        (first run after the demotion)
+      #   heavy     172-284s   157-264s    (five preceding runs, median 189s)
+      #
+      # A node-local hostPath cache is worth ~nothing on this pool -- measured
+      # separately at 0 hits in 4 runs across 5 distinct nodes, because spot
+      # nodes are routinely minutes old and a cache keyed to a node rarely
+      # meets a second job. That measurement predates this comment, so the
+      # GOCACHE half of the argument was never sound. The real cause of the
+      # stretch is contention: cpuavg measured 1384m against this tier's 750m
+      # request, with no CPU limit to stop it but other runners to share with.
+      #
+      # That is the documented medium-tier trade, not a regression: ~100s of
+      # duration against a p90 queue wait of 1205s on heavy. n=1 so far, and
+      # one heavy run did hit 284s, so treat the exact gap as provisional --
+      # but do not re-argue the cache. Keep two probes, not one: the reset
+      # the curl/tar tool installs from the Go test compile, because they are
+      # different arguments -- a big number from the installs would be page
+      # cache from untarring, a big anon number from the compile would not be.
+      - run: helm lint gardenio/helm/gardenio/
+        if: steps.superseded.outputs.superseded != 'true'
+      # Release-record size guard (gd-qiUiXvTX0k). Helm stores the whole
+      # packed chart + rendered manifest in one Secret capped at 1 MiB, and
+      # release 2026.292.1 failed there with every later release blocked. This
+      # packs the chart exactly as release-deploy.sh does, renders it with
+      # deploy-values, rebuilds the release record and fails over 900 KiB, so
+      # the creep is caught on the PR. ~2s. Runs the new strip/generator
+      # script tests first: they are what keep the pack render-safe.
+      - name: release record stays under 900 KiB
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          python3 scripts/strip-helm-yaml-comments_test.py
+          python3 gardenio/scripts/keycloak-theme-configmap_test.py
+          bash scripts/pack-gardenio-chart_test.sh
+          bash scripts/check-helm-release-size.sh
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: helm-before-chart-tests, reset: "true" }
+      # `-timeout` is NOT optional here. Without it `go test` applies its own
+      # 10-minute default, which is INVISIBLE in this file and sits BELOW the
+      # job's `timeout-minutes: 20` above -- so the tighter of the two ceilings
+      # was the one nobody chose. That was slack until a5a6647 demoted this job
+      # to the medium tier; the suite now straddles 10m on node contention and
+      # panics at random. Measured on main, not on a branch diff: 16:47Z
+      # success in 5m45s, 17:51Z `panic: test timed out after 10m0s` -- same
+      # commit range, same code, opposite outcomes (gd-dnk0zE75rw). A red check
+      # on a green diff is worse than a slow one: it sends whoever opened the
+      # PR back to re-diagnose a change that was fine.
+      #
+      # 18m keeps a real hang failing, and keeps it failing INSIDE the job so
+      # the panic stack names the stuck test, rather than the runner killing
+      # the step at 20m with nothing to read. Raise `timeout-minutes` first if
+      # you raise this.
+      - name: chart tests
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          cd gardenio/helm/gardenio/tests
+          GOWORK=off go test -timeout 18m ./...
+      # The ziti overlay is its own chart, off by default; this proves it still
+      # renders, and renders nothing, until ziti.enabled=true.
+      - name: ziti overlay render tests
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          helm lint gardenio/helm/ziti/
+          bash gardenio/helm/ziti/tests/render_test.sh
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: helm-after-chart-tests }
+
+  # ── SPLIT OUT OF `security` 2026-09-22 ─────────────────────────────────────
+  # gitleaks does not belong on the heavy tier and never did. It was there only
+  # because it shared a job with govulncheck. The four peak-memory probes on
+  # that job exist precisely to tell those two apart ("If one tool drives it,
+  # splitting this job moves the other two down"), and over 20 runs they do,
+  # unambiguously. anonmax is the decision number, NOT peak -- see
+  # .github/actions/peak-memory for why peak is only a one-sided test:
+  #
+  #   probe               peak med   ANONMAX med   max seen   fits medium 4Gi?
+  #   security-baseline      1272Mi         78Mi      103Mi   yes
+  #   after-gitleaks         1272Mi        240Mi      263Mi   YES -- 15x headroom
+  #   after-govulncheck      8354Mi       7028Mi     7563Mi   NO  -- 1.7x over
+  #   after-osv              8354Mi       7028Mi     7563Mi   see below
+  #
+  # ONE tool drives the whole job's tier. gitleaks moves down here; govulncheck
+  # stays heavy and is why that job stays heavy.
+  #
+  # osv-scanner is NOT proven either way, and is deliberately left on the heavy
+  # job rather than moved on a guess. `reset` reads `unsupported` on these
+  # nodes, so anonmax is a running maximum that never resets -- after-osv ==
+  # after-govulncheck therefore means only that osv never exceeded govulncheck's
+  # watermark. Its own footprint is MASKED, not measured as zero. It is also 2s
+  # of a 106.5s job, so there is nothing to win by guessing at it.
+  #
+  # What the split buys, from 13 runs of step timings: gitleaks 30.8s,
+  # govulncheck 54.2s, osv 1.7s, checkout+setup-go+tools 15.9s. Moving gitleaks
+  # takes ~31s of heavy occupancy (~30% of this job) off EVERY push -- the job
+  # is ungated, so that is every push -- from a tier measured pinned at its cap
+  # 65% of the time onto one measured averaging 1.53 of 6.
+  #
+  # The medium copy costs MORE wall-clock than it did on heavy, and the first
+  # post-split run measured it: 99s total, of which the scan step alone was
+  # 86s against 30.8s on heavy -- ~2.8x slower under medium's 750m cpu share.
+  # (An earlier revision of this comment estimated ~39s by assuming the scan
+  # ran at heavy speed. That was wrong; this is the measured number.) It is
+  # still the right trade: 8s queue wait against a heavy tier that had every
+  # one of its 10 slots busy and 11 jobs still queued in that same run, so the
+  # gitleaks verdict landed ~26 minutes earlier than it would have. The medium
+  # tier was idle, so those 99s cost nothing anyone was waiting on.
+  #
+  # Note what does NOT follow: the heavy job is not made cheap, it is made
+  # ~30% shorter. A job's TIER is set by its heaviest step; its slot COST is
+  # tier x duration. Conflating the two is what previously read as "not worth
+  # splitting" -- see gardenio/helm/ci/README.md, corrected there.
+  #
+  # gitleaks is also the only reason this job was ungated -- "a docs-only commit
+  # is not a commit they can skip" is a statement about a secret scanner, not
+  # about a Go vulnerability scanner.
+  #
+  # NOT done here, on purpose: path-gating the remaining heavy job to Go
+  # changes. That looks free once gitleaks is gone and it is not -- govulncheck's
+  # verdict depends on the upstream vulnerability database, which moves WITHOUT
+  # the tree, so a Go-gated job goes stale on a quiet week and the staleness is
+  # invisible. That is a coverage tradeoff, not a placement change, so it is
+  # filed rather than taken. (gd-yee312IdGD took it for PRs only; it went
+  # with every heavy PR job in gd-19ECZxvFQw and gd-whdmfznixO.)
+  #
+  # ON A PULL REQUEST IT SCANS ONLY THE PR'S COMMITS (gd-5iGDOjVCl7). The walk of
+  # all ~7000 commits was 46-196s of a 65-240s job, sampled over 5 PR runs, and
+  # every one of those commits other than the PR's own had already been scanned
+  # on main. GITLEAKS_LOG_OPTS=origin/<base_ref>..HEAD narrows it; HEAD is the
+  # PR's merge ref, so the range is the PR's commits plus that merge commit,
+  # whose own diff `git log -p` does not show. Push, schedule, dispatch and tag
+  # runs set nothing and keep the full-history scan, which is still where a
+  # secret that reached main by any other road gets found.
+  #
+  # The verdict changes with the scope. On the full history a finding stays
+  # advisory: the ~50 known fixture findings already there would red every run.
+  # In a PR's range those are out of scope, so a finding there is a secret THIS
+  # PR adds, and it fails the job. The positive control is the real-gitleaks
+  # cases in scripts/security/gitleaks-history_test.sh (a planted fake key in
+  # the range is caught, one only in the base is not); the `scripts` job runs it.
+  #
+  # The name keeps "history" and "advisory" because the ci-minutes baseline
+  # (gardenio/docs/ci-minutes/) matches on it; renaming it would break the
+  # before/after comparison this change is measured by.
+  gitleaks:
+    name: gitleaks history (advisory, as in RWX)
+    # Drafts skip this job; see `on.pull_request` at the top of this file.
+    # `!cancelled()` so a failed or unschedulable gate still runs this job;
+    # see the `supersession` job for why the run-wide verdict is sound here.
+    needs: supersession
+    if: >-
+      !cancelled() &&
+      needs.supersession.outputs.superseded != 'true' &&
+      github.event_name != 'pull_request'
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    runs-on: gardenio-k3s-medium # medium ARC scale set (gardenio/helm/ci) -- 750m cpu request and NO cpu limit, 1Gi/4Gi memory, no dind sidecar. gitleaks touches none of docker and peaked at 263Mi across 20 runs.
+    timeout-minutes: 20
+    # Its own displacement group, for the same reason and with the same measured
+    # effect as `security`'s (see the long note there): this job is ungated, so
+    # a newer instance scans the newer tip -- the whole history on main, the
+    # PR's current commits on a PR -- and a superseded instance can be dropped
+    # with no loss for what can still merge. A commit a force-push dropped from
+    # the PR goes unscanned, and it cannot land. A SEPARATE key from `security`'s -- sharing one would make
+    # the two jobs displace each other, which is not what either wants.
+    concurrency:
+      group: checks-gitleaks-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.run_id || github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        # load-bearing: gitleaks detect walks history and SILENTLY no-ops on a shallow clone -- that silent mode is what gitleaks-history.sh's rc=2 coverage gate exists to catch.
+        # On a PR it is also what fetches origin/<base_ref>, the bottom of the scanned range.
+        # Blobless on a PR (owner 2026-11-03, scripts/check-ci-blobless.py): the full clone had grown to 227-548 s against a
+        # ~1 s range scan; blob:none is 15 MB/4 s with every commit and tree, and git fetches only the range's blobs. The
+        # full-history scan (nightly, tag, push, dispatch) reads every blob, so it keeps the full clone ('' = no filter).
+        with:
+          fetch-depth: 0
+          filter: ${{ github.event_name == 'pull_request' && 'blob:none' || '' }}
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: gitleaks history (advisory, as in RWX)
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running gitleaks history (advisory, as in RWX)"
+      # Baseline probe -- starts the anon sampler. See the identical note on
+      # `lint-go`: a single end-of-job probe cannot report an anon high-water
+      # mark, because it is the thing that seeds the sampler. This job's
+      # confirmation reading said `samp=started anonmax=62Mi anon=62Mi`, which
+      # measured nothing about the step in between.
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: gitleaks-medium-baseline }
+      # No setup-go here, deliberately. gitleaks is a prebuilt release tarball
+      # and scripts/security/gitleaks-history.sh shells out to exactly two
+      # binaries, git and gitleaks (verified with comments stripped). Dropping
+      # setup-go also drops the latent shared-GOCACHE upload trap documented on
+      # `security` below, rather than copying it into a second job.
+      - name: gitleaks (pinned)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -e; . gardenio/locks/security-tools.lock; mkdir -p "$HOME/.local/bin"; echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -fsSL -o /tmp/gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256_X86_64}  /tmp/gitleaks.tgz" | sha256sum -c - || { echo "::error::bump GITLEAKS_SHA256_* in gardenio/locks/security-tools.lock with GITLEAKS_VERSION"; exit 1; }
+          tar -xzf /tmp/gitleaks.tgz -C "$HOME/.local/bin" gitleaks
+      - name: gitleaks history (coverage is the gate)
+        if: steps.superseded.outputs.superseded != 'true'
+        env:
+          # Empty except on a pull_request; see the note above the job. Passed
+          # through env, not spliced into the script, as base_ref is a branch name.
+          GITLEAKS_LOG_OPTS: ${{ github.event_name == 'pull_request' && format('origin/{0}..HEAD', github.base_ref) || '' }}
+        run: |
+          set +e; bash scripts/security/gitleaks-history.sh; rc=$?
+          [ "$rc" = 2 ] && { echo "::error::gitleaks history coverage failure"; exit 1; }
+          [ "$rc" = 1 ] && [ -n "$GITLEAKS_LOG_OPTS" ] && { echo "::error::gitleaks found a secret in this PR's commits ($GITLEAKS_LOG_OPTS). Remove it from the branch's history; a later commit deleting it does not. A false positive goes in .gitleaks.toml's allowlist."; exit 1; }
+          [ "$rc" = 1 ] && echo "::warning::gitleaks found secrets in history (advisory, pre-existing fixture debt)"; exit 0
+      # TEMPORARY DIAGNOSTIC -- one probe, to confirm the demotion holds WHERE IT
+      # NOW RUNS rather than only where it was measured. The 240Mi above was read
+      # on a heavy pod; this re-reads it on a medium one. Delete with the others.
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: gitleaks-medium }
+
+  security:
+    name: govulncheck + osv (advisory, as in RWX)
+    # Drafts skip this job; see `on.pull_request` at the top of this file.
+    # `!cancelled()` so a failed or unschedulable gate still runs this job;
+    # see the `supersession` job for why the run-wide verdict is sound here.
+    needs: supersession
+    if: >-
+      !cancelled() &&
+      needs.supersession.outputs.superseded != 'true' &&
+      github.event_name != 'pull_request'
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci) -- STAYS heavy: govulncheck's anonmax is 7028Mi median / 7563Mi max against medium's 4Gi limit. See the gitleaks job above for the measurement.
+    timeout-minutes: 25
+    # ── ONE OF THESE PER BRANCH, NOT ONE PER COMMIT ────────────────────────────
+    #
+    # Measured 2026-09-22 03:05Z: 34 jobs queued on the heavy pool, every single
+    # one labelled `gardenio-k3s`, while medium sat at 0/6 and light at 1/10.
+    # 26 of the 34 belonged to nine pushes to main whose shas were ALREADY
+    # ancestors of the main tip -- superseded before their first runner started.
+    # Ten of those 26 were this job, one per superseded push. That is the single
+    # largest identifiable block in the queue, and raising the ceiling does not
+    # touch it: ci_max_nodes went 8 -> 11 and heavy maxRunners 7 -> 10 forty
+    # minutes earlier (e8966662) and heavy was pinned at 10/10 within seconds.
+    #
+    # The run-level `concurrency:` above cannot fix this, and should not: it is
+    # keyed per-SHA on push so that nothing supersedes anything, which is right
+    # for this workflow's four PATH-GATED jobs. Their gate diffs one push at a
+    # time, so an older sha's `cargo audit` is genuinely not redone by a newer
+    # run that skipped it -- the same reason retry-lost-runners.yml exempts
+    # `images` from its staleness guard. Cancelling those would lose coverage.
+    #
+    # This job is the opposite case. It is UNGATED and whole-repo by design
+    # (see the `changes` header: "a docs-only commit is not a commit they can
+    # skip"), and it runs with fetch-depth: 0. So a newer run's instance scans
+    # a strict superset of an older one's: same tree plus the commits after it.
+    # A superseded instance can therefore be dropped with ZERO coverage loss,
+    # which is exactly the judgement retry-lost-runners.yml already applies to
+    # the same runs -- it SKIPS retrying a main push whose branch has moved on,
+    # calling it "pure queue load ... worst precisely during the churn storms".
+    # That policy was only ever enforced on the retry path. This enforces the
+    # same policy one layer earlier, on the first attempt.
+    #
+    # WHY cancel-in-progress IS FALSE. It looks like the weaker setting and it
+    # is the deliberate one. With it false, jobs in the group QUEUE instead, and
+    # GitHub keeps at most one PENDING job per group -- a newer pending job
+    # displaces the older. A burst of ten pushes therefore costs 1 running + 1
+    # pending = 2 slot-claims instead of 10, which is 8 of the 9 available, and
+    # it buys that without ever killing work already in flight. Two reasons that
+    # matters more than the last claim:
+    #   1. A cancelled in-flight job has already paid its pod start, its
+    #      checkout at fetch-depth 0 and part of its scan. Those slot-seconds
+    #      are spent either way; letting it finish converts them into a verdict.
+    #   2. `cancelled()` is a RUN-level function, and lint-go / helm /
+    #      cargo-security all begin `!cancelled()`. Whether a job cancelled by
+    #      job-level concurrency trips its siblings' `!cancelled()` was not
+    #      measured when this landed. If it does, killing this job would skip
+    #      the three path-gated jobs in the same run -- reintroducing the
+    #      coverage loss above through a side door. Displacing a job that never
+    #      started cannot have that effect.
+    #
+    # ── MEASURED 2026-09-22: IT WORKS, AND IT IS FREE ──────────────────────────
+    # Over 33 recent push runs this group cancelled 9 instances of this job, and
+    # all nine cost ZERO heavy slot-seconds: every one has `runner_name` empty,
+    # `steps_ran` 0, and `started_at` exactly equal to `created_at`. They were
+    # displaced out of the pending slot, never scheduled. The chain is textbook
+    # -- each cancellation's completed_at is the next one's created_at
+    # (03:12:03 -> 03:16:50 -> 03:19:29 -> 03:22:22 -> 03:28:00) -- so a burst
+    # of nine pushes really did collapse to 1 running + 1 pending.
+    #
+    # Beware the arithmetic trap this creates: on a cancelled job that never got
+    # a runner, `completed_at - started_at` is TIME IN THE PENDING SLOT, not slot
+    # consumption. Summing it reads as 18 wasted heavy minutes here when the true
+    # figure is zero. Check `runner_name` before costing any cancelled job.
+    #
+    # Reason 2's worry also did not materialise: in all nine runs the siblings
+    # behaved normally -- the three ungated whole-repo jobs all `success`, the
+    # path-gated ones `skipped` by their own gate. So displacement does not trip
+    # `!cancelled()`. That was the stated blocker on extending this pattern, and
+    # it is now answered for the displacement mode, which is the only mode in
+    # use here (cancel-in-progress is false). A job KILLED in flight remains
+    # unmeasured, because nothing kills one.
+    #
+    # EXTENDING IT ANYWAY IS NOT WORTH DOING, on separate evidence: the three
+    # path-gated heavy jobs barely run. In the same 33-run sample `helm` ran ONCE
+    # against 19 skips (4.7 heavy min total), `cargo audit + deny` once against
+    # 19 (0.3 min), and golangci-lint three times (1.1 min). A displacement group
+    # cannot recover queue load from jobs that are already skipped 19 times in 20;
+    # the path gate got there first. The remaining prerequisite -- a group key
+    # carrying the gate's own output, so a run whose gate said skip cannot
+    # displace one whose gate said run -- stands unbuilt on purpose.
+    # Do not extend it by symmetry; it is not symmetric, and it is not needed.
+    #
+    # The key mirrors the run-level block's shape on purpose: workflow_dispatch
+    # and schedule key per run_id so a deliberate manual run or the nightly is
+    # never made to wait behind (or be displaced by) a push, and `github.ref` keys PR runs to the PR (where the run-level group
+    # already cancels supersedes, making this a no-op) and push runs to the
+    # branch (where it is the whole point).
+    concurrency:
+      group: checks-security-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.run_id || github.ref }}
+      cancel-in-progress: false
+    # RWX: go-vuln, osv-scan (gitleaks is now the separate `gitleaks` job above
+    # -- all three were ADVISORY in .rwx/ci.yml and remain so; the one blocking
+    # condition, a gitleaks history-coverage failure at rc=2, moved with it).
+    # Pins from gardenio/locks/security-tools.lock. Pre-existing: 59 OSV ids on
+    # HEAD, red on the pristine tree (the 50 gitleaks fixture findings moved).
+    #
+    # fetch-depth: 0 below survived the split, but the reason CHANGED and the
+    # concurrency note above is now worded for the job this used to be. Restated
+    # for what it is today: govulncheck and osv-scanner read the TREE, not
+    # history, so the supersession argument no longer rests on "a superset of
+    # the history" -- it rests on the simpler fact that an advisory tree scan of
+    # a superseded sha on a branch that has moved on has no consumer. Same
+    # conclusion as retry-lost-runners.yml reaches for the same runs.
+    #
+    # It is kept anyway for two measured reasons, not by inertia. (1) It is
+    # free: over 14 runs this fetch-depth-0 checkout averaged 3.6 s, the FASTEST
+    # checkout step in the workflow -- faster than the shallow ones in
+    # `changed-path gate` (5.2 s) and `shell guards` (5.1 s). Removing it saves
+    # nothing. (2) Both scripts grow a history path the moment a target branch
+    # is passed: each does `git merge-base` + `git worktree add --detach`. They
+    # are called with "" today so that path is dead, but it is one argument away
+    # from live, and it self-fetches only --depth=200. Blobless
+    # (scripts/check-ci-blobless.py): the scanners read the checked-out tree,
+    # which a blob:none checkout still has in full.
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, filter: blob:none }
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: govulncheck + osv (advisory, as in RWX)
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running govulncheck + osv (advisory, as in RWX)"
+      # cache: false for the same reason as every other setup-go in this repo
+      # -- the runner pod points GOCACHE/GOMODCACHE at a node-local hostPath
+      # (gardenio/helm/ci) -- but here it closes a LATENT trap rather than
+      # fixing a live cost, which is worth stating precisely.
+      #
+      # Today `cache: true` does nothing at all: setup-go hashes a root
+      # `go.sum` to build its key, this is a multi-module repo with no root
+      # go.sum, and the logs show `Restore cache failed: Dependencies file is
+      # not found` followed by `Primary key was not generated` on the save.
+      # Both halves no-op.
+      #
+      # What makes it worth changing anyway is what happens the day that stops
+      # being true. setup-go asks `go env GOCACHE GOMODCACHE` and caches
+      # whatever it is told -- which is now /cache/go-build and /cache/go-mod,
+      # the directory every job on this node shares. So a root go.sum (or
+      # someone adding `cache-dependency-path` to be helpful) would make this
+      # step upload the node's entire multi-GB shared cache to the repo's
+      # 10 GB Actions cache budget, and restore a stale archive over a warm
+      # node cache on the way in. Verified 02:34Z: GOCACHE read back as
+      # /cache/go-build inside this very job.
+      - uses: actions/setup-go@v5
+        if: steps.superseded.outputs.superseded != 'true'
+        with: { go-version: "${{ env.GO_VERSION }}", cache: false }
+      - name: tools (pinned)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -e; . gardenio/locks/security-tools.lock; mkdir -p "$HOME/.local/bin"; echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -sSL "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64" -o "$HOME/.local/bin/osv-scanner"; chmod +x "$HOME/.local/bin/osv-scanner"
+          # The gitleaks download moved to the `gitleaks` job above with its
+          # scan; this job no longer runs gitleaks, so installing it here would
+          # be pure cost. The lock is still sourced whole -- it is a shell
+          # KEY=VALUE file and GITLEAKS_VERSION simply goes unused here.
+          #
+          # osv-scanner is a prebuilt download and costs ~3 s; govulncheck is a
+          # `go install` and is the rest of this
+          # step. Same node-local bindir and same mandatory version guard as
+          # lint-go -- see the long note there for why presence is not a
+          # sufficient test once the bindir outlives the pod.
+          #
+          # The version is read with `go version -m`, which reads the module
+          # stamp out of the binary. `govulncheck -version` would also print
+          # it, but it contacts the vulnerability database to report the DB
+          # timestamp, so it is neither offline nor free.
+          BIN="${GOTOOLS_BIN:-$(go env GOPATH)/bin}"
+          mkdir -p "$BIN"; echo "$BIN" >> "$GITHUB_PATH"
+          # `|| true` for the same reason as in lint-go: this step runs under
+          # `set -e`, and an absent binary must mean "install it", not "fail".
+          have=$(go version -m "$BIN/govulncheck" 2>/dev/null \
+                 | sed -n 's|^[[:space:]]*mod[[:space:]]*golang.org/x/vuln[[:space:]]*v\([0-9][0-9.]*\).*|\1|p') || true
+          if [ "$have" != "$GOVULNCHECK_VERSION" ]; then
+            echo "installing govulncheck $GOVULNCHECK_VERSION into $BIN (found: ${have:-none})"
+            GOBIN="$BIN" go install "golang.org/x/vuln/cmd/govulncheck@v${GOVULNCHECK_VERSION}"
+          else
+            echo "govulncheck $have already present in $BIN"
+          fi
+      # TEMPORARY DIAGNOSTIC (4 probes, .github/actions/peak-memory) -- delete
+      # them and that directory once the tier decision below is recorded.
+      #
+      # A single end-of-job probe already ran here and returned peak=7967Mi,
+      # which killed the plan to demote this job to the medium tier (1Gi
+      # request / 4Gi limit). These probes replace it because that one number
+      # answered the wrong question twice over:
+      #
+      #  1. It is a WHOLE-JOB peak, so it says the pod touched 8Gi somewhere
+      #     without saying which of gitleaks / govulncheck / osv-scanner did
+      #     it. If one tool drives it, splitting this job moves the other two
+      #     down; if all three do, the job stays heavy. Resetting the peak at
+      #     each boundary is what tells those apart.
+      #  2. cgroup memory.peak counts page cache, which is reclaimable, so
+      #     7967Mi is an UPPER BOUND on what a 4Gi limit would OOM on, not a
+      #     verdict. gitleaks reads every blob in history and osv-scanner
+      #     walks the whole tree -- both generate exactly the kind of file
+      #     cache that inflates this number without being unevictable. The
+      #     probe now reports anon and file separately for that reason.
+      #
+      # Everything else about the demotion case is unchanged: 121s average, no
+      # sustained CPU, and ungated by design (a secret in a markdown file is
+      # what it exists to catch) so it runs on every push and holds a 3-CPU
+      # slot on a tier that is pinned at its cap 65% of the time.
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: security-baseline, reset: "true" }
+      # The `after-gitleaks` probe went with the gitleaks step. Its measurement
+      # is recorded on the gitleaks job above; re-reading it here would only
+      # re-measure a step this job no longer runs. `security-baseline` stays as
+      # the floor and `after-govulncheck` remains the one that matters: the
+      # 240Mi -> 7028Mi jump across this next step is the entire tier argument.
+      - name: govulncheck
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set +e; export PATH="${GOTOOLS_BIN:-$(go env GOPATH)/bin}:$(go env GOPATH)/bin:$PATH"
+          for mod in gardenio/controller kbeads; do GOWORK=off scripts/security/govulncheck-baseline.sh "$mod" ""; done; exit 0
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: after-govulncheck, reset: "true" }
+      - name: osv-scanner
+        if: steps.superseded.outputs.superseded != 'true'
+        run: scripts/security/osv-baseline.sh ""
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: after-osv }
+
+  cargo-security:
+    name: cargo audit + deny (coop)
+    needs: changes
+    # Fail open -- see the `changes` job header.
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
+       startsWith(github.ref, 'refs/tags/') ||
+       needs.changes.result != 'success' ||
+       needs.changes.outputs.coop == 'true')
+    # No run-wide supersession conjunct here, deliberately: this job is
+    # path-gated per push, so a newer run need not run it. Its in-job
+    # re-check passes `job:` instead -- see the `supersession` job.
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    # DEMOTED to the medium tier 2026-09-22. The re-measurement this job's own
+    # comment demanded ("the tier decision needs a RE-MEASUREMENT after this
+    # change, not a re-reading of numbers taken from a job that no longer
+    # exists in this shape") has been taken, on the baseline probe below:
+    #
+    #   cargo-security (end)   peak 2119Mi   ANONMAX 599Mi   limit 4096Mi
+    #
+    # 6.8x headroom on anon. The job is now 23-43s of wall clock holding a
+    # whole 4-vCPU node, with a p90 queue wait of 1125s on this tier -- the
+    # exact profile the medium tier was created for.
+    #
+    # THE CARGO_HOME QUESTION, SETTLED BY MEASUREMENT. The medium tier
+    # deliberately sets no CARGO_HOME/RUSTUP_HOME ("no job on this tier needs
+    # a Rust toolchain" -- now false, so that line is struck there too), and
+    # the rustup step below falls back to $HOME/.cargo. On an ephemeral pod
+    # that means re-installing toolchain 1.93.0 every run. The objection is
+    # that this trades queue wait for a download -- but the heavy tier does
+    # not avoid that download either. The step is guarded on
+    # `[ ! -x "$CH/bin/rustup" ]`, so a warm CARGO_HOME would make it ~0s, and
+    # it measured 11/15/20/19/10/15/15s across the last seven runs: seven
+    # non-zero readings, no sub-5s outlier, no bimodality. The heavy tier's
+    # /cache never holds rustup, because this pool puts a job on a different
+    # spot node nearly every run (see gardenio/helm/ci/arc-runners-values.yaml
+    # and the cargo-install measurement in this file's history). The toolchain
+    # is ALREADY cold every run, so moving tiers costs nothing on that axis.
+    runs-on: gardenio-k3s-medium # ARC scale set on the k3s CI pool (gardenio/helm/ci)
+    timeout-minutes: 30
+    # RWX: cargo-audit, cargo-deny, coop/.rwx audit + deny. Advisory in RWX.
+    # Pins from the lock; installed with --locked into the runner's cargo home.
+    defaults: { run: { working-directory: coop } }
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: cargo audit + deny (coop)
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running cargo audit + deny (coop)"
+      # Baseline probe -- starts the anon sampler, which is what the "anonmax
+      # is unusable here" note below was actually describing. See `lint-go`
+      # for the mechanism and the proof it works when a job has two probes.
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: cargo-security-baseline }
+      # An apt install of build-essential + pkg-config + libssl-dev stood here
+      # (12.5s mean). It existed only so `cargo install` could COMPILE
+      # cargo-audit and cargo-deny -- openssl-sys needs libssl-dev and a cc.
+      # Both tools are now fetched as static musl binaries, so nothing in this
+      # job compiles a native dependency any more and none of it is reachable.
+      # Restore it if a future step here needs to build C.
+      #
+      # Ephemeral runner pod: nothing is preinstalled. rustup reads
+      # coop/rust-toolchain.toml (channel + components) on first use. It stays:
+      # `cargo audit` and `cargo deny` are cargo SUBCOMMANDS and `cargo deny`
+      # shells out to `cargo metadata`, so cargo itself is still required.
+      - name: rustup
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          # --default-toolchain none + a root working directory was the bug:
+          # rustup only reads a rust-toolchain.toml from the CWD upwards, and
+          # this repo's lives at coop/rust-toolchain.toml — nothing at the
+          # root. So `rustup show active-toolchain` exited "error: no active
+          # toolchain" and the bare `rustup toolchain install` had no spec to
+          # install either. quench runs at the ROOT (`quench check --ci`), so
+          # it needs a real default rather than coop's directory override.
+          #
+          # Pinned to the SAME channel coop pins (coop/rust-toolchain.toml:
+          # channel 1.93.0) so the tool that gates the tree is built with the
+          # tree's own compiler rather than drifting with whatever `stable` is.
+          # Update both together.
+          #
+          # Paths come from CARGO_HOME, not $HOME/.cargo: the runner pod sets
+          # CARGO_HOME to a node-local hostPath (gardenio/helm/ci/
+          # arc-runners-values.yaml) and rustup installs its binaries under
+          # CARGO_HOME when that is set, so $HOME/.cargo/bin would simply not
+          # exist. The fallback keeps this working where the env is unset.
+          set -euo pipefail
+          CH="${CARGO_HOME:-$HOME/.cargo}"
+          if [ ! -x "$CH/bin/rustup" ]; then
+            # DO NOT collapse this back to `curl -sSf https://sh.rustup.rs | sh`.
+            # That pipeline CANNOT FAIL CORRECTLY: on a transient fetch error
+            # curl writes nothing, `sh` reads EOF and exits 0, so the install
+            # "succeeds" and the job dies much later at exit 127 -- after it has
+            # held a heavy runner for minutes. `set -o pipefail` does not save
+            # it either: a TRUNCATED body is still fed to `sh` and partly run.
+            # Download to a file, prove it is non-empty, then execute it.
+            init="$(mktemp)"
+            curl -sSfL --retry 5 --retry-delay 2 --retry-connrefused \
+                 --max-time 180 -o "$init" https://sh.rustup.rs
+            [ -s "$init" ] || { echo "::error::rustup-init downloaded empty"; exit 1; }
+            sh "$init" -y --no-modify-path --profile minimal --default-toolchain 1.93.0
+            rm -f "$init"
+          fi
+          echo "$CH/bin" >> "$GITHUB_PATH"
+          "$CH/bin/rustup" show active-toolchain
+      # ── PREBUILT, not `cargo install` ────────────────────────────────────
+      #
+      # This step used to build cargo-audit and cargo-deny from source. The
+      # comment here claimed that was "usually a no-op" once the node-local
+      # CARGO_HOME was warm. IT IS NOT, and never was: measured across four
+      # runs on 2026-09-22 the step took 199s, 200s, 278s and 418s -- not one
+      # cache hit -- against `cargo audit` 2.8s and `cargo deny` 2.0s of actual
+      # scanning. 80% of the heaviest job in the pool (340s mean, 1699
+      # slot-seconds over 12 runs, the single largest heavy consumer) was
+      # rebuilding its own tools.
+      #
+      # The cache could not hit: five runs landed on five DISTINCT nodes. A
+      # node-local hostPath cache is worth nothing on a spot pool whose nodes
+      # are minutes old, which is the pool this repo runs on by design.
+      #
+      # Both tools publish static musl binaries for the exact pinned versions,
+      # so this is now a download. Checksums are pinned in the lock next to
+      # the versions and verified BEFORE extraction -- a bumped version with a
+      # stale checksum fails here, loudly, rather than scanning with the wrong
+      # tool. Downloaded to a file and checked, never piped to a shell
+      # (scripts/check-no-curl-pipe-shell.sh, and see the rustup step above for
+      # why a truncated body is the failure that matters).
+      - name: cargo-audit + cargo-deny (pinned binaries)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -euo pipefail
+          . ../gardenio/locks/security-tools.lock
+          CH="${CARGO_HOME:-$HOME/.cargo}"
+          mkdir -p "$CH/bin"
+
+          fetch() { # url  sha256  member  dest
+            local url=$1 want=$2 member=$3 dest=$4 tmp
+            tmp="$(mktemp)"
+            curl -sSfL --retry 5 --retry-delay 2 --retry-connrefused \
+                 --max-time 180 -o "$tmp" "$url"
+            [ -s "$tmp" ] || { echo "::error::$dest downloaded empty"; exit 1; }
+            echo "$want  $tmp" | sha256sum -c - >/dev/null || {
+              echo "::error::checksum mismatch for $url"
+              echo "::error::got $(sha256sum < "$tmp" | cut -d\  -f1), want $want"
+              echo "::error::bump the _SHA256 in gardenio/locks/security-tools.lock"
+              exit 1
+            }
+            tar -xzf "$tmp" --strip-components=1 -C "$CH/bin" "$member"
+            rm -f "$tmp"
+          }
+
+          A="cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}"
+          D="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          fetch "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v${CARGO_AUDIT_VERSION}/${A}.tgz" \
+                "$CARGO_AUDIT_SHA256" "$A/cargo-audit" cargo-audit
+          fetch "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${D}.tar.gz" \
+                "$CARGO_DENY_SHA256" "$D/cargo-deny" cargo-deny
+
+          # Prove the pins landed. A binary that runs but reports the wrong
+          # version means the checksum guarded the wrong asset.
+          for t in cargo-audit cargo-deny; do chmod +x "$CH/bin/$t"; done
+          "$CH/bin/cargo-audit" --version | grep -qF "$CARGO_AUDIT_VERSION" \
+            || { echo "::error::cargo-audit version mismatch"; exit 1; }
+          "$CH/bin/cargo-deny" --version | grep -qF "$CARGO_DENY_VERSION" \
+            || { echo "::error::cargo-deny version mismatch"; exit 1; }
+          "$CH/bin/cargo-audit" --version; "$CH/bin/cargo-deny" --version
+      # TEMPORARY DIAGNOSTIC -- see .github/actions/peak-memory. 2459s of heavy
+      # slot time over 40 runs.
+      #
+      # The rest of this comment used to argue that demoting this job to medium
+      # was blocked, because medium sets no CARGO_HOME / RUSTUP_HOME
+      # (arc-runners-medium-values.yaml -- "nothing here needs Rust") and a cold
+      # node would pay the 10m45s from-source build. THAT BLOCKER IS GONE: as
+      # of the step above nothing is built from source, so there is no cargo
+      # tool cache left to lose. `quench` already runs on medium on exactly
+      # this basis -- sha256-verified release tarball, no cargo build (see its
+      # comment) -- and this job now installs the same way.
+      #
+      # What is still NOT settled is the memory question, and the existing
+      # probe data does not settle it either way. Five runs read peak 3214-4150Mi
+      # (median 4111Mi) against medium's 4096Mi limit, so the one-sided peak
+      # test FAILS -- which means AMBIGUOUS, not rejected. And that peak was
+      # ~96% page cache (file=3614-3646Mi vs anon 63-121Mi) from the cargo
+      # BUILD that no longer happens.
+      #
+      # The earlier version of this note said anonmax was "unusable here"
+      # because samp=started makes it a post-step read. That was the symptom,
+      # not the cause, and reading it as a property of the number is what kept
+      # this undecidable: the sampler is started BY THE FIRST PROBE, and this
+      # job had exactly one. A baseline probe now stands after checkout, so
+      # anonmax here is a real high-water mark. The mechanism was never broken
+      # -- `security`, which has always had two probes, reports anonmax
+      # 6874-7325Mi against anon 90-119Mi and says samp=running.
+      #
+      # So the tier decision needs a RE-MEASUREMENT after this change, not a
+      # re-reading of numbers taken from a job that no longer exists in this
+      # shape. Keeping the probe for exactly that. Do not demote on the
+      # pre-baseline readings.
+      - run: cargo audit || echo "::warning::cargo audit findings (advisory)"
+        if: steps.superseded.outputs.superseded != 'true'
+      - run: cargo deny check licenses bans sources || echo "::warning::cargo deny findings (advisory)"
+        if: steps.superseded.outputs.superseded != 'true'
+      - uses: ./.github/actions/peak-memory
+        if: always() && steps.superseded.outputs.superseded != 'true'
+        with: { label: cargo-security }
+
+  quench:
+    name: quench quality gate
+    # Drafts skip this job; see `on.pull_request` at the top of this file.
+    # `!cancelled()` so a failed or unschedulable gate still runs this job;
+    # see the `supersession` job for why the run-wide verdict is sound here.
+    needs: supersession
+    if: >-
+      !cancelled() &&
+      needs.supersession.outputs.superseded != 'true' &&
+      github.event_name != 'pull_request'
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    runs-on: gardenio-k3s-medium # medium ARC scale set (gardenio/helm/ci) -- short CPU-bound jobs, no docker; see arc-runners-medium-values.yaml
+    timeout-minutes: 10
+    # RWX: quench (root + kbeads). Fully green (gd-cxKPq7DvA4): escapes
+    # resolved at the root cause, and every `docs` broken_link/broken_toc
+    # finding is either fixed or de-linked per that task's triage rule — see
+    # its comment history for the full disposition. continue-on-error
+    # dropped for exactly this reason: it is real signal again.
+    #
+    # Binary comes from the quench GitHub release tarball (sha256-verified),
+    # NOT `cargo install quench` from crates.io (gd-G0LEXCrytC): crates.io's
+    # quench 0.3.0 fails to build on this repo's pinned rustc — its
+    # lexical-core dependency hits 27 type errors (e.g. "no implementation for
+    # u32 - usize"). images/agent/install/rust-tools.sh already solved this
+    # for the agent image by fetching the release tarball instead of building
+    # from crates.io; this job sources the SAME QUENCH_VERSION/checksum pins
+    # so the two installs can't drift apart. Bonus: no rustup/cargo build, so
+    # this job no longer needs a Rust toolchain at all.
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: quench quality gate
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running quench quality gate"
+      - name: install quench (prebuilt release binary)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -e
+          . gardenio/images/agent/install/versions.env
+          . gardenio/images/agent/install/checksums.env
+          curl -fsSL "https://github.com/alfredjeanlab/quench/releases/download/v${QUENCH_VERSION}/quench-linux-x86_64.tar.gz" -o /tmp/quench.tar.gz
+          echo "${QUENCH_SHA256_X86_64}  /tmp/quench.tar.gz" | sha256sum -c --status -
+          mkdir -p "$HOME/.local/bin"
+          tar -xz -C "$HOME/.local/bin" -f /tmp/quench.tar.gz quench
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: quench check --ci
+        if: steps.superseded.outputs.superseded != 'true'
+      # WHOLE-TREE GUARDS (gd-is2Nts83Ai). A file far from scripts/ can change
+      # their verdict (any tracked file, any *.sh, any go.mod, a Go test dir an
+      # images.yml filter globs, a .tf file's reach), so they cannot sit behind
+      # a path gate. This job already scans the whole tree, is ungated and is
+      # checked out, and together they cost a few seconds. Their self-tests
+      # stay in `script-selftests`. scripts/check-ci-path-gates.py fails if
+      # one of them is run by no ungated job.
+      # `echo "$x" | grep -q PAT` is a SIGPIPE race, and until 2026-09-22 it was
+      # the most common red on main: 7 of the last 95 runs of script-selftests, six of
+      # them this one bug wearing four different names. grep -q exits at the
+      # first match without draining stdin, the producer's write() then takes
+      # EPIPE (immediately -- free pipe buffer is irrelevant), and `pipefail`
+      # promotes that to the pipeline's status, so the branch flips even though
+      # grep matched. The tell is an assertion reporting exactly the value it
+      # asserted. 423 sites were converted to here-strings; this keeps them gone.
+      - name: no producer piped into an early-exit grep
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/check-sigpipe-producers.py
+      # A guard that cannot fail is not a guard: the previous internal-strings
+      # audit reported green for weeks while its script did not exist
+      # (gd-3bU9QDf5sv). This one is hard-failing and whole-tree, and its
+      # self-test (lint-public-strings_test.sh, in script-selftests) plants a
+      # dead host, the old GitLab group path and an instance id and asserts red.
+      - name: public strings and infra ids
+        if: steps.superseded.outputs.superseded != 'true'
+        run: bash scripts/lint-public-strings.sh --all
+      # Proves the files the `helm` job sources are in its filter, and the
+      # whole-tree scans sit in an ungated job (gd-is2Nts83Ai, gd-whdmfznixO).
+      - name: checks.yml path gates watch what their jobs read
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/check-ci-path-gates.py
+      # `curl … | sh` cannot report failure: on a transient fetch error curl
+      # writes nothing, `sh` reads EOF and exits 0, so the install "succeeds"
+      # and the job dies minutes later at exit 127 -- having already held a
+      # HEAVY node through checkout and apt. 2 of the 6 failures in the last
+      # 100 ci.yml runs were exactly that. pipefail does NOT fix it; a
+      # truncated body is still executed. The policy already existed in
+      # gardenio/images/agent/install/ (clis.sh:8) and nothing enforced it, so
+      # three workflows drifted back to it -- ci.yml, e2e.yml and checks.yml,
+      # checks.yml's own rustup step among them. gd-ahaGQcSZFp.
+      - name: no installer piped straight into a shell
+        if: steps.superseded.outputs.superseded != 'true'
+        run: bash scripts/check-no-curl-pipe-shell.sh
+      - name: no merge-conflict markers in tracked files
+        if: steps.superseded.outputs.superseded != 'true'
+        run: bash scripts/check-merge-conflict-markers.sh
+      - name: no tracked file over 3 MiB
+        if: steps.superseded.outputs.superseded != 'true'
+        run: bash scripts/check-large-tracked-files.sh
+      - name: every Go module is in go.work or has a make target
+        if: steps.superseded.outputs.superseded != 'true'
+        run: bash scripts/check-go-module-coverage.sh
+      - name: no kubectl apply of Secrets in scripts or runbooks
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/security/lint-kubectl-apply-secret.py .
+      # Build policy (gd-kCs3VDmMWR; rules in the repo-root CLAUDE.md). A new
+      # cmd/ dir or guard test can land anywhere in the tree, so these sit
+      # here, ungated.
+      - name: every controller binary ships in an image or runs in CI
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/check-cmd-shipped.py
+      - name: every guard test cites the bead it protects against
+        if: steps.superseded.outputs.superseded != 'true'
+        run: python3 scripts/check-guard-provenance.py
+      # The per-package line budget (gd-d29n0m678l): every Go package against
+      # scripts/ratchets/line-budget.tsv, counted by code-size.sh (the counter
+      # of the reduction targets). Any Go file anywhere moves it, so it sits
+      # here, ungated. Reads source only, ~10 s.
+      - name: no Go package past its line budget
+        if: steps.superseded.outputs.superseded != 'true'
+        run: bash scripts/ratchets/line-budget.sh check
+
+  dictation-corpus:
+    name: scripts/build-dictation-corpus vet + test
+    # Drafts skip this job; see `on.pull_request` at the top of this file.
+    # `!cancelled()` so a failed or unschedulable gate still runs this job;
+    # see the `supersession` job for why the run-wide verdict is sound here.
+    needs: supersession
+    if: >-
+      !cancelled() &&
+      needs.supersession.outputs.superseded != 'true' &&
+      github.event_name != 'pull_request'
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    runs-on: gardenio-k3s-medium # medium ARC scale set (gardenio/helm/ci) -- short CPU-bound jobs, no docker; see arc-runners-medium-values.yaml
+    timeout-minutes: 10
+    # RWX: test-dictation-corpus
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: scripts/build-dictation-corpus vet + test
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running scripts/build-dictation-corpus vet + test"
+      # cache: false -- see the long note on the `security` job's setup-go for
+      # the trap this closes. It applies here as of 2026-09-22 for a second
+      # reason: this job runs on the MEDIUM tier, which until b689d995 mounted
+      # no node cache at all, so reaching for actions/cache over the network
+      # was the only caching it had. Now that /cache is mounted here too, the
+      # node-local cache is both warmer and free.
+      - uses: actions/setup-go@v5
+        if: steps.superseded.outputs.superseded != 'true'
+        with: { go-version: "${{ env.GO_VERSION }}", cache: false }
+      - run: cd scripts/build-dictation-corpus && GOWORK=off go vet ./... && GOWORK=off go test ./...
+        if: steps.superseded.outputs.superseded != 'true'
+
+  # scripts/wer-eval is a go.work member with its own main_test.go, and until
+  # gd-9DycTnzUo3 no job ran it: ci.yml's `go` job tests only the dirs in its
+  # matrix, and nothing here or there runs a repo-root `./...`.
+  # scripts/check-go-module-coverage.sh now maps every go.work member to the
+  # job that tests it, so a member with no job reds `script-selftests`. Same
+  # shape and tier as dictation-corpus: a small module, no docker, ungated.
+  wer-eval:
+    name: scripts/wer-eval vet + test
+    # Drafts skip this job; see `on.pull_request` at the top of this file.
+    # `!cancelled()` so a failed or unschedulable gate still runs this job;
+    # see the `supersession` job for why the run-wide verdict is sound here.
+    needs: supersession
+    if: >-
+      !cancelled() &&
+      needs.supersession.outputs.superseded != 'true' &&
+      github.event_name != 'pull_request'
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    runs-on: gardenio-k3s-medium # medium ARC scale set (gardenio/helm/ci); see arc-runners-medium-values.yaml
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: scripts/wer-eval vet + test
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running scripts/wer-eval vet + test"
+      # cache: false -- see dictation-corpus above; GOCACHE is the node-local /cache.
+      - uses: actions/setup-go@v5
+        if: steps.superseded.outputs.superseded != 'true'
+        with: { go-version: "${{ env.GO_VERSION }}", cache: false }
+      - run: cd scripts/wer-eval && GOWORK=off go vet ./... && GOWORK=off go test ./...
+        if: steps.superseded.outputs.superseded != 'true'
+
+  # The Lands contract module (lands/contract, task gd-DBEOg6p7rX). It is
+  # outside go.work on purpose, so nothing else here compiles it
+  # (scripts/check-go-module-coverage.sh maps it to `make test-lands-contract`,
+  # which this job runs the equivalent of). Same shape and tier as
+  # dictation-corpus: a small module, short CPU-bound work, no docker, ungated.
+  lands-contract:
+    name: lands/contract spec + bindings + fixtures
+    # Drafts skip this job; see `on.pull_request` at the top of this file.
+    # `!cancelled()` so a failed or unschedulable gate still runs this job;
+    # see the `supersession` job for why the run-wide verdict is sound here.
+    needs: supersession
+    if: >-
+      !cancelled() &&
+      needs.supersession.outputs.superseded != 'true' &&
+      github.event_name != 'pull_request'
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    runs-on: gardenio-k3s-medium # medium ARC scale set (gardenio/helm/ci); see arc-runners-medium-values.yaml
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: lands/contract
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: lands/contract spec + bindings + fixtures
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running lands/contract spec + bindings + fixtures"
+      # cache: false -- see dictation-corpus above; GOCACHE is the node-local /cache.
+      - uses: actions/setup-go@v5
+        if: steps.superseded.outputs.superseded != 'true'
+        with: { go-version: "${{ env.GO_VERSION }}", cache: false }
+      - uses: actions/setup-node@v4
+        if: steps.superseded.outputs.superseded != 'true'
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: lands/contract/ts/package-lock.json
+      - name: go vet + test (spec rules, golden fixtures, hygiene, deps)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: GOWORK=off go vet ./... && GOWORK=off go test -count=1 ./...
+      # Both bindings are committed so gl and the web UI build without the
+      # generators. Regenerate and fail on any difference, so a hand edit to a
+      # generated file or a spec change without regeneration cannot land.
+      - name: regenerate the Go and TypeScript bindings
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -euo pipefail
+          GOWORK=off go generate ./...
+          cd ts && npm ci --no-audit --no-fund && npm run generate
+      - name: fail on binding drift
+        if: steps.superseded.outputs.superseded != 'true'
+        run: |
+          set -euo pipefail
+          drift=$(git status --porcelain -- .)
+          if [ -n "$drift" ]; then
+            printf '%s\n' "$drift"
+            git --no-pager diff --stat -- .
+            echo "::error::lands/contract bindings are stale. Run 'make generate-lands-contract' and commit the result."
+            exit 1
+          fi
+      - name: type-check the golden fixtures against the TypeScript binding
+        if: steps.superseded.outputs.superseded != 'true'
+        run: cd ts && npm run check
+
+  # gl, the tenant's CLI (lands/gl, task gd-bR8MiyOpbe). Out of go.work like
+  # the contract, so neither the root ./... run nor any other job reaches it
+  # (scripts/check-go-module-coverage.sh maps it to `make test-lands-gl`, which
+  # this job runs the equivalent of). Its tests drive every command against a
+  # fake land serving lands/contract's golden fixtures, and deps_test.go fails
+  # if gl imports anything from the repo but the contract binding and the
+  # shared sign-in. Same tier and shape as lands-contract; ungated.
+  lands-gl:
+    name: lands/gl tenant CLI
+    # Drafts skip this job; see `on.pull_request` at the top of this file.
+    # `!cancelled()` so a failed or unschedulable gate still runs this job;
+    # see the `supersession` job for why the run-wide verdict is sound here.
+    needs: supersession
+    if: >-
+      !cancelled() &&
+      needs.supersession.outputs.superseded != 'true' &&
+      github.event_name != 'pull_request'
+    permissions:
+      actions: read # the in-job re-check lists this workflow's runs and jobs
+      contents: read
+    runs-on: gardenio-k3s-medium # medium ARC scale set (gardenio/helm/ci); see arc-runners-medium-values.yaml
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: lands/gl
+    steps:
+      - uses: actions/checkout@v4
+
+      # Re-ask the supersession question after the queue wait; read the
+      # `supersession` job before touching any of the next three steps.
+      # ADDING A STEP BELOW? Guard it with the same `if:` -- for the
+      # node-minutes, and so the sentinel keeps telling the truth.
+      # scripts/check-ci-draft-gate.py refuses an unguarded one.
+      - id: superseded
+        uses: ./.github/actions/superseded
+        with:
+          workflow: checks.yml
+          job: lands/gl tenant CLI
+      - name: guard decision
+        run: |
+          v='${{ steps.superseded.outputs.superseded }}'
+          echo "supersession guard: superseded='${v}'"
+          if [ -z "$v" ]; then
+            echo "::warning::supersession guard produced NO value -- it is failing open and saving nothing"
+          fi
+      - name: heavy work starting
+        if: steps.superseded.outputs.superseded != 'true'
+        run: echo "not superseded; running lands/gl tenant CLI"
+      # cache: false -- see dictation-corpus above; GOCACHE is the node-local /cache.
+      - uses: actions/setup-go@v5
+        if: steps.superseded.outputs.superseded != 'true'
+        with: { go-version: "${{ env.GO_VERSION }}", cache: false }
+      - name: go vet + test (commands, sign-in, live feed, deps guard)
+        if: steps.superseded.outputs.superseded != 'true'
+        run: GOWORK=off go vet ./... && GOWORK=off go test -count=1 ./...
+      - name: build gl the way a release would
+        if: steps.superseded.outputs.superseded != 'true'
+        run: GOWORK=off CGO_ENABLED=0 go build -trimpath -o /dev/null .
+
+  # ── D rows: real checks we cannot run yet ─────────────────────────────────
+  # coverage ratchets (RWX coverage*.yml, coverage-baselines.yml): ported as
+  #   ci.yml's advisory `coverage / patch` step in the `go` job (gd-roE5roXBKQ);
+  #   regen-baselines.sh's self-test runs with the ratchets' below.
+  # beads-viewer e2e (test-beads-viewer-e2e): needs node/playwright + a live
+  #   viewer; port after gardenio is deployed.
+  # advice-snapshot-freshness: needs a live beads daemon (same as the one
+  #   skipped test in ci.yml).
+  # terraform composition tests (test-release-closure-excludes-control-plane,
+  #   test-monorepo-protect-tf, lint-deploy-values*): their roots/overlays were
+  #   stripped by the redaction.
+  # coop rendering-bc / claudeless: needs tmux + the claudeless binary.
+  #
+  # internal-strings-audit (RWX ci.yml "OSS-readiness early-warning"): WAS a
+  #   real job here until 2026-09-22 and had never once run. It shelled out to
+  #   scripts/sanitize/no-internal-strings.sh, and scripts/sanitize/ does not
+  #   exist and never has -- `git log --all -- 'scripts/sanitize/*'` is empty,
+  #   so the redaction stripped it exactly like the terraform overlays above.
+  #   The failure was invisible by construction: `... || echo "::warning::"`
+  #   swallowed bash's "No such file or directory", and `continue-on-error:
+  #   true` made the job green on top of that. Log for job 106653927690:
+  #
+  #     bash: scripts/sanitize/no-internal-strings.sh: No such file or directory
+  #     ##[warning]internal strings audit (advisory)
+  #     conclusion: success
+  #
+  #   It billed a WHOLE heavy runner (3 CPU / 12Gi, one 4-vCPU node) and a
+  #   fetch-depth:0 clone per PR to do that. Measured p50 6 s wall, of which
+  #   the audit step itself was 10 ms (07:26:06.586 -> .588); the rest was git
+  #   fetch. Removed rather than fixed because the patterns it matched
+  #   (internal hosts, registry paths, AWS account ids, IAM ARNs, operator
+  #   PII) were redacted with the script -- reimplementing them from memory
+  #   would rebuild the same false green, which is the actual defect here, not
+  #   the wasted node. Replaced by scripts/lint-public-strings.sh
+  #   (hard-failing, with a planted-failure self-test), run whole-tree in the
+  #   ungated `quench` job; closes gd-3bU9QDf5sv.
+  deferred:
+    name: deferred (D rows, see comments)
+    if: false
+    runs-on: gardenio-k3s # ARC scale set on the k3s CI pool (gardenio/helm/ci)
+    steps:
+      - run: "true"
+
+  # ── THE REQUIRED CHECK `checks` (gd-UqzOTRj6cX) ────────────────────────────────
+  # A ruleset's required status check matches a CHECK-RUN (job) name, not a
+  # workflow name, so this job is the one name the main ruleset requires for
+  # all of checks.yml. Adding, renaming or path-gating a job then never touches
+  # the ruleset. It needs EVERY other job and fails when any of them did not
+  # end `success` or `skipped`: a failure, a cancel, a timeout. Skipped is
+  # fine, so path gates, the PR light tier and the supersession skip still pass.
+  #
+  # `if: always()`, not `!cancelled()`: a cancelled run must still report a
+  # FAILED `checks`. A skipped check satisfies a required check, so a skipped
+  # `checks` would read as green.
+  #
+  # The name is `checks` on every event. From gd-UqzOTRj6cX to part B
+  # (gd-19ECZxvFQw) a draft run reported `checks (draft)`, because its heavy
+  # jobs skipped and a ready_for_review run was still to come. Every PR run
+  # is now the light tier, draft or not, and `gh pr ready` starts no run,
+  # so the head's own run must report the check the ruleset requires.
+  #
+  # ADVISORY lists the job ids whose failure must not fail `checks`: a job that
+  # carries job-level `continue-on-error`. It is empty because no job here
+  # does. The advisory scans swallow their findings inside their own steps, so
+  # when one of those jobs fails, something real broke.
+  #
+  # scripts/check-ci-required-checks.py keeps `needs:` equal to every other
+  # job, the name, the `if:` and ADVISORY, and runs the step below on fixtures.
+  checks:
+    name: checks
+    needs:
+      - supersession
+      - changes
+      - lint-go
+      - script-selftests
+      - terraform
+      - helm
+      - gitleaks
+      - security
+      - cargo-security
+      - quench
+      - dictation-corpus
+      - wer-eval
+      - lands-contract
+      - lands-gl
+      - deferred
+    if: always()
+    runs-on: gardenio-k3s-light # never heavy: it only reads `needs`
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: every job passed or skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          ADVISORY: ""
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          n=$(jq 'length' <<<"$NEEDS")
+          if [ "$n" -eq 0 ]; then
+            echo "::error::no needs results to judge; failing closed"
+            exit 1
+          fi
+          bad=$(jq -r --arg adv "$ADVISORY" '
+            ($adv | split(" ") | map(select(length > 0))) as $a
+            | to_entries[]
+            | select(.value.result != "success" and .value.result != "skipped")
+            | if (.key as $k | $a | index($k)) != null
+              then "+advisory \(.key) \(.value.result)"
+              else "\(.key) \(.value.result)" end' <<<"$NEEDS")
+          rc=0
+          while read -r a b c; do
+            case "$a" in
+              "") ;;
+              +advisory) echo "::warning::$b ended $c (advisory, does not fail checks)" ;;
+              *) echo "::error::$a ended $b"; rc=1 ;;
+            esac
+          done <<<"$bad"
+          exit "$rc"

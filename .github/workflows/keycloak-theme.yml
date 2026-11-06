@@ -1,0 +1,195 @@
+# Keycloak login-theme preview harness (plan gd-QXq1fjYuRD, step S1b).
+#
+# Starts a real Keycloak in Docker with the chart's theme tree mounted, drives
+# the login pages with Playwright, and uploads desktop/mobile x light/dark
+# screenshots. The same run registers and uses a passkey with Chromium's
+# virtual authenticator, then builds the chart's passkey browser flow (S4a) and
+# walks every sign-in path through it (skipped with a message on a dispatch override older than Keycloak 26.4; the chart's
+# 26.7.5 runs it).
+#
+# GitHub-hosted on purpose: Docker is available there (edge-probe.yml also
+# runs on ubuntu-latest) and the harness needs no secrets and no cluster. Every
+# credential is a throwaway that lives only in gardenio/tests/keycloak-theme.
+#
+# Image: the chart's keycloak.runtime.image unless a dispatch overrides it
+# (kc_image / kc_tag). See gardenio/tests/keycloak-theme/README.md.
+#
+# Keycloak gate (gd-r4DXkBjPiB): the two values files below change on nearly
+# every chart PR, but only their Keycloak keys matter here. In the chart's
+# values.yaml that is the whole `keycloak` block: run.sh reads its image, and
+# passkey-policy.sh and build-flow.sh `helm template` the chart over its
+# defaults (keycloak.realm.*, keycloak.mfa.*, keycloak.roles,
+# keycloak.runtime.realmHardening.*, ...). In deploy-values it is only
+# keycloak.runtime.image, the one thing run.sh reads from it (the harness
+# never passes it to helm). When those files are a push's only matched paths and
+# their Keycloak key is unchanged in each, the `gate` step says run=false and
+# every later step is skipped, so the job bills one minute instead of ~9. The
+# gate fails open: if it errors, the harness runs.
+name: keycloak-theme
+
+# On main pushes, not pull requests (Task 7.3 part B, gd-19ECZxvFQw): pull
+# requests run the light tier only (owner rule 2026-10-31, root CLAUDE.md "CI
+# on pull requests"). As a pull_request trigger the harness ran on every push
+# to a matching PR: 105 runs past the gate, ~985 wall-minutes, in the week to
+# 11-01. A crew that wants the screenshots for a branch dispatches it once:
+#   gh workflow run keycloak-theme.yml --ref <branch>
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'gardenio/keycloak-theme/**'
+      - 'gardenio/tests/keycloak-theme/**'   # includes gen/ (redraws the scene art)
+      # The harness runs the hook block this template ships (passkey policy).
+      - 'gardenio/helm/gardenio/templates/keycloak-runtime/first-admin-job.yaml'
+      # ... and builds the browser flow this template renders (passkey factor).
+      - 'gardenio/helm/gardenio/templates/keycloak/auth-flow-mfa.yaml'
+      # The harness runs the chart's image and helm-templates the chart's
+      # keycloak defaults, so a Keycloak edit must re-run it. These two alone
+      # run the harness only when their Keycloak key changed (the `gate` step:
+      # .keycloak in values.yaml, .keycloak.runtime.image in deploy-values).
+      - 'gardenio/helm/gardenio/values.yaml'
+      - 'deploy-values/gardenio-k3s.yaml'
+      - '.github/workflows/keycloak-theme.yml'
+  workflow_dispatch:
+    inputs:
+      kc_image:
+        description: 'Keycloak image repository (default: the chart value, e.g. quay.io/keycloak/keycloak)'
+        required: false
+        default: ''
+      kc_tag:
+        description: 'Keycloak image tag (default: the chart value). >= 26.4 also runs the passkey tests'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# One run per pushed commit (or per dispatch). Keyed on the ref, a later main
+# push would evict or cancel the run of the change before it.
+concurrency:
+  group: keycloak-theme-${{ github.event_name == 'push' && github.sha || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    # One row: the shipped theme (the Dawn Meadow scene lives inside it since
+    # S1h, gd-0SYmLWCCM5). The per-candidate rows of S1g went with the variants.
+    name: theme screenshots + passkeys
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: gardenio/tests/keycloak-theme
+    env:
+      KC_IMAGE: ${{ inputs.kc_image }}
+      KC_TAG: ${{ inputs.kc_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The pushed commit and its first parent (main before the merge),
+          # so the gate can diff them. The harness needs no history.
+          fetch-depth: 2
+      # run=false only when every matched path is one of the two values files
+      # and that file's Keycloak key is identical at base and head:
+      #   gardenio/helm/gardenio/values.yaml  .keycloak (run.sh's image, plus
+      #     the defaults passkey-policy.sh and build-flow.sh helm-template)
+      #   deploy-values/gardenio-k3s.yaml     .keycloak.runtime.image (all
+      #     run.sh reads from it: registry, repository, tag, digest)
+      # Any other outcome, including this step erroring or writing nothing,
+      # leaves run unset and the harness runs (fail open).
+      - name: Keycloak gate (skip when no Keycloak key changed)
+        id: gate
+        continue-on-error: true
+        working-directory: .
+        shell: bash # -eo pipefail: a yq parse error fails the step (open)
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != push ]; then
+            echo "gate: $EVENT event, harness runs"; exit 0
+          fi
+          WF=.github/workflows/keycloak-theme.yml
+          VALUES="gardenio/helm/gardenio/values.yaml deploy-values/gardenio-k3s.yaml"
+          key() { # <path>: the yq path the harness reads from that values file
+            case "$1" in
+              gardenio/helm/gardenio/values.yaml) echo .keycloak ;;
+              *) echo .keycloak.runtime.image ;;
+            esac
+          }
+          # The trigger globs come from this file's own paths: list, so the
+          # gate cannot drift from the filter. bash [[ == ]] lets * cross /.
+          mapfile -t pats < <(yq '.on.push.paths[]' "$WF")
+          matched=() other=()
+          while IFS= read -r f; do
+            for p in "${pats[@]}"; do
+              # shellcheck disable=SC2053 # $p is a glob on purpose
+              [[ "$f" == $p ]] || continue
+              matched+=("$f")
+              case " $VALUES " in *" $f "*) ;; *) other+=("$f") ;; esac
+              break
+            done
+          done < <(git diff --name-only HEAD^1 HEAD)
+          val() { # <rev> <path> <key>: the key's block as one-line JSON, or "absent"
+            if git cat-file -e "$1:$2" 2>/dev/null; then
+              git show "$1:$2" | yq -o=json -I=0 "$3"
+            else
+              echo absent
+            fi
+          }
+          verdict() { echo "gate: $1"; echo "gate: $1" >> "$GITHUB_STEP_SUMMARY"; }
+          if [ "${#matched[@]}" -eq 0 ]; then
+            verdict "no matched path found (${#pats[@]} globs), harness runs"; exit 0
+          fi
+          if [ "${#other[@]}" -gt 0 ]; then
+            verdict "non-values path changed (${other[0]}), harness runs"; exit 0
+          fi
+          for f in "${matched[@]}"; do
+            k=$(key "$f")
+            before=$(val HEAD^1 "$f" "$k")
+            after=$(val HEAD "$f" "$k")
+            if [ "$before" != "$after" ]; then
+              # The whole .keycloak block is long; log only what differs.
+              diff <(jq -S . <<<"$before" 2>/dev/null || echo "$before") \
+                   <(jq -S . <<<"$after" 2>/dev/null || echo "$after") | head -20 || true
+              verdict "$k changed in $f, harness runs"; exit 0
+            fi
+          done
+          verdict "only ${matched[*]} changed and its Keycloak key is unchanged in each; harness skipped"
+          echo run=false >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.run != 'false'
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: gardenio/tests/keycloak-theme/package-lock.json
+      - name: Run the preview harness
+        if: steps.gate.outputs.run != 'false'
+        run: ./run.sh
+      - name: Upload screenshots and the axe report
+        if: always() && steps.gate.outputs.run != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: keycloak-theme-screenshots
+          path: |
+            gardenio/tests/keycloak-theme/screenshots/
+            gardenio/tests/keycloak-theme/axe-report/
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Upload diagnostics (Playwright report, Keycloak log, realm policy)
+        if: always() && steps.gate.outputs.run != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: keycloak-theme-diagnostics
+          path: |
+            gardenio/tests/keycloak-theme/playwright-report/
+            gardenio/tests/keycloak-theme/playwright-report-flow/
+            gardenio/tests/keycloak-theme/test-results/
+            gardenio/tests/keycloak-theme/test-results-flow/
+            gardenio/tests/keycloak-theme/kc.log
+            gardenio/tests/keycloak-theme/realm-webauthn.json
+            gardenio/tests/keycloak-theme/realm-webauthn-after-hook.json
+            gardenio/tests/keycloak-theme/flow-executions.json
+            gardenio/tests/keycloak-theme/browser-builtin-executions.json
+            gardenio/tests/keycloak-theme/conditional-credential-config.json
+          retention-days: 14
+          if-no-files-found: ignore

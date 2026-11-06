@@ -1,0 +1,1054 @@
+# charts_catalog.yaml — the E5 chart catalog (see charts_catalog.go for the
+# ChartDef contract, the PromQL fragments and the plan-of-record links).
+#
+# One list entry per ChartDef; keys are the fields' yaml tags. A query_template
+# may reference a Go-held PromQL fragment as ${realBillAgentLevel},
+# ${realBillTagFlowOr}, ${accountCostGaugeSelector} or ${activeAgentsInstant},
+# or the window-average agent count as ${avgActiveAgentsOver:<window>}; the
+# loader expands them. Unknown keys and unknown fragments fail the load.
+#
+# This catalog is the source of truth for the catalog-generated Grafana
+# dashboards: after editing an entry, regenerate the goldens
+#   GB_UPDATE_GOLDEN=1 go test ./internal/server/ -run 'TestDashboardModel_Golden|TestChartCatalog_Golden'
+# and review the diff (gardenio/docs/dashboard-sync.md).
+
+- id: spend-by-agent
+  title: Spend per agent
+  subtitle: 'cumulative real-bill USD, top {{.TopN}} agents'
+  category: spend
+  surfaces: [dashboard, agent-profile]
+  params:
+    project: {type: string, label: project}
+    agent: {type: 'string[]', label: agent}
+    role: {type: string, label: role}
+    model: {type: string, label: model}
+    # account scopes to one LiteLLM credential account. The primary
+    # metric gardenio_agent_spend_logs_usd carries the `account` label
+    # (realBillAgentLevel dedups by it), so the selector filters
+    # honestly — this is what lights up the per-bead chart card on a
+    # type=account bead (ka-0000005064).
+    account: {type: 'string[]', label: account}
+    top_n: {type: int, default: 10, min: 1, max: 50}
+  default_params: {top_n: 10}
+  # Per-agent cumulative REAL-BILL spend (a level, not a per-bucket flow).
+  # Reads the real-bill gauge as a deduped, gap-bridged LEVEL — see
+  # realBillAgentLevel for why increase() on the Reset+Set gauge reads
+  # garbage. Formerly `increase(gardenio_agent_spend_usd_total[step])`, the
+  # dead at-close counter that read ~1000x low (ka-0000001663).
+  query_template: 'sum by(agent)(${realBillAgentLevel})'
+  x_field: t
+  value_field: spend_usd
+  series_field: agent
+  series_label: agent
+  mark: bar
+  y_title: USD
+  y_format: currency_usd
+  ios_kind: bar-stacked
+
+- id: beads-events-rate
+  title: Beads events rate
+  subtitle: 'events/sec, by event'
+  category: beads
+  surfaces: [dashboard]
+  params:
+    project: {type: string, label: project}
+    event: {type: 'string[]', label: event}
+  query_template: 'sum by(event)(rate(gardenio_beads_events_total{{"{"}}{{.Selector}}{{"}"}}[{{.Step}}]))'
+  x_field: t
+  value_field: events_per_sec
+  series_field: event
+  series_label: event
+  mark: line
+  y_title: events/sec
+  y_format: rate
+  ios_kind: line-multi
+
+- id: agent-cost-per-bead
+  title: Cost per bead closed
+  subtitle: 'USD per closed bead — top {{.TopN}} by {{.Rollup}}'
+  category: spend
+  surfaces: [dashboard, agent-profile]
+  params:
+    project: {type: string, label: project}
+    agent: {type: 'string[]', label: agent}
+    role: {type: string, label: role}
+    model: {type: string, label: model}
+    # rollup selects the dimension the spend numerator is grouped by
+    # (the stacked-bar segments). It is NOT a label matcher — it has no
+    # Label — so it substitutes into the `sum by()` clause rather than the
+    # selector. Default role: a low-cardinality dimension whose displayed
+    # stack is the full fleet (no top_n truncation), so the default view
+    # is exactly honest (stack total == fleet cost-per-bead).
+    rollup: {type: enum, default: role, enum: [agent, role, project, model]}
+    top_n: {type: int, default: 10, min: 1, max: 50}
+  default_params: {top_n: 10, rollup: role}
+  rollup_other: true
+  # USD-per-bead cumulative STACKED BARS, segmented by {{.Rollup}}.
+  #
+  # KEY DATA FINDING (ka-0000003269, verified bundle ka-0000001963):
+  # the numerator (real-bill per-agent spend) carries
+  # {agent,role,project,model,account} so it splits any of four ways, but
+  # the denominator gardenio_beads_events_total{event="closed"} carries
+  # ONLY {event,project,bead_type} — NO agent/role/model. A naive
+  # `sum by(role)(spend)/sum by(role)(closed)` therefore returns ZERO
+  # series (the vector match fails on the missing label). The fix is a
+  # fleet-wide SCALAR denominator broadcast to every segment via
+  # `on() group_left()`: each segment becomes segment_spend/fleet_closed,
+  # so the STACKED TOTAL == fleet_spend/fleet_closed == the true fleet
+  # cost-per-bead. Numerically verified: sum-of-segment
+  # ratios == fleet ratio for every bucket, for all of agent/role/project/
+  # model. The `> 0` guard NaN-gaps buckets with no closures (honest-empty,
+  # R2) rather than dividing by zero into +Inf.
+  #
+  # NUMERATOR SOURCE (ka-0000002556, the deferred kbeads-catalog half of
+  # ka-0000000478). The spend numerator is the per-{{.Step}}-bucket real-bill
+  # FLOW read from the LIFETIME per-dimension tag gauge gardenio_tag_cost_usd
+  # for role/project/model, with a self-healing fallback to the per-agent
+  # gauge — realBillTagFlowOr, the kbeads-chart twin of the /costs page
+  # rollup (costs_rollup.go) and the Grafana "$rollup" panels 5/6 (uid
+  # gb-cost-per-bead-rollup-preview). It carries the SAME
+  # `label_replace(value->{{.Rollup}}) ... or <per-agent>` shape those two
+  # surfaces proved live against vmsingle.
+  #
+  #   - role|project|model → the LIFETIME real bill per (dim,value), synced
+  #     from LiteLLM /spend/tags every ~5min (metrics/spend.go), the same
+  #     source family as gardenio_account_cost_usd. This is the whole point of
+  #     the change: the earlier numerator (the per-agent spend-logs gauge)
+  #     only covers agents active in the sweep's ~48h lookback, so a
+  #     by-role/project/model sum over it was a recent-fleet SLICE, not the
+  #     lifetime bill; the tag gauge is the full lifetime bill per dimension.
+  #     The tag gauge is lifetime-cumulative + monotonic (tag totals only
+  #     grow), so increase() is VALID on it (unlike the Reset+Set per-agent
+  #     gauge, where increase() reads garbage — hence the fallback arm keeps
+  #     the level-delta shape).
+  #   - agent → gardenio_tag_cost_usd{dim="agent"} is empty (agent is excluded
+  #     from the tag gauge for cardinality), so PromQL's `or` falls through to
+  #     the per-agent gauge — the only source with per-agent spend — exactly
+  #     as the dashboard does. by-agent is thus unchanged by this MR.
+  #   - backfill window after the tag-spend producer deploys: the tag gauge
+  #     is empty until tagged spend accumulates, so `or` falls through to the
+  #     per-agent per-bucket flow and auto-upgrades once it fills — never a
+  #     blank stack.
+  #
+  # The numerator is PARENTHESIZED before the denominator division: PromQL's
+  # `or` binds LOOSER than `/`, so `A or B / denom` would divide only B — the
+  # parens keep the whole `or` as the numerator both arms of the ratio share.
+  # Only the numerator metric changed; the fleet-scalar denominator and its
+  # `on() group_left()` broadcast are preserved exactly (ka-0000002556 caveat).
+  #
+  # Top-N is applied post-query (RollupOther folds the tail into one
+  # "other" segment so the displayed stack stays honest), NOT in PromQL —
+  # keeping query parity the way the sibling agent-spend-over-time chart
+  # does. For role/project/model the cardinality is already ≤10 so the cap
+  # is a no-op; it only bites on the agent roll-up (~190 agents).
+  query_template: '(${realBillTagFlowOr}) / on() group_left() (sum(increase(gardenio_beads_events_total{event="closed"}[{{.Step}}])) > 0)'
+  x_field: t
+  value_field: usd_per_bead
+  series_field: role
+  series_label: role
+  mark: bar
+  y_title: USD / bead
+  y_format: currency_usd
+  ios_kind: bar-stacked
+
+- id: total-cost
+  title: Total cost
+  subtitle: 'real-bill USD — top {{.TopN}} by {{.Rollup}}'
+  category: spend
+  surfaces: [dashboard, agent-profile]
+  params:
+    project: {type: string, label: project}
+    agent: {type: 'string[]', label: agent}
+    role: {type: string, label: role}
+    model: {type: string, label: model}
+    # rollup selects the dimension the spend is grouped by (the stacked-bar
+    # segments). It is NOT a label matcher — no Label — so it substitutes
+    # into the `sum by()` clause rather than the selector, mirroring the
+    # sibling agent-cost-per-bead chart. Default role: a low-cardinality
+    # dimension whose displayed stack is the full fleet (no top_n
+    # truncation), so the default view is exactly honest (stack total ==
+    # fleet total cost).
+    #
+    # operator is the one dimension NOT free off the agent metric: it is a
+    # separate metric (gardenio_operator_cost_usd_total) keyed by an opaque
+    # integer operator_id, so rollup=operator does NOT substitute into the
+    # agent-metric template — computeChartRender routes it to a dedicated
+    # render-path branch (computeOperatorSeries) that queries the operator
+    # metric and joins operator_id -> human display SERVER-SIDE via
+    # store.ResolveOperators. The join is the same single privacy-critical
+    # seam the /charts/engagement/spend panel uses; a name is NEVER emitted
+    # into a metric label (design ka-0000005225, plan ka-0000001518).
+    rollup: {type: enum, default: role, enum: [agent, role, project, model, operator]}
+    top_n: {type: int, default: 10, min: 1, max: 50}
+  default_params: {top_n: 10, rollup: role}
+  rollup_other: true
+  # TOTAL real-bill spend as cumulative STACKED BARS, segmented by
+  # {{.Rollup}}. This is the source-of-truth landing of the bead-authored
+  # live dashboard's total-cost rollup (dashboard bead ka-0000003014, uid
+  # gb-cost-per-bead-rollup-preview panels 5/6), folded into the catalog per
+  # epic ka-0000002763. It is exactly the NUMERATOR half of the sibling
+  # agent-cost-per-bead chart — the same real-bill per-{{.Rollup}}-bucket
+  # FLOW (realBillTagFlowOr) — with NO closed-bead denominator: this is
+  # total cost, not cost-per-bead.
+  #
+  # NUMERATOR SOURCE (realBillTagFlowOr — see its doc comment): the LIFETIME
+  # real bill per (dim,value) from gardenio_tag_cost_usd (LiteLLM /spend/tags,
+  # synced ~5min) for role/project/model, with a self-healing `or`-fallback
+  # to the per-agent spend-logs gauge:
+  #   - role|project|model → the lifetime tag gauge (a monotonic
+  #     lifetime-cumulative series, so increase() is valid on it), the same
+  #     source family as gardenio_account_cost_usd. This is the whole point:
+  #     the tag gauge is the FULL lifetime bill per dimension, not the
+  #     recent-fleet slice a sum over the ~48h per-agent gauge would give.
+  #   - agent → gardenio_tag_cost_usd{dim="agent"} is empty (agent is excluded
+  #     from the tag gauge for cardinality), so PromQL's `or` falls through to
+  #     the per-agent spend-logs gauge — the only source with per-agent spend.
+  #   - backfill window after the tag-spend producer deploys: the tag gauge
+  #     is empty until tagged spend accumulates, so `or` falls through to the
+  #     per-agent per-bucket flow and auto-upgrades once it fills — never a
+  #     blank stack.
+  #
+  # Top-N is applied post-query (RollupOther folds the tail into one "other"
+  # segment so the displayed stack stays honest), NOT in PromQL — keeping
+  # query parity with agent-cost-per-bead. For role/project/model the
+  # cardinality is already ≤10 so the cap is a no-op; it only bites on the
+  # agent roll-up (~190 agents).
+  query_template: '${realBillTagFlowOr}'
+  x_field: t
+  value_field: spend_usd
+  series_field: role
+  series_label: role
+  mark: bar
+  y_title: USD
+  y_format: currency_usd
+  ios_kind: bar-stacked
+
+- id: bead-status-flow
+  title: Bead status flow
+  subtitle: 'status-change events per {{.Step}} bucket'
+  category: beads
+  surfaces: [dashboard]
+  params:
+    project: {type: string, label: project}
+  # The live gardenio_beads_events_total metric exposes {event, project,
+  # bead_type} — there is no `subtype` label. The updated family is
+  # selected via event="updated"; break the flow out by bead_type, the
+  # only further dimension the live series carries.
+  query_template: 'sum by(bead_type)(increase(gardenio_beads_events_total{event="updated"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}]))'
+  x_field: t
+  value_field: count
+  series_field: bead_type
+  series_label: bead_type
+  mark: area
+  y_title: events
+  y_format: count
+  ios_kind: area-stacked
+
+- id: agent-spend-cumulative
+  title: 'Agent spend (cumulative real bill)'
+  subtitle: 'cumulative real-bill USD, project/agent-scoped'
+  category: spend
+  surfaces: [dashboard, agent-profile]
+  params:
+    project: {type: string, label: project}
+    agent: {type: 'string[]', label: agent}
+    # account scopes to one LiteLLM credential account — same honest
+    # account label on gardenio_agent_spend_logs_usd as spend-by-agent
+    # above (realBillAgentLevel). Lets a type=account bead's chart card
+    # show that account's cumulative real bill (ka-0000005064).
+    account: {type: 'string[]', label: account}
+  # Formerly "hourly-rate-rolling-window" — an hourly USD/hour spend RATE
+  # on the dead at-close counter gardenio_agent_spend_usd_total (the
+  # operator's ka-0000001797 chart). That counter read ~1000x low, and its
+  # designated real-bill replacement gardenio_agent_spend_logs_usd is a
+  # Reset+Set LEVEL gauge that has NO honest rate: increase()/rate()/deriv()
+  # read the periodic Reset as garbage, and a windowed level-delta goes
+  # NEGATIVE as agents age out of the gauge's ~48h lookback (and cannot
+  # honor a 7d window at all — the gauge only covers ~48h). So the chart is
+  # re-cast (ka-0000001663) as the project/agent-scoped cumulative real-bill
+  # LEVEL, reading realBillAgentLevel — the only honest shape on this gauge.
+  #
+  # The authoritative fleet USD/hour spend RATE lives on the fleet-spend-rate
+  # and spend-by-account charts, which read the LiteLLM account-cost gauge
+  # gardenio_account_cost_usd — a real, monotonic counter where increase() is
+  # valid (it carries only {account,env}, so it cannot be agent-scoped; that
+  # is why the per-agent view here is a level, not a rate).
+  query_template: 'sum(${realBillAgentLevel})'
+  x_field: t
+  value_field: spend_usd
+  series_field: '' # primary is a single aggregate series
+  series_label: ''
+  mark: line
+  y_title: USD
+  y_format: currency_usd
+  ios_kind: line
+  primary_series_name: spend
+  # Multi-query extension (ka-0000006625): overlay the count of ACTIVE
+  # agents on a secondary right-hand axis, so the operator can read the
+  # cumulative spend against how many agents are producing it. We sum
+  # gardenio_agents_active (a {project,role,state} gauge) and exclude the
+  # non-producing states — prewarmed/idle pool agents burn no spend, so
+  # counting them would inflate the line relative to the spend it is
+  # meant to contextualize. The state set is exclusion-based (drop the
+  # known idle states) rather than an allowlist so a newly-added active
+  # state still counts. The selector is scoped to project (and role)
+  # only: the gauge has no `agent` label, so AllowedLabels drops it.
+  #
+  # ka-0000006890 (gap-bridge): the raw overlay showed brief one-sample
+  # dips during controller-pod churn. Metrics collection runs on EVERY
+  # controller replica (metricsCollector.Start is outside leader
+  # election), so a controller Deployment rollover drops a scrape or two
+  # and the whole sum() momentarily goes absent — a NaN gap the panel
+  # draws as a dip to the axis floor. `last_over_time(sum(...)[2m:30s])`
+  # (the OUTER-subquery form, over the already-summed instant vector on a
+  # 30s grid = the scrape cadence) carries the last real sum across a
+  # missed scrape without inventing a value. Confirmed live on vmsingle:
+  # it bridges the 30-60s churn blips while genuine multi-minute
+  # controller outages stay visible as honest gaps, and it does NOT
+  # smooth real agent-count transitions (they are value-present, not
+  # absent). It stays on the OUTER sum() on purpose: a per-series
+  # last_over_time(gauge[2m]) would instead prolong stale
+  # {project,role,state} series across real state churn (more notches),
+  # and avg_over_time would inject fractional values that break the
+  # integer agent-count semantics.
+  extra_series:
+    - name: active agents
+      query_template: 'last_over_time(sum(gardenio_agents_active{state!~"prewarmed|idle|assigning|done|failed|exited|stopped"{{if .Selector}},{{.Selector}}{{end}}})[2m:30s])'
+      value_field: agents
+      y_format: count
+      y_title: agents
+      y_axis_index: 1
+      allowed_labels: {project: true, role: true, state: true}
+
+- id: fleet-spend-rate
+  title: Fleet spend rate
+  subtitle: 'USD/hour, {{.Window}} rolling window'
+  category: spend
+  surfaces: [dashboard]
+  # account_cost is the LiteLLM-synced billing gauge (refreshed every
+  # ~5 min, stable cardinality, 0 resets/24h). Its only labels are
+  # {account,env}, so this chart is fleet-wide (or account/env-scoped),
+  # NOT per-agent — that is what the per-agent real-bill charts on
+  # gardenio_agent_spend_logs_usd are for. This is the AUTHORITATIVE
+  # fleet spend RATE: it tracks the actual LiteLLM bill on a real monotonic
+  # counter where increase() is valid — unlike the per-agent gauge, which
+  # is a Reset+Set level with no honest rate (ka-0000004779, ka-0000001663).
+  params:
+    account: {type: 'string[]', label: account}
+    env: {type: string, label: env}
+    window: {type: enum, default: '1d', enum: ['1d', '7d']}
+  default_params: {window: '1d'}
+  uses_window: true
+  # increase()/WindowHours (not rate()*3600) so the instant headline and
+  # the range chart agree — see ka-0000004779 for the VM
+  # rate()-extrapolation gap this avoids.
+  #
+  # ka-0000000170 (de-bump): two extra moves over a bare
+  # increase(gauge[W]) keep the line smooth instead of "bumpy" with
+  # one-sample spikes:
+  #   1. `max by (account, env)` collapses per-POD duplicates of the
+  #      gauge. gardenio_account_cost_usd carries scrape-side
+  #      {pod,instance} labels, so on a gardenio-agents pod rollover the
+  #      old and new pods briefly co-report the SAME LiteLLM cost — a
+  #      bare sum() double-counts (one-sample UP spike) and increase()
+  #      sees the vanished old series as a reset (one-sample DOWN
+  #      notch). max-by the gauge's true identity {account,env} keeps
+  #      exactly one series per account through the churn.
+  #   2. The `[W:5m]` SUBQUERY re-samples the deduped gauge on a fixed
+  #      5-minute grid (its real LiteLLM refresh cadence) before
+  #      increase(). Evaluated every 30s, a bare increase() over a
+  #      coarse ~5-min staircase re-extrapolates to a window edge that
+  #      moves each step → a sawtooth. The aligned 5m subquery grid
+  #      changes the in-window sample set only every 5 min, so the
+  #      value is flat between real steps. Verified live: instant ==
+  #      range last point (parity invariant preserved).
+  query_template: 'sum(increase((max by (account, env) (${accountCostGaugeSelector}))[{{.Window}}:5m])) / {{.WindowHours}}'
+  x_field: t
+  value_field: usd_per_hour
+  series_field: ''
+  series_label: ''
+  mark: line
+  y_title: USD/hour
+  y_format: rate_per_hour
+  ios_kind: line
+  # Primary series legend label. Stays "spend" (the long rolling
+  # window is conveyed by the {{.Window}} subtitle); the short-window
+  # companion below is the explicit "spend (1h)" so the two are
+  # distinguishable in the legend. PrimarySeriesName is NOT templated.
+  primary_series_name: spend
+  extra_series:
+    # 1h rolling spend rate, drawn on the SAME left USD/hour axis as
+    # the primary {{.Window}} line (YAxisIndex 0). The primary line is
+    # a smoothed daily/weekly average; this short window is a 1-hour
+    # moving average that reacts to load swings the long window hides,
+    # so the operator can read "right now" pace next to the smoothed
+    # rate — the chart counterpart to the /costs headline that already
+    # shows both 1h and 24h (gardenio costs_rate.go, ka-0000001327).
+    # Fixed [1h]/1 regardless of the ?window= param: it is the
+    # always-1h companion, so it must not move with the long window.
+    # increase()/1 keeps it instant==range stable like the primary
+    # (ka-0000004779). Account/env filters still scope it (the gauge
+    # carries both); the agents gauge labels are excluded.
+    - name: 'spend (1h)'
+      # max-by-dedup + [1h:5m] aligned subquery, same de-bump as the
+      # primary above (ka-0000000170). This is the line the operator
+      # flagged as "bumpy" — the short 1h window makes the
+      # per-step-extrapolation sawtooth most visible. Stays a fixed
+      # [1h] window (NOT {{.Window}}); increase()/1 keeps it
+      # instant==range stable (ka-0000004779).
+      query_template: 'sum(increase((max by (account, env) (${accountCostGaugeSelector}))[1h:5m])) / 1'
+      value_field: usd_per_hour_1h
+      y_format: rate_per_hour
+      y_title: USD/hour
+      y_axis_index: 0
+      allowed_labels: {account: true, env: true}
+    # Cost PER AGENT, {{.Window}} rolling (the 24h-by-default companion
+    # to the "spend" primary), on the SAME left USD/hour axis
+    # (YAxisIndex 0). Operator request (ka-0000003828, Matt Baker): a
+    # per-agent cost line "matching the cost series", averaged over the
+    # last 24h — so it moves with the ?window= param exactly like the
+    # primary "spend" line does.
+    #
+    # It is the fleet spend RATE divided by the AVERAGE number of
+    # producing agents over the same window: numerator is the identical
+    # increase()/WindowHours fleet rate as the "spend" primary (so the two
+    # share a source, basis, and de-bump); denominator is
+    # avgActiveAgentsOver({{.Window}}) — the agent count
+    # time-averaged over the matching window, which is what "averaged over
+    # the last 24h" means. Both sides collapse to a single label-less
+    # series (sum() drops all labels), so the bare `/` matches on the
+    # empty label set and yields one USD/hour-per-agent series. The
+    # `> 0` guard drops buckets with zero producing agents to an honest
+    # NaN gap instead of dividing to +Inf (same discipline as
+    # agent-cost-per-bead's fleet-denominator guard). The active-agent
+    # state filter mirrors the "active agents" overlay below (both via
+    # activeAgentStates) so the denominator counts only producing agents
+    # (prewarmed/idle pool agents burn no spend, so counting them would
+    # deflate the per-agent cost). The injected {{.Selector}} scopes only
+    # the account-cost numerator (account/env), matching "spend (1h)".
+    #
+    # ka-0000006587: the denominator was `sum(avg_over_time(gauge[W]))`,
+    # the per-series INNER form, which sums over the window's CUMULATIVE
+    # (ephemeral) series population instead of the CONCURRENT count — it
+    # read 117x high at 24h, so this line read 117x LOW ($0.115 vs a true
+    # ~$13.2/hr/agent), and the 1h and 24h lines were wrong by DIFFERENT
+    # factors so they could not even be compared to each other.
+    # avgActiveAgentsOver is the corrected outer-subquery form; see its doc
+    # comment for the live measurements and the grid-size rationale.
+    - name: cost per agent
+      query_template: 'sum(increase((max by (account, env) (${accountCostGaugeSelector}))[{{.Window}}:5m])) / {{.WindowHours}} / (${avgActiveAgentsOver:{{.Window}}} > 0)'
+      value_field: usd_per_agent
+      y_format: rate_per_hour
+      y_title: USD/hour
+      y_axis_index: 0
+      allowed_labels: {account: true, env: true}
+    # Cost per agent, fixed 1h rolling — the always-1h companion to the
+    # "spend (1h)" line, pairing 1:1 with it just as "cost per agent"
+    # pairs with "spend". Same ratio shape as above but with a fixed
+    # [1h] numerator window and a 1h agent-count average (NOT
+    # {{.Window}}), so it never moves with the ?window= param. increase()/1
+    # keeps the numerator instant==range stable (ka-0000004779).
+    - name: 'cost per agent (1h)'
+      query_template: 'sum(increase((max by (account, env) (${accountCostGaugeSelector}))[1h:5m])) / 1 / (${avgActiveAgentsOver:1h} > 0)'
+      value_field: usd_per_agent_1h
+      y_format: rate_per_hour
+      y_title: USD/hour
+      y_axis_index: 0
+      allowed_labels: {account: true, env: true}
+    # Same active-agent overlay as the rolling chart, for context. The
+    # gauge selector drops account/env (the agents gauge has neither), so
+    # only project/role/state pass through. Same last_over_time gap-bridge
+    # as the rolling chart (ka-0000006890): carries the last summed count
+    # across a controller-rollover scrape gap so the overlay does not dip
+    # to the floor for one sample, while genuine outages stay honest. Kept
+    # byte-identical to the agent-spend-cumulative overlay so the two
+    # panels move in lockstep.
+    - name: active agents
+      query_template: 'last_over_time(sum(gardenio_agents_active{state!~"prewarmed|idle|assigning|done|failed|exited|stopped"})[2m:30s])'
+      value_field: agents
+      y_format: count
+      y_title: agents
+      y_axis_index: 1
+      allowed_labels: {project: true, role: true, state: true}
+    # Rolling agent-count averages on the same right-hand agents axis
+    # (operator request ka-0000006587). The instantaneous "active agents"
+    # line above is spiky; these smooth it over 1h and 24h. They are the
+    # EXACT denominators of the "cost per agent (1h)" and "cost per agent"
+    # lines, which is the point: the ratio's denominator is now plotted
+    # beside the ratio, so a move in $/hr/agent is attributable to spend or
+    # to headcount by eye rather than by inference.
+    - name: 'agents (1h avg)'
+      query_template: '${avgActiveAgentsOver:1h}'
+      value_field: agents_1h
+      y_format: count
+      y_title: agents
+      y_axis_index: 1
+      allowed_labels: {project: true, role: true, state: true}
+    - name: 'agents (24h avg)'
+      query_template: '${avgActiveAgentsOver:24h}'
+      value_field: agents_24h
+      y_format: count
+      y_title: agents
+      y_axis_index: 1
+      allowed_labels: {project: true, role: true, state: true}
+
+- id: cost-per-agent-hour
+  title: Cost per agent-hour
+  subtitle: 'USD per hour per producing agent, 1h + 24h rolling'
+  category: spend
+  surfaces: [dashboard]
+  # Operator request (ka-0000006587, Matt Baker): promote
+  # dollars-per-hour-per-agent from two of five lines on the crowded fleet
+  # panel to its OWN chart, placed at the TOP of /costs.
+  #
+  # WHY IT IS A SOUND STATISTIC. It is a UNIT ECONOMIC: fleet burn rate
+  # normalized by fleet size, so it answers "what does one agent cost me per
+  # hour of running?" independent of how many are running. The raw spend rate
+  # conflates two very different events — the fleet got bigger (fine, it is
+  # doing more work) and each agent got more expensive (a regression worth
+  # paging on) — and this ratio separates them. Read together with the fleet
+  # rate it is diagnostic: spend up + this FLAT = pure scale-out; spend up +
+  # this UP = per-agent cost regression (a model/context/retry-loop change);
+  # spend flat + this UP = the fleet shrank without the bill following, i.e.
+  # idle burn. Both windows are drawn because the 1h line is the actionable
+  # "right now" pace and the 24h line is the stable baseline to judge it
+  # against; their SPREAD is itself the signal.
+  #
+  # Dimensional check: USD/hour ÷ agents = USD/(hour·agent), and both sides
+  # are averaged over the SAME window, so the ratio is a true window mean and
+  # not a mean-of-ratios. Live 2026-08-03: ~$13.2/hr/agent on both windows
+  # (67-70 USD/hour over ~5.1 concurrent agents).
+  #
+  # HONEST-DENOMINATOR CAVEAT (rubric C2, gardenio/docs/data-correctness-
+  # rubric.md). The numerator is the WHOLE LiteLLM credential bill, which
+  # includes non-agent traffic (human/manual calls, test harnesses), while the
+  # denominator counts only producing AGENTS. So this reads as an UPPER BOUND
+  # on true per-agent cost, and the E2E/probe account exclusion
+  # (accountCostGaugeSelector) removes the largest known non-agent contributor.
+  # The gap is quantifiable — whole bill 74.5 vs post-exclusion 67.3 USD/hour
+  # live, ~10% — and it is why the Subtitle says "per producing agent" rather
+  # than claiming agent-attributed spend. A strictly agent-attributed
+  # numerator would need the per-agent real-bill gauge, but that gauge is a
+  # Reset+Set LEVEL with no honest rate (see realBillAgentLevel) and its
+  # `offset` form returns EMPTY (verified live), so no faithful per-agent flow
+  # exists to divide. The bound is the honest available shape.
+  params:
+    account: {type: 'string[]', label: account}
+    env: {type: string, label: env}
+  # Primary = the 1h rolling ratio (the actionable one), so a single-series
+  # consumer gets "right now" pace. Numerator is byte-for-byte the
+  # fleet-spend-rate chart's "spend (1h)" line and the denominator is its
+  # "agents (1h avg)" line, so this panel reconciles with that one by
+  # construction — the same de-bump (max-by dedup + aligned 5m subquery,
+  # ka-0000000170) and the same instant==range-stable increase()/hours form
+  # (ka-0000004779). The `> 0` guard NaN-gaps windows with no producing agents
+  # instead of dividing to +Inf.
+  query_template: 'sum(increase((max by (account, env) (${accountCostGaugeSelector}))[1h:5m])) / 1 / (${avgActiveAgentsOver:1h} > 0)'
+  x_field: t
+  value_field: usd_per_agent_hour_1h
+  series_field: ''
+  series_label: ''
+  mark: line
+  y_title: USD / agent-hour
+  y_format: rate_per_hour
+  ios_kind: line
+  primary_series_name: '$/agent-hour (1h)'
+  extra_series:
+    # 24h rolling companion on the SAME left axis — the stable baseline the
+    # 1h line is read against. Fixed [24h] (never {{.Window}}): this chart
+    # deliberately shows both fixed windows rather than one movable one, so
+    # the pair is always comparable.
+    - name: '$/agent-hour (24h)'
+      query_template: 'sum(increase((max by (account, env) (${accountCostGaugeSelector}))[24h:5m])) / 24 / (${avgActiveAgentsOver:24h} > 0)'
+      value_field: usd_per_agent_hour_24h
+      y_format: rate_per_hour
+      y_title: USD / agent-hour
+      y_axis_index: 0
+      allowed_labels: {account: true, env: true}
+    # The denominator itself, on the right-hand axis. Without it a reader
+    # cannot tell whether a spike in the ratio is the bill rising or the
+    # fleet draining — the two have opposite operational meanings. Plotting
+    # it makes the panel self-diagnosing.
+    - name: 'agents (1h avg)'
+      query_template: '${avgActiveAgentsOver:1h}'
+      value_field: agents_1h
+      y_format: count
+      y_title: agents
+      y_axis_index: 1
+      allowed_labels: {project: true, role: true, state: true}
+
+- id: agent-spend-over-time
+  title: Per-agent cost over time
+  subtitle: 'cumulative real-bill USD, top {{.TopN}} agents'
+  category: spend
+  surfaces: [dashboard, agent-profile]
+  params:
+    project: {type: string, label: project}
+    agent: {type: 'string[]', label: agent}
+    role: {type: string, label: role}
+    model: {type: string, label: model}
+    top_n: {type: int, default: 8, min: 1, max: 50}
+  default_params: {top_n: 8}
+  # Per-agent cumulative REAL-BILL spend, stacked over time (the LIVE /costs
+  # Grafana panel 2). Reads the real-bill gauge gardenio_agent_spend_logs_usd
+  # as a deduped, gap-bridged LEVEL (realBillAgentLevel) — it replaced
+  # increase(gardenio_agent_spend_usd_total[step]), the dead at-close counter
+  # that read ~1000x low (ka-0000001663). The gauge carries the same
+  # {agent,project,role,model,account} labels, so every param still scopes.
+  # Top-N agents are kept; the long tail is summarized into a single
+  # "other" series (RollupOther) so the stack still sums to fleet total.
+  query_template: 'sum by(agent)(${realBillAgentLevel})'
+  x_field: t
+  value_field: spend_usd
+  series_field: agent
+  series_label: agent
+  rollup_other: true
+  # Chonky stacked bars (matching the by-role rollup panel), per operator
+  # request 2026-07-17 (ka-0000004162): the per-agent cost panel used to be
+  # a thin stacked area; the operator wants it to read like the "cost by
+  # role" panel's big chunky bars. Mark "bar" → drawStyle bars + stacking
+  # normal + fillOpacity 80 (markCustom), same as spend-by-agent /
+  # agent-cost-per-bead.
+  mark: bar
+  y_title: USD
+  y_format: currency_usd
+  ios_kind: bar-stacked
+# ───────────────────────── perf RED (W2b, ka-0000003074) ─────────────
+#
+# RED = Rate / Errors / Duration for the perf services federated from
+# the k6-perf VictoriaMetrics into gardenio-vmsingle (source="perf").
+#
+# Ground truth (probed in-cluster 2026-06-22, gated by the data-correctness
+# rubric C1–C6/R1–R5 in gardenio/docs/data-correctness-rubric.md):
+#   * The bead's original premise — "span-derived RED from VictoriaTraces
+#     via span_calls_total / span_duration_milliseconds_*" — does NOT
+#     hold: no spanmetrics families exist in VM (no spanmetrics connector
+#     emits into VM, and the catalog only queries VM). Authoring those
+#     panels would fail C5 (MISSING-SERIES), so span-derived RED is
+#     deferred to a follow-up that first stands up the connector.
+#   * The real, live app-RED source is the FastAPI Prometheus
+#     instrumentation on sponsor-api: fastapi_sponsor_api_http_requests_total
+#     (request counter, labels {handler,status,service}) and
+#     fastapi_sponsor_api_http_request_duration_highr_seconds_bucket (a
+#     fine-grained histogram, le ∈ {0.01..60,+Inf}; the coarse non-highr
+#     histogram only has le ∈ {0.1,0.5,1.0}, which would pin p95 to a
+#     bucket edge — failing rubric §2.2 — so the highr histogram is used).
+#   * http_server_* perf series carry only service="otel-collector" (the
+#     collector's own OTLP ingest endpoint), NOT downstream app traffic,
+#     so they are deliberately excluded (the title would claim app RED
+#     while measuring collector self-ingest — a C2 aggregation drift).
+#
+# All three entries hard-pin source="perf" so a future dev/prod series on
+# the same family cannot silently leak in (C2). They render as honest
+# empty time series (R2) when no perf traffic flows, exactly like the
+# spend/beads charts above when their counters are not emitting.
+
+- id: perf-fastapi-request-rate
+  title: 'sponsor-api request rate (perf)'
+  subtitle: 'requests/sec by status, {{.Step}} buckets'
+  category: perf
+  surfaces: [dashboard]
+  params:
+    handler: {type: 'string[]', label: handler}
+    status: {type: 'string[]', label: status}
+  # rate() over the step bucket on the FastAPI request counter. The
+  # source="perf" matcher is hard-coded into the template (not a param)
+  # because this chart is specifically the perf-federated view; mixing
+  # in dev/prod would be a C2 aggregation drift.
+  query_template: 'sum by(status)(rate(fastapi_sponsor_api_http_requests_total{source="perf"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}]))'
+  x_field: t
+  value_field: requests_per_sec
+  series_field: status
+  series_label: status
+  mark: line
+  y_title: requests/sec
+  y_format: rate
+  ios_kind: line-multi
+
+- id: perf-fastapi-error-ratio
+  title: 'sponsor-api error ratio (perf)'
+  subtitle: '4xx+5xx as fraction of all requests, {{.Step}} buckets'
+  category: perf
+  surfaces: [dashboard]
+  params:
+    handler: {type: 'string[]', label: handler}
+  # Errors (status class 4xx/5xx) over total requests. The `> 0` guard
+  # on the denominator drops buckets with no requests so the ratio is
+  # NaN-gapped (honest-empty, R2) rather than 0/0 → NaN or a misleading
+  # flat 0 (C5 existence-honesty). status labels are the FastAPI "Nxx"
+  # class strings (e.g. "2xx","4xx","5xx").
+  query_template: 'sum(rate(fastapi_sponsor_api_http_requests_total{source="perf",status=~"4xx|5xx"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])) / (sum(rate(fastapi_sponsor_api_http_requests_total{source="perf"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])) > 0)'
+  x_field: t
+  value_field: error_ratio
+  series_field: ''
+  series_label: ''
+  mark: line
+  y_title: error fraction
+  y_format: ratio
+  ios_kind: line
+
+- id: perf-fastapi-latency-quantiles
+  title: 'sponsor-api latency p50/p95/p99 (perf)'
+  subtitle: 'seconds, {{.Step}}-windowed quantiles'
+  category: perf
+  surfaces: [dashboard]
+  params:
+    handler: {type: 'string[]', label: handler}
+  # p95 over the highr (fine-grained) duration histogram. The highr
+  # layout (le 0.01..60) keeps the quantile off the +Inf edge (rubric
+  # §2.2 latency-quantile honesty); the coarse 3-bucket histogram would
+  # pin it. p50 and p99 ride along as extra series on the same axis so
+  # the operator reads the full latency spread, not a single point.
+  query_template: 'histogram_quantile(0.95, sum by(le)(rate(fastapi_sponsor_api_http_request_duration_highr_seconds_bucket{source="perf"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])))'
+  x_field: t
+  value_field: seconds
+  series_field: ''
+  series_label: ''
+  mark: line
+  y_title: seconds
+  y_format: duration_seconds
+  ios_kind: line
+  primary_series_name: p95
+  extra_series:
+    - name: p50
+      query_template: 'histogram_quantile(0.50, sum by(le)(rate(fastapi_sponsor_api_http_request_duration_highr_seconds_bucket{source="perf"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])))'
+      value_field: p50_seconds
+      y_format: duration_seconds
+      y_title: seconds
+      y_axis_index: 0
+      allowed_labels: {handler: true}
+    - name: p99
+      query_template: 'histogram_quantile(0.99, sum by(le)(rate(fastapi_sponsor_api_http_request_duration_highr_seconds_bucket{source="perf"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])))'
+      value_field: p99_seconds
+      y_format: duration_seconds
+      y_title: seconds
+      y_axis_index: 0
+      allowed_labels: {handler: true}
+
+- id: spend-by-account
+  title: Spend by account over time
+  subtitle: 'USD/hour, 1h rolling window, top {{.TopN}} accounts'
+  category: spend
+  surfaces: [dashboard]
+  params:
+    account: {type: 'string[]', label: account}
+    env: {type: string, label: env}
+    top_n: {type: int, default: 8, min: 1, max: 50}
+  default_params: {top_n: 8}
+  # Per-account spend RATE in USD/hour, stacked over time — the
+  # account-axis counterpart to the fleet-spend-rate chart, broken out
+  # per credential account. It reads the SAME LiteLLM-synced account-cost
+  # gauge the fleet rate uses (gardenio_account_cost_usd, {account,env},
+  # refreshed ~5 min, 0 resets/24h, tracks the actual bill).
+  #
+  # ka-0000007972 (operator request): this chart used to plot
+  # increase(...[{{.Step}}]) — raw USD ACCUMULATED PER STEP BUCKET — so the
+  # y-axis magnitude rescaled with the dashboard time range (zoom to 7d and
+  # each bucket reads huge; zoom to 1h and it reads tiny). That made it
+  # inconsistent with the fleet-spend-rate chart above it, which is a
+  # range-stable USD/hour rate. We re-point it to a FIXED [1h] rolling
+  # window — increase(...[1h])/1 — exactly the shape of the fleet chart's
+  # "spend (1h)" companion line, so the per-account stack now reads in
+  # USD/hour and is invariant to zoom. sum by(account)(...[1h]) over all
+  # accounts equals the fleet "spend (1h)" line, so the stack reconciles
+  # with it by construction (ka-0000004779). The [1h] window is fixed (NOT
+  # {{.Step}}) so it is a true 1-hour moving average regardless of range.
+  # increase()/1 keeps the per-point value instant==range stable like the
+  # fleet rate. Top-N accounts are kept; the long tail is summarized into a
+  # single "other" series (RollupOther) — summing rates over the tail is
+  # still a rate, so the stacked total stays correct.
+  #
+  # max-by-dedup + [1h:5m] aligned subquery, same de-bump as the
+  # fleet-spend-rate chart (ka-0000000170): max by (account, env)
+  # collapses per-pod gauge duplicates across agent-pod churn, and the
+  # 5m subquery grid removes the per-step extrapolation sawtooth. The
+  # inner dedup groups by the gauge's true identity {account,env}; the
+  # outer sum stays by(account) so per-account stacking is unchanged.
+  query_template: 'sum by(account)(increase((max by (account, env) (${accountCostGaugeSelector}))[1h:5m])) / 1'
+  x_field: t
+  value_field: usd_per_hour
+  series_field: account
+  series_label: account
+  rollup_other: true
+  mark: area
+  y_title: USD/hour
+  y_format: rate_per_hour
+  ios_kind: area-stacked
+
+- id: spend-by-model
+  title: Spend by model over time
+  subtitle: 'cumulative real-bill USD, top {{.TopN}} models'
+  category: spend
+  surfaces: [dashboard]
+  params:
+    project: {type: string, label: project}
+    model: {type: 'string[]', label: model}
+    role: {type: string, label: role}
+    account: {type: 'string[]', label: account}
+    top_n: {type: int, default: 8, min: 1, max: 50}
+  default_params: {top_n: 8}
+  # Per-MODEL cumulative REAL-BILL spend, stacked over time — the
+  # model-axis counterpart to the per-agent chart, so the operator can
+  # read haiku-vs-opus totals side by side (ka-0000003821).
+  #
+  # SOURCE CHOICE (rubric C2 honest-aggregation, gardenio/docs/data-
+  # correctness-rubric.md): this reads the real-bill per-agent gauge
+  # gardenio_agent_spend_logs_usd ({agent,project,role,model,account}) as a
+  # deduped, gap-bridged cumulative LEVEL (realBillAgentLevel), NOT the
+  # gardenio_account_cost_usd gauge the fleet-spend-rate and spend-by-account
+  # charts use. The account-cost gauge is the authoritative LiteLLM bill but
+  # carries only {account,env} — it has NO `model` label, so a per-model
+  # breakdown is impossible from it. The per-agent real-bill gauge is the
+  # only real-bill spend series with a `model` label, so this chart shares
+  # its SOURCE with the per-AGENT chart (panel 2), re-summed by model — the
+  # two reconcile by construction.
+  #
+  # SHAPE (ka-0000001663): formerly a USD/hour RATE via
+  # increase(gardenio_agent_spend_usd_total[1h]) on the dead at-close counter
+  # (read ~1000x low). Its real-bill replacement is a Reset+Set LEVEL gauge
+  # on which increase()/rate() read garbage, so the chart is re-cast as the
+  # per-model cumulative real-bill LEVEL — the only honest shape on this
+  # gauge. Top-N models are kept; the long tail folds into one "other"
+  # series (RollupOther). Model cardinality is tiny (~3 live), so "other"
+  # rarely appears.
+  query_template: 'sum by(model)(${realBillAgentLevel})'
+  x_field: t
+  value_field: spend_usd
+  series_field: model
+  series_label: model
+  rollup_other: true
+  mark: area
+  y_title: USD
+  y_format: currency_usd
+  ios_kind: area-stacked
+# ──────────── span-derived RED (ka-0000008091) ────────────
+#
+# RED (Rate/Errors/Duration) derived from the spanmetrics families the
+# perf OTel collector already emits — span_calls_total and
+# span_duration_milliseconds_{bucket,count,sum} — now federated into
+# gardenio-vmsingle under source="perf" (see deploy-values/gardenio.yaml,
+# the perf-federation vmagent job). This is the trace-derived half W2b
+# (ka-0000003074) deferred: that task shipped VM-metrics RED on the
+# FastAPI families (sponsor-api only); these three add RED across ALL
+# four spanmetrics-instrumented services (keycloak/site-api/sponsor-api/
+# study-web) straight from the span counters.
+#
+# Correctness notes (rubric gardenio/docs/data-correctness-rubric.md):
+#   * source="perf" hard-pinned (C2) so dev/prod span series can never
+#     leak into the perf view.
+#   * span_kind="SPAN_KIND_SERVER" filter (C2): RED is each service's own
+#     request surface. Client/internal spans (DB calls, outbound) would
+#     inflate the rate — the same honest-aggregation discipline W2c used
+#     deriving RED straight from VT server spans.
+#   * Units are MILLISECONDS — the family is span_duration_MILLISECONDS_*;
+#     the latency panel's YFormat is duration_ms, not duration_seconds
+#     (C3 unit-scale). The bucket layout (le 5..10000,+Inf) has real
+#     resolution near p95 (e.g. site-api p95 ≈ 6.3s, not +Inf-pinned),
+#     so it satisfies rubric §2.2 latency-quantile honesty.
+#   * status_code is OTel span status: STATUS_CODE_ERROR / _UNSET / _OK
+#     (NOT HTTP Nxx). Error ratio = ERROR / all server spans, with a
+#     `> 0` denominator guard so empty windows are NaN-gapped (R2/C5).
+#   * rubric §2.1 count-reconciliation (span_calls_total increase vs the
+#     raw VT trace count, ±5%) is enforced at audit time by
+#     ClassifySpanCount (charts_audit.go) — these panels are the metric
+#     side of that cross-check, with the VT-direct RED (charts_traces.go,
+#     W2c) as the trace-side ground truth. IMPORTANT population caveat:
+#     the federated span_calls_total is perf's FULL-fidelity spanmetric
+#     (the perf collector aggregates every span), whereas the in-chart
+#     VT holds only the relay-SAMPLED subset (perftracesrelay caps at
+#     MaxTracesPerService=200/service/cycle). So these VM panels and the
+#     W2c VT-direct panels measure different populations and will NOT
+#     reconcile ±5% against the in-chart VT — §2.1 reconciliation for
+#     THESE panels is against the perf-side VT, not the relay copy.
+
+- id: perf-span-request-rate
+  title: 'service request rate (perf, span-derived)'
+  subtitle: 'server spans/sec by service, {{.Step}} buckets'
+  category: perf
+  surfaces: [dashboard]
+  params:
+    service_name: {type: 'string[]', label: service}
+  # Per-service server-span rate — the service-map node tier (req
+  # rate is the R in RED). A true node+edge topology is NOT derivable
+  # from this stack (the relay mirrors single-service traces with no
+  # cross-service span references; VT's dependencies API returns [] —
+  # see the W2c report). So this is the honest service tier, one rate
+  # series per live service, not a fabricated edge graph.
+  query_template: 'sum by(service_name)(rate(span_calls_total{source="perf",span_kind="SPAN_KIND_SERVER"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}]))'
+  x_field: t
+  value_field: spans_per_sec
+  series_field: service_name
+  series_label: service
+  mark: line
+  y_title: server spans/sec
+  y_format: rate
+  ios_kind: line-multi
+
+- id: perf-span-error-ratio
+  title: 'service error ratio (perf, span-derived)'
+  subtitle: 'STATUS_CODE_ERROR as fraction of server spans, {{.Step}} buckets'
+  category: perf
+  surfaces: [dashboard]
+  params:
+    service_name: {type: 'string[]', label: service}
+  # Errored server spans over all server spans, per service. The `> 0`
+  # guard on the denominator NaN-gaps windows with no traffic so a
+  # quiet service reads honest-empty (R2/C5), not a misleading flat 0.
+  query_template: 'sum by(service_name)(rate(span_calls_total{source="perf",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])) / (sum by(service_name)(rate(span_calls_total{source="perf",span_kind="SPAN_KIND_SERVER"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])) > 0)'
+  x_field: t
+  value_field: error_ratio
+  series_field: service_name
+  series_label: service
+  mark: line
+  y_title: error fraction
+  y_format: ratio
+  ios_kind: line-multi
+
+- id: perf-span-latency-quantiles
+  title: 'service latency p50/p95/p99 (perf, span-derived)'
+  subtitle: 'milliseconds, {{.Step}}-windowed quantiles (all services)'
+  category: perf
+  surfaces: [dashboard]
+  params:
+    service_name: {type: 'string[]', label: service}
+  # p95 over the span duration histogram. Buckets are in MILLISECONDS
+  # (family name) with le 5..10000,+Inf — real resolution near p95, no
+  # +Inf pin (rubric §2.2). p50 and p99 ride the same ms axis so the
+  # operator sees the full latency spread (R3 scale-sanity). Quantiles
+  # are computed over the server-span surface only (span_kind filter).
+  query_template: 'histogram_quantile(0.95, sum by(le)(rate(span_duration_milliseconds_bucket{source="perf",span_kind="SPAN_KIND_SERVER"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])))'
+  x_field: t
+  value_field: milliseconds
+  series_field: ''
+  series_label: ''
+  mark: line
+  y_title: milliseconds
+  y_format: duration_ms
+  ios_kind: line
+  primary_series_name: p95
+  extra_series:
+    - name: p50
+      query_template: 'histogram_quantile(0.50, sum by(le)(rate(span_duration_milliseconds_bucket{source="perf",span_kind="SPAN_KIND_SERVER"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])))'
+      value_field: p50_milliseconds
+      y_format: duration_ms
+      y_title: milliseconds
+      y_axis_index: 0
+      allowed_labels: {service_name: true}
+    - name: p99
+      query_template: 'histogram_quantile(0.99, sum by(le)(rate(span_duration_milliseconds_bucket{source="perf",span_kind="SPAN_KIND_SERVER"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])))'
+      value_field: p99_milliseconds
+      y_format: duration_ms
+      y_title: milliseconds
+      y_axis_index: 0
+      allowed_labels: {service_name: true}
+# ──────── operation-level RED (span_name topk) — W2b parity (ka-0000001551) ────────
+#
+# The per-SERVICE span RED charts above answer "which SERVICE is
+# slow/erroring". The ACME distributed-traces dashboard's highest-value
+# panels (W2a inventory ka-0000003866, ranked #1) drill one level deeper:
+# per-OPERATION topk — "Top Operations by Volume", "Operations with
+# Errors", "Slowest Operations" — keyed by the OTel span_name label so an
+# operator lands on the noisiest/erroring/slowest ENDPOINT, not just the
+# service. Direct parity target: gardenio/helm/gardenio/dashboards/
+# monorepo-distributed-traces.json panels 9/10/11 (topk by span_name).
+#
+# These read the SAME federated spanmetrics families as the per-service
+# charts (span_calls_total / span_duration_milliseconds_bucket under
+# source="perf"), so they reconcile with them by construction: summing
+# any per-operation chart over span_name equals its per-service sibling.
+#
+# Correctness (rubric gardenio/docs/data-correctness-rubric.md):
+#   * source="perf" + span_kind="SPAN_KIND_SERVER" pinned on EVERY query
+#     (C2) — identical honest-aggregation discipline as the per-service
+#     charts: client/internal spans would inflate the operation ranking.
+#   * top_n is applied CLIENT-SIDE by window total (topNSeries), ranking
+#     operations by their integrated volume/error-count over the visible
+#     window — stable membership as the window pans, the same mechanism
+#     the spend-by-account/model charts use. The tail is DROPPED (not
+#     rolled into "other"): these are ranking panels, not stacked totals,
+#     so a synthetic "other" line would be noise, and the honest reading
+#     is "the top N operations, everything else omitted".
+#   * the errors panel plots errored-spans/sec (a RATE), not an error
+#     RATIO — the ACME parity panel ranks operations by ERROR VOLUME so
+#     the loudest failing endpoint sorts first; a per-operation ratio
+#     would float a single-call 100%-error operation above a
+#     thousand-call 5%-error one. Per-service error RATIO stays the
+#     perf-span-error-ratio chart's job.
+#   * the latency panel is in MILLISECONDS (duration_ms, C3 — the family
+#     is span_duration_MILLISECONDS_*) and reads p99 (the ACME panel-11
+#     quantile) so the slowest tail is what ranks.
+
+- id: perf-span-top-operations
+  title: 'top operations by volume (perf, span-derived)'
+  subtitle: 'server spans/sec by operation, top {{.TopN}}, {{.Step}} buckets'
+  category: perf
+  surfaces: [dashboard]
+  params:
+    service_name: {type: 'string[]', label: service}
+    span_name: {type: 'string[]', label: span_name}
+    top_n: {type: int, default: 10, min: 1, max: 50}
+  default_params: {top_n: 10}
+  # Per-operation server-span rate — the "noisiest endpoints" view. topk
+  # membership is resolved client-side (topNSeries) by window total, so
+  # the N busiest operations over the visible range are drawn.
+  query_template: 'sum by(span_name)(rate(span_calls_total{source="perf",span_kind="SPAN_KIND_SERVER"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}]))'
+  x_field: t
+  value_field: spans_per_sec
+  series_field: span_name
+  series_label: span_name
+  mark: line
+  y_title: server spans/sec
+  y_format: rate
+  ios_kind: line-multi
+
+- id: perf-span-operation-errors
+  title: 'operations with errors (perf, span-derived)'
+  subtitle: 'errored server spans/sec by operation, top {{.TopN}}, {{.Step}} buckets'
+  category: perf
+  surfaces: [dashboard]
+  params:
+    service_name: {type: 'string[]', label: service}
+    span_name: {type: 'string[]', label: span_name}
+    top_n: {type: int, default: 10, min: 1, max: 50}
+  default_params: {top_n: 10}
+  # Per-operation ERROR rate (STATUS_CODE_ERROR server spans/sec). Ranks
+  # operations by error VOLUME (a rate), so the loudest failing endpoint
+  # sorts first — the ACME "Operations with Errors" reading. A quiet
+  # operation with zero errors simply produces no series (honest-empty,
+  # R2/C5) rather than a flat-zero line.
+  query_template: 'sum by(span_name)(rate(span_calls_total{source="perf",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}]))'
+  x_field: t
+  value_field: errored_spans_per_sec
+  series_field: span_name
+  series_label: span_name
+  mark: line
+  y_title: errored spans/sec
+  y_format: rate
+  ios_kind: line-multi
+
+- id: perf-span-slowest-operations
+  title: 'slowest operations p99 (perf, span-derived)'
+  subtitle: 'p99 milliseconds by operation, top {{.TopN}}, {{.Step}}-windowed'
+  category: perf
+  surfaces: [dashboard]
+  params:
+    service_name: {type: 'string[]', label: service}
+    span_name: {type: 'string[]', label: span_name}
+    top_n: {type: int, default: 10, min: 1, max: 50}
+  default_params: {top_n: 10}
+  # Per-operation p99 latency over the span-duration histogram (ms), the
+  # ACME panel-11 shape. The `by(span_name, le)` grouping keeps one
+  # quantile series per operation; topNSeries then keeps the N with the
+  # highest integrated p99 over the window — the slowest tail. Buckets
+  # are MILLISECONDS (family name); duration_ms (C3). No denominator
+  # guard is needed — histogram_quantile over an empty window yields no
+  # series (honest-empty), not a misleading zero.
+  query_template: 'histogram_quantile(0.99, sum by(span_name, le)(rate(span_duration_milliseconds_bucket{source="perf",span_kind="SPAN_KIND_SERVER"{{if .Selector}},{{.Selector}}{{end}}}[{{.Step}}])))'
+  x_field: t
+  value_field: p99_milliseconds
+  series_field: span_name
+  series_label: span_name
+  mark: line
+  y_title: milliseconds
+  y_format: duration_ms
+  ios_kind: line-multi

@@ -1,0 +1,168 @@
+{{- if .Values.alertmanager.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.alertmanager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.alertmanager.labels" . | nindent 4 }}
+spec:
+  # Alertmanager clustering (gossip) is intentionally NOT configured — this is a
+  # single-replica deployment. Running >1 replica without --cluster.peer wiring
+  # would duplicate every notification, so keep replicaCount at 1 unless the
+  # HA gossip mesh is added.
+  replicas: {{ .Values.alertmanager.replicaCount | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.alertmanager.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.alertmanager.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "gardenio.contentChecksum" (include (print .Template.BasePath "/alertmanager/configmap.yaml") .) }}
+        # Scrape Alertmanager's own metrics (:9093/metrics) into the in-chart
+        # vmsingle via the vmagent pod-annotation discovery (same convention as
+        # controller/coopmux/litellm).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.alertmanager.service.port | default 9093 | quote }}
+        prometheus.io/path: "/metrics"
+        {{- include "gardenio.doNotDisrupt" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: alertmanager
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.alertmanager.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.alertmanager.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            - "--config.file=/etc/alertmanager/config/alertmanager.yml"
+            # Writable data dir (nflog + silences). Backed by emptyDir (or a PVC
+            # when persistence.enabled) so readOnlyRootFilesystem holds.
+            - "--storage.path=/alertmanager"
+            - "--log.level={{ .Values.alertmanager.logLevel | default "info" }}"
+            # web.external-url is left at the default; this Alertmanager is
+            # in-cluster only (no ingress) — vmalert reaches it over the Service.
+            - "--cluster.listen-address="
+          ports:
+            - name: http
+              containerPort: {{ .Values.alertmanager.service.port | default 9093 }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.alertmanager.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager/config
+              readOnly: true
+            - name: slack-webhook
+              mountPath: /etc/alertmanager/slack
+              readOnly: true
+            {{- if and .Values.alertmanager.securityRoute.enabled .Values.alertmanager.securityRoute.slack.secretName }}
+            # Dedicated security-channel webhook (ka-0000002447). Mounted only
+            # when a separate security webhook is wired; the security receivers
+            # read it via api_url_file so intrusion alerts deliver to the security
+            # channel independently of the ops webhook above.
+            - name: slack-security-webhook
+              mountPath: /etc/alertmanager/slack-security
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.alertmanager.costRoute.enabled .Values.alertmanager.costRoute.slack.secretName }}
+            # Dedicated cost-channel webhook (ka-0000003023). Mounted only when a
+            # separate cost webhook is wired; the slack-cost receiver reads it via
+            # api_url_file so fleet-size cost alerts deliver to #aws-cost-management
+            # independently of the ops webhook above.
+            - name: slack-cost-webhook
+              mountPath: /etc/alertmanager/slack-cost
+              readOnly: true
+            {{- end }}
+            - name: storage
+              mountPath: /alertmanager
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "gardenio.alertmanager.configMapName" . }}
+        - name: slack-webhook
+          secret:
+            secretName: {{ .Values.alertmanager.slack.secretName }}
+            # optional: the pod still starts (and reports Ready) if the Secret
+            # is not yet seeded. Alertmanager validates only that
+            # slack_api_url_file is a non-empty PATH at config load — it does NOT
+            # require the file to exist, and /-/ready returns 200 regardless. So
+            # before the operator seeds the SM webhook, delivery fails LAZILY at
+            # first alert-fire (the Slack notifier's file read errors, alert not
+            # delivered, error logged) — it is NOT surfaced as not-ready. This
+            # `optional: true` only avoids a CreateContainerConfigError crash on
+            # a missing Secret; it does not make the missing credential a
+            # readiness signal.
+            optional: true
+        {{- if and .Values.alertmanager.securityRoute.enabled .Values.alertmanager.securityRoute.slack.secretName }}
+        - name: slack-security-webhook
+          secret:
+            secretName: {{ .Values.alertmanager.securityRoute.slack.secretName }}
+            # optional for the same reason as the ops webhook above: the pod
+            # starts before the operator seeds the security webhook; delivery to
+            # the security channel fails lazily (falls back to the mounted ops
+            # webhook only if api_url_file is absent — otherwise the read errors
+            # and the alert is logged undelivered), never a crashloop.
+            optional: true
+        {{- end }}
+        {{- if and .Values.alertmanager.costRoute.enabled .Values.alertmanager.costRoute.slack.secretName }}
+        - name: slack-cost-webhook
+          secret:
+            secretName: {{ .Values.alertmanager.costRoute.slack.secretName }}
+            # optional for the same reason as the ops + security webhooks above:
+            # the pod starts before the operator seeds the cost webhook; delivery
+            # to #aws-cost-management fails lazily until it is seeded, never a
+            # crashloop.
+            optional: true
+        {{- end }}
+        {{- if .Values.alertmanager.persistence.enabled }}
+        - name: storage
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.alertmanager.fullname" . }}
+        {{- else }}
+        - name: storage
+          emptyDir: {}
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.alertmanager.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.alertmanager.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.alertmanager.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

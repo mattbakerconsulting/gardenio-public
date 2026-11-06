@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright (c) 2026 Matt Baker <fimbaz@gmail.com>
+
+pub mod backend;
+pub mod command;
+pub mod compact_resume;
+pub mod config;
+pub mod driver;
+pub mod error;
+pub mod event;
+pub mod event_log;
+pub mod mouse;
+pub mod mux_client;
+pub mod probe;
+pub mod profile;
+pub mod record;
+pub mod rehydrate;
+pub mod rendering_test_support;
+pub mod replay_gate;
+pub mod ring;
+pub mod run;
+#[cfg(feature = "s3")]
+pub mod s3;
+pub mod screen;
+pub mod session;
+pub mod start;
+pub mod stop;
+pub mod switch;
+pub mod test_support;
+pub mod thaw;
+pub mod transcript;
+pub mod transport;
+pub mod usage;

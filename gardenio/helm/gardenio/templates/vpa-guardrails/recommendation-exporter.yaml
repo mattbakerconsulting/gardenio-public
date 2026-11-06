@@ -1,0 +1,276 @@
+{{- if .Values.agents.metrics.prometheusRule.vpaGuardrails.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.vpaGuardrails }}
+{{- $exp := $cfg.recommendationExporter }}
+{{- if $exp.enabled }}
+{{- $name := printf "%s-vpa-reco-exporter" (include "gardenio.agents.fullname" .) }}
+# VPA recommendation-value exporter.
+#
+# Surfaces VPA.status.recommendation.target as a Prometheus gauge so the
+# dashboard can plot the "recommended" line against actual (cadvisor) and
+# request (KSM). This is the ONLY source of that series:
+#   - kube-state-metrics removed its built-in `verticalpodautoscalers`
+#     collector in v2.x (confirmed empirically on v2.13.0: the resource is not
+#     in the available-resources list), and
+#   - the cluster KSM (observability ns) runs neither the VPA collector nor a
+#     Custom Resource State config for VPAs.
+#
+# So we run a dedicated kube-state-metrics in Custom Resource State (CRS) mode,
+# SCOPED to a single namespace (--namespaces), reading only gardenio's own VPA
+# objects — it can never read the ~130 product VPAs on the shared cluster.
+#
+# SCRAPE PATH (ka-0000000525): the ServiceMonitor below is honored only where a
+# prometheus-operator / observability Prometheus runs (e.g. america-e2e-eks).
+# The in-chart vmagent runs a STATIC -promscrape.config and does NOT discover
+# ServiceMonitors, and prod-gardenio-eks has no observability Prometheus — so on
+# prod the series reach vmsingle via the dedicated static `vpa-reco-exporter`
+# vmagent scrape job (templates/vmagent/configmap.yaml), which targets this
+# Service's :8080 with honor_labels. Both paths are gated on the same knob.
+# Emitted series (verified against a live recommender):
+#   kube_customresource_vpa_status_recommendation_target{
+#     namespace, verticalpodautoscaler, target_kind, target_name, container,
+#     resource} = <recommended target bytes|cpu>
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+---
+# CRS mode still resolves the target GVK via a cluster-scoped CRD list/watch,
+# and reads VerticalPodAutoscaler objects. VPA list/watch is restricted to the
+# release namespace via a Role; only the CRD discovery is cluster-scoped (read
+# of CRD definitions, not of any product data).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+rules:
+  - apiGroups: ["autoscaling.k8s.io"]
+    resources: ["verticalpodautoscalers"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+data:
+  # Custom Resource State config. `valueFrom: [target, memory]` reads
+  # status.recommendation.containerRecommendations[*].target.memory; the
+  # `resource` label distinguishes the memory vs cpu series. lowerBound /
+  # uncappedTarget are exported too so the dashboard can show the recommended
+  # band, not just the point target.
+  crs.yaml: |
+    kind: CustomResourceStateMetrics
+    spec:
+      resources:
+        - groupVersionKind:
+            group: "autoscaling.k8s.io"
+            version: "v1"
+            kind: "VerticalPodAutoscaler"
+          metricNamePrefix: kube_customresource
+          labelsFromPath:
+            verticalpodautoscaler: [metadata, name]
+            namespace: [metadata, namespace]
+            target_apiversion: [spec, targetRef, apiVersion]
+            target_kind: [spec, targetRef, kind]
+            target_name: [spec, targetRef, name]
+          metrics:
+            - name: "vpa_status_recommendation_target"
+              help: "VPA recommended target per container/resource (bytes for memory)"
+              each:
+                type: Gauge
+                gauge:
+                  path: [status, recommendation, containerRecommendations]
+                  labelsFromPath:
+                    container: [containerName]
+                  valueFrom: [target, memory]
+            - name: "vpa_status_recommendation_lowerbound"
+              help: "VPA recommended lower bound per container (bytes for memory)"
+              each:
+                type: Gauge
+                gauge:
+                  path: [status, recommendation, containerRecommendations]
+                  labelsFromPath:
+                    container: [containerName]
+                  valueFrom: [lowerBound, memory]
+            - name: "vpa_status_recommendation_uncappedtarget"
+              help: "VPA uncapped recommended target per container (bytes for memory)"
+              each:
+                type: Gauge
+                gauge:
+                  path: [status, recommendation, containerRecommendations]
+                  labelsFromPath:
+                    container: [containerName]
+                  valueFrom: [uncappedTarget, memory]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.agents.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/part-of: vpa-guardrails
+      app.kubernetes.io/name-suffix: vpa-reco-exporter
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.agents.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/part-of: vpa-guardrails
+        app.kubernetes.io/name-suffix: vpa-reco-exporter
+    spec:
+      serviceAccountName: {{ $name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: kube-state-metrics
+          image: "{{ $exp.image.repository }}:{{ $exp.image.tag }}"
+          imagePullPolicy: {{ $exp.image.pullPolicy }}
+          args:
+            - "--custom-resource-state-only=true"
+            - "--custom-resource-state-config-file=/etc/crs/crs.yaml"
+            - "--namespaces={{ .Release.Namespace }}"
+            - "--port=8080"
+            - "--telemetry-port=8081"
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: telemetry
+              containerPort: 8081
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml $exp.resources | nindent 12 }}
+          volumeMounts:
+            - name: crs
+              mountPath: /etc/crs
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+      volumes:
+        - name: crs
+          configMap:
+            name: {{ $name }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "gardenio.agents.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+    app.kubernetes.io/name-suffix: vpa-reco-exporter
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: vpa-guardrails
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.agents.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/part-of: vpa-guardrails
+      app.kubernetes.io/name-suffix: vpa-reco-exporter
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: "30s"
+{{- end }}
+{{- end }}

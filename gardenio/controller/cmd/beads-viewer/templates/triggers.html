@@ -1,0 +1,271 @@
+{{template "layout" .}}
+{{define "title"}}Triggers · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+<script type="text/javascript">
+  // Apply stored density preference before any paint to avoid FOUC. Sets
+  // data-triggers-density on <html> so CSS selectors below can resolve before
+  // the wrapper element parses (the CSS doesn't care which element carries
+  // the attribute — we set it on both for redundancy + server-side correctness).
+  (function() {
+    try {
+      var d = localStorage.getItem('triggers.density');
+      if (d === 'compact' || d === 'comfortable') {
+        document.documentElement.setAttribute('data-triggers-density', d);
+      }
+    } catch (e) { /* private mode / disabled storage — fall through to server default */ }
+  })();
+</script>
+<style>
+  /* /triggers page-specific. The row template is universal — density mode is
+     a pure-CSS class flip on the page wrapper. */
+
+  /* Wrapper + density toggle */
+  .triggers-page { /* placeholder — density data-attribute drives row layout below */ }
+  .triggers-density-toggle { display: inline-flex; gap: 0; border: 1px solid rgba(128,128,128,0.4); border-radius: 4px; overflow: hidden; }
+  .triggers-density-toggle a { padding: 0.2rem 0.6rem; text-decoration: none; color: inherit; font-size: 0.85em; border-right: 1px solid rgba(128,128,128,0.4); }
+  .triggers-density-toggle a:last-child { border-right: none; }
+  .triggers-density-toggle a:hover { background: rgba(128,128,128,0.1); }
+  .triggers-density-toggle a.is-active { background: rgba(33,150,243,0.15); font-weight: 600; }
+  .triggers-controls { display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem; align-items: center; margin: 0.5rem 0 0.75rem; font-size: 0.9em; }
+  /* color #595959 on #fff is ~7:1 contrast — passes WCAG AA without opacity. */
+  .triggers-controls-label { font-size: 0.78rem; color: #595959; margin-right: 0.25rem; text-transform: uppercase; letter-spacing: 0.04em; }
+
+  /* Sort strip */
+  .trig-sort { font-size: 0.9em; }
+  .trig-sort a { margin-right: 0.5rem; text-decoration: none; }
+  .trig-sort a.is-active { font-weight: 600; text-decoration: underline; }
+
+  /* Universal row scaffolding. The frame is invariant across sources/actions
+     and across density modes; CSS toggles which sub-lines are visible. */
+  .trig-row { padding: 0.5rem 0.25rem; border-bottom: 1px solid rgba(128,128,128,0.18); }
+  .trig-row:last-child { border-bottom: none; }
+  .trig-row.trig-disabled .trig-title { color: #595959; }
+  .trig-row.trig-disabled .trig-title:hover { color: #404040; }
+  .trig-line { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .trig-line-1 { gap: 0.5rem; }
+  .trig-line-2 { gap: 0.4rem; margin-top: 0.25rem; font-size: 0.88em; }
+  .trig-line-3 { gap: 0.5rem; margin-top: 0.15rem; font-size: 0.85em; color: #595959; }
+  /* color #595959 keeps ~7:1 contrast on #fff. Children inherit unless they
+     set their own color — none set opacity now (would dilute contrast). */
+  .trig-line-4 { gap: 0.5rem; margin-top: 0.15rem; font-size: 0.78em; color: #595959; }
+  .trig-title { font-weight: 600; text-decoration: none; color: inherit; line-height: 1.3; flex: 1; min-width: 0; }
+  .trig-title:hover { text-decoration: underline; }
+  .trig-ago { font-variant-numeric: tabular-nums; color: #595959; flex-shrink: 0; }
+  .trig-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .trig-spacer { flex: 1; }
+  .trig-match { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; min-width: 0; overflow-wrap: anywhere; }
+  .trig-dest  { font-size: 0.9em; }
+  .trig-meta-bit { }
+  .trig-nextfire-err { color: #b04040; }
+
+  /* Source pills — color-coded per design bundle ka-0000003886. */
+  .trig-src { display: inline-block; padding: 0.05rem 0.4rem; border-radius: 3px; font-size: 0.82em; line-height: 1.4; border: 1px solid rgba(128,128,128,0.3); background: rgba(128,128,128,0.12); text-transform: lowercase; letter-spacing: 0.02em; flex-shrink: 0; font-weight: 600; }
+  .trig-src-jira           { background: rgba(25,118,210,0.14);   border-color: rgba(25,118,210,0.42);   color: #14528e; }
+  .trig-src-gitlab         { background: rgba(252,109,38,0.16);   border-color: rgba(252,109,38,0.46);   color: #a04612; }
+  .trig-src-webhook        { background: rgba(0,150,136,0.14);    border-color: rgba(0,150,136,0.42);    color: #0a665b; }
+  .trig-src-bead           { background: rgba(156,99,193,0.16);   border-color: rgba(156,99,193,0.42);   color: #4c2c70; }
+  .trig-src-account        { background: rgba(232,170,42,0.18);   border-color: rgba(232,170,42,0.50);   color: #8a6516; }
+  .trig-src-schedule       { background: rgba(120,144,170,0.18);  border-color: rgba(120,144,170,0.42);  color: #2c3a4a; }
+  .trig-src-slack-reaction { background: rgba(120,57,108,0.16);   border-color: rgba(120,57,108,0.46);   color: #6d2f60; }
+  .trig-src-unknown        { background: rgba(128,128,128,0.18);  border-color: rgba(128,128,128,0.40);  color: #404040; }
+
+  /* Compact mode: 2-letter glyph swap-in. Comfortable mode shows full name. */
+  .trig-src-glyph { display: none; }
+
+  /* Action pill */
+  .trig-action { display: inline-block; padding: 0.05rem 0.4rem; border-radius: 3px; font-size: 0.82em; line-height: 1.4; border: 1px solid rgba(128,128,128,0.3); background: rgba(128,128,128,0.10); flex-shrink: 0; }
+  .trig-action-spawn_agent   { background: rgba(67,160,71,0.14);  border-color: rgba(67,160,71,0.42);  color: #245a28; }
+  .trig-action-apply_formula { background: rgba(189,87,156,0.14); border-color: rgba(189,87,156,0.42); color: #8a3f72; }
+  .trig-action-create_bead   { background: rgba(58,130,210,0.14); border-color: rgba(58,130,210,0.42); color: #2867aa; }
+  .trig-action-notify        { background: rgba(232,140,42,0.14); border-color: rgba(232,140,42,0.42); color: #8a5012; }
+  .trig-action-short { display: none; }
+
+  /* Closed-bead chip — disabled-style row + a small inline marker. The
+     enabled/disabled state for open beads is rendered by the .trig-toggle
+     switch below, not by a static chip. */
+  .trig-state-closed   { background: rgba(214,69,69,0.10); color: #a83232; border: 1px solid rgba(214,69,69,0.32); padding: 0.05rem 0.4rem; border-radius: 3px; font-size: 0.78em; }
+  /* Pouring-but-never-worked stall badge (ka-0000000957): an amber warning on a
+     trigger that keeps pouring molecules on cadence while they go unworked. */
+  .trig-pour-stall     { background: rgba(214,145,40,0.14); color: #9a6a12; border: 1px solid rgba(214,145,40,0.42); padding: 0.05rem 0.4rem; border-radius: 3px; font-size: 0.78em; white-space: nowrap; }
+  .trig-meta-stall     { color: #9a6a12; }
+
+  /* Inline enable/disable switch (ka-0000005886). Track + thumb shape,
+     reused for both schedule and trigger:schedule beads. */
+  .trig-toggle { display: inline-flex; margin: 0; padding: 0; }
+  .trig-toggle-btn {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    padding: 0.05rem 0.45rem 0.05rem 0.35rem;
+    border-radius: 999px; border: 1px solid rgba(128,128,128,0.32);
+    background: rgba(128,128,128,0.10); color: inherit;
+    font-size: 0.78em; cursor: pointer;
+    transition: background-color 0.12s ease, border-color 0.12s ease;
+  }
+  .trig-toggle-btn:hover { border-color: rgba(128,128,128,0.55); }
+  .trig-toggle-btn:focus-visible { outline: 2px solid rgba(33,150,243,0.55); outline-offset: 1px; }
+  .trig-toggle-btn[disabled] { opacity: 0.55; cursor: progress; }
+  .trig-toggle-on  { background: rgba(67,160,71,0.16); border-color: rgba(67,160,71,0.40); color: #245a28; }
+  .trig-toggle-off { background: rgba(128,128,128,0.18); border-color: rgba(128,128,128,0.40); color: #404040; }
+  .trig-toggle-track {
+    position: relative; display: inline-block; width: 1.6rem; height: 0.85rem;
+    border-radius: 999px; background: rgba(128,128,128,0.40); flex-shrink: 0;
+    transition: background-color 0.12s ease;
+  }
+  .trig-toggle-on .trig-toggle-track { background: rgba(67,160,71,0.55); }
+  .trig-toggle-thumb {
+    position: absolute; top: 50%; left: 0.1rem;
+    width: 0.65rem; height: 0.65rem; border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+    transform: translateY(-50%);
+    transition: left 0.12s ease;
+  }
+  .trig-toggle-on .trig-toggle-thumb { left: 0.85rem; }
+  .trig-toggle-label { font-weight: 600; letter-spacing: 0.02em; }
+
+  /* Kind chip — small, distinguishes legacy schedule from type=trigger
+     primitive (both source=schedule). */
+  .trig-kind { display: inline-block; padding: 0.02rem 0.35rem; border-radius: 3px; font-size: 0.72em; line-height: 1.4; border: 1px solid rgba(128,128,128,0.3); background: rgba(128,128,128,0.10); flex-shrink: 0; opacity: 0.85; }
+  .chip-kind-schedule { background: rgba(120,144,170,0.18); color: #2c3a4a; border: 1px solid rgba(120,144,170,0.36); }
+  .chip-kind-trigger  { background: rgba(156,99,193,0.16); color: #4c2c70; border: 1px solid rgba(156,99,193,0.34); }
+
+  /* ---- Density flip ---- */
+
+  /* COMPACT mode: collapse rows to one line, swap source pill text for the
+     2-letter glyph, hide line 3/4 and the destination summary. */
+  [data-triggers-density="compact"] .trig-row,
+  .triggers-page[data-density="compact"] .trig-row {
+    padding: 0.18rem 0.25rem;
+    font-size: 0.92em;
+  }
+  [data-triggers-density="compact"] .trig-line-2,
+  .triggers-page[data-density="compact"] .trig-line-2 {
+    margin-top: 0;
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+  [data-triggers-density="compact"] .trig-line-3,
+  [data-triggers-density="compact"] .trig-line-4,
+  .triggers-page[data-density="compact"] .trig-line-3,
+  .triggers-page[data-density="compact"] .trig-line-4 {
+    display: none;
+  }
+  [data-triggers-density="compact"] .trig-src-full,
+  .triggers-page[data-density="compact"] .trig-src-full {
+    display: none;
+  }
+  [data-triggers-density="compact"] .trig-src-glyph,
+  .triggers-page[data-density="compact"] .trig-src-glyph {
+    display: inline-block;
+  }
+  [data-triggers-density="compact"] .trig-action-full,
+  .triggers-page[data-density="compact"] .trig-action-full {
+    display: none;
+  }
+  [data-triggers-density="compact"] .trig-action-short,
+  .triggers-page[data-density="compact"] .trig-action-short {
+    display: inline-block;
+  }
+  [data-triggers-density="compact"] .trig-line-1,
+  .triggers-page[data-density="compact"] .trig-line-1 {
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+  [data-triggers-density="compact"] .trig-title,
+  .triggers-page[data-density="compact"] .trig-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  [data-triggers-density="compact"] .trig-match,
+  .triggers-page[data-density="compact"] .trig-match {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 28rem;
+  }
+  [data-triggers-density="compact"] .trig-kind,
+  .triggers-page[data-density="compact"] .trig-kind {
+    display: none;
+  }
+</style>
+
+<h1>Triggers
+  {{if .Rows}}<span class="meta">({{len .Rows}})</span>{{end}}
+</h1>
+
+{{if .Error}}
+<div class="banner banner-error">{{.Error}}</div>
+{{end}}
+
+{{if .Truncated}}
+<div class="banner banner-warn">Showing first {{.Limit}} trigger beads.</div>
+{{end}}
+
+{{template "filter_strip" (dict "Chips" .Chips "AriaLabel" "Trigger filter" "Wrapper" "nav" "ChipClass" "chip" "AriaCurrent" "true" "CountMode" "always" "ActiveSpan" true)}}
+
+{{template "filter_strip" (dict "Chips" .SourceChips "AriaLabel" "Trigger source filter" "Wrapper" "nav" "ChipClass" "chip" "AriaCurrent" "true" "CountMode" "always" "ActiveSpan" true "DataKey" "source")}}
+
+{{template "filter_strip" (dict "Chips" .ActionChips "AriaLabel" "Trigger action filter" "Wrapper" "nav" "ChipClass" "chip" "AriaCurrent" "true" "CountMode" "always" "ActiveSpan" true "DataKey" "action")}}
+
+<div class="triggers-controls">
+  <span class="triggers-controls-label">Density</span>
+  <span class="triggers-density-toggle" role="group" aria-label="Row density">
+    {{range .DensityChoices}}
+      <a href="{{.Href}}"
+         data-density-value="{{.Value}}"
+         {{if .Active}}class="is-active" aria-current="true"{{end}}>{{.Label}}</a>
+    {{end}}
+  </span>
+  <span class="trig-sort" aria-label="Sort">
+    <span class="triggers-controls-label">Sort</span>
+    {{range .SortLinks}}
+      <a href="{{.Href}}"{{if .Active}} class="is-active"{{end}}>{{.Label}}</a>
+    {{end}}
+  </span>
+</div>
+
+<div class="triggers-page" data-bulk-scope="triggers" data-density="{{if .Density}}{{.Density}}{{else}}comfortable{{end}}">
+{{template "trigger_bulk_toolbar" (dict "BasePath" $.BasePath "ErrMsg" "")}}
+{{if .Rows}}
+<ul class="bead-list trig-list">
+  {{range .Rows}}
+    {{template "trigger_row" (dict "Row" . "BasePath" $.BasePath "OOB" false)}}
+  {{end}}
+</ul>
+{{else if not .Error}}
+<p class="empty">No triggers.</p>
+{{end}}
+</div>
+
+<script type="text/javascript">
+  // Density toggle: persist selection to localStorage and flip the wrapper
+  // data-attribute immediately so the page reflows without a navigation.
+  (function() {
+    var wrapper = document.querySelector('.triggers-page');
+    if (!wrapper) return;
+    try {
+      var stored = localStorage.getItem('triggers.density');
+      if (stored === 'compact' || stored === 'comfortable') {
+        wrapper.setAttribute('data-density', stored);
+        document.documentElement.setAttribute('data-triggers-density', stored);
+        document.querySelectorAll('.triggers-density-toggle a').forEach(function(a) {
+          a.classList.toggle('is-active', a.getAttribute('data-density-value') === stored);
+        });
+      }
+    } catch (e) { /* ignore */ }
+    document.querySelectorAll('.triggers-density-toggle a').forEach(function(a) {
+      a.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        var v = a.getAttribute('data-density-value') || 'comfortable';
+        try { localStorage.setItem('triggers.density', v); } catch (e) { /* ignore */ }
+        wrapper.setAttribute('data-density', v);
+        document.documentElement.setAttribute('data-triggers-density', v);
+        document.querySelectorAll('.triggers-density-toggle a').forEach(function(x) {
+          x.classList.toggle('is-active', x === a);
+        });
+      });
+    });
+  })();
+</script>
+{{end}}

@@ -1,0 +1,37 @@
+# Cloud config for aws-cloud-controller-manager (see aws-ccm-values.yaml).
+#
+# The AWS cloud provider refuses to initialize without a ClusterID:
+#   F main.go:104] Cloud provider could not be initialized: could not init
+#   cloud provider "aws": AWS cloud failed to find ClusterID
+# It normally discovers one from a `kubernetes.io/cluster/<id>` or legacy
+# `KubernetesCluster` tag on its OWN instance. This cluster's instances carry
+# `k8s.io/cluster-autoscaler/gardenio` (a different key, for the autoscaler)
+# and no cluster tag, so discovery fails and all three pods CrashLoopBackOff.
+#
+# Supplying the ID here rather than tagging instances is deliberate: a tag
+# lives on the instance, so a replaced server silently loses it and the CCM
+# crashloops -- taking node GC with it -- until someone notices. A ConfigMap
+# is declarative, survives instance replacement, and needs nothing from the
+# terraform lane (the launch templates and IAM are fimba-e6's).
+#
+# SAFETY: setting ClusterID switches on tag filtering in awsTagging.addFilters
+# for the *filter-based* lookups (describeInstances by private-dns-name etc.),
+# which would find nothing here since the instances lack the tag. That is
+# fine because the only controller enabled is cloud-node-lifecycle, whose
+# path is InstanceExists -> InstanceExistsByProviderID -> DescribeInstances
+# BY INSTANCE ID through describeInstanceBatcher. Verified against
+# cloud-provider-aws v1.36.1: that batcher is constructed as
+# newdescribeInstanceBatcher(ctx, ec2) with no reference to the tagging
+# struct, and neither InstanceExistsByProviderID (aws.go:890) nor
+# getInstancesByIDs (aws.go:3417) calls hasClusterTag. So a live but
+# untagged instance can never be misread as "gone" and its node deleted.
+# Re-check this before enabling any further controller.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aws-ccm-cloud-config
+  namespace: kube-system
+data:
+  cloud-config: |
+    [Global]
+    KubernetesClusterID=gardenio

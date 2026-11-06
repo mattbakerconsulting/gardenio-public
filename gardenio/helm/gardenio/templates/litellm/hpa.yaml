@@ -1,0 +1,57 @@
+{{- if and .Values.litellm.enabled .Values.litellm.autoscaling.enabled }}
+# HorizontalPodAutoscaler for the in-cluster litellm proxy (H5, epic
+# ka-0000005228). The proxy is the LLM data-plane for the whole fleet; this HPA
+# holds an HA floor of minReplicas (>=2) and adds scale-up headroom under load.
+# When enabled the Deployment omits its own `replicas` field so this object owns
+# the replica count (templates/litellm/deployment.yaml). See the `autoscaling`
+# block in values.yaml for the metric rationale.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "gardenio.litellm.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.litellm.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "gardenio.litellm.fullname" . }}
+  minReplicas: {{ .Values.litellm.autoscaling.minReplicas | default 2 }}
+  maxReplicas: {{ .Values.litellm.autoscaling.maxReplicas | default 6 }}
+  metrics:
+    {{- if .Values.litellm.autoscaling.targetCPUUtilizationPercentage }}
+    # CPU utilization — Resource metric, served by metrics-server. Always
+    # available on prod-gardenio-eks + in-box k3s.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.litellm.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.litellm.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.litellm.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.litellm.autoscaling.customMetric.enabled }}
+    # Latency / in-flight-request custom metric — Pods type, one value per pod
+    # averaged across the fleet. Requires a custom.metrics.k8s.io adapter
+    # (prometheus-adapter / KEDA) exposing `name`; inert without one.
+    - type: Pods
+      pods:
+        metric:
+          name: {{ .Values.litellm.autoscaling.customMetric.name }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.litellm.autoscaling.customMetric.targetAverageValue | quote }}
+    {{- end }}
+  {{- with .Values.litellm.autoscaling.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

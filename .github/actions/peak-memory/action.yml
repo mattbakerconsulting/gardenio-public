@@ -1,0 +1,455 @@
+# TEMPORARY DIAGNOSTIC -- delete this whole directory once the tier decisions
+# it exists to inform are recorded in gardenio/helm/ci/README.md. Precedent:
+# the ci.yml cache-hit diagnostic was removed in d30a2ef3 the moment it had
+# answered its question, because a diagnostic that outlives its question is
+# just a tax on every job that carries it.
+#
+# ── WHAT THIS IS FOR ────────────────────────────────────────────────────────
+# The heavy tier ran pinned at its cap 65% of a 4h40m window with 56 jobs
+# queued, while gardenio-k3s-medium averaged 1.53 of 6 and light 0.64 of 10.
+#
+# CORRECTION (2026-09-22 18:0xZ): this paragraph used to open "One heavy
+# runner needs a whole node -- `cpu: 3` and `memory: 12Gi` requested against 4
+# allocatable CPU and ~15.25Gi on a ci node". BOTH numbers are now stale and
+# the conclusion drawn from them is false:
+#
+#   * `c3c2fa3d` (09-22 05:56) lowered the request to **1900m**, titled "to
+#     pack two per large node". It changed the value and left this header,
+#     arc-runners-values.yaml:205 and arc-runners-medium-values.yaml:41 all
+#     still asserting `cpu: 3` / one-runner-per-node.
+#   * ci nodes are not ~15.25Gi. Measured 18:0xZ: 8 of 8 are r5a.xlarge at
+#     31705Mi allocatable, and 13 of 13 launches EC2 still remembers were
+#     r-class. The ~15.25Gi figure was a real reading of an m-class node --
+#     the pool genuinely held seven of them when this was written.
+#
+# THE DURABLE LESSON, which is why this correction is kept rather than just
+# edited away: the ci ASG lists six m-class and four r-class .xlarge overrides
+# under `price-capacity-optimized`, so NODE SHAPE IS A VARIABLE, not a
+# constant. Allocatable memory per ci node swings ~15.25Gi <-> ~31Gi with no
+# config change and no notification. Any packing conclusion is valid only for
+# the fleet composition it was measured on, and this one flipped within hours.
+# Re-read the live shape before reusing a per-node number from any document.
+#
+# An earlier version of this note said the pool was "hard-capped at
+# ci_max_nodes = 8", and used that to argue the ceiling was the constraint.
+# Both halves are wrong now. The value is 11 (composition/gardenio/main.tf:182)
+# and the ASG sits at 11 of 11, but raising it has been measured and
+# DISCONFIRMED as a lever: admitted peak is bounded by maxRunners, not by
+# nodes, and unmet demand stayed flat across ceilings. Do not re-derive that.
+#
+# What the corrected numbers actually show is a PACKING problem. heavy's
+# maxRunners is 10 against 11 nodes, and a heavy runner's 3-CPU request leaves
+# under a core once daemonsets are counted -- so a saturated heavy tier does
+# not merely fill the pool, it denies medium and light anywhere to land. That
+# is how gardenio-k3s-medium sits at 0 of 6 and light at 0 of 10 while jobs
+# queue: not idle capacity going unused, no capacity to use.
+#
+# So there are two levers, and this action exists to size both. Moving jobs
+# DOWN a tier, blocked on peak memory because medium limits at 4Gi; and the
+# heavy request shape itself, blocked on CPU, which nothing was measuring
+# until `cpuavg`/`cpumax` below.
+#
+# ── WHY NOT JUST GUESS ──────────────────────────────────────────────────────
+# Because a guess was already wrong once, in the expensive direction. The
+# `security` job (gitleaks + govulncheck + osv) looked like an obvious demotion
+# -- 121s, no sustained CPU, ungated so it runs on every push -- and measuring
+# it returned a 7967Mi peak against medium's 4Gi limit. Guessing here is worse
+# than usual: arc-runners-medium-values.yaml records that a runner OOM-killed
+# for exceeding its limit produces the same "lost communication with the
+# server" annotation as a spot reclaim, so retry-lost-runners.yml cannot tell
+# them apart and an undersized job fails three times before it goes red.
+#
+# ── HOW TO READ THE OUTPUT ──────────────────────────────────────────────────
+# One grep-able line per probe:
+#   PEAKMEM label=<x> peak=<N>Mi anonmax=<N>Mi anon=<N>Mi file=<N>Mi \
+#           current=<N>Mi cpuavg=<N>m cpumax=<N>m loadavg=<1m/5m/15m> \
+#           node=<n> cpu=<host CPU model, spaces as _> vcpu=<N> \
+#           samp=<started|running>
+#
+# `cpu` and `vcpu` are NOT memory numbers and are not here for sizing -- they
+# are the confound control. This pool's spot fleet silently swaps CPU
+# generation through the day (gd-Q6iltiM1TO), so two readings of the same job
+# hours apart are not comparable unless their `cpu` matches. Check it before
+# comparing ANY two timings, including two probes of the same arm.
+#
+# `peak` is cgroup v2's memory.peak, read rather than wrapping commands in
+# `/usr/bin/time -v` (which measures one process and is not in the runner image
+# anyway).
+#
+# But `peak` INCLUDES PAGE CACHE, and page cache is reclaimable. A cgroup that
+# touches 8Gi of files does not OOM at a 4Gi limit; the kernel drops cache
+# first. So `peak` is an UPPER BOUND on what a limit would kill on, not the
+# decision number. The decision number is `anonmax` -- the high-water mark of
+# unreclaimable anonymous memory. A job with peak=8000Mi / anonmax=900Mi is a
+# fine 4Gi tenant; one with anonmax=6000Mi is not. Read both or you will
+# re-make the mistake this action exists to prevent, one layer down.
+#
+# `peak` is still worth reading, because it is a valid ONE-SIDED test:
+# anonmax <= peak always, so a job whose attributable peak already clears the
+# target limit is PROVEN to fit and needs no anon measurement at all. Only a
+# job that fails the peak test is ambiguous -- not rejected. (Refinement from
+# fimba-a6 while sizing gd-Jm8arvF17D; it saves a sampler run on most jobs.)
+#
+# ── SCOPE: THIS MEASURES THE `runner` CONTAINER, NOT THE POD ────────────────
+# This paragraph used to read "the high-water mark of the WHOLE POD (runner +
+# dind + every job step)". That is FALSE and it invalidates every reading this
+# action has taken on an image build. Measured 2026-09-22:
+#
+#   * inside `runner`, /proc/self/cgroup is `0::/` -- a cgroup NAMESPACE is
+#     active, so /sys/fs/cgroup is the container's own root, not the pod's.
+#   * inside `runner`, memory.max reads 15032385536 = 14Gi, which is the
+#     RUNNER container's own `limits.memory`. A pod-scoped cgroup would not
+#     carry a single container's limit.
+#   * inside `dind`, /proc/self/cgroup is the absolute
+#     `kubepods-burstable.slice/...` path -- dind is privileged and NOT
+#     namespaced, which is why the two containers disagree about what `/` is.
+#
+# So `dind` is invisible here, and `dind` is where `docker build` runs. The
+# consequence, measured on the same day:
+#
+#   image `agent` (9 stages: Playwright, Whisper, a Rust toolchain, Terraform
+#   providers; ~1200 s of wall clock) reported cpuavg=29m anonmax=159Mi
+#   peak=473Mi. Meanwhile node ip-10-90-27-221, holding two such pods, showed
+#   **loadavg 14.50 on 4 vCPU** while its two runner containers had burned a
+#   cumulative 30 s and 58 s of CPU and peaked at 470Mi/475Mi of 14336Mi.
+#
+# READ THIS BEFORE SIZING ANYTHING:
+#   * VALID for jobs whose work runs in the runner container -- the Go and
+#     Rust jobs in ci.yml and checks.yml. (Corroboration: ci.yml's `controller`
+#     arm reported cpuavg=2580m / anonmax=2875Mi, i.e. real load, same tier,
+#     same node shape.)
+#   * MEANINGLESS for the images.yml `build` arms and `controller-base`, which
+#     do all their work in dind. A near-zero reading there is the probe missing
+#     the workload, NOT a cheap job.
+#
+# `loadavg` below is reported precisely because it is the one node-scoped
+# number the runner container CAN see (/proc/loadavg is not namespaced). On a
+# 4-vCPU ci node, loadavg >> 4 means the pod cgroups are lying to the
+# scheduler about who is consuming the box.
+#
+# ── WHY THERE IS A SAMPLER, AND WHY `reset` IS DEAD WEIGHT HERE ─────────────
+# `anon` in memory.stat is INSTANTANEOUS, and the kernel exposes no peak-anon
+# counter. A probe that runs after a step therefore reports the anon that step
+# has already freed. Measured on the `security` job 2026-09-22 (job
+# 106601326347): peak climbed 1179Mi -> 8214Mi across govulncheck while `anon`
+# read 88Mi -> 91Mi. Those 91Mi are not govulncheck's footprint, they are what
+# was left once it exited, and reading them as a demotion green light would be
+# the same error as reading `peak` as a red one.
+#
+# Hence the background sampler: one per job, started by the first probe,
+# polling memory.stat every 0.5s and keeping the max. Every probe then reports
+# `anonmax` as well, and -- because it is monotonic like `peak` -- the DELTA
+# between two probes attributes anon to the steps between them.
+#
+# ── A JOB WITH ONE PROBE MEASURES NO ANON AT ALL ────────────────────────────
+# This is the trap, and it cost three jobs their tier decision before anyone
+# noticed. The sampler is started BY THE FIRST PROBE. A job whose only probe
+# sits at the end therefore reports the seed that very probe just wrote, so
+# `anonmax` equals the instantaneous `anon` and measures nothing. It does not
+# look broken -- it looks like a job with a tiny anon footprint, which is the
+# most expensive possible way to be wrong here.
+#
+# The tell is `samp=started` on the LAST probe of a job (this step now emits a
+# ::notice:: saying so). `samp=running` means a real high-water mark. Compare:
+#   one probe   lint-go, gitleaks, cargo-security: anonmax == anon, 62-121Mi
+#   two probes  security: anonmax 6874-7325Mi while anon read 90-119Mi
+# Same action, same nodes. So: EVERY job that carries this action needs a
+# baseline probe right after checkout, and adding the end probe alone is not
+# half the measurement, it is none of it.
+#
+# ── WHY IT ALSO REPORTS CPU, AND WHY THE AVERAGE IS THE RIGHT NUMBER ────────
+# Because CPU, not memory, is what actually forbids a second runner -- and
+# after `c3c2fa3d` that is measurable rather than theoretical.
+#
+# Re-measured 2026-09-22 18:0xZ, 8 ci nodes, all 4 allocatable CPU / 31705Mi:
+#
+#   3 nodes hold TWO heavy runners  (2 x 1900m = 3800m, 190m left)
+#   3 nodes hold ONE heavy runner   (2090m free -- room for exactly one more)
+#   1 node holds FIVE medium        (5 x 750m = 3750m, 26653Mi memory idle)
+#
+# So `c3c2fa3d`'s two-per-node goal is REAL and observed. What binds now is
+# CPU, on every node and by a wide margin. Against a heavy runner's
+# 1900m + 12288Mi ask: 3 of 8 nodes had enough CPU, 5 of 8 had enough memory,
+# and the memory-short set is a strict SUBSET of the CPU-short set. Memory was
+# never the sole blocker on any node. Pool-wide free: 8420m CPU against
+# 124660Mi (121.7Gi) memory -- 26% of CPU idle versus 48% of memory.
+#
+# This paragraph previously read "max-heavy-per-node = 1 on all ten of them
+# ... the 3-CPU REQUEST is the sole thing forbidding a second runner". The
+# CONCLUSION (CPU is the binding axis) survives and is strengthened; the
+# premise it rested on (`cpu: 3`, one-per-node) does not. See the correction
+# at the top of this file before reusing any per-node number from here.
+#
+# That is worth measuring because the tier sets a memory limit but NO cpu
+# limit. A request is a scheduling reservation and a contention weight, not a
+# ceiling: a job on an otherwise-idle node bursts past it freely. So lowering
+# a CPU request cannot throttle a job that has the node to itself -- the
+# failure mode that makes memory demotions dangerous simply does not exist on
+# this axis. What it costs is guaranteed share when two jobs do land together.
+#
+# Hence `cpuavg`, in millicores, measured across the whole job from the
+# baseline probe (delta of cpu.stat's usage_usec over wall clock), and
+# `cpumax`, the busiest ~2s window the sampler saw. Read cpuavg for the
+# request: mean-plus-headroom is exactly what a reservation should cover, and
+# a mean is the honest number for a job that is serial for most of its life
+# and parallel in bursts. Read cpumax only to judge how much contention a
+# co-tenant would actually feel. Neither can OOM anything, so unlike anonmax
+# a wrong read here is recoverable.
+#
+# That same monotonicity is why `reset` no longer matters much. It came back
+# `reset=unsupported` on the ci nodes (the kernel rejects writes to
+# memory.peak), and the run above shows the delta method localises a step just
+# as well without it: peak 1179 -> 8214 is govulncheck's, whatever the
+# baseline. Do not spend time trying to make reset work on these nodes; probe
+# on both sides of a suspect step and subtract.
+name: peak-memory
+description: Report this pod's cgroup memory (peak/anon/file) and CPU (mean/peak), for CI runner tier sizing (TEMPORARY)
+
+inputs:
+  label:
+    description: Identifies this probe in the output line, e.g. "after-govulncheck".
+    required: true
+  reset:
+    description: >
+      Reset memory.peak AFTER reporting, so the next probe's peak covers only
+      the steps in between. Leave false for a single end-of-job measurement.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: peak memory (${{ inputs.label }})
+      shell: bash
+      # Never fail the job it is measuring: a diagnostic that can red a build
+      # is worse than no diagnostic. No `set -e`, and an explicit exit 0.
+      run: |
+        set +e
+        peak_file=/sys/fs/cgroup/memory.peak            # cgroup v2
+        stat_file=/sys/fs/cgroup/memory.stat
+        cur_file=/sys/fs/cgroup/memory.current
+        mib() { [ -r "$1" ] && echo $(( $(cat "$1" 2>/dev/null || echo 0) / 1048576 )) || echo "?"; }
+
+        if [ ! -r "$peak_file" ]; then
+          # cgroup v1 fallback, in case a node ever runs a pre-v2 hierarchy.
+          v1=/sys/fs/cgroup/memory/memory.max_usage_in_bytes
+          if [ -r "$v1" ]; then
+            echo "PEAKMEM label=${{ inputs.label }} peak=$(mib $v1)Mi anonmax=? anon=? file=? current=? cpuavg=? cpumax=? node=${NODE_NAME:-?} src=cgroupv1"
+          else
+            echo "PEAKMEM label=${{ inputs.label }} unavailable: no readable cgroup memory peak (v2 memory.peak needs kernel 5.19+)"
+          fi
+          exit 0
+        fi
+
+        anon=$(awk '$1=="anon"{print int($2/1048576)}' "$stat_file" 2>/dev/null); anon=${anon:-?}
+        file=$(awk '$1=="file"{print int($2/1048576)}' "$stat_file" 2>/dev/null); file=${file:-?}
+
+        # ── CPU, in millicores ──────────────────────────────────────────────
+        # cpu.stat's usage_usec is a monotonic counter of CPU-microseconds
+        # burned by the whole pod cgroup, so (delta usage / delta wall) is the
+        # mean core count over that span -- no sampling needed for the average,
+        # only for the peak. The baseline is written once per job by the first
+        # probe, next to the anon sampler's files and for the same reason: this
+        # composite has no state of its own between steps.
+        cpu_dir="${RUNNER_TEMP:-/tmp}"
+        cpu_file=/sys/fs/cgroup/cpu.stat
+        cpu_base="$cpu_dir/peakmem-cpu-base"
+        cpu_peak="$cpu_dir/peakmem-cpu-max"
+        num() { case "$1" in ""|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+        cpuavg="?"
+        now_ns=$(date +%s%N 2>/dev/null); now_ns=$(num "$now_ns")
+        cpu_us=$(num "$(awk '$1=="usage_usec"{print $2}' "$cpu_file" 2>/dev/null)")
+        if [ "$cpu_us" -gt 0 ] && [ "$now_ns" -gt 0 ]; then
+          [ -s "$cpu_base" ] || printf '%s %s\n' "$cpu_us" "$now_ns" > "$cpu_base" 2>/dev/null
+          b_us=$(num "$(cut -d' ' -f1 "$cpu_base" 2>/dev/null)")
+          b_ns=$(num "$(cut -d' ' -f2 "$cpu_base" 2>/dev/null)")
+          # A wall floor, not a guard against divide-by-zero alone: over a span
+          # shorter than a second the quotient is scheduler noise, and printing
+          # it as a core count would invite sizing a request off it.
+          d_wall_us=$(( (now_ns - b_ns) / 1000 ))
+          if [ "$b_us" -gt 0 ] && [ "$d_wall_us" -ge 1000000 ]; then
+            cpuavg=$(( (cpu_us - b_us) * 1000 / d_wall_us ))
+          fi
+        fi
+        cpumax=$(cat "$cpu_peak" 2>/dev/null); case "$cpumax" in ""|*[!0-9]*) cpumax="?" ;; esac
+
+        # ── anon high-water sampler: idempotent, one per job ────────────────
+        # A backgrounded SUBSHELL, not `nohup bash -c '...'` and not a heredoc
+        # to a script file. Both of those were tried first and are wrong here:
+        # `bash -c` needs the awk program to survive a second round of shell
+        # quoting, and a heredoc body has to sit at column 0, which ends the
+        # YAML block scalar this whole script lives in and makes action.yml
+        # unparseable. A subshell inherits the parsing context, so there is no
+        # nested quoting to get wrong.
+        #
+        # Started by the FIRST probe in the job, so put a baseline probe early
+        # -- anything before it is unmeasured. 0.5s can miss a sub-second
+        # spike; it will not miss a step that allocates for seconds, which is
+        # every case this exists to decide.
+        samp_dir="${RUNNER_TEMP:-/tmp}"
+        samp_max="$samp_dir/peakmem-anon-max"
+        samp_pid="$samp_dir/peakmem-sampler.pid"
+        if [ ! -s "$samp_pid" ] || ! kill -0 "$(cat "$samp_pid" 2>/dev/null)" 2>/dev/null; then
+          # Seed with the reading we already have rather than 0, so the probe
+          # that starts the sampler reports a real number instead of a
+          # misleading anonmax=0Mi before the first tick lands.
+          #
+          # NEVER seed DOWNWARD. This branch is also the sampler-died path, and
+          # clobbering the file there would throw away the high-water mark of
+          # everything measured so far and silently replace it with whatever
+          # anon happens to be right now -- i.e. report a big job as a small
+          # one, the exact failure this whole action exists to prevent. Keep
+          # the larger of (what is on disk, what memory.stat says now).
+          seed=$(awk '$1=="anon"{print $2}' "$stat_file" 2>/dev/null)
+          case "$seed" in ""|*[!0-9]*) seed=0 ;; esac
+          prev=$(cat "$samp_max" 2>/dev/null)
+          case "$prev" in ""|*[!0-9]*) prev=0 ;; esac
+          [ "$prev" -gt "$seed" ] && seed=$prev
+          echo "$seed" > "$samp_max" 2>/dev/null
+          # Every fd redirected: the runner waits on a step's inherited file
+          # descriptors, so a sampler still holding stdout would hang the job
+          # it is supposed to be measuring.
+          samp_run() {
+            # Start from the seed above, not 0, for the same reason: a sampler
+            # that restarts mid-job must not publish a smaller number than the
+            # one already recorded.
+            m=$seed
+            # CPU peak over a ~2s sliding window, not per 0.5s tick. Two
+            # reasons, and the second is the one that matters: a sub-second
+            # quotient is mostly scheduler jitter, and this sampler's own forks
+            # land in the very cgroup it is measuring. One awk per 0.5s is
+            # roughly 5 millicores of self-noise against a 3000-millicore
+            # request -- immaterial, but only because the cpu read is every
+            # 4th tick and the clock is bash's EPOCHREALTIME rather than a
+            # fork of date(1).
+            cm=0; p_us=0; p_w=0; tick=0
+            # ~2h ceiling at 0.5s -- longer than any heavy job, and
+            # self-terminating so a sampler can never outlive its pod.
+            for _ in $(seq 1 14400); do
+              a=$(awk '$1=="anon"{print $2}' "$stat_file" 2>/dev/null)
+              case "$a" in
+                ""|*[!0-9]*) : ;;
+                *) if [ "$a" -gt "$m" ]; then
+                     m=$a
+                     # Write-then-rename, so a probe reading concurrently can
+                     # never see a half-written number.
+                     printf '%s\n' "$m" > "$samp_max.tmp" 2>/dev/null &&
+                       mv -f "$samp_max.tmp" "$samp_max" 2>/dev/null
+                   fi ;;
+              esac
+              tick=$(( tick + 1 ))
+              if [ $(( tick % 4 )) -eq 0 ]; then
+                c=$(awk '$1=="usage_usec"{print $2}' "$cpu_file" 2>/dev/null)
+                # Both are microseconds: usage_usec straight from cpu.stat, and
+                # EPOCHREALTIME with its separator removed. Under a locale that
+                # renders that separator as a comma the strip leaves one behind,
+                # the digit test below rejects it, and cpumax stays "?" -- wrong
+                # is not on the menu, only absent.
+                w=${EPOCHREALTIME/./}
+                case "$c$w" in
+                  ""|*[!0-9]*) : ;;
+                  *) if [ "$p_us" -gt 0 ] && [ "$w" -gt "$p_w" ]; then
+                       mc=$(( (c - p_us) * 1000 / (w - p_w) ))
+                       # Discard anything above 64 cores: no ci node has them,
+                       # so such a value is a clock step or a counter reset, and
+                       # cm is a high-water mark that would keep it forever.
+                       if [ "$mc" -gt "$cm" ] && [ "$mc" -lt 64000 ]; then
+                         cm=$mc
+                         printf '%s\n' "$cm" > "$cpu_peak.tmp" 2>/dev/null &&
+                           mv -f "$cpu_peak.tmp" "$cpu_peak" 2>/dev/null
+                       fi
+                     fi
+                     p_us=$c; p_w=$w ;;
+                esac
+              fi
+              sleep 0.5
+            done
+          }
+          ( samp_run ) >/dev/null 2>&1 &
+          echo $! > "$samp_pid" 2>/dev/null
+          disown 2>/dev/null
+          samp=started
+        else
+          samp=running
+        fi
+        anonmax=$(cat "$samp_max" 2>/dev/null)
+        case "$anonmax" in
+          ""|*[!0-9]*) anonmax="?" ;;
+          *) anonmax=$(( anonmax / 1048576 )) ;;
+        esac
+
+        # Say so when this probe is the one that started the sampler: its
+        # anonmax is the seed it just wrote, not a high-water mark. Harmless
+        # on a baseline probe, and the whole story on a job whose only probe
+        # is at the end -- which is how three jobs' tier decisions sat blocked
+        # on a number that was never measured. A ::notice:: rather than a
+        # ::warning:: because a diagnostic must not colour the job it measures.
+        if [ "$samp" = started ]; then
+          echo "::notice::peak-memory ${{ inputs.label }}: anonmax=${anonmax}Mi is the sampler SEED (samp=started), not a high-water mark. If this is the job's last probe, add a baseline probe after checkout."
+        fi
+
+        # Node-scoped, and the only such number visible from this container:
+        # /proc/loadavg is NOT namespaced. See the SCOPE section at the top --
+        # on a 4-vCPU ci node a loadavg far above 4 alongside a near-zero
+        # cpuavg means the work is in dind, outside this cgroup entirely.
+        loadavg=$(cut -d" " -f1-3 /proc/loadavg 2>/dev/null | tr " " "/")
+        loadavg=${loadavg:-?}
+
+        # WHICH CPU THIS JOB ACTUALLY GOT. Added 2026-09-22 for gd-Q6iltiM1TO.
+        #
+        # The ci ASG is spot across ten types that `ci_instance_types` calls
+        # interchangeable "4 vCPU / 16-32 GiB candidates". They are not:
+        # m7a is EPYC Genoa at 3.7 GHz, r5a is EPYC Naples at 2.5 GHz, and
+        # that is roughly 2x per core. price-capacity-optimized weighs price
+        # and interruption risk, never throughput, so the fleet DRIFTS
+        # generation through the day -- measured on 2026-09-22, 06-09Z was 94%
+        # 7th-gen and 15-18Z was 96% 5th-gen, and identical FIXED work (a pure
+        # grep with no build and no cache) ran 2.93x slower on the late fleet.
+        #
+        # Every duration this pool has ever produced is therefore confounded
+        # unless you know the generation, and NOTHING recorded it. Recovering
+        # it for one day cost a CloudTrail RunInstances crawl, and CloudTrail
+        # cannot be joined to a job -- it gives launches, not assignments.
+        #
+        # node= above is not a substitute. Node names are `ip-10-90-x-y`, which
+        # carries no generation, and the node is a terminated spot instance
+        # long before anyone reads the log. Kubernetes cannot answer it either:
+        # every node in this cluster reports `node.kubernetes.io/instance-type:
+        # k3s` because the aws-ccm DaemonSet runs with
+        # `--controllers=cloud-node-lifecycle-controller`, so the controller
+        # that writes that label has never run. That is DELIBERATE and the
+        # decision stands -- see the WHAT IT DELIBERATELY DOES NOT DO block in
+        # gardenio/helm/ci/aws-ccm-values.yaml, which prices it.
+        #
+        # /proc/cpuinfo is not namespaced, so this reads the HOST CPU from
+        # inside the runner container with no credentials and no IMDS call --
+        # deliberately not IMDS, which is a live P1 (gd-adirNxx3Qo) and must
+        # not be normalised into CI. Spaces are squashed to `_` so the field
+        # stays whitespace-delimited like every other field on this line.
+        # `q` inside the block rather than `| head -1`: head exits after the
+        # first line and SIGPIPEs the producer. Harmless here (no set -e, no
+        # pipefail, and the status taken is tr's) but it is the exact shape
+        # scripts/check-sigpipe-producers.py exists to ban, and that guard only
+        # inspects grep -- so writing it the unsafe way would pass the guard and
+        # still be wrong. sed stops itself; nothing gets a signal.
+        cpumodel=$(sed -n '/^model name/{s/^model name[[:space:]]*:[[:space:]]*//p;q;}' /proc/cpuinfo 2>/dev/null | tr " " "_")
+        cpumodel=${cpumodel:-?}
+        # vcpu is the control: the tier arithmetic assumes 4 everywhere, and a
+        # node that is not 4 invalidates the packing numbers, not just the
+        # timings. Cheap to carry, and it makes a wrong assumption visible
+        # instead of silently skewing an average.
+        vcpu=$(nproc 2>/dev/null)
+        vcpu=${vcpu:-?}
+
+        reset=n/a
+        if [ "${{ inputs.reset }}" = "true" ]; then
+          # Reporting order matters: report first, then reset, or the number
+          # this probe prints is the one it just destroyed.
+          echo "PEAKMEM label=${{ inputs.label }} peak=$(mib $peak_file)Mi anonmax=${anonmax}Mi anon=${anon}Mi file=${file}Mi current=$(mib $cur_file)Mi cpuavg=${cpuavg}m cpumax=${cpumax}m loadavg=${loadavg} node=${NODE_NAME:-?} cpu=${cpumodel} vcpu=${vcpu} samp=${samp} reset=pending"
+          if echo r > "$peak_file" 2>/dev/null; then reset=ok; else reset=unsupported; fi
+          echo "PEAKMEM label=${{ inputs.label }}-reset reset=${reset} now=$(mib $peak_file)Mi"
+          exit 0
+        fi
+
+        echo "PEAKMEM label=${{ inputs.label }} peak=$(mib $peak_file)Mi anonmax=${anonmax}Mi anon=${anon}Mi file=${file}Mi current=$(mib $cur_file)Mi cpuavg=${cpuavg}m cpumax=${cpumax}m loadavg=${loadavg} node=${NODE_NAME:-?} cpu=${cpumodel} vcpu=${vcpu} samp=${samp} reset=${reset}"
+        exit 0

@@ -1,0 +1,705 @@
+# Runner scale set "gardenio-k3s-medium" for mattbakerconsulting/gardenio.
+# Chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+# Namespace: arc-runners. The Helm release NAME is the `runs-on:` label.
+# Tier 3 of N, built exactly as arc-runners-light-values.yaml's
+# "EXTENSIBILITY" section prescribes: copy, resize, install as its own
+# release, repoint runs-on on only the jobs that belong to it. No other
+# tier's values file, release, node pool or job definition is touched.
+githubConfigUrl: https://github.com/mattbakerconsulting/gardenio
+githubConfigSecret: gardenio-github
+
+# ── WHY THIS TIER EXISTS: PACKING DENSITY, NOT CAPACITY ─────────────────────
+# Measured 2026-09-21/22 over 1037 heavy-pool job records from a 9.9-hour
+# window (734 that actually occupied a runner; the other 303 were `skipped`
+# or `cancelled` and never took a slot -- counting those inflates utilisation
+# to a nonsensical 296%, so filter on conclusion in {success,failure} before
+# drawing any conclusion from this data):
+#
+#   heavy pool median queue wait   1.1 - 2.3 h     (p90 2.6h, max 4.3h)
+#   heavy pool median job duration 1.9 m
+#   heavy pool utilisation          57 %
+#   minutes at the 6-runner cap    2.9 % of the window
+#   minutes completely idle        6.0 % of the window
+#
+# Jobs wait two hours for a pool that is running four of its six slots. That
+# is not a capacity shortage, and the usual suspects were measured and ruled
+# out one by one:
+#   - pod startup    7-12 s, and PodScheduled fires at 0 s
+#   - node boot      50-60 s from EC2 launch to Node Ready
+#   - ASG activity   4 s median
+#   - superseded runs already cancel (ci/checks/images all carry
+#     cancel-in-progress on pull_request; push groups per-sha deliberately)
+#
+# The real shape is BURSTINESS. One push fans out to three workflows and
+# ~14 heavy jobs; a handful of near-simultaneous pushes therefore delivers
+# 60-140 jobs into 6 slots at once. At ~2.8 min mean duration that is ~65
+# minutes of drain -- which is precisely the median wait observed. Between
+# bursts the pool idles, which is why the 9.9-hour average reads 57%.
+#
+# Average capacity is therefore the wrong lever; PEAK CONCURRENCY is the
+# right one, and peak concurrency is capped by NODES, not by maxRunners. A
+# heavy runner requests 3 CPU on a 4-vCPU node, so it is one runner per node
+# -- verified live 2026-09-22 on every ci node, including the three ~31Gi
+# ones where memory would have allowed two and CPU still did not.
+#
+# STRUCK (2026-09-22 18:0xZ): "3 CPU ... one runner per node" is stale. That
+# verification was taken before `c3c2fa3d` (09-22 05:56) lowered the heavy
+# request to 1900m to pack two per large node. Re-measured at 18:0xZ across 8
+# ci nodes, all 4 CPU / 31705Mi: three nodes held TWO heavy runners each, and
+# the pool had 8420m CPU free against 121.7Gi memory free. The SENTENCE that
+# matters here is unaffected -- peak concurrency is still bounded by node CPU
+# rather than by this file's maxRunners -- but the per-node divisor is 2, not
+# 1, so do not reuse the "one runner per node" figure in any sizing.
+#
+# Note also that ~31Gi is not a constant: the ci ASG mixes six m-class and
+# four r-class .xlarge overrides under price-capacity-optimized, so a ci
+# node's allocatable memory swings ~15.25Gi <-> ~31Gi with no config change.
+# It was majority m-class when the struck text was written and 8 of 8 r5a at
+# 18:0xZ. See the header of .github/actions/peak-memory/action.yml.
+#
+# CORRECTION (2026-09-22): the two sentences that used to close this
+# paragraph -- "the ci ASG is pinned at MaxSize 8 (Desired 8, InService 8 ...
+# the ceiling is fully consumed)" and "ci_max_nodes belongs to fimba-e6's
+# terraform lane, so raising it is not available here" -- are both wrong and
+# are struck. ci_max_nodes is 11 (composition/gardenio/main.tf), and session
+# names rotate, so a lane claim keyed to one is not a durable fact; record
+# ownership by artifact, not by session name.
+#
+# More importantly, raising the ceiling has since been MEASURED and
+# DISCONFIRMED as a lever: admitted peak is bounded by maxRunners, not by
+# nodes, and unmet demand stayed flat across every ceiling tested. Do not
+# re-derive that. What the corrected numbers show is a PACKING problem --
+# heavy's maxRunners is 10 against 11 nodes, and a heavy runner leaves under
+# a core once daemonsets are counted, so a saturated heavy tier does not
+# merely fill the pool, it denies medium and light anywhere to land. That is
+# how this tier can read 0 of 6 busy while jobs queue.
+#
+# What IS available is making the short jobs stop eating a whole node each.
+# Of the ~11 heavy jobs checks.yml fires per push, four are 23-33 s of work
+# holding a 4-vCPU node apiece:
+#
+#   job                                        med dur   med wait   node-min/day
+#   quench quality gate                            8 s      1.9 h        ~5
+#   scripts/build-dictation-corpus vet + test     23 s      2.2 h        16
+#   merge-conflict-marker guard                   26 s      2.3 h        18
+#   terraform fmt + validate + module tests       33 s      1.9 h        26
+#
+# Together they are ~45% of checks.yml's per-push job COUNT and ~4% of the
+# heavy pool's node-minutes. Moving them here removes nearly half the burst
+# from the heavy queue while adding almost no compute, and collapses the four
+# whole nodes they used to hold during a burst into roughly one.
+#
+# ── WHY NOT THE LIGHT TIER ──────────────────────────────────────────────────
+# All four of these were explicitly REJECTED for gardenio-k3s-light by the
+# 2026-09-21 adversarial classify pass, and those rejections are correct and
+# still stand -- see arc-runners-light-values.yaml for the full reasoning:
+#   terraform        4x fresh ~100MB+ AWS provider downloads, no plugin cache
+#   quench           whole-repo cloc/regex/docs-TOC/docs-links pass, 7,500+ files
+#   dictation-corpus a real cold-cache `go vet`/`go test`, ~55 CPU-s / ~275Mi RSS
+#   conflict-markers a fallback path forking ~15,000 subprocesses
+# Every one of those is a cost the light tier's 250m / 512Mi request and
+# 1536Mi limit genuinely cannot absorb. None of them is a reason to hold a
+# 3-CPU/12Gi slot with a dind sidecar. They are middle-sized, and the light
+# file already names this tier as the answer for exactly that case. This is
+# that tier, sized from those measured costs rather than from the duration
+# sample that misled the first pass.
+#
+# STILL EXCLUDED, deliberately:
+#   internal-strings-audit  its script (scripts/sanitize/no-internal-strings.sh)
+#     is STILL absent from the tree -- re-checked 2026-09-22, stripped by the
+#     export redaction. Its 5 s duration today is the pipeline failing fast on
+#     a missing file, not a measurement of the job. Restoring the script would
+#     change its cost by an unknown factor, so it keeps its heavy slot until
+#     someone can measure the real thing. Do not "optimise" it on the strength
+#     of a duration that only reflects the script being gone.
+#   security (govulncheck) / golangci-lint / build+test
+#     MEASURED, not estimated -- 2026-09-22, .github/actions/peak-memory with
+#     a baseline probe on every job so the anon sampler is actually running:
+#
+#       probe                      peak      ANONMAX   vs 4096Mi limit
+#       security after-govulncheck  8354Mi    7028Mi    1.7x over
+#       lint-go gardenio/controller 10096Mi   5889Mi    1.4x over
+#
+#     anonmax is the decision number, not peak: peak counts page cache, which
+#     is reclaimable. Both of these genuinely need the heavy tier.
+#
+#     lint-go is the one to remember. Its OTHER matrix arm (kbeads) reads
+#     anonmax 2021Mi and would have fit here comfortably -- but both arms
+#     share one `runs-on`, so the controller arm sets the tier. Sampling the
+#     arm that finishes first would have moved a job here that then OOMs.
+#
+# NO LONGER EXCLUDED -- the estimate above was wrong about these two, and the
+# line that used to name them ("real compilers and real linters ...
+# golangci-lint alone routinely wants 2-4Gi") is struck rather than softened:
+#
+#       probe                      peak      ANONMAX   vs 4096Mi limit
+#       helm after-chart-tests      2367Mi     971Mi    4.2x headroom
+#       cargo-security (end)        2119Mi     599Mi    6.8x headroom
+#
+#   Both moved here 2026-09-22. Neither needs dind (no docker/buildx/kind/
+#   k3d/`services:` in either job). helm's dominant step is a `GOWORK=off go
+#   test ./...`, which is what this tier's GOCACHE/GOMODCACHE on /cache is
+#   for. cargo-security is 23-43 s of work that was holding a whole 4-vCPU
+#   node behind a p90 queue wait of 1125 s.
+#
+#   cargo-security's peak fell 3214-4150Mi -> 2119Mi when its `cargo install`
+#   was replaced by pinned binaries (see gardenio/locks/security-tools.lock).
+#   That is not a coincidence: removing a from-source build also removes the
+#   page cache that made up most of the old reading. A tier verdict taken
+#   before a build is removed is a verdict on a job that no longer exists.
+#
+# ── THE TRADE THIS MAKES, STATED HONESTLY ───────────────────────────────────
+# 750m of guaranteed CPU instead of the heavy tier's (3000m when this was
+# written; 1900m since 2026-09-22) means these jobs get SLOWER when the
+# node is busy: a 26 s CPU-bound job can stretch toward 1-2 min under full
+# contention. That is a deliberate trade of job duration for queue wait, and
+# the numbers make it lopsided -- 2.3 h of waiting to save ~60 s of running.
+# Absolute cost stays small: all four together are ~65 node-min/day today, so
+# even a 4x stretch keeps them a minor share of the pool.
+#
+# If these jobs later show durations that no longer look like the table above,
+# re-measure before raising anything -- the first response should be to check
+# whether a burst was in flight, not to grow the request.
+#
+# ── MEASURED AFTER, first two pushes on the new tier (2026-09-22 00:09/00:11Z) ─
+#   job                           wait before   wait after   dur before  dur after
+#   quench quality gate                 1.9 h        6 s          8 s     9-12 s
+#   merge-conflict-marker guard         2.3 h        6 s         27 s     42-49 s
+#   scripts/build-dictation-corpus      2.2 h        8 s         32 s        40 s
+#   terraform fmt + validate            1.9 h        5 s         38 s        63 s
+#
+# The trade landed exactly where the section above predicted it would: waits
+# collapsed from hours to single-digit seconds, and durations stretched 1.4-1.9x
+# -- which is +9 to +30 SECONDS against 2 hours of queueing saved. Do not
+# "fix" the slower durations; they are the price being paid on purpose, and
+# they are three orders of magnitude cheaper than what they bought.
+
+minRunners: 0
+# 6 runners at 750m packs onto ~1.5 nodes (see the sizing note below), against
+# the 4 heavy runners' worth of whole nodes these same jobs used to hold during
+# a burst. Peak node demand goes DOWN, not up, which is the only reason this is
+# safe to add against an ASG whose ceiling (ci_max_nodes = 11) is fully
+# consumed. Deliberately not higher on day one: the ci node ceiling is shared
+# with the heavy pool (10), the light pool (4 at 250m, ~1 node) and three
+# sibling scale sets. Raise it only after measuring this tier's own queue wait
+# -- and never without re-checking ci_max_nodes and the account spot quota
+# first, which is the mistake arc-runners-values.yaml's header records being
+# made three times.
+#
+# 2026-09-22, that measurement, over 20 completed checks.yml runs. True queue
+# wait = job.started_at - the `changes` gate's completed_at, NOT created_at
+# (which includes `needs:` wait), and jobs with an empty runner_name excluded
+# (they never got one, so they have no wait to report):
+#
+#   tier      job                                p50 wait   p90 wait
+#   medium    merge-conflict-marker guard              0 s       0 s
+#   medium    shell guards + script self-tests         0 s       0 s
+#   medium    terraform fmt + validate                 0 s      13 s
+#   medium    gitleaks history (advisory)              0 s       4 s
+#   medium    quench quality gate                      0 s       0 s
+#   heavy     golangci-lint (gardenio/controller)     45 s    2019 s
+#   heavy     helm lint + chart tests                 74 s    1205 s
+#   heavy     cargo audit + deny (coop)               50 s    1125 s
+#
+# The cleanest pair is gitleaks: the SAME tool, split across two jobs on two
+# tiers, reads p90 4 s here and p90 464 s on heavy. The tier is the entire
+# difference.
+#
+# So this tier has no queue pressure of its own and the precondition above is
+# met -- but maxRunners is STILL 6, on purpose. helm and cargo-security have
+# just moved here, taking this tier from 5 jobs to 7 against 6 slots, and
+# helm is ~200 s rather than the ~30 s everything else here runs. That may
+# well create real pressure. Raising the cap in the SAME change would make
+# the next measurement uninterpretable: a queue that did not appear could
+# mean the demotion was free or that the extra slots absorbed it, and there
+# would be no way to tell. Land the demotion, re-measure the table above,
+# then decide. The packing headroom is there when it is wanted -- 750m fits
+# in the ~990m a node has left under a heavy runner, so slots 7 and 8 would
+# co-schedule onto existing nodes and need no new capacity (which mattered
+# then: the account's spot quota L-34B43A08 was 64 vCPU and CI alone was
+# 11x4=44. STRUCK 2026-09-23 -- the quota is 96 now and ci_max_nodes is 13;
+# every "64" in this file is superseded. See the 18:1xZ block below).
+#
+# 2026-09-23 17:2xZ -- THE RE-MEASUREMENT ASKED FOR ABOVE, and it says raise.
+# `build + test (kbeads)` then also landed here (c29d59fa), taking the tier to
+# EIGHT jobs per push against 6 slots. One push can no longer seat its own
+# medium jobs, so a queue is now structurally guaranteed, not merely likely.
+#
+# Measured live during a spot-reclaim storm (5x r5.xlarge, comment 3438):
+#
+#   AutoscalingRunnerSet gardenio-k3s-medium   6/6  PINNED AT maxRunners
+#   gardenio-k3s (heavy)                       7/10 slots free
+#   gardenio-k3s-light                         0/10 idle
+#   13 jobs queued 974-979s, EVERY ONE a medium-tier job
+#
+# The decisive part is that it was NOT capacity. At that moment three ci nodes
+# were COMPLETELY EMPTY -- 10m requested of 4000m allocatable -- and free CPU
+# across the ci pool totalled 18880m, room for 25 more 750m runners. Jobs
+# queued 16 minutes beside idle nodes because ARC will not create a 7th pod at
+# maxRunners 6. The cap was the whole constraint.
+#
+# Raised to 8: exactly one push's medium demand, and exactly the two slots the
+# paragraph above pre-cleared as needing no new capacity. NOT raised further --
+# beyond 8 this stops being a packing change and starts pulling new nodes
+# against the 64-vCPU spot quota, which is a separate decision (gd-Q6iltiM1TO).
+# This is a cap change ALONE; no demotion rides with it, so the next
+# measurement stays interpretable (the rule that held it at 6 cuts both ways).
+#
+# 2026-09-23 18:1xZ -- 8 -> 16. THE BLOCKER NAMED DIRECTLY ABOVE IS GONE, on
+# both of its halves, so this is that paragraph's own precondition being met
+# rather than its judgement being overridden:
+#
+#   - "the 64-vCPU spot quota" is stale. L-34B43A08 was raised to **96** on
+#     2026-09-22 (CASE_CLOSED).
+#   - "starts pulling new nodes ... is a separate decision (gd-Q6iltiM1TO)" --
+#     that decision was taken today: ci_max_nodes 11 -> 13 (68753e07, APPLIED).
+#     Those two nodes are where this raise packs.
+#
+# And the correction that makes the rest of it easy: **a maxRunners raise
+# cannot pull a single node past ci_max_nodes.** Quota exposure is bounded by
+# the NODE ceiling, not by any scale set's cap -- at 13 nodes it is ci 52 +
+# agents 8 + servers 4 = 64 of 96 whatever this number says. A cap raise costs
+# exactly zero additional quota. Only ci_max_nodes spends quota; this knob
+# spends packing.
+#
+# Packing, measured live at 18:0xZ rather than computed:
+#
+#   ip-10-90-23-34   heavy 1 + light 2 + medium 2   3980m of 4000m
+#   ip-10-90-23-74   heavy 1 + light 3 + medium 1   3470m
+#   ip-10-90-18-195  heavy 1 +           medium 1   2690m
+#
+# which pins the per-pod requests exactly: heavy 1920m, medium 770m, light
+# 260m. At 13 nodes the three caps can together request at most
+# 10x1920 + 16x770 + 10x260 = 34120m of 52000m = 66%; at the old cap of 8 it
+# was 54%. The node layer stays the slack layer either way, which is the whole
+# point -- heavy must still be able to place a 1920m pod, and ~4.4 nodes of
+# headroom is what buys that.
+#
+# Why 16 and not more: 16 is exactly TWO pushes' medium demand. Measured today
+# across completed runs, one `checks` run = 6 medium jobs and one `ci` run = 1;
+# this file's table above counts 8 per push with e2e in play. Three concurrent
+# pushes (3-4 inflight runs were observed on main today) would want 24, and 24
+# is where fragmentation starts to deny heavy a slot. Seating two pushes and
+# queueing the third is the deliberate stopping point, not a round number.
+#
+# The demand this closes, measured 17:45-18:09Z over 92 jobs that actually got
+# a runner assigned -- p90/max, never the median:
+#
+#   tier      n    p50    p90    max   >120s
+#   light    36     13s    32s    73s      0
+#   medium   44     49s   172s   340s      8
+#   heavy    12    108s   187s   196s      5
+#
+# Medium carries the most jobs AND the worst tail, and its worst waits EXCEED
+# their own runtimes: golangci-lint (kbeads) waited 340s to run 134s; the
+# merge-conflict-marker guard waited 231s to run 135s. Light, on the same
+# nodes, is idle at p90 32s. None of that tail is capacity: at 18:0xZ four of
+# eleven ci nodes were completely empty and flagged
+# DeletionCandidateOfClusterAutoscaler while those jobs waited.
+#
+# STILL a cap change ALONE. No demotion rides with it.
+maxRunners: 16
+
+# No containerMode -- no dind sidecar. Verified per job: none of the four
+# mentions docker, buildx or a job `container:` anywhere in its steps, and on
+# the heavy pool dind measures 1m CPU / 25Mi on every runner (it is idle for
+# everything except images.yml). Dropping it removes the sidecar, the shared
+# work/dind-sock volumes and its idle footprint outright.
+
+template:
+  spec:
+    # Same ci node pool as the other tiers -- the whole point is to pack
+    # alongside them rather than to claim nodes of its own.
+    nodeSelector:
+      gardenio.io/role: ci
+    tolerations:
+      - key: ci
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+
+    # ── NODE-LOCAL BUILD CACHE ──────────────────────────────────────────────
+    # The same hostPath the heavy tier uses, mounted for the same reason and
+    # documented in full at gardenio/helm/ci/README.md ("Node-local Go build
+    # cache"). Added here 2026-09-22, and the omission was costing twice over:
+    #
+    #   1. This tier's Go jobs were ALL cold builds -- exactly the bug that
+    #      section describes fixing for the heavy tier. `terraform` (module
+    #      tests) and `dictation-corpus` (vet + test) both compile Go, and
+    #      dictation-corpus was reaching for `actions/cache` over the network
+    #      instead (it is the one job in checks.yml whose setup-go is not
+    #      `cache: false`).
+    #   2. More importantly, it made every heavy job UNMOVABLE. The obvious
+    #      relief for a saturated heavy tier is to demote the jobs that do not
+    #      actually need 3 CPUs -- but with no /cache here, a demotion traded
+    #      a queue wait for a cold build, so the move was a regression and the
+    #      jobs stayed put. Mounting it here is what makes the demotion free.
+    #
+    # Medium runners co-schedule onto nodes that already hold a heavy runner
+    # (see the cpu note below), so this is the SAME directory a heavy runner is
+    # concurrently reading and writing. That is fine for GOCACHE/GOMODCACHE:
+    # both are designed for concurrent use by multiple `go` processes and
+    # coordinate through their own lock files. It is emphatically NOT fine for
+    # everything the heavy tier puts here -- see the env block for what is
+    # deliberately left out.
+    initContainers:
+      # Fail fast if this node cannot do cluster DNS. A k3s agent can boot with
+      # kube-proxy's first iptables sync failed and never retried (it races
+      # flannel's iptables bootstrap), leaving the node with zero KUBE-SERVICES
+      # rules while reporting Ready=True -- pod-to-pod and egress fine, every
+      # ClusterIP a black hole, so cluster DNS dead. A runner that lands there
+      # never resolves GitHub, so it never claims its job: the pod sits Running
+      # holding a maxRunners slot while GitHub shows the job `queued`. That cost
+      # 35+ minutes on 2026-09-22 (ip-10-90-19-145) and reads as congestion with
+      # idle capacity. 20x3s because coredns is a single replica here; a healthy
+      # node exits on attempt 1. Full rationale in arc-runners-values.yaml.
+      - name: dns-preflight
+        image: ghcr.io/actions/actions-runner:latest
+        command:
+          - sh
+          - -c
+          - |
+            i=1
+            while [ $i -le 20 ]; do
+              if getent hosts github.com >/dev/null 2>&1; then
+                echo "cluster dns ok on $NODE_NAME (attempt $i)"
+                exit 0
+              fi
+              sleep 3
+              i=$((i + 1))
+            done
+            echo "FATAL: cluster dns unusable on node $NODE_NAME after 60s." >&2
+            echo "This node likely has no kube-proxy service rules; confirm with" >&2
+            echo "  iptables-save | grep -c KUBE-SERVICES   (0 == broken)" >&2
+            exit 1
+        env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        resources:
+          requests: { cpu: 10m, memory: 32Mi }
+      - name: prepare-build-cache
+        image: ghcr.io/actions/actions-runner:latest
+        # mkdir + chown + tool-cache seeding. The heavy tier's copy of this
+        # container ALSO evicts /cache/cargo-target when the disk runs low,
+        # and that eviction MUST NOT be replicated here: up to 5 medium pods
+        # start on a node that is simultaneously running a heavy cargo build,
+        # and an `rm -rf` from any one of them would destroy that build's
+        # target dir underneath it. Eviction stays the heavy tier's job.
+        #
+        # (The heavy tier used to justify that delete with "exactly one heavy
+        # runner fits per node". That has been false since the CPU request
+        # dropped 3000m -> 1900m -- two heavy runners now share the big nodes,
+        # measured. It makes the argument for keeping eviction out of THIS
+        # file stronger, not weaker.)
+        #
+        # chown is not recursive, for the reason the README gives: the runner
+        # always writes as 1001, so ownership below the top level stays
+        # correct, and a recursive chown over a warm multi-GB cache costs more
+        # pod-startup time than the cache saves.
+        command:
+          - sh
+          - -c
+          - |
+            set -e
+            mkdir -p /cache/go-build /cache/go-mod /cache/go-bin /cache/golangci-lint /cache/tool-cache
+            chown 1001:1001 /cache /cache/go-build /cache/go-mod /cache/go-bin /cache/golangci-lint /cache/tool-cache
+            # ── GitHub tool cache: seed Go once per NODE ────────────────────
+            # Identical to the heavy tier's block, against the SAME hostPath,
+            # so whichever tier's pod starts first on a node seeds it for both
+            # and the flock is shared across tiers. Medium runs 53 of the 99
+            # measured setup-go steps, so it is the larger half of the 8.8% of
+            # pool cpu-seconds this recovers. Full rationale and the safety
+            # argument for the pod-local symlink live in
+            # arc-runners-values.yaml; the short version is that
+            # @actions/tool-cache `rm -rf`s its destination before writing, so
+            # no runner may ever be pointed at the shared tree directly.
+            #
+            # Keep in sync with GO_VERSION in ci.yml / checks.yml --
+            # scripts/check-go-toolcache-pin.py fails CI if they drift.
+            GO_TOOLCACHE_VERSION=1.25.14
+            GO_TOOLCACHE_SHA256=a21ae5633a269bcd7e90cf767e48225633795e99d831742cbf3397064fee7712
+            shared=/cache/tool-cache/go/$GO_TOOLCACHE_VERSION/x64
+            # The loser of the per-node race WAITS for the winner's marker
+            # instead of skipping to a per-pod download -- see the heavy
+            # tier's copy for the measurement that changed this, and note
+            # that BOTH of the misses it is based on were medium pods.
+            if [ ! -e "$shared.complete" ]; then
+              seed_rc=0
+              (
+                set +e
+                flock -n 9 || exit 3
+                if [ -e "$shared.complete" ]; then exit 0; fi
+                began=$(date +%s)
+                tmp=$(mktemp -d /cache/tool-cache/.seed-XXXXXX) || exit 0
+                printf '%s  %s\n' "$GO_TOOLCACHE_SHA256" "$tmp/go.tgz" > "$tmp/sum"
+                if curl -fsSL --retry 3 --max-time 300 -o "$tmp/go.tgz" \
+                     "https://go.dev/dl/go$GO_TOOLCACHE_VERSION.linux-amd64.tar.gz" \
+                   && sha256sum -c "$tmp/sum" >/dev/null \
+                   && tar -xzf "$tmp/go.tgz" -C "$tmp" \
+                   && [ -x "$tmp/go/bin/go" ]; then
+                  mkdir -p "$(dirname "$shared")"
+                  rm -rf "$shared"
+                  mv "$tmp/go" "$shared"
+                  touch "$shared.complete"
+                  echo "seeded go $GO_TOOLCACHE_VERSION on $NODE_NAME in $(( $(date +%s) - began ))s"
+                else
+                  echo "WARN: could not seed go $GO_TOOLCACHE_VERSION on $NODE_NAME after $(( $(date +%s) - began ))s; jobs will download it per pod" >&2
+                fi
+                rm -rf "$tmp"
+              ) 9>/cache/tool-cache/.go-seed.lock || seed_rc=$?
+              if [ "$seed_rc" = 3 ]; then
+                waited=0
+                while [ ! -e "$shared.complete" ]; do
+                  if flock -n /cache/tool-cache/.go-seed.lock true 2>/dev/null; then break; fi
+                  if [ "$waited" -ge 30 ]; then break; fi
+                  sleep 1
+                  waited=$(( waited + 1 ))
+                done
+                if [ -e "$shared.complete" ]; then
+                  echo "waited ${waited}s for a sibling pod to seed go $GO_TOOLCACHE_VERSION on $NODE_NAME"
+                else
+                  echo "WARN: no seed on $NODE_NAME after ${waited}s; this pod's jobs download go per pod" >&2
+                fi
+              fi
+            fi
+            if [ -e "$shared.complete" ]; then
+              mkdir -p /toolcache/go/$GO_TOOLCACHE_VERSION
+              ln -sfn "$shared" /toolcache/go/$GO_TOOLCACHE_VERSION/x64
+              touch /toolcache/go/$GO_TOOLCACHE_VERSION/x64.complete
+            fi
+            chown -R 1001:1001 /toolcache
+        env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+          - name: build-cache
+            mountPath: /cache
+          - name: tool-cache
+            mountPath: /toolcache
+        resources:
+          requests: { cpu: 10m, memory: 32Mi }
+    volumes:
+      - name: build-cache
+        hostPath:
+          path: /var/lib/gardenio-ci-cache
+          type: DirectoryOrCreate
+      # Pod-local, NOT the hostPath. See arc-runners-values.yaml for why:
+      # pointing a runner at the shared tree would let @actions/tool-cache
+      # delete a GOROOT another pod's job is executing from.
+      - name: tool-cache
+        emptyDir: {}
+
+    containers:
+      - name: runner
+        image: ghcr.io/actions/actions-runner:latest
+        command: ["/home/runner/run.sh"]
+        env:
+          # Set on the POD so every step inherits it -- setup-go does not
+          # override these, it only manages GOROOT and PATH.
+          - name: GOCACHE
+            value: /cache/go-build
+          - name: GOMODCACHE
+            value: /cache/go-mod
+          - name: GOTOOLS_BIN
+            value: /cache/go-bin
+          - name: GOLANGCI_LINT_CACHE
+            value: /cache/golangci-lint
+          # DELIBERATELY ABSENT, and each for its own reason -- do not "finish
+          # the job" by copying the rest of the heavy tier's env here:
+          #
+          #   CARGO_TARGET_DIR -- a cargo target dir is guarded by one
+          #     whole-directory lock. On the heavy tier that costs nothing
+          #     because only one runner fits per node, so there is never a
+          #     second cargo build to block. Here there can be five, plus the
+          #     heavy runner on the same node, and they would serialise on the
+          #     lock -- strictly worse than the cold builds it replaces.
+          #   CARGO_HOME / RUSTUP_HOME -- the reason used to be "no job on
+          #     this tier needs a Rust toolchain". That became false on
+          #     2026-09-22 when cargo-security moved here, so the reason is
+          #     replaced rather than the variables added.
+          #
+          #     cargo-security's rustup step resolves CARGO_HOME:-$HOME/.cargo
+          #     and is guarded on `[ ! -x "$CH/bin/rustup" ]`, so a warm cache
+          #     would make it ~0s. It measured 11/15/20/19/10/15/15s across
+          #     seven consecutive runs ON THE HEAVY TIER, where CARGO_HOME
+          #     *is* set to /cache. Seven non-zero readings, no sub-5s
+          #     outlier: that cache never hits, because this pool lands a job
+          #     on a different spot node nearly every run. Pointing these at
+          #     /cache here would reproduce a cache that has already been
+          #     measured not to work, and would put this tier in the way of
+          #     the heavy tier's cargo state to do it. The ~15s cold install
+          #     is the real, unavoidable cost on either tier.
+          #
+          #     `quench` separately stopped needing a toolchain at all (it
+          #     fetches a prebuilt release tarball; see its comment in
+          #     checks.yml). Prefer that pattern over a cache here.
+          #   TF_PLUGIN_CACHE_DIR -- tempting, since `terraform` runs four
+          #     `terraform init`s per job and re-downloads every provider each
+          #     time. Left out because terraform does not guarantee the plugin
+          #     cache is concurrency-safe, and two medium runners CAN both be
+          #     running this job. Worth doing, but it needs its own change and
+          #     its own verification, not a ride-along here.
+          #
+          # NODE_NAME because these caches are per NODE. Any timing claim about
+          # this tier has to name the node and the cache size or it means
+          # nothing -- see the README's retraction of an earlier one that did
+          # not.
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          # The GitHub tool cache. Unset, the runner defaults it to
+          # _work/_tool inside the `work` emptyDir, so all 243 MB of Go died
+          # with every pod and 53 setup-go steps on this tier re-downloaded
+          # it. prepare-build-cache links the node's seeded copy in here.
+          - name: RUNNER_TOOL_CACHE
+            value: /toolcache
+        volumeMounts:
+          - name: build-cache
+            mountPath: /cache
+          - name: tool-cache
+            mountPath: /toolcache
+        resources:
+          # Sizing, against a measured 4-vCPU / 15.4Gi allocatable ci node
+          # carrying only ~10m of DaemonSet CPU requests (aws-node-termination
+          # -handler; nothing else lands on the ci pool):
+          #   cpu 750m  -> 5 runners per node vs the heavy pool's 1. Chosen
+          #     over 500m (7/node) because these are CPU-bound jobs and 500m
+          #     stretches them too far under contention, and over 1000m
+          #     (3/node) because that gives back most of the density this tier
+          #     exists to buy. No CPU LIMIT, matching both existing tiers, so a
+          #     job still bursts into idle node capacity -- which is the common
+          #     case, since these run for seconds.
+          #
+          # DO NOT RAISE THIS TO 1000m -- but the ORIGINAL reason expired on
+          # 2026-09-22 and is struck here rather than left to be re-derived.
+          #
+          # It used to read: a ci node has 4000m allocatable less ~10m of
+          # DaemonSet requests = 3990m; a heavy runner takes 3000m; so 750m
+          # co-schedules onto a node already running a heavy one (3000 + 750
+          # + 10 = 3760) and 1000m would not (4010 > 3990). That margin was
+          # real -- verified live on first use, 4 medium runners landed on 4
+          # nodes that each already held a heavy runner, 12 runner pods across
+          # 7 nodes, and the ci node count went DOWN from 8 to 7.
+          #
+          # The heavy request is now 1900m, so that specific cliff is gone:
+          # 1900 + 750 + 10 = 2660, and even 1000m would fit. Two mediums now
+          # fit beside a heavy runner on a small node (1900 + 1500 + 10 =
+          # 3410) where only one did before.
+          #
+          # Keep 750m anyway, for the reason above this block rather than this
+          # one: 5 runners per node vs the heavy pool's 1. Raising it to 1000m
+          # would cut that to 4 and buy nothing measurable, since there is no
+          # CPU limit and gitleaks already averages 3239m against this 750m
+          # request without trouble. If anyone does revisit it, re-check the
+          # co-scheduling sum against whatever the heavy tier requests THEN --
+          # this margin has already moved once.
+          #   memory 1Gi request / 4Gi limit. The largest measured resident set
+          #     among the four is dictation-corpus at ~275Mi; 4Gi is deliberate
+          #     headroom for a cold Go build and for quench over 7,500 files,
+          #     and is still under a third of what a heavy runner reserves.
+          # Memory IS limited and CPU is not, because memory is the resource a
+          # runaway job could use to evict its neighbours on a shared node.
+          requests: { cpu: "750m", memory: 1Gi }
+          limits: { memory: 4Gi }
+
+# NOTE ON THE OOM/RECLAIM COUPLING: a runner killed for exceeding the 4Gi
+# limit produces the SAME "lost communication with the server" annotation as a
+# spot reclaim, so retry-lost-runners.yml cannot tell them apart and will
+# retry it. That is bounded (its attempt cap is 3) and is the documented
+# reason the cap is not optional -- but it means a job that OOMs here fails
+# three times before going red. If a job on this tier starts failing in
+# threes, suspect the memory limit before suspecting spot.
+
+# ── LISTENER PLACEMENT ──────────────────────────────────────────────────────
+# Every Ready node in this cluster carries a NoSchedule taint, so the listener
+# needs the control-plane toleration or it is permanently unschedulable the
+# moment it has to be (re-)placed. This is the failure mode that left the
+# gascity-hq-k3s / gascity-packs-hq-k3s listeners Pending for 13-19 hours on
+# 2026-09-17..21. Do not launch a new scale set without this block.
+listenerTemplate:
+  spec:
+    containers:
+      - name: listener # required by the ARS CRD even when only tolerations change
+        # requests == limits => Guaranteed QoS => oom_score_adj -997.
+        # Listeners ran BestEffort (adj ~1000) until 2026-09-22, making the CI
+        # dispatch path the kernel's first victim when a k3s server runs out of
+        # memory -- which happened: a crew pod OOM'd ip-10-90-10-77 and took the
+        # heavy listener with it, stopping dispatch ~26 min (gd-V0I09YuV8K
+        # comment 2389). Burstable is no help on a 1.86 GiB node (a 128Mi
+        # request only reaches adj ~967), so the QoS class is the fix, not the
+        # size. Measured usage 8-18Mi / 0-1m; CPU 200m -> 50m on 2026-10-23
+        # (gd-TEP4ygX3dq). Full rationale in arc-runners-values.yaml.
+        resources:
+          requests: { cpu: 50m, memory: 128Mi }
+          limits:   { cpu: 50m, memory: 128Mi }
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      # Home off the servers (gd-ybTutceJpn). The 2 GiB servers ran out of memory
+      # one after another on 2026-10-14 because a server drain piled the ARC
+      # listeners onto the survivors. Tolerate the platform pool's taint and
+      # PREFER those nodes; the control-plane toleration above stays as the
+      # fallback, so a listener is never stranded Pending.
+      - key: gardenio.agent
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: gardenio.io/role
+                  operator: In
+                  values: ["platform"]
+
+    # Keep the listeners off one another's node. All six tolerate only the
+    # control-plane taint above, so they all compete for the same three k3s
+    # servers; left alone they pile up (3/2/1 on 2026-09-22, with every
+    # gardenio tier on one node), which turns a single node loss into a
+    # TIER-BLIND dispatch outage.
+    #
+    # ScheduleAnyway is deliberate and must stay: six listeners over three
+    # nodes means a hard constraint can strand one Pending, the failure this
+    # file already has a scar from. The selector here is NOT the same as in the
+    # three mirror values files in this directory -- the note on the constraint
+    # says why. Full rationale in arc-runners-values.yaml.
+    topologySpreadConstraints:
+      #
+      # WHY THIS SELECTS ON repository AND NOT part-of, UNLIKE THE THREE MIRROR
+      # VALUES FILES IN THIS DIRECTORY. The obvious form -- keep the all-six
+      # constraint AND add a gardenio-only one -- IS REJECTED BY THE API:
+      #
+      #   duplicate entries for key
+      #     [topologyKey="kubernetes.io/hostname",whenUnsatisfiable="ScheduleAnyway"]
+      #
+      # topologySpreadConstraints is a listType=map keyed on exactly that pair,
+      # so a pod can hold only ONE soft hostname constraint. Two is not merely
+      # discouraged, it fails server-side apply and the helm upgrade errors out.
+      # The only way to have both would be to make one DoNotSchedule, which is
+      # precisely what must never happen here (six listeners, three schedulable
+      # nodes, and a history of listeners stranded Pending for 13-19 hours).
+      #
+      # So the one constraint each file gets is spent where it buys most.
+      # For gardenio that is actions.github.com/repository -- the one label the
+      # three gardenio tiers share and no mirror scale set carries -- which
+      # spreads heavy, medium and light 1/1/1 over the three servers. A single
+      # node loss then costs ONE tier rather than stopping dispatch for all of
+      # them at once. The mirrors keep the all-six selector, so they balance
+      # against gardenio's placement and the cluster still lands near 2/2/2.
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            actions.github.com/repository: gardenio
+            app.kubernetes.io/component: runner-scale-set-listener

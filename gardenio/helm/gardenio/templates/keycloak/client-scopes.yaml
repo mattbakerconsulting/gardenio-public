@@ -1,0 +1,140 @@
+{{- if .Values.keycloak.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- range .Values.keycloak.clientScopes }}
+# ── KeycloakClientScope: {{ .name }} ──────────────────────────────────────────
+# Renders a requestable realm client-scope via the EDP keycloak-operator
+# (keycloakclientscopes.v1.edp.epam.com). A scope with `type: default` is
+# auto-attached to every client in the realm, so oauth2-proxy can request it in
+# `scope=...` without Keycloak rejecting it as invalid_scope. See
+# values.yaml keycloak.clientScopes (ka-0000000403).
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakClientScope
+metadata:
+  name: {{ $fullname }}-clientscope-{{ .name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  name: {{ .name | quote }}
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  protocol: {{ .protocol | default "openid-connect" | quote }}
+  type: {{ .type | default "default" | quote }}
+  {{- if .description }}
+  description: {{ .description | quote }}
+  {{- end }}
+  {{- if .attributes }}
+  attributes:
+    {{- toYaml .attributes | nindent 4 }}
+  {{- end }}
+  {{- if .protocolMappers }}
+  protocolMappers:
+    {{- toYaml .protocolMappers | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+{{- /* ── land-<name> (gd-eAfptUBh9Z) ───────────────────────────────────────
+       One optional scope per land the chart knows (keycloak.landScopes and
+       keycloak.projectGroups): its only mapper adds aud land-<name> to the
+       access token. Attached to keycloak.landScopeClients by clients.yaml.
+       The shape matches keycloakadmin's landScopeRepresentation, so a land
+       made at runtime and one made here are the same thing. */}}
+{{- $landNames := .Values.keycloak.landScopes | default list -}}
+{{- range .Values.keycloak.projectGroups }}
+{{-   $landNames = append $landNames .name -}}
+{{- end }}
+{{- range $landNames | uniq }}
+{{- if not (regexMatch "^[a-z][a-z0-9-]{0,57}$" .) }}
+{{- fail (printf "keycloak.landScopes / projectGroups: %q is not a land name for a land-<name> scope" .) }}
+{{- end }}
+# ── KeycloakClientScope: land-{{ . }} ─────────────────────────────────────────
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakClientScope
+metadata:
+  name: {{ $fullname }}-clientscope-land-{{ . }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  name: {{ printf "land-%s" . | quote }}
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  protocol: "openid-connect"
+  type: "optional"
+  description: {{ printf "Mints a token for the land %s alone (aud land-%s)" . . | quote }}
+  attributes:
+    gardenio_land: {{ . | quote }}
+    include.in.token.scope: "true"
+    display.on.consent.screen: "false"
+  protocolMappers:
+    - name: land-audience
+      protocol: openid-connect
+      protocolMapper: oidc-audience-mapper
+      config:
+        included.custom.audience: {{ printf "land-%s" . | quote }}
+        access.token.claim: "true"
+        id.token.claim: "false"
+        introspection.token.claim: "true"
+---
+{{- end }}
+{{- /* ── github-identity (Lands Track B §2.2 item 1, gd-0o4Ggf9ngP) ────────
+       Puts the GitHub IdP's github_id / github_login user attributes in the
+       access token (oauth2-proxy hands kbeads and the viewer the access token),
+       the ID token and userinfo. A default scope, attached to every chart
+       client by clients.yaml. A user who did not sign in through GitHub has
+       neither attribute, so neither claim. */}}
+{{- if .Values.keycloak.githubIdp.enabled }}
+# ── KeycloakClientScope: github-identity ────────────────────────────────────
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakClientScope
+metadata:
+  name: {{ $fullname }}-clientscope-github-identity
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  name: "github-identity"
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  protocol: "openid-connect"
+  type: "default"
+  description: "GitHub account (github_id, github_login) of a user who signed in through GitHub"
+  attributes:
+    # Always applied, so it need not be named in the token's scope string.
+    include.in.token.scope: "false"
+  protocolMappers:
+    - name: github-id
+      protocol: openid-connect
+      protocolMapper: oidc-usermodel-attribute-mapper
+      config:
+        user.attribute: github_id
+        claim.name: github_id
+        # A JSON number; kbeads and the viewer also accept a numeric string.
+        jsonType.label: long
+        access.token.claim: "true"
+        id.token.claim: "true"
+        userinfo.token.claim: "true"
+        introspection.token.claim: "true"
+    - name: github-login
+      protocol: openid-connect
+      protocolMapper: oidc-usermodel-attribute-mapper
+      config:
+        user.attribute: github_login
+        claim.name: github_login
+        jsonType.label: String
+        access.token.claim: "true"
+        id.token.claim: "true"
+        userinfo.token.claim: "true"
+        introspection.token.claim: "true"
+---
+{{- end }}
+{{- end }}

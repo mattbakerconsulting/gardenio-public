@@ -1,0 +1,274 @@
+{{template "layout" .}}
+{{define "title"}}{{.Project}} · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+<h1>Project: {{.Project}}</h1>
+<p><a href="{{.BasePath}}/">&larr; all projects</a></p>
+
+{{/* ── Tab / section bar ── shared with the hub (design doc §2): the Work list
+     is a same-document tab so it links back to Overview/Agents/etc. ── */}}
+{{if .Tabs}}
+{{template "section_tabs" (dict "Tabs" .Tabs "AriaLabel" "Project sections")}}
+{{end}}
+
+{{if .Error}}
+<div class="banner banner-error">{{.Error}}</div>
+{{end}}
+
+<div class="project-layout">
+<div class="project-main" data-bulk-scope="project">
+
+{{if .Summary}}
+<div class="project-header-band" aria-label="Project summary">
+  <span class="band-group">
+    <span class="band-label">Active</span>
+    <span class="band-count">{{.Summary.TotalOpen}}</span>
+  </span>
+  <span class="band-sep"></span>
+  <span class="band-group">
+    <span class="band-label">Open</span>
+    <span class="band-count">{{.Summary.Open}}</span>
+  </span>
+  <span class="band-group">
+    <span class="band-label">In progress</span>
+    <span class="band-count">{{.Summary.InProgress}}</span>
+  </span>
+  {{if gt .Summary.Blocked 0}}
+  <span class="band-sep"></span>
+  <span class="band-group">
+    <span class="band-label">Blocked</span>
+    <span class="band-count badge-warn">{{.Summary.Blocked}}</span>
+  </span>
+  {{end}}
+  {{if gt .Summary.StaleInProgress 0}}
+  <span class="band-group">
+    <span class="band-label">Stale &gt;24h</span>
+    <span class="band-count badge-warn">{{.Summary.StaleInProgress}}</span>
+  </span>
+  {{end}}
+  {{if gt .Summary.Created24h 0}}
+  <span class="band-group">
+    <span class="band-label">New 24h</span>
+    <span class="band-count">{{.Summary.Created24h}}</span>
+  </span>
+  {{end}}
+  {{if .Summary.TopAssignees}}
+  <span class="band-sep"></span>
+  <span class="band-group">
+    <span class="band-label">Top owners</span>
+    <span class="band-owners">
+      {{range .Summary.TopAssignees}}
+      <a class="band-owner" href="{{$.BasePath}}/p/{{$.Project}}?status=open&amp;sort=updated" title="{{.Assignee}}"><span class="name">{{.Assignee}}</span><span class="count">{{.Count}}</span></a>
+      {{end}}
+    </span>
+  </span>
+  {{end}}
+</div>
+{{end}}
+
+<form class="project-search" method="get" action="{{.BasePath}}/p/{{.Project}}" role="search">
+  <input type="search" name="q" value="{{.Search}}" placeholder="Filter beads..."
+         aria-label="Filter beads"
+         autocomplete="off"
+         hx-get="{{.BasePath}}/p/{{.Project}}"
+         hx-trigger="input changed delay:300ms, search"
+         hx-push-url="true"
+         hx-include="closest form">
+  {{if .TypeFilter}}<input type="hidden" name="type" value="{{.TypeFilter}}">{{end}}
+  {{if .StatusFilter}}<input type="hidden" name="status" value="{{.StatusFilter}}">{{end}}
+  {{if .SortFilter}}<input type="hidden" name="sort" value="{{.SortFilter}}">{{end}}
+  {{if .LabelFilter}}<input type="hidden" name="label" value="{{.LabelFilter}}">{{end}}
+</form>
+
+{{template "filter_strip" (dict "Chips" .Chips "AriaLabel" "Type filter" "Wrapper" "nav" "ChipClass" "chip" "Boost" true "AriaCurrent" "true" "CountMode" "gated")}}
+
+<form class="project-controls" method="get" action="{{.BasePath}}/p/{{.Project}}"
+      hx-get="{{.BasePath}}/p/{{.Project}}"
+      hx-trigger="change"
+      hx-push-url="true"
+      hx-include="closest form">
+  <label class="project-control">
+    Sort
+    <select name="sort" aria-label="Sort beads">
+      {{range .SortOptions}}
+      <option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>
+      {{end}}
+    </select>
+  </label>
+  <label class="project-control">
+    Status
+    <select name="status" aria-label="Status filter">
+      {{range .StatusOptions}}
+      <option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>
+      {{end}}
+    </select>
+  </label>
+  {{if .TypeFilter}}<input type="hidden" name="type" value="{{.TypeFilter}}">{{end}}
+  {{if .Search}}<input type="hidden" name="q" value="{{.Search}}">{{end}}
+  {{if .LabelFilter}}<input type="hidden" name="label" value="{{.LabelFilter}}">{{end}}
+  <noscript><button type="submit" class="bead-action">Apply</button></noscript>
+</form>
+
+{{/* Bulk action bar — sticky, shown by project_bulk.js when ≥1 row is
+     checked. Two parallel forms: one POSTs status, the other POSTs labels.
+     Both include all checked checkboxes via hx-include=".project-row-select"
+     and target #project-bulk-bar so we can OOB-swap each updated row plus
+     reset the bar in one response. */}}
+<div id="project-bulk-bar" class="project-bulk-bar" data-project="{{.Project}}" hidden>
+  <span class="project-bulk-count" data-bulk-count>0 selected</span>
+  <form class="project-bulk-form project-bulk-status"
+        hx-post="{{.BasePath}}/p/{{.Project}}/bulk/status"
+        hx-include=".project-row-select:checked"
+        hx-target="#project-bulk-bar"
+        hx-swap="outerHTML"
+        hx-disabled-elt="find select, find button">
+    <label>
+      Status
+      <select name="status" aria-label="Bulk status">
+        <option value="open">open</option>
+        <option value="in_progress">in_progress</option>
+        <option value="closed">closed</option>
+      </select>
+    </label>
+    <button type="submit" class="bead-action">Apply</button>
+  </form>
+  <form class="project-bulk-form project-bulk-labels"
+        hx-post="{{.BasePath}}/p/{{.Project}}/bulk/labels"
+        hx-include=".project-row-select:checked"
+        hx-target="#project-bulk-bar"
+        hx-swap="outerHTML"
+        hx-disabled-elt="find input, find button">
+    <label>
+      Add label
+      <input type="text" name="add_label" autocomplete="off" aria-label="Bulk add label">
+    </label>
+    <label>
+      Remove label
+      <input type="text" name="remove_label" autocomplete="off" aria-label="Bulk remove label">
+    </label>
+    <button type="submit" class="bead-action">Apply</button>
+  </form>
+  <form class="project-bulk-form project-bulk-assignee"
+        hx-post="{{.BasePath}}/p/{{.Project}}/bulk/assignee"
+        hx-include=".project-row-select:checked"
+        hx-target="#project-bulk-bar"
+        hx-swap="outerHTML"
+        hx-disabled-elt="find input, find button">
+    <label>
+      Assignee
+      <input type="text" name="assignee" autocomplete="off" aria-label="Bulk assignee">
+    </label>
+    <button type="submit" class="bead-action">Apply</button>
+  </form>
+  <button type="button" class="bead-action" data-bulk-spawn
+          aria-label="Spawn agent on selection">Spawn agent on selection</button>
+  <button type="button" class="bead-action project-bulk-clear" data-bulk-clear>Clear</button>
+  {{if .BulkError}}<span class="bead-actions-error" role="alert">{{.BulkError}}</span>{{end}}
+</div>
+
+<h2>Open beads{{if .Truncated}} (showing first {{.Limit}}){{end}}</h2>
+{{if .Beads}}
+<div class="project-bead-toolbar">
+  <button type="button" class="bead-action" data-bulk-select-all aria-pressed="false">Select all</button>
+</div>
+<ul class="bead-list" id="project-bead-list">
+  {{range .Beads}}
+  {{template "project_row" (dict "Row" . "BasePath" $.BasePath "OOB" false)}}
+  {{end}}
+</ul>
+{{else}}
+<p class="empty">No open beads.</p>
+{{end}}
+
+</div>{{/* /.project-main */}}
+
+{{if .Summary}}
+<aside class="project-sidebar" aria-label="Project summary">
+  <section class="project-summary-panel">
+    <h3>Status</h3>
+    <ul class="project-summary-list">
+      <li><span class="label">Open</span><span class="count">{{.Summary.Open}}</span></li>
+      <li><span class="label">In progress</span><span class="count">{{.Summary.InProgress}}</span></li>
+      <li class="project-summary-total"><span class="label">Total active</span><span class="count">{{.Summary.TotalOpen}}</span></li>
+    </ul>
+    {{if .Summary.Truncated}}
+    <p class="project-summary-note">Counts are a floor — &gt;{{.Summary.TotalOpen}} active beads in this project.</p>
+    {{end}}
+  </section>
+
+  {{if or (gt .Summary.Blocked 0) (gt .Summary.StaleInProgress 0) (gt .Summary.Created24h 0)}}
+  <section class="project-summary-panel">
+    <h3>Attention</h3>
+    <ul class="project-summary-list">
+      {{if gt .Summary.Blocked 0}}
+      <li><span class="label">Blocked on decision</span><span class="count badge-warn">{{.Summary.Blocked}}</span></li>
+      {{end}}
+      {{if gt .Summary.StaleInProgress 0}}
+      <li><span class="label">Stale in-progress (&gt;24h)</span><span class="count badge-warn">{{.Summary.StaleInProgress}}</span></li>
+      {{end}}
+      {{if gt .Summary.Created24h 0}}
+      <li><span class="label">Created in last 24h</span><span class="count">{{.Summary.Created24h}}</span></li>
+      {{end}}
+    </ul>
+  </section>
+  {{end}}
+
+  {{if .Summary.BlockedBeads}}
+  <section class="project-summary-panel" aria-label="Blocked beads">
+    <h3>Blocked <span class="project-summary-count badge-warn">{{.Summary.Blocked}}</span></h3>
+    <ul class="project-summary-bead-list">
+      {{range .Summary.BlockedBeads}}
+      <li class="project-summary-bead">
+        <a class="project-summary-bead-title" href="{{$.BasePath}}/{{.ID}}" title="{{.Title}}">{{.Title}}</a>
+        <span class="project-summary-bead-meta"><span class="project-summary-bead-id">{{.ID}}</span>{{if .Ago}} · <span class="project-summary-bead-ago">{{.Ago}}</span>{{end}}</span>
+      </li>
+      {{end}}
+    </ul>
+  </section>
+  {{end}}
+
+  {{if .Summary.StaleBeads}}
+  <section class="project-summary-panel" aria-label="Stale in-progress beads">
+    <h3>Stale in-progress <span class="project-summary-count badge-warn">{{.Summary.StaleInProgress}}</span></h3>
+    <ul class="project-summary-bead-list">
+      {{range .Summary.StaleBeads}}
+      <li class="project-summary-bead">
+        <a class="project-summary-bead-title" href="{{$.BasePath}}/{{.ID}}" title="{{.Title}}">{{.Title}}</a>
+        <span class="project-summary-bead-meta"><span class="project-summary-bead-id">{{.ID}}</span>{{if .Ago}} · <span class="project-summary-bead-ago">{{.Ago}}</span>{{end}}</span>
+      </li>
+      {{end}}
+    </ul>
+  </section>
+  {{end}}
+
+  {{if or (gt (index .Summary.PriorityCounts 0) 0) (gt (index .Summary.PriorityCounts 1) 0) (gt (index .Summary.PriorityCounts 2) 0) (gt (index .Summary.PriorityCounts 3) 0) (gt (index .Summary.PriorityCounts 4) 0)}}
+  <section class="project-summary-panel">
+    <h3>Priority</h3>
+    <ul class="project-summary-list project-summary-priority">
+      {{range $i, $n := .Summary.PriorityCounts}}
+      {{if gt $n 0}}
+      <li><span class="label">P{{$i}}</span><span class="count prio-pill prio-pill-{{$i}}">{{$n}}</span></li>
+      {{end}}
+      {{end}}
+    </ul>
+  </section>
+  {{end}}
+
+  {{if .Summary.TopAssignees}}
+  <section class="project-summary-panel">
+    <h3>Top assignees</h3>
+    <ul class="project-summary-list">
+      {{range .Summary.TopAssignees}}
+      <li>
+        <span class="label" title="{{.Assignee}}">{{.Assignee}}</span>
+        <span class="count">{{.Count}}</span>
+      </li>
+      {{end}}
+    </ul>
+  </section>
+  {{end}}
+</aside>
+{{end}}
+
+</div>{{/* /.project-layout */}}
+{{end}}

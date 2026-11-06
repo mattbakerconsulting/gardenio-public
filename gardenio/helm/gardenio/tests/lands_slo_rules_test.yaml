@@ -1,0 +1,299 @@
+# rule_files is rewritten at runtime by TestLandsSLO_Fire (lands_slo_test.go):
+# the placeholder is replaced with the path to the helm-rendered PrometheusRule
+# spec. By hand:
+#   helm template test gardenio/helm/gardenio --show-only templates/lands-slo-rules.yaml \
+#     --set agents.metrics.prometheusRule.landsSLO.enabled=true \
+#     --set vmagent.uptimeProbeScrape.enabled=true \
+#     --set vmagent.uptimeProbeScrape.url=https://status.example/metrics | yq eval '.spec' - > /tmp/slo_rules.yaml
+#   sed 's#__RULES_FILE__#/tmp/slo_rules.yaml#' this-file > /tmp/slo_test.yaml
+#   promtool test rules /tmp/slo_test.yaml
+#
+# Lands SLOs (Track B §5.8, step 10.8): each burn-rate alert fires on its
+# signal and stays quiet for a healthy surface beside it.
+rule_files:
+  - __RULES_FILE__
+
+evaluation_interval: 1m
+
+tests:
+  # /lands/ fails every probe from the start: a fast burn (ratio 1 over 1h and
+  # 5m) after the 2m for. /garden passes every probe: quiet.
+  - name: probe_fast_burn
+    interval: 1m
+    input_series:
+      - series: 'gardenio_uptime_probe_total{target="lands"}'
+        values: '0+1x60'
+      - series: 'gardenio_uptime_probe_failures_total{target="lands"}'
+        values: '0+1x60'
+      - series: 'gardenio_uptime_probe_total{target="garden"}'
+        values: '0+1x60'
+      - series: 'gardenio_uptime_probe_failures_total{target="garden"}'
+        values: '0x60'
+    promql_expr_test:
+      - expr: gardenio:lands_slo_errors:ratio_rate5m
+        eval_time: 10m
+        exp_samples:
+          - labels: 'gardenio:lands_slo_errors:ratio_rate5m{slo="lands_availability"}'
+            value: 1
+          - labels: 'gardenio:lands_slo_errors:ratio_rate5m{slo="garden_availability"}'
+            value: 0
+      - expr: gardenio:lands_slo:objective{slo="lands_availability"}
+        eval_time: 1m
+        exp_samples:
+          - labels: 'gardenio:lands_slo:objective{slo="lands_availability"}'
+            value: 0.995
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: LandsSLOFastBurn
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: LandsSLOFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: gardenio
+              subsystem: lands-slo
+              slo: lands_availability
+            exp_annotations:
+              summary: "SLO lands_availability is burning its error budget fast (/lands/ answers from outside the cluster)"
+              description: |
+                lands_availability (/lands/ answers from outside the cluster, objective 0.995) is spending its
+                30-day error budget at more than 14.4x over the last hour (or 6x over 6 hours):
+                100% of events bad in the window that fired.
+                At this rate the month's budget is gone in about two days.
+                Check the off-cluster status page and gb lands status; the prober's
+                last detail per target is in status.json.
+                Query: gardenio:lands_slo_errors:ratio_rate1h{slo="lands_availability"}
+
+  # One failed probe in six healthy hours (0.3%, under the 0.5% budget): a
+  # 5m window that is 20% bad on its own must not page, and nothing burns.
+  - name: probe_blip_is_quiet
+    interval: 1m
+    input_series:
+      - series: 'gardenio_uptime_probe_total{target="lands"}'
+        values: '0+1x400'
+      - series: 'gardenio_uptime_probe_failures_total{target="lands"}'
+        values: '0x300 1x100'
+    alert_rule_test:
+      - eval_time: 303m
+        alertname: LandsSLOFastBurn
+        exp_alerts: []
+      - eval_time: 303m
+        alertname: LandsSLOSlowBurn
+        exp_alerts: []
+      - eval_time: 390m
+        alertname: LandsSLOSlowBurn
+        exp_alerts: []
+
+  # 2% of /garden probes fail for 8 hours (4x budget): too slow to page, a
+  # slow burn (1d and 2h both over 3x) after its 15m for.
+  - name: probe_slow_burn
+    interval: 1m
+    input_series:
+      - series: 'gardenio_uptime_probe_total{target="garden"}'
+        values: '0+50x480'
+      - series: 'gardenio_uptime_probe_failures_total{target="garden"}'
+        values: '0+1x480'
+    alert_rule_test:
+      - eval_time: 470m
+        alertname: LandsSLOFastBurn
+        exp_alerts: []
+      - eval_time: 470m
+        alertname: LandsSLOSlowBurn
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              component: gardenio
+              subsystem: lands-slo
+              slo: garden_availability
+            exp_annotations:
+              summary: "SLO garden_availability is burning its error budget (/garden reaches the sign-in check from outside the cluster)"
+              description: |
+                garden_availability (/garden reaches the sign-in check from outside the cluster, objective 0.995) is spending its
+                30-day error budget faster than it earns it: more than 3x over a day, or
+                more than 1x over three days. 2% of
+                events bad in the window that fired. Not urgent; find the cause this week.
+                Query: gardenio:lands_slo_errors:ratio_rate1d{slo="garden_availability"}
+
+  # Commons events: half arrive later than 5s. Fast burn on the latency SLO.
+  # The le="5.0" spelling counts as the 5s bound too.
+  - name: latency_fast_burn
+    interval: 1m
+    input_series:
+      - series: 'gardenio_commons_event_lag_seconds_bucket{land="tomato-patch", kind="message", le="5"}'
+        values: '0+5x30'
+      - series: 'gardenio_commons_event_lag_seconds_count{land="tomato-patch", kind="message"}'
+        values: '0+10x30'
+      - series: 'gardenio_commons_event_lag_seconds_bucket{land="bean-row", kind="message", le="5.0"}'
+        values: '0+5x30'
+      - series: 'gardenio_commons_event_lag_seconds_count{land="bean-row", kind="message"}'
+        values: '0+10x30'
+    promql_expr_test:
+      - expr: gardenio:lands_slo_errors:ratio_rate5m{slo="commons_event_latency"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'gardenio:lands_slo_errors:ratio_rate5m{slo="commons_event_latency"}'
+            value: 0.5
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LandsSLOFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: gardenio
+              subsystem: lands-slo
+              slo: commons_event_latency
+            exp_annotations:
+              summary: "SLO commons_event_latency is burning its error budget fast (Commons events reach the stream within 5s)"
+              description: |
+                commons_event_latency (Commons events reach the stream within 5s, objective 0.99) is spending its
+                30-day error budget at more than 14.4x over the last hour (or 6x over 6 hours):
+                50% of events bad in the window that fired.
+                At this rate the month's budget is gone in about two days.
+                Query: gardenio:lands_slo_errors:ratio_rate1h{slo="commons_event_latency"}
+
+  # Tenant spawns: 4 of every 5 agents across the lands take longer than 300s
+  # to reach working (ratio 0.8, burn 16 against the 95% objective). The
+  # SLI sums every land; the controller writes the bound as le="300".
+  - name: spawn_to_working_fast_burn
+    interval: 1m
+    input_series:
+      - series: 'gardenio_lands_spawn_to_working_seconds_bucket{land="tomato-patch", le="300"}'
+        values: '0+1x30'
+      - series: 'gardenio_lands_spawn_to_working_seconds_count{land="tomato-patch"}'
+        values: '0+4x30'
+      - series: 'gardenio_lands_spawn_to_working_seconds_bucket{land="bean-row", le="300"}'
+        values: '0x30'
+      - series: 'gardenio_lands_spawn_to_working_seconds_count{land="bean-row"}'
+        values: '0+1x30'
+    promql_expr_test:
+      - expr: gardenio:lands_slo_errors:ratio_rate5m{slo="tenant_spawn_to_working"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'gardenio:lands_slo_errors:ratio_rate5m{slo="tenant_spawn_to_working"}'
+            value: 0.8
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LandsSLOFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: gardenio
+              subsystem: lands-slo
+              slo: tenant_spawn_to_working
+            exp_annotations:
+              summary: "SLO tenant_spawn_to_working is burning its error budget fast (a tenant land's agent is working within 5 minutes of its spawn)"
+              description: |
+                tenant_spawn_to_working (a tenant land's agent is working within 5 minutes of its spawn, objective 0.95) is spending its
+                30-day error budget at more than 14.4x over the last hour (or 6x over 6 hours):
+                80% of events bad in the window that fired.
+                At this rate the month's budget is gone in about two days.
+                Query: gardenio:lands_slo_errors:ratio_rate1h{slo="tenant_spawn_to_working"}
+
+  # Steward: 4 of every 5 human #general messages wait past 900s for the
+  # steward (ratio 0.8). At the 90% objective the 1h/5m pair needs a ratio
+  # past 1.44 and never fires; the 6h/30m pair (past 0.6) does.
+  - name: steward_response_fast_burn
+    interval: 1m
+    input_series:
+      - series: 'gardenio_lands_steward_response_seconds_bucket{land="tomato-patch", le="900"}'
+        values: '0+1x30'
+      - series: 'gardenio_lands_steward_response_seconds_count{land="tomato-patch"}'
+        values: '0+5x30'
+    promql_expr_test:
+      - expr: gardenio:lands_slo_errors:ratio_rate30m{slo="steward_response"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'gardenio:lands_slo_errors:ratio_rate30m{slo="steward_response"}'
+            value: 0.8
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LandsSLOFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: gardenio
+              subsystem: lands-slo
+              slo: steward_response
+            exp_annotations:
+              summary: "SLO steward_response is burning its error budget fast (the steward answers a human in #general within 15 minutes)"
+              description: |
+                steward_response (the steward answers a human in #general within 15 minutes, objective 0.9) is spending its
+                30-day error budget at more than 14.4x over the last hour (or 6x over 6 hours):
+                80% of events bad in the window that fired.
+                At this rate the month's budget is gone in about two days.
+                Query: gardenio:lands_slo_errors:ratio_rate1h{slo="steward_response"}
+
+  # Server side: half the Commons API's responses are 500s; /garden's are all
+  # 200. Only commons_api_requests burns.
+  - name: requests_fast_burn
+    interval: 1m
+    input_series:
+      - series: 'gardenio_user_request_latency_seconds_count{surface="web", endpoint="POST /garden/c/{land}/{channel}/say", status_code="500"}'
+        values: '0+5x30'
+      - series: 'gardenio_user_request_latency_seconds_count{surface="web", endpoint="GET /garden/c/{land}/{channel}", status_code="200"}'
+        values: '0+5x30'
+      - series: 'gardenio_user_request_latency_seconds_count{surface="web", endpoint="GET /garden", status_code="200"}'
+        values: '0+20x30'
+    promql_expr_test:
+      - expr: gardenio:lands_slo_errors:ratio_rate5m{slo=~"garden_requests|commons_api_requests"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'gardenio:lands_slo_errors:ratio_rate5m{slo="commons_api_requests"}'
+            value: 0.5
+          - labels: 'gardenio:lands_slo_errors:ratio_rate5m{slo="garden_requests"}'
+            value: 0
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LandsSLOFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: gardenio
+              subsystem: lands-slo
+              slo: commons_api_requests
+            exp_annotations:
+              summary: "SLO commons_api_requests is burning its error budget fast (Commons API requests answered without a 5xx)"
+              description: |
+                commons_api_requests (Commons API requests answered without a 5xx, objective 0.995) is spending its
+                30-day error budget at more than 14.4x over the last hour (or 6x over 6 hours):
+                50% of events bad in the window that fired.
+                At this rate the month's budget is gone in about two days.
+                Query: gardenio:lands_slo_errors:ratio_rate1h{slo="commons_api_requests"}
+
+  # The prober's metrics file stopped updating at t=1m: stale after 600s
+  # plus the 10m for. A fresh file is quiet.
+  - name: probe_stale
+    interval: 1m
+    input_series:
+      - series: 'gardenio_uptime_probe_last_run_timestamp_seconds'
+        values: '60x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LandsUptimeProbeStale
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: LandsUptimeProbeStale
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              component: gardenio
+              subsystem: lands-slo
+            exp_annotations:
+              summary: "The off-cluster availability prober has not reported for over 600s"
+              description: |
+                gardenio_uptime_probe_last_run_timestamp_seconds, scraped from the status
+                bucket's metrics file, is older than 600s or missing.
+                Either the gardenio-uptime-probe Lambda stopped (its heartbeat alarm
+                emails too) or vmagent cannot reach vmagent.uptimeProbeScrape.url. Until
+                it is back, the probe SLOs cannot burn and the status page may be stale.
+
+  - name: probe_fresh
+    interval: 1m
+    input_series:
+      - series: 'gardenio_uptime_probe_last_run_timestamp_seconds'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LandsUptimeProbeStale
+        exp_alerts: []

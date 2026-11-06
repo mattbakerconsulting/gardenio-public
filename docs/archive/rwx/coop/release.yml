@@ -1,0 +1,271 @@
+# Release — builds the coop/coopmux binaries for the 2 linux targets and
+# publishes a GitLab release on a CalVer tag.
+#
+# ── No darwin targets: the Apple SDK is not available here (ka-0000005954) ──
+# This workflow used to carry `build-darwin-amd64` / `build-darwin-arm64`
+# (`cargo zigbuild --target *-apple-darwin`) plus the `zig` task that fed them.
+# They NEVER produced a published artifact — `release` has always attached only
+# the two linux tarballs — and they failed on every run that ever reached them, so
+# keeping them only manufactured a false red. Removing them changes zero
+# published bytes. (They were NOT reddening real releases, though: this file has
+# never been tag-triggered at all — see the trigger note below.)
+#
+# Root cause (MEASURED, run 897ca56b7ccc4d26956be49668791b7c, both targets):
+#
+#   aws-lc-sys@0.40.0: .../jitterentropy-base-user.h:90:10: fatal error:
+#   'CoreServices/CoreServices.h' file not found
+#   error: failed to run custom build command for `aws-lc-sys v0.40.0`
+#
+# zig ships macOS *libc* headers (`lib/libc/include/any-macos-any`) and a single
+# `lib/libc/darwin/libSystem.tbd` — it ships NO Apple frameworks. `aws-lc-sys`
+# needs `CoreServices`, and even with aws-lc-sys removed the darwin graph still
+# pulls `security-framework` (-framework Security) via `rustls-native-certs`
+# and `core-foundation` (-framework CoreFoundation) via
+# `rustls-platform-verifier`, so the link would fail next. Supplying the real
+# frameworks means vendoring the macOS SDK, whose license restricts use to
+# Apple-branded hardware. That is a product/licensing decision, not a CI
+# config tweak — and it is now DECIDED (ka-0000001190): coop does NOT ship
+# macOS binaries. Nothing consumed the darwin tarballs. The agent image
+# installs `coop-linux-<arch>.tar.gz` (gardenio/images/agent/Dockerfile),
+# production runs the `coop`/`coopmux` CONTAINER images built by the root
+# `.rwx/docker.yml` (`push-coop`), microvm-agent builds from source for linux,
+# and the documented Mac operator path needs only `kd`+`gb` — it substitutes
+# `gb-claude` for coop's system-prompt splicing (docs/onboarding-mac-operator.md).
+# A repo-wide grep finds no `coop-darwin-*` reference outside the inert
+# `coop/.github/workflows/release.yml.disabled`. Vendoring the SDK is
+# license-restricted to Apple hardware, no macOS RWX runner exists, and purging
+# the Apple-framework deps is surgery across the AWS SDK + async-nats that
+# changes macOS TLS-trust behaviour — none of it justified by zero demand.
+#
+# macOS builds are local-only: `cd coop && cargo build --release` on a Mac.
+#
+# ── This file is NOT tag-triggered — `rwx run` only (ka-0000001190) ─────────
+# RWX auto-triggers only workflows in the ROOT `.rwx/` directory, so the
+# `gitlab: tag-push` block below has never fired. Measured over 15 consecutive
+# release tags (2026.244.1 .. 2026.245.9): every tag-push runs exactly
+# `.rwx/{ci,docker,helm,microvm-image,release}.yml` and NO nested workflow, and
+# every recorded run of every `coop/.rwx/*` workflow is `cli`-triggered. The
+# control that rules out a retention artifact: the sibling `coop/.rwx/docker.yml`
+# declares `gitlab: push if branch == 'main'` and has ZERO recorded runs, while
+# the ROOT `.rwx/docker.yml` shows 21 `gitlab.push` runs in its last 100.
+#
+# Consequence: this workflow publishes no release assets today (release
+# 2026.245.9 carries zero coop tarballs), so the darwin tasks removed above were
+# never actually reddening a release the way ka-0000005954 assumed — the `failed
+# rwx/release` status on a tag is the ROOT workflow. Whether this file should
+# exist at all (its `release` task would collide with the root workflow's
+# `create-release` on the same tag) is tracked in ka-0000001870.
+#
+# ── The clone roots at the MONOREPO root, not at coop/ (ka-0000001846) ──────
+# `code` clones the whole gardenio monorepo, so the RWX workspace root holds
+# `coop/`, `kbeads/`, `gardenio/`, `.rwx/` — there is NO `Cargo.toml` at the
+# workspace root (the Rust workspace is `coop/Cargo.toml`). Every cargo
+# invocation below must therefore `cd coop` first, the version-stamping `sed`
+# must edit `coop/Cargo.toml`, and every path (filter globs, lock files, the
+# `target/<triple>/release` dirs the tarballs are built from) is
+# workspace-root-relative and needs its `coop/` prefix. Without the `cd`,
+# cargo dies with "could not find Cargo.toml in /var/mint-workspace or any
+# parent directory" (exit 101) — the same defect ka-0000006904 measured in the
+# sibling `coop/.rwx/ci.yml`. Same convention as the root `.rwx/ci.yml` coop
+# tasks (`cd coop && cargo …`).
+#
+# The `release`/`dispatch-*` tasks deliberately stay at the workspace root:
+# they only touch /tmp and the GitLab/RWX APIs, nothing component-relative.
+on:
+  gitlab:
+    tag-push:
+      if: ${{ starts-with(event.git.ref, 'refs/tags/20') }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        tag: ${{ event.git.tag }}
+      status-checks:
+        name: Release
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      tag: dev
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tool-cache:
+  vault: default
+
+tasks:
+  - key: system-deps
+    filter:
+      - coop/.rwx/release.yml
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y protobuf-compiler libssl-dev gcc-aarch64-linux-gnu
+
+  # ── Clone (parallel with system-deps) ─────────────────────────────────
+  - key: code
+    # ── Clone credential MUST be in the URL (ka-0000006904) ────────────────
+    # With a bare `https://gitlab.com/...` URL, `git/clone` falls back to the
+    # RWX vault-resolved GitLab credential, which is DENIED on the CLI/manual
+    # `rwx run` path: every run aborted in the first task,
+    # `code.get-latest-sha-for-ref`, with `remote: HTTP Basic: Access denied`
+    # / `fatal: Authentication failed` (exit 128) — killing the self-verify
+    # command this repo's CLAUDE.md documents. `secrets.GITLAB_CLONE_TOKEN` is
+    # the credential source the root `.rwx/ci.yml` and `.rwx/e2e.yml` already
+    # use, and it resolves on every trigger (cli, push, tag-push, MR, dispatch).
+    call: git/clone 2.0.3
+    with:
+      repository: https://oauth2:${{ secrets.GITLAB_CLONE_TOKEN }}@gitlab.com/Acme/Platform/gardenio.git
+      ref: ${{ init.commit-sha }}
+
+  - key: rust
+    use: [code, system-deps]
+    filter:
+      - coop/.rwx/release.yml
+      # The pin decides the channel AND the component set this task installs.
+      - coop/rust-toolchain.toml
+    run: |
+      # ── Toolchain install is DERIVED from coop/rust-toolchain.toml ──────
+      # Nothing here hand-copies the channel or the component list. That
+      # duplication is what let the `llvm-tools` component conflict bite twice
+      # (ka-0000001846, ka-0000001870); the trigger is characterized in
+      # ka-0000008092 and the two guards below are the measured fix.
+      curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+      . "$HOME/.cargo/env"
+      COOP_TOOLCHAIN=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' coop/rust-toolchain.toml)
+      test -n "$COOP_TOOLCHAIN" || { echo "cannot parse [toolchain] channel from coop/rust-toolchain.toml"; exit 1; }
+      # GUARD 1 — completeness. Argument-less `rustup toolchain install` run
+      # inside `coop/` reads the pin and installs the channel plus EVERY
+      # component it declares, so this task cannot drift from the pin. It MUST
+      # run before RUSTUP_TOOLCHAIN is exported below: the env var suppresses
+      # the toolchain file, and with it the component list.
+      ( cd coop && rustup toolchain install )
+      # Assert the pin's components really landed, HERE in the cheap toolchain
+      # task, instead of surfacing as a confusing failure inside an 8-cpu build.
+      for c in $(sed -n 's/^[[:space:]]*components[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p' coop/rust-toolchain.toml | tr -d '" ' | tr ',' ' '); do
+        rustup component list --toolchain "$COOP_TOOLCHAIN" --installed | grep -q "^${c}-" \
+          || { echo "coop/rust-toolchain.toml declares component '$c' but rustup did not install it"; exit 1; }
+        echo "component ok: $c"
+      done
+      # GUARD 2 — no lazy sync, ever. RUSTUP_TOOLCHAIN outranks
+      # rust-toolchain.toml in rustup's override precedence, so no cargo
+      # invocation in any downstream task re-reads the pin and rustup can never
+      # attempt a component sync into a `tool-cache:`d tree. This is what makes
+      # the fix deterministic rather than probabilistic — see ka-0000008092.
+      export RUSTUP_TOOLCHAIN="$COOP_TOOLCHAIN"
+      echo "$COOP_TOOLCHAIN" | tee $RWX_ENV/RUSTUP_TOOLCHAIN
+      echo "$HOME/.cargo/bin" | tee -a $RWX_ENV/PATH
+      # Disable sccache wrapper (set by rwx/base) — we use RWX content caching.
+      echo "" | tee $RWX_ENV/RUSTC_WRAPPER
+      # Linux only — see the "no darwin targets" note in the header (ka-0000005954).
+      # Uses the RUSTUP_TOOLCHAIN exported just above.
+      rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+
+  - key: set-version
+    use: rust
+    run: |
+      VERSION="${TAG#v}"
+      if [ "$VERSION" = "dev" ]; then
+        VERSION="0.1.0"
+      else
+        # CalVer tags are already 3-part semver-compatible (YYYY.MDD.N).
+        # Legacy 4-part tags (YYYY.MM.DD.N) are converted to YYYY.MDD.N for Cargo.toml.
+        if [[ "$VERSION" =~ ^([0-9]{4})\.0?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+          VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}${BASH_REMATCH[3]}.${BASH_REMATCH[4]}"
+          echo "Converted legacy 4-part CalVer to semver: $VERSION"
+        fi
+      fi
+      echo "Setting workspace version to $VERSION"
+      # coop/Cargo.toml: the Rust workspace manifest is NOT at the RWX
+      # workspace root (ka-0000001846), so the bare `Cargo.toml` below named a
+      # file that does not exist — `sed` aborts the task with
+      # "can't read Cargo.toml: No such file or directory" under RWX errexit,
+      # and the version stamp never reached the real manifest.
+      cd coop
+      tmp=$(mktemp)
+      sed "s/^version = \"[0-9][0-9.]*\"/version = \"$VERSION\"/" Cargo.toml > "$tmp"
+      mv "$tmp" Cargo.toml
+    env:
+      TAG: ${{ init.tag }}
+
+  # Parallel builds for both published targets (linux only — see header)
+  - key: build-linux-amd64
+    use: set-version
+    agent:
+      cpus: 8
+    tool-cache: release-linux-amd64
+    run: |
+      cd coop
+      cargo build --release --target x86_64-unknown-linux-gnu
+      strip target/x86_64-unknown-linux-gnu/release/coop 2>/dev/null || true
+      strip target/x86_64-unknown-linux-gnu/release/coopmux 2>/dev/null || true
+      cd target/x86_64-unknown-linux-gnu/release
+      cp coopmux coop-mux 2>/dev/null || true
+      tar czf /tmp/coop-linux-amd64.tar.gz coop coop-mux
+
+  - key: build-linux-arm64
+    use: set-version
+    agent:
+      cpus: 8
+    tool-cache: release-linux-arm64
+    run: |
+      cd coop
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+        cargo build --release --target aarch64-unknown-linux-gnu
+      aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/coop 2>/dev/null || true
+      aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/coopmux 2>/dev/null || true
+      cd target/aarch64-unknown-linux-gnu/release
+      cp coopmux coop-mux 2>/dev/null || true
+      tar czf /tmp/coop-linux-arm64.tar.gz coop coop-mux
+
+  - key: release
+    use: [build-linux-amd64, build-linux-arm64]
+    if: ${{ init.tag != 'dev' }}
+    run: |
+      # Install glab CLI
+      curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v1.52.0/downloads/glab_1.52.0_linux_amd64.tar.gz" \
+        | tar xz -C /tmp
+      sudo cp /tmp/bin/glab /usr/local/bin/
+
+      # Create checksums
+      cd /tmp
+      sha256sum coop-linux-amd64.tar.gz coop-linux-arm64.tar.gz > checksums.txt
+
+      # Create GitLab release (linux only — darwin cross-compile from a linux
+      # agent is blocked on the absent Apple SDK; see the header. macOS builds
+      # are local-only: `cd coop && cargo build --release` on the Mac.)
+      glab release create "$TAG" \
+        --repo Acme/Platform/gardenio \
+        --name "$TAG" \
+        --notes "Coop release $TAG" \
+        coop-linux-amd64.tar.gz \
+        coop-linux-arm64.tar.gz \
+        checksums.txt
+    env:
+      GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+      TAG: ${{ init.tag }}
+
+  - key: dispatch-gastown
+    use: release
+    run: |
+      # Trigger gastown agent image rebuild via RWX dispatch API
+      DISPATCH_ID=$(curl -fsSL -X POST https://cloud.rwx.com/mint/api/runs/dispatches \
+        -H "Authorization: Bearer $RWX_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"key\": \"gastown-agent-rebuild\", \"params\": {\"trigger-source\": \"coop-release-$TAG\", \"coop-version\": \"$TAG\"}, \"ref\": \"main\", \"title\": \"Agent rebuild (coop $TAG)\"}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('dispatch_id',''))")
+      echo "Dispatched gastown-agent-rebuild via RWX (dispatch_id=$DISPATCH_ID, tag=$TAG)"
+    env:
+      RWX_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+      TAG: ${{ init.tag }}
+
+  - key: dispatch-gardenio
+    use: release
+    run: |
+      # Trigger gardenio agent image rebuild via RWX dispatch API
+      echo "Dispatching to gardenio for agent rebuild (coop: $TAG)..."
+      curl -fsSL -X POST https://cloud.rwx.com/mint/api/runs/dispatches \
+        -H "Authorization: Bearer $RWX_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"key\": \"gardenio-agent-rebuild\", \"params\": {\"trigger-source\": \"coop-release-$TAG\", \"coop-version\": \"$TAG\"}, \"ref\": \"main\", \"title\": \"Agent rebuild (coop $TAG)\"}"
+    env:
+      RWX_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+      TAG: ${{ init.tag }}

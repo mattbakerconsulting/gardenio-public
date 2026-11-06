@@ -1,0 +1,74 @@
+{{- /*
+  Parallel IngressRoute for beads-viewer served behind AWS Verified Access.
+
+  This is the canonical beads-viewer route: a one-level host (e.g.
+  beads-viewer.example.com) that is covered by the existing
+  *.example.com ACM cert and gated upstream by an AWS Verified
+  Access endpoint. The legacy host (beads-viewer.gardenio.<env>.example.com)
+  and its 301-redirect-to-AVA route were retired after the Epic A adoption
+  window (ka-0000004107, parent epic ka-0000005702).
+
+  Keycloak forwardauth is intentionally OMITTED here: AVA already
+  authenticates the user before traffic reaches Traefik, and double-gating
+  would force two OIDC flows.
+
+  Enabled per environment via .Values.beadsViewer.avaIngress.enabled. See
+  epic ka-0000005862 for the broader rollout plan.
+
+  STRIP-PREFIX (ka-0000000593): the viewer pod's BASE_PATH is derived via
+  gardenio.unified.beadsBasePath — once unifiedHost.enabled=true that resolves
+  to paths.beads (e.g. "/beads"), so every template link renders prefixed
+  (/beads/decisions, /beads/assets/static/...). The unified host strips that
+  prefix in its own IngressRoute before forwarding; this AVA route forwards
+  the request path verbatim, so without a matching stripPrefix the prefixed
+  links 404 here (e.g. /beads/decisions instead of /decisions). Mirror the
+  unified host: when BASE_PATH is non-empty, attach a stripPrefix middleware
+  so the AVA host accepts the same prefixed URLs the app emits. When
+  BASE_PATH is empty (unifiedHost off), the middleware is omitted and the
+  route behaves exactly as before — links are already root-relative.
+*/}}
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.beadsViewer.enabled .Values.beadsViewer.avaIngress .Values.beadsViewer.avaIngress.enabled }}
+{{- $fullname := printf "%s-beads-viewer" (include "gardenio.fullname" .) -}}
+{{- $host := .Values.beadsViewer.avaIngress.host -}}
+{{- $port := .Values.beadsViewer.service.port | default 8095 -}}
+{{- $basePath := include "gardenio.unified.beadsBasePath" . -}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-ava
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beads-viewer
+    app.kubernetes.io/gate: ava
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $host }}`)
+      kind: Rule
+      services:
+        - name: {{ $fullname }}
+          port: {{ $port }}
+      {{- if ne $basePath "" }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        - name: {{ $fullname }}-ava-stripprefix
+      {{- end }}
+{{- if ne $basePath "" }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ava-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beads-viewer
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $basePath }}
+{{- end }}
+{{- end }}

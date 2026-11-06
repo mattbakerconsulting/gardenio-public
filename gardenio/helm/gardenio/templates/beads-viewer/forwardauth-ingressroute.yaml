@@ -1,0 +1,86 @@
+{{- /*
+  G9 (ka-0000001782): Keycloak-forwardauth-gated beads-viewer IngressRoute.
+
+  The chart's canonical beads-viewer route does not cover the Gardenio-in-a-Box
+  edge:
+    * ava-ingressroute.yaml — gated by AVA UPSTREAM of Traefik, forwardauth
+      intentionally omitted. AVA does not exist on a standalone box.
+  (The legacy host's 301-redirect-to-AVA route was retired in ka-0000004107.)
+  So with avaIngress.enabled=false there is NO authenticated public beads-viewer
+  route, and one had to be hand-applied on the box (Host beads-viewer.<dashed>.
+  sslip.io -> svc:8095 with the gardenio-forwardauth middleware).
+
+  This template closes that gap: a standalone IngressRoute on beadsViewer.ingress.host
+  that points at the beads-viewer Service behind the in-cluster oauth2-proxy
+  forwardauth middleware (templates/forwardauth/middleware.yaml, named
+  <release>-forwardauth) plus the edge middlewares (buffering/inFlightReq/crowdsec).
+  It mirrors the gate the beads daemon browser route uses, so the same Keycloak
+  login protects both.
+
+  Gated on beadsViewer.ingress.forwardAuthIngress.enabled AND
+  keycloak.forwardAuth.enabled (the middleware only exists when forwardauth is
+  on). Independent of avaIngress — both can be off. DEFAULT OFF; the in-box
+  overlay turns it on.
+
+  STRIP-PREFIX: identical handling to the AVA route — when BASE_PATH is non-empty
+  (unifiedHost on) attach a stripPrefix so the prefixed links the app emits resolve.
+*/}}
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.beadsViewer.enabled .Values.beadsViewer.ingress.forwardAuthIngress.enabled .Values.beadsViewer.ingress.host .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled }}
+{{- $fullname := printf "%s-beads-viewer" (include "gardenio.fullname" .) -}}
+{{- $releaseName := include "gardenio.fullname" . -}}
+{{- $host := .Values.beadsViewer.ingress.host -}}
+{{- $port := .Values.beadsViewer.service.port | default 8095 -}}
+{{- $basePath := include "gardenio.unified.beadsBasePath" . -}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-forwardauth
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beads-viewer
+    app.kubernetes.io/gate: forwardauth
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $host }}`)
+      kind: Rule
+      services:
+        - name: {{ $fullname }}
+          port: {{ $port }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        - name: {{ $releaseName }}-forwardauth
+        {{- if .Values.keycloak.forwardAuth.forceLogoutOn403.enabled }}
+        - name: {{ $releaseName }}-forwardauth-errors
+        {{- end }}
+        {{- if ne $basePath "" }}
+        - name: {{ $fullname }}-forwardauth-stripprefix
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if ne $basePath "" }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-forwardauth-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beads-viewer
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $basePath }}
+{{- end }}
+{{- end }}

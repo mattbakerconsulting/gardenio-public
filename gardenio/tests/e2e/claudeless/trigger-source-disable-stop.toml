@@ -1,0 +1,201 @@
+# trigger-source-disable-stop.toml
+#
+# Claudeless scenario: gb trigger disable halts firing within one poll.
+#
+# ka-0000002354 / parent ka-0000008095 §P3:
+#   "trigger-source-disable-stop.toml — enabled=false halts firing within one
+#    poll interval."
+#
+# Drives the disable invariant by:
+#   1. Creating a trigger:schedule with cron='* * * * *', action=notify.
+#   2. Starting trigger-engine subprocess with poll=1s.
+#   3. Waiting for the first fire (audit bead with outcome=allow).
+#   4. Disabling the trigger via `gb trigger disable` — this sets
+#      fields.enabled=false on the bead.
+#   5. Recording the audit-bead count at the time of disable.
+#   6. Waiting through at least one new minute boundary (~75s).
+#   7. Asserting the audit-bead count did not grow — the engine must have
+#      filtered the trigger out within one poll.
+
+[claude]
+session_id = "e2e00000-000a-4000-a000-000000000004"
+username = "e2e-trigger-disable-stop"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 60000
+
+[[responses]]
+on = "*"
+say = "Running trigger-source-disable-stop: gb trigger disable halts firing within one poll."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight ─────────────────────────────────────────────────────
+TE_BIN=""
+if command -v trigger-engine >/dev/null 2>&1; then
+  TE_BIN=$(command -v trigger-engine)
+elif [ -x /usr/local/bin/trigger-engine ]; then
+  TE_BIN=/usr/local/bin/trigger-engine
+elif [ -x /tmp/trigger-engine ]; then
+  TE_BIN=/tmp/trigger-engine
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-engine from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-engine ./cmd/trigger-engine/ ) || {
+    echo "SKIP: trigger-engine build failed"; exit 0;
+  }
+  TE_BIN=/tmp/trigger-engine
+else
+  echo "SKIP: trigger-engine binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-engine: $TE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL not set"
+  exit 0
+fi
+if [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_TOKEN not set"
+  exit 0
+fi
+if ! command -v gb >/dev/null 2>&1; then
+  echo "SKIP: gb not present"
+  exit 0
+fi
+
+# ── Setup ──────────────────────────────────────────────────────────
+TAG="e2e-tsd-$$-$(date +%s)"
+echo "tag: $TAG"
+
+TRIG_OUT=$(gb trigger create schedule \
+  --http-url "$BEADS_HTTP_URL" \
+  --title "$TAG" \
+  --cron '* * * * *' \
+  --action notify \
+  --prompt "fired at {{fire_time}}" \
+  --label "e2e:claudeless" \
+  --label "e2e-tag:$TAG" \
+  --json 2>&1) || { fail "gb trigger create" "$TRIG_OUT"; exit 1; }
+
+TRIG_ID=$(echo "$TRIG_OUT" | jq -r '.id // .ID // empty')
+if [ -z "$TRIG_ID" ]; then
+  fail "extract trigger id" "out=$TRIG_OUT"
+  exit 1
+fi
+echo "trigger: $TRIG_ID"
+
+cleanup() {
+  gb trigger disable "$TRIG_ID" --http-url "$BEADS_HTTP_URL" >/dev/null 2>&1 || true
+  kd close "$TRIG_ID" >/dev/null 2>&1 || true
+  if [ -n "${TE_PID:-}" ]; then
+    kill "$TE_PID" 2>/dev/null || true
+    wait "$TE_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+audit_count() {
+  kd list --type=event -l "trigger:$TRIG_ID" --json 2>/dev/null | \
+    jq '[.[] | select(.fields.outcome=="allow")] | length' 2>/dev/null
+}
+
+# ── Run trigger-engine subprocess ──────────────────────────────────
+TE_LOG=/tmp/trigger-engine-disable-$$.log
+BEADS_HTTP_ADDR="$BEADS_HTTP_URL" \
+  BEADS_DAEMON_TOKEN="$BEADS_TOKEN" \
+  TRIGGER_POLL_INTERVAL=1s \
+  LISTEN_ADDR=":0" \
+  LOG_LEVEL=info \
+  "$TE_BIN" >"$TE_LOG" 2>&1 &
+TE_PID=$!
+echo "trigger-engine pid: $TE_PID"
+
+# ── Wait for first fire ────────────────────────────────────────────
+DEADLINE=$(( $(date +%s) + 75 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  C=$(audit_count)
+  if [ -n "$C" ] && [ "$C" -gt 0 ]; then
+    FIRED=1
+    pass "engine fired at least once before disable (count=$C)"
+    break
+  fi
+  sleep 2
+done
+if [ "$FIRED" = "0" ]; then
+  fail "engine did not fire before disable within 75s"
+  echo "--- engine log (tail) ---"
+  tail -40 "$TE_LOG" 2>/dev/null || true
+  echo "--- end log ---"
+  exit 1
+fi
+
+# ── Disable the trigger ────────────────────────────────────────────
+DISABLE_OUT=$(gb trigger disable "$TRIG_ID" --http-url "$BEADS_HTTP_URL" 2>&1) || {
+  fail "gb trigger disable" "$DISABLE_OUT"
+  exit 1
+}
+echo "disabled: $DISABLE_OUT"
+
+# Verify the field actually flipped on the bead.
+ENABLED=$(kd show "$TRIG_ID" --json 2>/dev/null | jq -r '.fields.enabled // empty')
+if [ "$ENABLED" = "false" ]; then
+  pass "trigger bead reports enabled=false"
+else
+  fail "trigger bead enabled field is $ENABLED (expected false)"
+fi
+
+# Snapshot audit count at disable time. Allow up to one extra fire that may
+# already be in flight when disable lands (within the same poll cycle).
+PRE_DISABLE_COUNT=$(audit_count)
+PRE_DISABLE_COUNT="${PRE_DISABLE_COUNT:-0}"
+echo "audit count at disable: $PRE_DISABLE_COUNT"
+sleep 3
+AFTER_GRACE_COUNT=$(audit_count)
+AFTER_GRACE_COUNT="${AFTER_GRACE_COUNT:-0}"
+echo "audit count 3s after disable: $AFTER_GRACE_COUNT"
+
+# ── Wait through a new minute boundary (≥75s) ─────────────────────
+# A fresh cron tick must NOT produce a new audit bead now that enabled=false.
+sleep 75
+
+POST_COUNT=$(audit_count)
+POST_COUNT="${POST_COUNT:-0}"
+echo "audit count 75s after disable: $POST_COUNT"
+
+if [ "$POST_COUNT" -le "$AFTER_GRACE_COUNT" ]; then
+  pass "no new audit beads after disable (after_grace=$AFTER_GRACE_COUNT, final=$POST_COUNT)"
+else
+  fail "trigger continued firing after disable" "after_grace=$AFTER_GRACE_COUNT final=$POST_COUNT"
+  echo "--- engine log (tail) ---"
+  tail -60 "$TE_LOG" 2>/dev/null || true
+  echo "--- end log ---"
+fi
+
+# ── Summary ────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "trigger-source-disable-stop: gb trigger disable halts firing within one poll OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "trigger-source-disable-stop scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

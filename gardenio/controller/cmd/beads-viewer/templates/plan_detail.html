@@ -1,0 +1,833 @@
+{{template "layout" .}}
+{{define "title"}}{{.Title}} · Plan · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+{{with .GardenHref}}{{template "garden_banner" .}}{{end}}
+<style>
+  /* /plans/{id} — the one-page plan cockpit (epic ka-0000001409). The layout
+     (Matt ka-0000007957, "official and best") is a 2×2 grid of named areas:
+     the PLAN (narrative + clarifying questions) fills the LEFT column, the
+     BUILD STEPS timeline fills the RIGHT column, and the ASSISTANT pane spans
+     the full width along the BOTTOM. Named grid areas decouple this visual
+     placement from DOM source order — build steps stay first in the markup so
+     they precede the plan bundle (work-items-prominence, ka-0000004291) and
+     stack first on narrow screens. Everything scoped under .plan-detail;
+     reuses .chip / .banner / .bundle-doc from layout.html + bundle.html so it
+     shares the viewer's visual idiom. */
+  .plan-breadcrumb { margin-bottom: 0.5rem; font-size: 0.85rem; }
+  .plan-header { margin-bottom: 1rem; }
+  .plan-title { margin: 0.2rem 0; }
+  /* The plan's badge (gb badge --upload, badge_image.go) rides LEFT of the
+     title at 64 px beside the arms run (badges plan gd-pQZO9ie11D, step 9),
+     read off the already-fetched .Bead. A plan with no badge draws nothing. */
+  .plan-title-row { display: flex; align-items: flex-start; gap: 0.7rem; }
+  .plan-title-row .plan-title { flex: 1; min-width: 0; }
+  /* The plan GOAL (fields.goal) — the one-line seed the plan grew from, rendered
+     as a quiet subtitle under the title. Self-suppresses when unset. */
+  .plan-header-goal { margin: 0.15rem 0 0; font-size: 0.95rem; opacity: 0.8; overflow-wrap: anywhere; }
+  .plan-header-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: 0.4rem 0; }
+  /* "created N ago" origin stamp (ka-0000006040) — a muted sibling of the
+     trailing "updated N ago", carried on the header meta row. */
+  .plan-header-created { font-size: 0.8rem; opacity: 0.65; }
+  /* "updated N ago" freshness stamp (ka-0000002873) — pushed to the trailing
+     edge of the header meta row, matching the index card's meta stamp. */
+  .plan-header-updated { margin-left: auto; }
+  .plan-header-actions { margin: 0.5rem 0; }
+  .plan-mark-form { display: inline; }
+  .plan-unlabeled-note { margin-top: 0.5rem; }
+  /* PLAN left, STEPS right, ASSISTANT full-width bottom. The two top-row
+     tracks are BALANCED (equal fr) so neither column starves. The narrative
+     used to get the wider (1.5fr) track "because the prose + bundle docs
+     benefit from width", but that inverted the visual weight on build-heavy
+     plans: a short narrative left ~600px of dead space in the wide column
+     while the long step timeline was crammed into the narrow one and wrapped
+     more than it needed (ka-0000001855). Wide narrative content (code blocks,
+     tables, ASCII diagrams) now scrolls inside its own overflow-x box (see
+     .plan-narrative pre/table below, ka-0000000256), so the narrative no
+     longer needs the extra width — an even split reads as deliberately
+     designed and lands both columns near the ~680px sweet spot (prose's ideal
+     reading measure, and enough to un-wrap the step meta rows). This
+     supersedes the earlier "narrative wider" sizing (Matt ka-0000007957); the
+     plan-left / steps-right placement from that decision is preserved.
+     minmax(0, …) is load-bearing: a bare 1fr floors at min-content and
+     reintroduces the horizontal-overflow bug class (cf. .charts-grid,
+     ka-0000004897). */
+  .plan-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+               grid-template-areas: "plan steps" "assistant assistant";
+               gap: 1.5rem; align-items: start; }
+  .plan-col-plan { grid-area: plan; min-width: 0; }
+  .plan-col-steps { grid-area: steps; min-width: 0; }
+  .plan-col-assistant { grid-area: assistant; min-width: 0; }
+  /* Single column when narrow: build steps on top (work-items-prominence),
+     then the plan, then the assistant — a straight reading stack. */
+  @media (max-width: 60rem) {
+    .plan-grid { grid-template-columns: 1fr;
+                 grid-template-areas: "steps" "plan" "assistant"; }
+  }
+  .plan-col-plan > section, .plan-col-plan > details,
+  .plan-col-steps > section, .plan-col-steps > details { margin-bottom: 1.4rem; }
+  .chip-attention { background: #fff3cd; border: 1px solid #e6c96a; color: #5a4200; }
+  .plan-chip-progress { background: rgba(76,175,80,0.14); border: 1px solid rgba(76,175,80,0.5); }
+  /* Stalled-plan warning badge (ka-0000005581) — same treatment as /plans. */
+  .plan-stall-badge { display: inline-flex; align-items: center; gap: 0.3rem;
+                      font-size: 0.72rem; font-weight: 600; padding: 0.05rem 0.45rem;
+                      border-radius: 999px; background: rgba(179,38,30,0.1);
+                      border: 1px solid rgba(179,38,30,0.55); color: #7c1d17; }
+  /* Stall reason on the badge face (ka-0000001697) — same treatment as /plans. */
+  .plan-stall-badge-reason { opacity: 0.8; font-weight: 500; font-variant-numeric: tabular-nums; }
+  /* Dead-agent orphan wait-age (ka-0000005352 iter 11) — same treatment as /plans:
+     the "· 3d" frozen-duration suffix, loud (solid-red) past the 1-day bar. */
+  .plan-stall-badge-age { opacity: 0.8; font-variant-numeric: tabular-nums; }
+  .plan-stall-badge-stale { background: rgba(179,38,30,0.92); border-color: #7c1d17; color: #fff; }
+  .plan-stall-badge-stale .plan-stall-badge-reason,
+  .plan-stall-badge-stale .plan-stall-badge-age { opacity: 0.95; }
+  /* Blocked-by-escalation banner (epic ka-0000005480, WS4): the full-width
+     hard-stop banner between the header and the grid — "WHAT it's blocked by,
+     prominently". Reuses .banner/.banner-error; each row names one escalation
+     with its operation type, sensitivity, age, and the approve/reject link.
+     Live-swapped via the SSE plan-escalations-updated frame so it clears the
+     instant the operator approves. */
+  .plan-escalations-banner { border-width: 2px; }
+  .plan-escalations-head { font-weight: 600; }
+  .plan-escalations-list { list-style: none; padding: 0; margin: 0.5rem 0 0; display: flex; flex-direction: column; gap: 0.4rem; }
+  .plan-escalations-row { display: flex; align-items: baseline; gap: 0.45rem; flex-wrap: wrap; }
+  .plan-escalations-title { font-weight: 500; color: inherit; overflow-wrap: anywhere; }
+  .plan-escalations-op { font-size: 0.72rem; background: rgba(179,38,30,0.12); border-color: rgba(179,38,30,0.45); }
+  .plan-escalations-sens { font-size: 0.72rem; background: rgba(90,66,0,0.1); border: 1px solid #e6c96a; color: #5a4200; text-transform: uppercase; }
+  .plan-escalations-age { font-size: 0.75rem; }
+  .plan-escalations-review { font-size: 0.75rem; font-weight: 600; text-decoration: none;
+                             border-color: rgba(179,38,30,0.55); }
+  @keyframes plan-escalations-flash { from { background: rgba(76,175,80,0.16); } to { background: transparent; } }
+  .plan-escalations.plan-escalations-updated { animation: plan-escalations-flash 1.1s ease-out; border-radius: 8px; }
+  .chip-status-open { border-color: rgba(33,150,243,0.55); }
+  .chip-status-in_progress { border-color: rgba(255,152,0,0.6); }
+  .chip-status-closed { border-color: rgba(76,175,80,0.55); opacity: 0.85; }
+  /* Step timeline (replaces the constellation; ask ka-0000001134) */
+  .plan-steps-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+  .plan-steps h3 { display: flex; align-items: baseline; gap: 0.5rem; margin: 0; }
+  .plan-steps h3 .meta { font-size: 0.8rem; opacity: 0.7; font-weight: normal; }
+  .plan-progress { display: flex; align-items: center; gap: 0.5rem; margin: 0; flex: 1; min-width: 10rem; max-width: 22rem; }
+  .plan-progress-bar { flex: 1; height: 7px; border-radius: 4px; overflow: hidden; background: rgba(0,0,0,0.08); }
+  .plan-progress-bar > span { display: block; height: 100%; background: #4caf50; border-radius: 4px; transition: width 0.3s ease; }
+  .plan-progress-label { font-size: 0.75rem; opacity: 0.75; white-space: nowrap; }
+  /* When a step flips live via SSE the whole #plan-steps swaps; a soft flash
+     draws the eye to the change (ka-0000001793). */
+  @keyframes plan-steps-flash { from { background: rgba(76,175,80,0.16); } to { background: transparent; } }
+  .plan-steps.plan-steps-updated { animation: plan-steps-flash 1.1s ease-out; border-radius: 8px; }
+  .plan-timeline { list-style: none; padding: 0; margin: 0.75rem 0 0; }
+  .plan-tl-step { position: relative; display: flex; gap: 0.75rem; padding: 0 0 1.1rem 0; }
+  /* the connecting rail: a vertical line behind the markers, hidden on the last step */
+  .plan-tl-step::before { content: ""; position: absolute; left: 0.85rem; top: 1.75rem; bottom: -0.15rem;
+                          width: 2px; background: var(--rule, #e2e5e9); }
+  .plan-tl-step:last-child::before { display: none; }
+  .plan-tl-marker { position: relative; z-index: 1; flex: 0 0 1.7rem; width: 1.7rem; height: 1.7rem;
+                    display: flex; align-items: center; justify-content: center; border-radius: 50%;
+                    border: 2px solid var(--rule, #cfd4da); background: var(--card-bg, #fff);
+                    font-size: 0.8rem; font-weight: 600; color: var(--fg, #555); }
+  .plan-tl-step.is-done > .plan-tl-marker { background: #4caf50; border-color: #4caf50; color: #fff; }
+  .plan-tl-step.is-active > .plan-tl-marker { border-color: #ff9800; color: #b06e00; box-shadow: 0 0 0 3px rgba(255,152,0,0.16); }
+  /* Deep-link focus highlight (ka-0000000150): plan_focus_step.js paints this
+     on the row a /plans index "now / next" chip deep-linked to, for ~10s, so
+     the operator lands on exactly the task they clicked. A soft accent glow +
+     tinted rail-gap that reads clearly over both the plain and the is-active
+     (in-progress) row treatment, then the class is removed and the row snaps
+     back to normal. The pulse draws the eye on arrival; it settles to a steady
+     ring so a slow reader still sees the emphasis at second 9. */
+  @keyframes plan-tl-focus-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(33,150,243,0.35); }
+    60% { box-shadow: 0 0 0 6px rgba(33,150,243,0); }
+    100% { box-shadow: 0 0 0 0 rgba(33,150,243,0); }
+  }
+  .plan-tl-step.plan-tl-step-focus { background: rgba(33,150,243,0.09); border-radius: 8px;
+    box-shadow: 0 0 0 2px rgba(33,150,243,0.45); animation: plan-tl-focus-pulse 1.1s ease-out 2;
+    transition: background 0.4s ease, box-shadow 0.4s ease; scroll-margin-top: 5rem; }
+  @media (prefers-reduced-motion: reduce) {
+    .plan-tl-step.plan-tl-step-focus { animation: none; }
+  }
+  .plan-tl-body { flex: 1; min-width: 0; padding-top: 0.1rem; }
+  .plan-tl-line { display: flex; align-items: baseline; gap: 0.5rem; }
+  .plan-tl-title { flex: 1; min-width: 0; overflow-wrap: anywhere; text-decoration: none; color: var(--fg, #1a1a1a); font-weight: 500; }
+  .plan-tl-title:hover { text-decoration: underline; }
+  /* A phone has no room for the title beside the step's buttons (it was
+     squeezed to one letter a line): there the title takes a row of its own
+     and the buttons wrap under it (Homestead 2.3). */
+  @media (max-width: 30rem) {
+    .plan-tl-line { flex-wrap: wrap; }
+    .plan-tl-title { flex: 1 0 100%; }
+  }
+  .plan-tl-step.is-done .plan-tl-title { text-decoration: line-through; opacity: 0.65; font-weight: 400; }
+  .plan-tl-actions { margin-left: auto; }
+  .plan-tl-meta { display: flex; align-items: center; gap: 0.35rem; margin-top: 0.3rem; flex-wrap: wrap; }
+  /* Full-row extras (S4 ka-0000001060): assignee link, MR pill, blocked-by
+     chips, lifecycle stamps. Chip idiom matches inbox_row / extern. */
+  .plan-tl-assignee { font-size: 0.78rem; }
+  .plan-tl-assignee .agent-link { text-decoration: none; }
+  .plan-tl-assignee .agent-link:hover { text-decoration: underline; }
+  .chip-mr { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px; font-size: 0.72rem;
+             border: 1px solid rgba(120,120,120,0.35); text-decoration: none; color: inherit; }
+  .chip-mr-merged { background: rgba(138,92,246,0.18); border-color: rgba(138,92,246,0.5); }
+  .chip-mr-opened { background: rgba(29,107,189,0.16); border-color: rgba(29,107,189,0.5); }
+  .chip-mr-closed { background: rgba(120,120,120,0.18); border-color: rgba(120,120,120,0.5); }
+  .plan-tl-blocked { font-size: 0.72rem; background: rgba(179,38,30,0.08); border-color: rgba(179,38,30,0.45);
+                     color: #7c1d17; text-decoration: none; opacity: 1; }
+  /* Escalation blocker chip (epic ka-0000005480, WS5): a step blocked by a
+     privileged-op escalation reads distinctly from an ordinary bead blocker —
+     stronger tint + bold, carrying the operation type instead of the bare id. */
+  .plan-tl-blocked-esc { background: rgba(179,38,30,0.2); border-color: rgba(179,38,30,0.8);
+                         font-weight: 700; }
+  /* white-space:normal (not nowrap) so the 'created … · closed …' stamps can
+     shrink and wrap on a narrow step column. With nowrap the span's min-content
+     was the whole ~351px string, which forced .plan-tl-body wider than the
+     ~300px column at 375px, spilling the row (and the Reopen/Done button) past
+     the viewport — the /plans cockpit's horizontal-overflow source A
+     (ka-0000000256). min-width:0 lets the flex item shrink below content. */
+  .plan-tl-stamps { margin-left: auto; min-width: 0; font-size: 0.72rem; opacity: 0.6; white-space: normal; }
+  .plan-step-add { display: flex; gap: 0.5rem; margin-top: 0.7rem; }
+  .plan-step-add-input { flex: 1; padding: 0.4rem 0.6rem; border: 1px solid var(--rule, #cfd4da); border-radius: 7px; }
+  .bead-action { cursor: pointer; padding: 0.3rem 0.7rem; border: 1px solid var(--rule, #cfd4da);
+                 border-radius: 7px; background: var(--card-bg, #fff); font-size: 0.82rem; }
+  .bead-action:hover { border-color: var(--accent, #b9851b); }
+  .bead-actions-error { color: #b3261e; font-size: 0.85rem; }
+  /* Dispatch — the "hand this step to the gardener" action reads as the primary
+     step verb (accent-tinted) so it stands out from Edit/Done. */
+  .plan-step-dispatch { border-color: var(--accent, #b9851b); color: var(--accent, #b9851b); font-weight: 600; }
+  .plan-step-dispatch:hover { background: var(--accent, #b9851b); color: #fff; }
+  /* Transient success notice above the timeline (e.g. the dispatch confirmation);
+     cleared by the next SSE re-render. Green to distinguish it from the red error. */
+  .plan-steps-notice { color: #256029; background: rgba(76,175,80,0.1);
+                       border: 1px solid rgba(76,175,80,0.4); border-radius: 7px;
+                       padding: 0.4rem 0.7rem; font-size: 0.85rem; margin: 0.4rem 0; }
+  /* Phase-mislabel hint (ka-0000002630): flat "Phase N" steps that should be
+     phase sub-epics. Amber advisory — a suggestion, not an error (red) or a
+     success (green). code chips echo the fix command inline. */
+  .plan-phase-hint { color: #7a5200; background: rgba(217,164,6,0.1);
+                     border: 1px solid rgba(217,164,6,0.45); border-radius: 7px;
+                     padding: 0.45rem 0.7rem; font-size: 0.85rem; margin: 0.4rem 0; line-height: 1.5; }
+  .plan-phase-hint code { background: rgba(0,0,0,0.06); border-radius: 4px;
+                          padding: 0.05rem 0.3rem; font-size: 0.92em; }
+  /* Crew roster (ka-0000000150): the agents the plan gardener dispatched onto
+     steps + how each is going, under the timeline. Card idiom matches the
+     plan-agent card; live crew lead with a pulsing green dot, stuck crew tint
+     red. Live-swapped as #plan-crew via the SSE plan-crew-updated frame. */
+  .plan-crew { margin-top: 1.4rem; }
+  .plan-crew-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+  .plan-crew h3 { display: flex; align-items: baseline; gap: 0.5rem; margin: 0; }
+  .plan-crew h3 .meta { font-size: 0.8rem; opacity: 0.7; font-weight: normal; }
+  .plan-crew-tally { display: inline-flex; gap: 0.35rem; flex-wrap: wrap; }
+  .plan-crew-count { font-size: 0.72rem; display: inline-flex; align-items: center; gap: 0.3rem; }
+  .plan-crew-count-working { background: rgba(76,175,80,0.14); border-color: rgba(76,175,80,0.5); color: #256029; }
+  /* "(K starting)" sub-qualifier inside the working chip (ka-0000005352): of the N
+     working crew, K are still booting their pod. Muted a touch within the green chip
+     — a booting crew is context, not an alarm; twin of the index card's
+     .plan-card-crew-starting. */
+  .plan-crew-count-starting { opacity: 0.8; font-variant-numeric: tabular-nums; }
+  /* Working RUNTIME suffix inside the working chip (ka-0000005352): "· 4h" for the
+     longest-running live crew. Muted a touch within the green chip — a long-running
+     working crew is context like spend, not an alarm; twin of the index card's
+     .plan-card-crew-working-age. */
+  .plan-crew-count-working-age { opacity: 0.85; font-variant-numeric: tabular-nums; }
+  .plan-crew-count-done { background: rgba(120,120,120,0.12); border-color: rgba(120,120,120,0.4); color: #555; }
+  /* Queued tally chip (ka-0000005352 iter-31): crew dispatched but not yet working
+     (waiting on a pod slot). Calm neutral — a queued crew is context, not an alarm;
+     shares the done chip's muted-gray wash so it reads as a quiet "not started yet"
+     beside the green working / red stuck chips. */
+  .plan-crew-count-idle { background: rgba(120,120,120,0.12); border-color: rgba(120,120,120,0.4); color: #555; }
+  /* Pool-starved queued chip (ka-0000005352 iter-32): a queued crew that has waited
+     past planCrewQueuedStaleThreshold tints the loud stall-red the failed chip uses,
+     so a genuinely starved pool pops out of the cockpit header — the same
+     calm-by-default, loud-when-egregious two-tier treatment the index facet gives. */
+  .plan-crew-count-idle-stale { background: rgba(179,38,30,0.1); border-color: rgba(179,38,30,0.55); color: #7c1d17; }
+  .plan-crew-count-failed { background: rgba(179,38,30,0.1); border-color: rgba(179,38,30,0.55); color: #7c1d17; }
+  /* Closed-failed history chip (ka-0000005352 iter-33): the "✕ K failed" count of
+     crew that failed and CLOSED — no reachable terminal, so nothing to act on now.
+     Reads the SAME calm/muted neutral as the done + spend chips (context, not an
+     alarm), the deliberate opposite of the loud red "⚠ K stuck" chip above: color
+     carries actionability. Mirrors the index card's .plan-card-crew-failed-closed
+     marker (iter-29) so the cockpit tally and the board chip read the same split. */
+  .plan-crew-count-failed-closed { background: rgba(120,120,120,0.12); border-color: rgba(120,120,120,0.4); color: #555; font-variant-numeric: tabular-nums; }
+  /* Crew SPEND chip (ka-0000004218, iter-12): the roster's cumulative crew dollars,
+     calm/neutral (spend is context, not an alarm), tabular-nums for alignment. */
+  .plan-crew-count-spend { background: rgba(120,120,120,0.12); border-color: rgba(120,120,120,0.4); color: #555; font-variant-numeric: tabular-nums; }
+  .plan-crew-dot { width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #4caf50;
+                   animation: plan-crew-pulse 1.6s infinite ease-in-out; }
+  @keyframes plan-crew-pulse { 0%,100% { opacity: 0.45; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .plan-crew-dot, .plan-crew-live-dot { animation: none; } }
+  .plan-crew-list { list-style: none; padding: 0; margin: 0.75rem 0 0; display: flex; flex-direction: column; gap: 0.5rem; }
+  .plan-crew-member { border: 1px solid var(--rule, #e2e5e9); border-radius: 8px; padding: 0.5rem 0.65rem; background: var(--card-bg, #fff); }
+  .plan-crew-member.is-live { border-color: rgba(76,175,80,0.5); }
+  .plan-crew-member.is-failed { border-color: rgba(179,38,30,0.5); background: rgba(179,38,30,0.03); }
+  .plan-crew-line { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+  .plan-crew-live-dot { flex: 0 0 auto; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: #4caf50;
+                        box-shadow: 0 0 0 0 rgba(76,175,80,0.5); animation: plan-crew-live-pulse 1.8s infinite ease-in-out; }
+  @keyframes plan-crew-live-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(76,175,80,0.5); }
+    70% { box-shadow: 0 0 0 5px rgba(76,175,80,0); }
+    100% { box-shadow: 0 0 0 0 rgba(76,175,80,0); }
+  }
+  .plan-crew-name { font-weight: 500; text-decoration: none; color: var(--fg, #1a1a1a); overflow-wrap: anywhere; }
+  .plan-crew-name:hover { text-decoration: underline; }
+  .plan-crew-role { font-size: 0.68rem; background: rgba(120,120,120,0.1); border-color: rgba(120,120,120,0.35); opacity: 0.85; }
+  .plan-crew-state { font-size: 0.68rem; text-transform: lowercase; }
+  .plan-crew-state-alive { background: rgba(76,175,80,0.14); border-color: rgba(76,175,80,0.5); color: #256029; }
+  .plan-crew-state-idle { background: rgba(120,120,120,0.1); border-color: rgba(120,120,120,0.35); color: #555; }
+  .plan-crew-state-stuck, .plan-crew-state-failed { background: rgba(179,38,30,0.12); border-color: rgba(179,38,30,0.55); color: #7c1d17; }
+  .plan-crew-ago { margin-left: auto; font-size: 0.72rem; opacity: 0.6; white-space: nowrap; }
+  .plan-crew-step { margin-top: 0.3rem; }
+  .plan-crew-step-link { display: inline-flex; align-items: baseline; gap: 0.35rem; font-size: 0.78rem;
+                         text-decoration: none; color: inherit; opacity: 0.85; border-radius: 5px;
+                         padding: 0.05rem 0.2rem; margin: -0.05rem -0.2rem; }
+  .plan-crew-step-link:hover { background: rgba(33,150,243,0.1); opacity: 1; }
+  .plan-crew-step-link:hover .plan-crew-step-title { text-decoration: underline; }
+  .plan-crew-step-num { opacity: 0.55; font-weight: 600; }
+  .plan-crew-step-title { overflow-wrap: anywhere; }
+  .plan-crew-outcome { margin: 0.35rem 0 0; font-size: 0.78rem; opacity: 0.8; overflow-wrap: anywhere; }
+  .plan-crew-outcome.is-failed { color: #7c1d17; opacity: 0.95; }
+  .plan-crew-more { margin: 0.5rem 0 0; font-size: 0.75rem; }
+  .plan-crew-empty { margin: 0.6rem 0 0; font-size: 0.82rem; }
+  @keyframes plan-crew-flash { from { background: rgba(76,175,80,0.16); } to { background: transparent; } }
+  .plan-crew.plan-crew-updated { animation: plan-crew-flash 1.1s ease-out; border-radius: 8px; }
+  /* Narrative (summary + bundle docs; live-swapped via SSE, S3 ka-0000002473) */
+  .plan-prose-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
+  .plan-narrative > section { margin-bottom: 1.4rem; }
+  .plan-narrative-attribution { font-size: 0.72rem; background: rgba(76,175,80,0.1); border: 1px solid rgba(76,175,80,0.4); color: #256029; }
+  .plan-narrative-attribution .agent-link { text-decoration: none; }
+  @keyframes plan-narrative-flash { from { background: rgba(76,175,80,0.16); } to { background: transparent; } }
+  .plan-narrative.plan-narrative-updated { animation: plan-narrative-flash 1.1s ease-out; border-radius: 8px; }
+  /* Clamp wide preformatted / tabular narrative content so it scrolls inside
+     its own container rather than widening the page body. The narrative renders
+     epic-description / bundle-doc markdown (GFM: code blocks -> <pre>, tables ->
+     <table>) plus the raw <pre>{{.Description}}</pre> fallback; without these
+     guards a wide ASCII diagram (~704px) or table (~432px) forces horizontal
+     page overflow at 375px — the /plans cockpit's overflow source B
+     (ka-0000000256). Matches the viewer's standard 'wide content scrolls in its
+     own overflow-x:auto box' idiom (.bead-show-layout pre/table, .agents-table). */
+  .plan-narrative pre, .plan-narrative .bundle-doc-content { overflow-x: auto; max-width: 100%; }
+  .plan-narrative table { display: block; overflow-x: auto; max-width: 100%; }
+  /* Overflow source C (ka-0000002291): a long unbroken INLINE <code> token in a
+     prose paragraph (a bead id / file path / snake_case symbol like
+     `OperatedByEmail`) computes overflow-wrap:normal, so it has no break
+     opportunity and paints past its column — re-widening the page at 375px even
+     after the pre/table guards above. Force a break in prose blocks ONLY. Scoped
+     to text containers (not `table`) so the GFM table keeps its own
+     display:block + overflow-x:auto scroll box (the containment the responsive
+     test asserts). Mirrors the .bead-show-layout p/li/code idiom in layout.html. */
+  .plan-narrative :is(p, li, h1, h2, h3, h4, h5, h6, blockquote, dd, dt),
+  .plan-narrative :is(p, li, h1, h2, h3, h4, h5, h6, blockquote, dd, dt) code {
+    overflow-wrap: anywhere; word-break: break-word;
+  }
+  .plan-narrative img, .plan-narrative svg { max-width: 100%; height: auto; }
+  .plan-bundle-docs { display: flex; flex-direction: column; gap: 0.8rem; }
+  /* The ONE plan-agent card (step 6, ka-0000000116): gardener loop levers +
+     the plan-agent conversation in a single surface. Replaces the two former
+     cards (.plan-gardener bar + .plan-assistant lane), which each defined their
+     own near-identical card box. The inner .plan-assistant-* (conversation) and
+     .plan-gardener-* (levers) CSS rules below keep their historical names — they
+     style sections INSIDE this one card, not cards of their own. */
+  .plan-agent { margin-bottom: 1.4rem; border: 1px solid var(--rule, #e2e5e9); border-radius: 8px; padding: 0.75rem; background: var(--card-bg, #fff); }
+  .plan-agent-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; }
+  .plan-agent h3 { display: flex; align-items: baseline; gap: 0.5rem; margin: 0; }
+  .plan-agent-links { display: inline-flex; gap: 0.4rem; }
+  .plan-agent-open { font-size: 0.78rem; padding: 0.2rem 0.55rem; }
+  @keyframes plan-agent-flash { from { background: rgba(76,175,80,0.16); } to { background: transparent; } }
+  .plan-agent.plan-agent-updated { animation: plan-agent-flash 1.1s ease-out; border-radius: 8px; }
+  /* Honest post-send delivery ack (R1): distinct from the liveness chip so the
+     operator learns what happened to their message (sent/queued-waking/spawning). */
+  .plan-assistant-delivery { margin: 0.5rem 0 0; font-size: 0.76rem; padding: 0.3rem 0.55rem; border-radius: 6px; border: 1px solid var(--rule, #cfd4da); }
+  .plan-assistant-delivery-sent { background: rgba(76,175,80,0.12); border-color: rgba(76,175,80,0.45); color: #256029; }
+  .plan-assistant-delivery-queued-waking { background: rgba(255,152,0,0.12); border-color: rgba(255,152,0,0.5); color: #7a4a00; }
+  .plan-assistant-delivery-spawning { background: rgba(33,150,243,0.1); border-color: rgba(33,150,243,0.4); color: #1e4a72; }
+  /* "plan agent is typing…" indicator (task 2c, ka-0000000311): a live three-dot
+     bubble at the foot of the transcript while the bound plan agent is
+     spawning/working, replacing the dead static "waking" chip (§10-R1). */
+  .plan-assistant-typing { display: flex; align-items: center; gap: 0.5rem; margin: 0.4rem 0 0;
+    padding: 0.4rem 0.6rem; border-radius: 6px; background: rgba(128,128,128,0.06);
+    border: 1px solid rgba(128,128,128,0.14); font-size: 0.82rem; opacity: 0.9; }
+  .plan-assistant-typing-dots { display: inline-flex; gap: 0.2rem; }
+  .plan-assistant-typing-dots span { width: 0.4rem; height: 0.4rem; border-radius: 50%;
+    background: currentColor; opacity: 0.4; animation: plan-assistant-typing-pulse 1.2s infinite ease-in-out; }
+  .plan-assistant-typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .plan-assistant-typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes plan-assistant-typing-pulse {
+    0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+    30% { opacity: 1; transform: translateY(-2px); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .plan-assistant-typing-dots span { animation: none; opacity: 0.7; }
+  }
+  /* Client-populated (hx-on::response-error) so a failed send is visible while
+     the operator's typed message stays untouched in the textarea. */
+  .plan-assistant-error { margin: 0.5rem 0 0; }
+  .plan-assistant-error[hidden] { display: none; }
+  .plan-assistant-form { margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.4rem; }
+  .plan-assistant-input { width: 100%; box-sizing: border-box; padding: 0.5rem 0.6rem; border: 1px solid var(--rule, #cfd4da); border-radius: 7px; font-family: inherit; resize: vertical; min-height: 3rem; }
+  .plan-assistant-form-row { display: flex; align-items: center; gap: 0.5rem; justify-content: space-between; }
+  .plan-assistant-hint { flex: 1; font-size: 0.72rem; opacity: 0.7; }
+  /* Enter-to-send keybinding hint (task ka-0000002000): a quiet affordance so
+     the Slack-like gesture (bare Enter sends, Shift+Enter newline) is
+     discoverable next to the Send button. */
+  .plan-assistant-kbd { font-size: 0.68rem; opacity: 0.55; white-space: nowrap; }
+  .plan-assistant-kbd kbd { font-family: inherit; font-size: 0.92em; padding: 0.02rem 0.28rem;
+    border: 1px solid var(--rule, #cfd4da); border-radius: 4px; background: rgba(120,120,120,0.08); }
+  @media (max-width: 30rem) { .plan-assistant-kbd { display: none; } }
+  .plan-assistant-activity { margin-top: 0.75rem; padding-top: 0.5rem; border-top: 1px dashed var(--rule, #e2e5e9); }
+  /* Demoted to a collapsed <details> (task 2b, ka-0000004607): the transcript is
+     the primary surface now, the lifecycle feed a secondary glance. */
+  .plan-assistant-activity-summary { font-size: 0.82rem; font-weight: 600; opacity: 0.85; cursor: pointer; list-style-position: inside; }
+  .plan-assistant-activity[open] .plan-assistant-activity-summary { margin-bottom: 0.3rem; }
+  .plan-assistant-events { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.35rem; }
+  .plan-assistant-event { display: flex; align-items: baseline; gap: 0.4rem; font-size: 0.78rem; flex-wrap: wrap; }
+  .plan-assistant-event-kind { font-size: 0.68rem; padding: 0 0.4rem; border-radius: 4px; background: rgba(120,120,120,0.14); color: #555; text-transform: uppercase; }
+  .plan-assistant-event-closed .plan-assistant-event-kind { background: rgba(76,175,80,0.14); color: #256029; }
+  .plan-assistant-event-created .plan-assistant-event-kind { background: rgba(33,150,243,0.14); color: #1e4a72; }
+  .plan-assistant-event-type { font-size: 0.68rem; opacity: 0.7; }
+  /* The bead-id <code> link and the event title both carry unbroken tokens —
+     a bead id and, especially, long agent handles like
+     'gardenio-crit-critique-build-gardener-line…'. flex:1 + min-width:0 shrinks
+     the box but a no-break-opportunity word still PAINTS past it (overflow
+     visible), leaking ~7px to the page at 375px — a third /plans cockpit
+     overflow source beyond Causes A/B (ka-0000000256), surfaced by the SSE
+     activity feed. overflow-wrap:anywhere forces the break so the feed stays
+     inside its lane. */
+  .plan-assistant-event-link { text-decoration: none; overflow-wrap: anywhere; }
+  .plan-assistant-event-title { flex: 1; min-width: 0; opacity: 0.85; overflow-wrap: anywhere; }
+  /* The unified plan-agent chip's .plan-agent-chip-* rules live in layout.html
+     (step 7, ka-0000003685) — shared with the /plans index cards. */
+  /* Gardener loop levers (pause/resume/wake) inside the plan-agent card. */
+  .plan-gardener-controls { margin-top: 0.55rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .plan-gardener-ctl { font-size: 0.82rem; }
+  .plan-gardener-toggle-paused { border-color: rgba(76,175,80,0.55); }
+  .plan-gardener-toggle-running { border-color: rgba(255,152,0,0.55); }
+  .plan-gardener-inflight { font-size: 0.72rem; opacity: 0.7; }
+  .plan-gardener-note, .plan-gardener-none { margin: 0.5rem 0 0; font-size: 0.78rem; }
+  .plan-gardener-none code { overflow-wrap: anywhere; }
+  /* Parked gardener (gd-f2fc4jcRn3): the live blocker its frontier waits on. */
+  .plan-gardener-parked { margin: 0.5rem 0 0; padding: 0.35rem 0.55rem; font-size: 0.78rem; border: 1px solid var(--warn-rule); border-radius: 6px; background: var(--warn-bg); color: var(--warn-fg); overflow-wrap: anywhere; }
+  .plan-gardener-parked a { color: inherit; }
+  /* Cadence editor (task ka-0000008237): a compact <details> disclosure beneath
+     the pause/wake controls. Set/tune the firing cadence (cron in timed mode, the
+     fallback watchdog in event mode — blank = purely event-driven) without leaving
+     /plans. Full-width so it stacks below the control row rather than crowding it. */
+  .plan-gardener-cadence { flex-basis: 100%; margin-top: 0.35rem; font-size: 0.78rem; }
+  .plan-gardener-cadence-summary { cursor: pointer; list-style: none; color: var(--muted, #667); user-select: none; }
+  .plan-gardener-cadence-summary::-webkit-details-marker { display: none; }
+  .plan-gardener-cadence-summary code { overflow-wrap: anywhere; }
+  .plan-gardener-cadence-form { margin-top: 0.4rem; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+  .plan-gardener-cadence-label { font-size: 0.74rem; opacity: 0.8; }
+  .plan-gardener-cadence-input { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem; padding: 0.2rem 0.4rem; min-width: 14rem; flex: 1 1 14rem; border: 1px solid var(--rule, #cfd4da); border-radius: 0.3rem; }
+  .plan-gardener-cadence-hint { flex-basis: 100%; margin: 0.1rem 0 0; font-size: 0.72rem; opacity: 0.7; }
+  /* One-click "Enable gardener" button on an unbound plan (thread ka-0000004696):
+     the note takes the full row so the button sits beneath it, and the button
+     reads as the inviting green "enable" action. */
+  .plan-gardener-controls .plan-gardener-none { flex-basis: 100%; margin: 0; }
+  .plan-gardener-enable { border-color: rgba(76,175,80,0.6); font-weight: 600; }
+  /* Approve→build lifecycle (task ka-0000005350, D5, R6): the draft/ready/
+     building chip + the approve/edit levers, carried on the plan-agent card. */
+  .plan-lifecycle-chip { font-size: 0.72rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--rule, #cfd4da); text-transform: uppercase; letter-spacing: 0.04em; }
+  .plan-lifecycle-chip-draft { background: rgba(120,120,120,0.12); border-color: rgba(120,120,120,0.4); color: #555; }
+  .plan-lifecycle-chip-ready { background: rgba(33,150,243,0.12); border-color: rgba(33,150,243,0.5); color: #1e4a72; }
+  .plan-lifecycle-chip-building { background: rgba(76,175,80,0.16); border-color: rgba(76,175,80,0.55); color: #256029; }
+  /* complete — the terminal state (task ka-0000000616): a muted, "done" grey. */
+  .plan-lifecycle-chip-complete { background: rgba(96,125,139,0.16); border-color: rgba(96,125,139,0.5); color: #37474f; }
+  /* abandoned — the DISTINCT terminal state (task ka-0000001377): a muted amber,
+     visibly different from complete's grey so a "given up on" plan never reads as
+     "done". */
+  .plan-lifecycle-chip-abandoned { background: rgba(158,110,60,0.14); border-color: rgba(158,110,60,0.5); color: #7a4a1e; }
+  .plan-lifecycle { margin-top: 0.55rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .plan-lifecycle-note { margin: 0; flex-basis: 100%; font-size: 0.78rem; opacity: 0.85; }
+  .plan-lifecycle-ctl { font-size: 0.82rem; }
+  .plan-lifecycle-approve { border-color: rgba(76,175,80,0.6); font-weight: 600; }
+  .plan-lifecycle-ready { border-color: rgba(33,150,243,0.55); }
+  /* Terminal completion levers (task ka-0000000616): "Mark complete" reads as a
+     deliberate finish; "Reopen" is a quieter inverse. "Abandon" (task
+     ka-0000001377) is the muted-amber cheap exit — visibly not a proud finish. */
+  .plan-lifecycle-complete { border-color: rgba(96,125,139,0.6); font-weight: 600; }
+  .plan-lifecycle-abandon { border-color: rgba(158,110,60,0.6); }
+  .plan-lifecycle-reopen { border-color: rgba(33,150,243,0.45); opacity: 0.9; }
+  /* Decisions rail — answerable IN PLACE (task ka-0000003157). */
+  .plan-decisions h3 { display: flex; align-items: center; gap: 0.5rem; }
+  .plan-decision-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.6rem; }
+  .plan-decision { border: 1px solid var(--rule, #e2e5e9); border-radius: 7px; padding: 0.55rem 0.65rem; }
+  .plan-decision-resolved { opacity: 0.62; }
+  .plan-decision-title { display: block; text-decoration: none; color: var(--fg, #1a1a1a); font-size: 0.9rem; }
+  .plan-decision-title:hover { text-decoration: underline; }
+  .plan-decision-q { font-size: 0.9rem; color: var(--fg, #1a1a1a); }
+  .plan-decision-q > :first-child { margin-top: 0; }
+  .plan-decision-q > :last-child { margin-bottom: 0; }
+  .plan-decision-meta { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.35rem; flex-wrap: wrap; }
+  .plan-decision-meta .meta { font-size: 0.72rem; opacity: 0.65; }
+  .plan-decision-open { text-decoration: none; }
+  .plan-decision-open:hover { text-decoration: underline; }
+  .plan-decision-outcome { margin-top: 0.4rem; padding: 0.35rem 0.5rem; border-radius: 6px; background: rgba(76,175,80,0.1);
+                           border: 1px solid rgba(76,175,80,0.35); font-size: 0.82rem; }
+  .plan-decision-response { margin-top: 0.25rem; white-space: pre-wrap; opacity: 0.85; }
+  /* Options: read-only list, or one-click answer forms when the viewer can resolve. */
+  .plan-decision-options { list-style: none; padding: 0; margin: 0.5rem 0 0; display: flex; flex-direction: column; gap: 0.35rem; }
+  .plan-decision-opt { display: flex; align-items: baseline; gap: 0.4rem; flex-wrap: wrap; font-size: 0.82rem; }
+  .plan-decision-opt-form { margin: 0; }
+  .plan-decision-opt-id { font-size: 0.74rem; opacity: 0.85; }
+  .plan-decision-opt-short { font-weight: 600; }
+  .plan-decision-opt-label { opacity: 0.8; }
+  .plan-decision-opt-chosen .plan-decision-opt-short { color: #2e7d32; }
+  .plan-decision-opt-badge { font-size: 0.68rem; padding: 0.05rem 0.35rem; border-radius: 999px;
+                             background: rgba(76,175,80,0.18); border: 1px solid rgba(76,175,80,0.5); color: #2e7d32; }
+  .plan-decision-chip { display: inline-flex; align-items: baseline; gap: 0.4rem; text-align: left; cursor: pointer; }
+  .plan-decision-chip:hover { background: rgba(33,150,243,0.12); }
+  .plan-decision-more { margin-top: 0.5rem; font-size: 0.82rem; }
+  .plan-decision-more summary { cursor: pointer; opacity: 0.75; }
+  .plan-decision-more form { margin: 0.45rem 0 0; display: flex; flex-direction: column; gap: 0.3rem; }
+  .plan-decision-more label { font-size: 0.75rem; opacity: 0.75; }
+  .plan-decision-more textarea { width: 100%; box-sizing: border-box; font: inherit; font-size: 0.82rem;
+                                 padding: 0.35rem 0.45rem; border-radius: 5px; border: 1px solid var(--rule, #cfd4da);
+                                 background: Canvas; color: inherit; resize: vertical; }
+  .plan-decision-more .bead-action { align-self: flex-start; }
+  .plan-decision-dismiss-btn { background: rgba(198,40,40,0.1); border-color: rgba(198,40,40,0.4); }
+  .plan-decision-dismiss-btn:hover { background: rgba(198,40,40,0.2); }
+  @keyframes plan-decisions-flash { from { background: rgba(33,150,243,0.14); } to { background: transparent; } }
+  .plan-decisions.plan-decisions-updated { animation: plan-decisions-flash 1.1s ease-out; border-radius: 8px; }
+  /* Phase groups (ka-0000005926): ordered phase sub-epics, each a header + its
+     own step timeline + per-phase progress. Reorder arrows are operator-only. */
+  .plan-phase { margin: 0.5rem 0 1.1rem; border: 1px solid var(--rule, #e2e5e9); border-radius: 8px; padding: 0.55rem 0.7rem; background: var(--card-bg, #fff); }
+  .plan-phase.is-done { opacity: 0.82; }
+  .plan-phase-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .plan-phase-num { flex: 0 0 1.4rem; width: 1.4rem; height: 1.4rem; display: inline-flex; align-items: center; justify-content: center;
+                    border-radius: 999px; border: 1px solid var(--rule, #cfd4da); font-size: 0.75rem; font-weight: 600; }
+  .plan-phase.is-done .plan-phase-num { background: #4caf50; border-color: #4caf50; color: #fff; }
+  .plan-phase-title { font-weight: 600; text-decoration: none; color: var(--fg, #1a1a1a); }
+  .plan-phase-title:hover { text-decoration: underline; }
+  .plan-phase-progress { margin-left: 0.25rem; }
+  /* Poured-phase provenance chip (ka-0000002220): links a molecule phase back to
+     the formula it was poured from + signals its applied-var count. Inline on the
+     header row (no new card row — the info-density gate). Amethyst accent to read
+     as "recipe/pour", distinct from the blue § section chip. Opacity 1 so it does
+     not dim to the .chip default; hover deepens the fill. The ⚗ glyph shrinks to
+     fit and never wraps mid-chip. */
+  .plan-phase-provenance { font-size: 0.72rem; opacity: 1; background: rgba(142,36,170,0.08);
+                           border-color: rgba(142,36,170,0.45); color: #7b1fa2; text-decoration: none;
+                           white-space: nowrap; max-width: 22rem; overflow: hidden; text-overflow: ellipsis; }
+  .plan-phase-provenance:hover, .plan-phase-provenance:focus { opacity: 1; background: rgba(142,36,170,0.16); }
+  .plan-phase-reorder { margin-left: auto; display: inline-flex; gap: 0.2rem; }
+  .plan-phase-reorder .bead-action { padding: 0.1rem 0.45rem; font-size: 0.8rem; line-height: 1; }
+  .plan-phase-reorder .bead-action:disabled { opacity: 0.35; cursor: default; }
+  .plan-phase-steps { margin-top: 0.6rem; }
+  .plan-phase-empty { margin: 0.5rem 0 0.2rem; }
+  .plan-unphased-head { margin: 0.5rem 0 0; font-size: 0.85rem; font-weight: 600; opacity: 0.8; }
+  /* Step → bundle-section cross-ref chip (ask 2, ka-0000005926). */
+  .plan-tl-section { font-size: 0.72rem; background: rgba(33,150,243,0.08); border-color: rgba(33,150,243,0.4);
+                     color: #1e4a72; text-decoration: none; }
+  /* In-cockpit direct editing (3e, ka-0000007445). Step reorder ▲▼ mirrors the
+     phase reorder controls; they sit in the marker gutter so they don't crowd
+     the title row. */
+  .plan-tl-reorder { flex: 0 0 auto; display: inline-flex; flex-direction: column; gap: 0.1rem; margin-right: -0.4rem; }
+  .plan-tl-reorder .bead-action { padding: 0 0.3rem; font-size: 0.7rem; line-height: 1.2; }
+  .plan-tl-reorder .bead-action:disabled { opacity: 0.3; cursor: default; }
+  /* Inline reword / summary / doc / phase editors — a native <details>
+     disclosure. The summary is styled as a bead-action pill; the revealed form
+     stacks its input/textarea + Save. Write-through: the whole fragment
+     re-renders on save, collapsing the disclosure. */
+  .plan-step-reword, .plan-prose-edit, .plan-doc-edit, .plan-newphase { display: inline-block; }
+  .plan-prose-edit, .plan-doc-edit, .plan-newphase { display: block; margin-top: 0.6rem; }
+  .plan-step-reword summary, .plan-prose-edit summary, .plan-doc-edit summary, .plan-newphase summary {
+    display: inline-block; list-style: none; }
+  .plan-step-reword summary::-webkit-details-marker,
+  .plan-prose-edit summary::-webkit-details-marker,
+  .plan-doc-edit summary::-webkit-details-marker,
+  .plan-newphase summary::-webkit-details-marker { display: none; }
+  .plan-step-reword-form { display: flex; gap: 0.4rem; margin-top: 0.4rem; align-items: center; }
+  .plan-step-reword-input { flex: 1; min-width: 0; padding: 0.3rem 0.5rem; border: 1px solid var(--rule, #cfd4da); border-radius: 6px; }
+  .plan-prose-edit-form, .plan-doc-edit-form, .plan-newphase-form { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.4rem; }
+  .plan-prose-edit-input, .plan-doc-edit-input { width: 100%; box-sizing: border-box; padding: 0.4rem 0.6rem;
+    border: 1px solid var(--rule, #cfd4da); border-radius: 7px; font-family: inherit; resize: vertical; }
+  .plan-prose-edit-form button, .plan-doc-edit-form button, .plan-newphase-form button { align-self: flex-start; }
+  .plan-newphase-form { flex-direction: row; align-items: center; }
+  .plan-newphase-input { flex: 1; min-width: 0; padding: 0.4rem 0.6rem; border: 1px solid var(--rule, #cfd4da); border-radius: 7px; }
+
+  /* "⚗ Pour a formula" disclosure (epic ka-0000000759, Phase 3). Mirrors the
+     .plan-newphase idiom; the ⚗ affordance carries the same purple pour accent
+     as the poured-phase provenance chip so pour reads as one motif. */
+  .plan-pour { display: block; margin-top: 0.6rem; }
+  .plan-pour summary { display: inline-block; list-style: none; color: #7c3aed; }
+  .plan-pour summary::-webkit-details-marker { display: none; }
+  /* Violet at 3:1 on a dark card; lifted for both dark skins (Homestead 2.3). */
+  html[data-skin^="dark"] .plan-pour summary { color: #b9a3e8; }
+  html[data-skin^="dark"] .plan-pour-warning { color: #f5d578; }
+  html[data-skin^="dark"] .plan-escalations-sens { color: #f5d578; border-color: #7c6020; }
+  html[data-skin^="dark"] .plan-narrative-attribution { color: #6ee7b7; }
+  html[data-skin^="dark"] .plan-phase-provenance { color: #d7a6f0; }
+  .plan-pour-panel { margin-top: 0.5rem; }
+  .plan-pour-picker { display: flex; flex-direction: column; gap: 0.3rem; }
+  .plan-pour-picker label { font-size: 0.85rem; font-weight: 600; }
+  .plan-pour-picker label .meta { font-weight: normal; opacity: 0.7; }
+  .plan-pour-picker select, .plan-pour-var select, .plan-pour-var input[type="text"] {
+    padding: 0.35rem 0.5rem; border: 1px solid var(--rule, #cfd4da); border-radius: 6px; font: inherit; max-width: 30rem; }
+  .plan-pour-body { margin-top: 0.6rem; }
+  .plan-pour-empty { font-size: 0.85rem; opacity: 0.75; margin: 0.4rem 0; }
+  .plan-pour-form { display: flex; flex-direction: column; gap: 0.55rem; margin-top: 0.5rem; }
+  .plan-pour-var { display: flex; flex-direction: column; gap: 0.2rem; }
+  .plan-pour-var label { font-size: 0.85rem; font-weight: 600; }
+  .plan-pour-var .pv-desc { font-size: 0.78rem; opacity: 0.75; }
+  .plan-pour-var .pv-req { color: #b3261e; }
+  .plan-pour-toggles { display: flex; flex-wrap: wrap; gap: 1rem; font-size: 0.85rem; }
+  .plan-pour-toggles label { display: inline-flex; align-items: center; gap: 0.35rem; font-weight: normal; }
+  .plan-pour-actions { display: flex; gap: 0.5rem; }
+  .plan-pour-pour-btn { border-color: #7c3aed; }
+  .plan-pour-warning { color: #92610a; background: rgba(245,166,35,0.12); border: 1px solid rgba(245,166,35,0.4);
+    border-radius: 6px; padding: 0.35rem 0.6rem; font-size: 0.82rem; margin: 0.3rem 0; }
+  .plan-pour-preview { border: 1px solid rgba(124,58,237,0.4); background: rgba(124,58,237,0.06);
+    border-radius: 7px; padding: 0.6rem 0.85rem; margin: 0.4rem 0 0.6rem; }
+  .plan-pour-preview h4 { margin: 0 0 0.4rem; font-size: 0.9rem; }
+  .plan-pour-steplist { margin: 0; padding-left: 1.2rem; }
+  .plan-pour-steplist li { margin: 0.12rem 0; font-size: 0.85rem; }
+  .plan-pour-steplist .pp-type { opacity: 0.6; font-size: 0.82em; }
+  .plan-pour-steplist .pp-deps { opacity: 0.6; font-size: 0.82em; }
+
+  /* ── Dark-skin theming for the /plans/{id} cockpit (ka-0000005740,
+       iteration-18 of plan ka-0000005352). ─────────────────────────────────
+     THE ROOT BUG — the same shape iteration-16 (ka-0000007937) fixed on the
+     /plans INDEX, one surface over: every cockpit card is
+     `background: var(--card-bg, #fff)`, but NO skin defines --card-bg (the
+     dark skin defines --bg/--bg-alt/--text, never --card-bg or --fg). So on
+     the dark skin (--bg #0b0f14, near-black page) the crew roster's
+     .plan-crew-member cards and the full-width .plan-agent CHAT-THREAD lane —
+     plus the phase cards, timeline markers, and action buttons — rendered as
+     glaring pure-#fff rectangles (~2400px of near-white band; the dark PACES
+     pass MR !6604 measured desktop near_white_ratio 0.207, tripping
+     dark_white_island_flag). The /plans index was themed in iteration-16; this
+     cockpit never was — the harness only rendered the LIGHT skin until !6604.
+
+     THE FIX (color-only — no box/size/layout change, so the 375px no-overflow
+     gate is untouched):
+       (1) give the cockpit its OWN dark surface by defining --card-bg (#14181d,
+           the same --bg-alt-family tone the index's .plan-card and the dark
+           .plans-search input use). Scoped to .plan-detail so it themes every
+           var(--card-bg,#fff) card on this page — crew rows, the plan-agent
+           lane, phase cards, timeline markers, .bead-action buttons — in ONE
+           place, and lift the two var(--fg,…) card headings (crew name /
+           decision / phase titles are anchors already coloured by the dark
+           `a{}` rule, but these fall through to the near-black --fg default).
+       (2) the form fields have NO --card-bg fallback at all (bare
+           `border:…; padding:…`), so the always-visible compose textarea and
+           the step/reword/phase inputs stayed UA-white on the dark page — give
+           them an explicit dark field surface (--bg-alt tone + --text).
+       (3) now that the cards are dark, lift each light-mode chip/state/lane text
+           that rides them to a bright dark-palette tone — the SAME palette
+           iteration-16 validated ≥ 4.5× (mostly 6-11×) WCAG AA over the dark
+           card (neutral #b8c2d0 ≈ --text-muted, green #6ee7b7 = --accent,
+           red #ff8a8a = --err-fg, amber #f5d578 = --warn-fg, blue #58a6ff
+           matching the dark operator-link). Solid-fill badges that already pass
+           on dark (the .plan-stall-badge-stale white-on-red, the is-done green
+           marker) are left as-is. */
+  html[data-skin^="dark"] .plan-detail { --card-bg: #14181d; }
+  html[data-skin^="dark"] .plan-crew-member { border-color: rgba(160,170,185,0.28); }
+  html[data-skin^="dark"] .plan-crew-member.is-live { border-color: rgba(110,231,183,0.5); }
+  html[data-skin^="dark"] .plan-crew-member.is-failed { border-color: rgba(255,138,138,0.5); background: rgba(179,38,30,0.12); }
+  html[data-skin^="dark"] .plan-crew-name { color: #d6e0ec; }
+  html[data-skin^="dark"] .plan-crew-count-working, html[data-skin^="dark"] .plan-crew-state-alive { color: #6ee7b7; border-color: rgba(110,231,183,0.45); background: rgba(76,175,80,0.16); }
+  html[data-skin^="dark"] .plan-crew-count-done, html[data-skin^="dark"] .plan-crew-count-idle, html[data-skin^="dark"] .plan-crew-count-failed-closed, html[data-skin^="dark"] .plan-crew-count-spend, html[data-skin^="dark"] .plan-crew-state-idle, html[data-skin^="dark"] .plan-crew-role { color: #b8c2d0; border-color: rgba(160,170,185,0.4); }
+  html[data-skin^="dark"] .plan-crew-count-failed, html[data-skin^="dark"] .plan-crew-count-idle-stale, html[data-skin^="dark"] .plan-crew-state-stuck, html[data-skin^="dark"] .plan-crew-state-failed, html[data-skin^="dark"] .plan-crew-outcome.is-failed { color: #ff8a8a; border-color: rgba(255,138,138,0.55); }
+  /* The chat-thread lane (the plan-agent card): its dark --card-bg comes from
+     the .plan-detail rule above; lift the delivery-ack + lifecycle + activity
+     chips that ride it, and give the compose textarea a dark field surface. */
+  html[data-skin^="dark"] .plan-assistant-delivery-sent { color: #6ee7b7; border-color: rgba(110,231,183,0.45); background: rgba(76,175,80,0.16); }
+  html[data-skin^="dark"] .plan-assistant-delivery-queued-waking { color: #f5d578; border-color: rgba(245,213,120,0.5); background: rgba(255,152,0,0.14); }
+  html[data-skin^="dark"] .plan-assistant-delivery-spawning { color: #58a6ff; border-color: rgba(88,166,255,0.45); background: rgba(33,150,243,0.14); }
+  html[data-skin^="dark"] .plan-assistant-event-kind { color: #b8c2d0; background: rgba(160,170,185,0.16); }
+  html[data-skin^="dark"] .plan-assistant-event-closed .plan-assistant-event-kind { color: #6ee7b7; background: rgba(76,175,80,0.18); }
+  html[data-skin^="dark"] .plan-assistant-event-created .plan-assistant-event-kind { color: #58a6ff; background: rgba(33,150,243,0.18); }
+  html[data-skin^="dark"] .plan-assistant-input,
+  html[data-skin^="dark"] .plan-step-add-input,
+  html[data-skin^="dark"] .plan-step-reword-input,
+  html[data-skin^="dark"] .plan-prose-edit-input,
+  html[data-skin^="dark"] .plan-doc-edit-input,
+  html[data-skin^="dark"] .plan-newphase-input,
+  html[data-skin^="dark"] .plan-pour-picker select,
+  html[data-skin^="dark"] .plan-pour-var select,
+  html[data-skin^="dark"] .plan-pour-var input[type="text"] { background: #11161d; color: #d6e0ec; border-color: rgba(160,170,185,0.28); }
+  html[data-skin^="dark"] .plan-lifecycle-chip-draft { color: #b8c2d0; background: rgba(160,170,185,0.14); border-color: rgba(160,170,185,0.4); }
+  html[data-skin^="dark"] .plan-lifecycle-chip-ready { color: #58a6ff; background: rgba(88,166,255,0.16); border-color: rgba(88,166,255,0.5); }
+  html[data-skin^="dark"] .plan-lifecycle-chip-building { color: #6ee7b7; background: rgba(76,175,80,0.18); border-color: rgba(110,231,183,0.5); }
+  html[data-skin^="dark"] .plan-lifecycle-chip-complete { color: #b8c2d0; background: rgba(96,125,139,0.2); border-color: rgba(160,170,185,0.4); }
+  html[data-skin^="dark"] .plan-lifecycle-chip-abandoned { color: #d0a06e; background: rgba(200,150,90,0.16); border-color: rgba(200,150,90,0.45); }
+  /* Timeline + phase card text that falls through to the near-black --fg
+     default once the marker/card surface goes dark. */
+  html[data-skin^="dark"] .plan-tl-title, html[data-skin^="dark"] .plan-decision-title, html[data-skin^="dark"] .plan-decision-q, html[data-skin^="dark"] .plan-phase-title { color: #d6e0ec; }
+  html[data-skin^="dark"] .plan-tl-marker { color: #b8c2d0; }
+  html[data-skin^="dark"] .plan-tl-step.is-active > .plan-tl-marker { color: #f5d578; }
+  html[data-skin^="dark"] .plan-tl-blocked { color: #ff8a8a; background: rgba(179,38,30,0.16); border-color: rgba(255,138,138,0.5); }
+  html[data-skin^="dark"] .plan-tl-section { color: #58a6ff; background: rgba(33,150,243,0.14); border-color: rgba(88,166,255,0.45); }
+  html[data-skin^="dark"] .plan-decision-opt-chosen .plan-decision-opt-short, html[data-skin^="dark"] .plan-decision-opt-badge { color: #6ee7b7; }
+  /* Header chips + stall badge (mirror the index treatment). */
+  html[data-skin^="dark"] .chip-attention { color: #f5d578; background: rgba(245,213,120,0.12); border-color: rgba(245,213,120,0.5); }
+  html[data-skin^="dark"] .plan-stall-badge { color: #ff8a8a; background: rgba(179,38,30,0.16); border-color: rgba(255,138,138,0.55); }
+  html[data-skin^="dark"] .plan-steps-notice { color: #6ee7b7; background: rgba(76,175,80,0.12); border-color: rgba(110,231,183,0.4); }
+  html[data-skin^="dark"] .plan-phase-hint { color: #f5d578; background: rgba(217,164,6,0.12); }
+  html[data-skin^="dark"] .bead-actions-error, html[data-skin^="dark"] .plan-pour-var .pv-req { color: #ff8a8a; }
+</style>
+
+<div class="plan-detail">
+  <nav class="plan-breadcrumb" aria-label="Breadcrumb"><a href="{{.BasePath}}/plans">&larr; Plans</a></nav>
+
+  <header class="plan-header">
+    {{/* Badge + title row: the plan's badge picture (badge_image.go) sits LEFT
+         of the title at 64 px, beside the arms run. Both the badge and the goal
+         subtitle below self-suppress when their field is unset. */}}
+    <div class="plan-title-row">
+      {{with badge .Bead}}<img class="badge-64" src="{{$.BasePath}}{{.Src}}" alt="" width="64" height="64">{{end}}
+      {{/* An epic without arms shows "no arms yet" in the slot (gd-YvWv4mR4fu). */}}
+      {{/* The arms slot sits INSIDE the h1, as in title_block.html, so .arms-64's
+           1em is the title size and the run wraps with the title instead of
+           reserving a body-size column beside it (gd-29Ou0yBzPj). */}}
+      <h1 class="plan-title">{{with bearerArms .Bead}}<span class="heraldry-slot">{{heraldry . 64}}</span>{{else}}{{if eq .Bead.Type "epic"}}<span class="heraldry-slot"><span class="chip arms-none" title="No arms yet: the plan gardener chooses them">no arms yet</span></span>{{end}}{{end}}{{.Title}}</h1>
+    </div>
+    {{with .Bead.Fields.goal}}<p class="plan-header-goal">{{.}}</p>{{end}}
+    {{template "release_shipped" .ShippedIn}}
+    <div class="plan-header-meta">
+      <span class="chip chip-status chip-status-{{.Status}}">{{.Status}}</span>
+      {{if .Project}}<a class="chip chip-type" href="{{.BasePath}}/plans?project={{.Project}}">{{.Project}}</a>{{end}}
+      <a class="chip chip-type" href="{{.BasePath}}/{{.PlanID}}?bead=1" title="Open the underlying epic bead"><code>{{.PlanID}}</code></a>
+      {{if .StepsTotal}}<span class="chip plan-chip-progress">{{.StepsClosed}}/{{.StepsTotal}} · {{.PctDone}}%</span>{{end}}
+      {{/* The "N to answer" chip lives OUTSIDE #plan-decisions, so the SSE swap
+           of that section can't update it directly. It always renders (hidden
+           when zero) and carries a stable id so plan_events.js updates its count
+           from the swapped section's data-open-decisions attr — never
+           section-live / header-static (task ka-0000003157). */}}
+      <a id="plan-open-decisions-chip" class="chip chip-attention" href="#plan-decisions"{{if not .OpenDecisions}} hidden{{end}}>{{.OpenDecisions}} to answer</a>
+      {{/* Stall reason on the badge face (ka-0000001697) + dead-agent orphan
+           wait-age (ka-0000005352 iter 11) — same treatment as the /plans index
+           card, so the two surfaces agree on WHAT stalled, THAT it stalled, and
+           HOW LONG the orphan has been frozen. Rendered only for a dead-agent
+           stall with a datable orphan; loud past the 1-day staleness bar.
+           Verdict re-scope when live crew coexist (iter 23): when .Stall.Orphaned
+           the header softens to "⚠ N orphaned" (matching the index card badge) so
+           it no longer contradicts the crew roster header's "N working".
+           Escalation de-dup (iter 26): gate on ShowBadge, not Stalled — a
+           gardener-state stall is suppressed when the ⛔ escalation banner already
+           blocks the plan, so the header badge agrees with the index card. A
+           dead-agent orphan stays loud. */}}
+      {{if .Stall.ShowBadge}}<span class="plan-stall-badge{{if .Stall.AgeStale}} plan-stall-badge-stale{{end}}" title="{{if .Stall.Orphaned}}{{.Stall.DeadSteps}} step{{if ne .Stall.DeadSteps 1}}s{{end}} orphaned under a dead agent (other crew still working the plan): {{end}}Stalled: {{.Stall.Reason}}{{if .Stall.AgeLabel}} — oldest dead-agent step frozen {{.Stall.AgeLabel}}{{if .Stall.AgeStale}} (stale){{end}}{{end}}">⚠ {{with .Stall.HeadlineCount}}{{.}} {{end}}{{.Stall.HeadlineLabel}}{{with .Stall.FaceLabel}} <span class="plan-stall-badge-reason">· {{.}}</span>{{end}}{{with .Stall.AgeLabel}} <span class="plan-stall-badge-age">· {{.}}</span>{{end}}</span>{{end}}
+      {{/* Origin stamp (ka-0000006040): when the plan epic was created, off the
+           already-fetched .Bead. Muted, and self-suppressing on a zero time. It
+           precedes the auto-margined "updated" stamp so the two read
+           "created … | … updated" across the row. */}}
+      {{if not .Bead.CreatedAt.IsZero}}<span class="meta plan-header-created" title="Created {{.Bead.CreatedAt.Format "2006-01-02 15:04:05 MST"}}">created {{humanizeTime .Bead.CreatedAt}}</span>{{end}}
+      {{if .LastChangeAgo}}<span class="meta plan-header-updated"{{if .LastChangeRFC}} title="Last change {{.LastChangeRFC}}"{{end}}>updated {{.LastChangeAgo}}</span>{{end}}
+    </div>
+    {{if .IsOperator}}
+    <div class="plan-header-actions">
+      <form method="post" action="{{.BasePath}}/plans/{{.PlanID}}/mark" class="plan-mark-form">
+        {{if .IsPlan}}
+        <button type="submit" class="bead-action plan-unmark" title="Remove the plan label from this epic">Unmark as plan</button>
+        {{else}}
+        <button type="submit" class="bead-action plan-mark" title="Add the plan label so this epic shows on /plans">Mark as plan</button>
+        {{end}}
+      </form>
+    </div>
+    {{end}}
+    {{/* Share (Lands: the Window, PW.4): a read-only public link to the plan,
+         offered to the owner of its land and to operators (plan_share.html). */}}
+    {{if .CanShare}}{{template "plan_share" (dict "PlanID" .PlanID "BasePath" .BasePath)}}{{end}}
+    {{if not .IsPlan}}
+    <p class="banner banner-warn plan-unlabeled-note">This epic is not yet labelled <code>plan</code>, so it won't appear on the /plans index.{{if .IsOperator}} Use <em>Mark as plan</em> above to add it.{{end}}</p>
+    {{end}}
+  </header>
+
+  {{/* Live-progress wiring (task ka-0000001793, Matt's ask ka-0000008267:
+       "the progress on it should be visible immediately"). plan_events.js reads
+       this anchor, opens an EventSource against /plans/{id}/events, and swaps the
+       #plan-steps section outerHTML whenever a child bead changes — a step flips
+       to done the moment a crew agent closes it, no reload. Nil/no-op when the
+       browser has no EventSource. */}}
+  <span class="plan-events-anchor" data-plan-events="{{.BasePath}}/plans/{{.PlanID}}/events" hidden></span>
+
+  {{/* Blocked-by-escalation banner (epic ka-0000005480, WS4): full-width, above
+       the grid, naming exactly what privileged operation(s) the plan waits on.
+       The wrapper section always renders so the SSE plan-escalations-updated
+       frame can clear the banner live when the escalation closes. */}}
+  {{template "plan_escalations" (dict "PlanID" .PlanID "Escalations" .Escalations "BasePath" .BasePath)}}
+
+  <div class="plan-grid">
+    {{/* BUILD STEPS on the RIGHT (Matt ka-0000007957). The step timeline is
+         kept FIRST in DOM source order so it still precedes the plan bundle
+         markup (work-items-prominence, ka-0000004291) and stacks first on
+         narrow screens; the named grid area places it in the right column on
+         wide screens. It replaces the constellation as the plan's graph and
+         live-swaps via the #plan-steps id when the SSE stream reports a
+         change. Phases (ka-0000005926): when the plan declares phase sub-epics
+         (fields.phase_order) the steps group into ordered phase sections;
+         plan_steps handles both the grouped and the flat render. */}}
+    <div class="plan-col-steps">
+      {{template "plan_steps" (dict "PlanID" .PlanID "Steps" .Steps "Phases" .Phases "HasPhases" .HasPhases "StepsTotal" .StepsTotal "StepsClosed" .StepsClosed "StepsOpen" .StepsOpen "PctDone" .PctDone "PhaseHint" .PhaseHint "IsOperator" .IsOperator "BasePath" .BasePath)}}
+      {{/* The crew roster (ka-0000000150): the agents the plan gardener has
+           dispatched onto the steps above + how each is going, live-swapped via
+           the SSE plan-crew-updated frame. Sits directly under the timeline it
+           annotates so "here are the steps" and "here's who's on them" read as
+           one column. */}}
+      {{template "plan_crew" (dict "PlanID" .PlanID "Crew" .Crew "IsOperator" .IsOperator "BasePath" .BasePath)}}
+    </div>
+
+    {{/* THE PLAN on the LEFT (Matt ka-0000007957): the narrative (epic-
+         description summary + bundle doc cards) and the clarifying-question
+         decisions — everything that describes what the plan IS, distinct from
+         the build steps that track how it's progressing. */}}
+    <div class="plan-col-plan">
+      {{/* Automated crit-style inline critique (prototype, task ka-0000002614):
+           computed PROOF / coverage / design-review findings with collapsible
+           detail, rendered ABOVE the narrative so a reviewer sees the gaps
+           before reading the plan. Dark-launched — .CritiqueFindings is nil
+           unless BEADS_VIEWER_PLAN_CRITIQUE_FINDINGS=1, and the partial no-ops
+           on an empty bag, so the column is byte-identical with the flag off. */}}
+      {{with .CritiqueFindings}}
+      {{template "plan_critique_findings" .}}
+      {{end}}
+      {{/* Plan narrative: the epic-description summary + the bundle doc cards,
+           in one #plan-narrative wrapper the SSE stream live-swaps when the
+           assistant edits the plan (S3 ka-0000002473 — nudge-to-edit replaced
+           the manual textarea). The bundle is where a work item cross-
+           references the plan detail it corresponds to. */}}
+      {{with .Narrative}}
+      {{template "plan_narrative" (dict "PlanID" .PlanID "ProseHTML" .ProseHTML "Description" .Description "Prose" .Prose "ProseBeadID" .ProseBeadID "IsOperator" .IsOperator "UpdatedBy" .UpdatedBy "BasePath" $.BasePath)}}
+      {{end}}
+
+      {{/* Clarifying-question decisions scoped to this plan — answerable IN
+           PLACE (task ka-0000003157). Extracted into the plan_decisions partial
+           so the SSE stream can live-swap the whole #plan-decisions section
+           under `plan-decisions-updated` when a question is asked, answered, or
+           dismissed. */}}
+      {{template "plan_decisions" (dict "PlanID" .PlanID "Decisions" .Decisions "OpenDecisions" .OpenDecisions "IsOperator" .IsOperator "BasePath" $.BasePath)}}
+    </div>
+
+    {{/* PLAN-AGENT pane on the BOTTOM, full width (Matt ka-0000007957). The
+         ONE merged card (step 6, ka-0000000116): unified chip + gardener loop
+         levers (Pause/Resume, Wake) + the conversation (transcript, typing
+         indicator, compose box, activity feed) for the plan's single bound
+         agent. First message spawns; live messages nudge instantly; parked
+         messages wake via the S1 spawn/thaw path. Spanning the full width
+         along the bottom gives the prompt box room and keeps it a persistent,
+         page-wide input surface. Live-swaps as one unit via the shared
+         /plans/{id}/events SSE stream on the `plan-agent-updated` frame. */}}
+    <div class="plan-col-assistant">
+      {{/* plan_agent reads the ONE merged bag (step 4, ka-0000001218): the
+           gardener view under .Gardener, the unified chip under .Chip (step 5,
+           ka-0000001332) and the assistant lane's flat keys (BasePath folded
+           in by planAgentPanelData) — so pass it straight through.
+           Re-projecting keys by hand here silently dropped new fields like
+           MaxLen/Delivery on the first paint (the 2d regression,
+           ka-0000004026). */}}
+      {{with .Agent}}
+      {{template "plan_agent" .}}
+      {{end}}
+    </div>
+  </div>
+
+  {{/* Inline line-critique cockpit (T4, ka-0000000167, epic ka-0000002316):
+       the static overlay shell + operator compose form. Ships ON BY DEFAULT —
+       no flag guard (decision ka-0000004596). plan_gutter.js injects a gutter
+       icon per step row and mounts the T3 thread fragment into this overlay on
+       click; text selection inside a [data-block-id] block (T1) pre-fills the
+       hidden anchor inputs. */}}
+  {{template "plan_critique" (dict "PlanID" .PlanID "IsOperator" .IsOperator "BasePath" .BasePath)}}
+</div>
+<script src="{{.BasePath}}/assets/static/plan_events.js" defer></script>
+<script src="{{.BasePath}}/assets/static/plan_composer.js" defer></script>
+<script src="{{.BasePath}}/assets/static/plan_gutter.js" defer></script>
+<script src="{{.BasePath}}/assets/static/plan_focus_step.js" defer></script>
+{{end}}

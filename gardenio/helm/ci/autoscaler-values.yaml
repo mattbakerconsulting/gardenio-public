@@ -1,0 +1,157 @@
+# cluster-autoscaler for the gardenio k3s cluster (chart autoscaler/cluster-autoscaler).
+# Discovers the CI ASG by tag (k8s.io/cluster-autoscaler/enabled +
+# k8s.io/cluster-autoscaler/gardenio) and scales it 0..N from pending runner
+# pods. Runs on the server nodes using the instance role via IMDS (hop limit 2).
+cloudProvider: aws
+awsRegion: us-east-1
+
+autoDiscovery:
+  clusterName: gardenio
+
+extraArgs:
+  # ~10 idle minutes before a CI node is returned; a job usually queues
+  # another within that window, and a node costs ~$0.01 for those minutes.
+  scale-down-unneeded-time: 10m
+  scale-down-delay-after-add: 10m
+  scale-down-utilization-threshold: 0.3
+
+  # ── DELETION CASCADES ──────────────────────────────────────────────────
+  # The three flags above govern WHETHER a node is unneeded. None of them
+  # governs how fast unneeded nodes are removed once several qualify at once,
+  # and that is the gap: CI nodes go idle TOGETHER at the end of a run, so
+  # their 10m unneeded timers also expire together and the autoscaler deletes
+  # the whole batch back-to-back, one per scan.
+  #
+  # Flag default verified against the running binary (v1.35.0, same discipline
+  # as the backoff block below): scale-down-delay-after-delete defaults to
+  # **0s** -- NOT the scan interval, as is easy to assume. With --scan-interval
+  # at 10s that permits a deletion every 10 seconds indefinitely.
+  #
+  # Measured 2026-09-23 over 12.7h of gardenio-k3s-ci scaling activity (200
+  # activities, profile gardenio / us-east-1), 64 autoscaler scale-downs:
+  #
+  #   gap to previous scale-down:  <30s   9   |  1-3min  13
+  #                                30-60s  9   |  3-10min 16   >10min 16
+  #   7 of 63 gaps were <=15s -- literally consecutive scans.
+  #   31 of 63 (49%) were under 3 minutes, against a steady-state removal
+  #   rate of one node per 12 minutes. The pool is drained in bursts.
+  #
+  # 11 of those 64 scale-downs were REVERSED by a scale-up within 5 minutes
+  # (17%). The clearest instance, which is what prompted this:
+  #
+  #   18:28:05Z  autoscaler shrinks ci 8 -> 7
+  #   18:28:50Z  a push lands; 5 medium + 5 light runner pods go Pending
+  #   18:29:16Z  autoscaler shrinks ci 7 -> 6   <-- 26s INTO the burst
+  #   18:29:30Z  autoscaler sets desired 6 -> 7 -> 8 in the same second
+  #   18:29:45Z  two instances launch; they join at ~18:31, after the burst
+  #              had already drained onto the nodes that were left
+  #
+  # So the second deletion removed capacity the cluster was actively asking
+  # for, and the replacement arrived too late to be the thing that helped.
+  # Spacing deletions is the fix; keeping nodes warm LONGER is not, because
+  # scale-down-unneeded-time is already 10m and the nodes really were idle.
+  #
+  # Why 2m and not more. Cost of the brake, computed from the same 64 events
+  # (extra idle node-time, re-anchoring each deferred deletion):
+  #
+  #     1m  defers 31%  0.6 node-h/day      3m  defers 56%  4.6 node-h/day
+  #     2m  defers 44%  2.0 node-h/day      5m  defers 73%  12.0 node-h/day
+  #
+  # The pool is r5/r5a/m5/m7i .xlarge spot, so 3m is ~$10/mo and 2m ~$4/mo.
+  # The account run rate is already $212-238 against a $200 ceiling
+  # (aws-cost-baseline), so this buys the cheapest value that still covers
+  # every case actually observed: 2m clips both <=15s pairs and the 71s
+  # deletion above. Revisit with the curve, not with a round number.
+  #
+  # Global vs per-nodegroup does not arise: scale-down-delay-type-local is
+  # left unset (global), and only ONE node group carries the discovery tags
+  # (gardenio-k3s-ci). gardenio-k3s-agents and -servers are not autoscaler
+  # managed, so there is nothing else for a global delay to hold back. If a
+  # second group is ever tagged, set scale-down-delay-type-local: true.
+  #
+  # This does NOT touch ci_max_nodes or maxRunners, and is not a capacity
+  # change: MaxSize stays 13 and no tier's cap moves.
+  scale-down-delay-after-delete: 2m
+  # The CI nodes exist only for runner pods; nothing else should keep them.
+  skip-nodes-with-system-pods: false
+  skip-nodes-with-local-storage: false
+  balance-similar-node-groups: true
+  expander: least-waste
+
+  # ── SPOT-FAILURE BACKOFF ───────────────────────────────────────────────
+  # When a scale-up's instance never registers, the autoscaler puts the WHOLE
+  # node group in backoff and refuses every further scale-up until it expires
+  # -- no matter how many pods are Pending. On a 100%-spot group that is the
+  # wrong reflex: `UnfulfillableCapacity` means "not this type in this AZ right
+  # now", not "this group is finished", and the ASG keeps retrying across its
+  # ten types on its own while the autoscaler sits out.
+  #
+  # Measured 2026-09-22 (profile gardenio / us-east-1). A failed launch at
+  # 19:49:21Z put gardenio-k3s-ci in backoff until 20:09:12Z -- 19.9 minutes,
+  # 132 consecutive `not ready for scaleup ... AWS cannot provision any more
+  # instances for this node group` lines. Inside that window the ASG ITSELF
+  # launched two spot instances successfully (i-0123456789abcdef0 at 19:52:31,
+  # i-0123456789abcdef1 at 20:06:34). Capacity came back 1.8 min after the last
+  # refusal; the autoscaler stayed frozen for a further 16.7 min on its own say-so.
+  #
+  # The defaults also COMPOUND. Backoff doubles per consecutive failure toward
+  # the max and only resets after node-group-backoff-reset-timeout (default 3h)
+  # with no failures. 2026-09-22 saw 26 refusals clustered at 13Z/15Z/17Z/19Z --
+  # gaps under 3h throughout, so the group never reset and every afternoon miss
+  # bought the 30m ceiling. The 18Z hour is what that costs: heavy-tier queue
+  # p50 581s / p90 1585s, 51 jobs waiting at 18:10, and the ci ASG pinned at 8
+  # of max 11 with ONE scale-out in the whole hour -- then a scale-IN at 18:25
+  # with 27 still queued.
+  #
+  # So: retry in a minute, cap the freeze at five, and forget the failure after
+  # twenty so a morning cluster cannot still be throttling the afternoon. The
+  # cost of being wrong is a futile SetDesiredCapacity roughly once a minute
+  # during a genuine outage -- AWS does not charge for refused spot requests,
+  # and the autoscaler's own loop is 10s, so this is not a hot loop.
+  #
+  # NOT a substitute for either open thread, and deliberately neither of them:
+  # this does not add instance types (that reflex is banned for reclaim storms)
+  # and does not touch ci_max_nodes or maxRunners. gd-DKY4yKg8tK covers quota
+  # refusals (`MaxSpotInstanceCountExceeded`) -- note today's 26 were all
+  # capacity (`UnfulfillableCapacity` x24, `InsufficientInstanceCapacity` x2),
+  # a different failure with the same silent shape.
+  #
+  # Flag names and defaults verified against the running binary, v1.35.0:
+  #   initial 5m0s, max 30m0s, reset 3h0m0s.
+  initial-node-group-backoff-duration: 1m
+  max-node-group-backoff-duration: 5m
+  node-group-backoff-reset-timeout: 20m
+
+# Small footprint (the servers are small; see the affinity below for where it prefers to run).
+resources:
+  requests: { cpu: 50m, memory: 128Mi }
+  limits: { memory: 256Mi }
+
+# Keep it off the CI pool (tainted anyway); the control plane is the fallback home.
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  - key: gardenio.agent
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+# Home off the servers (gd-ybTutceJpn). On 2026-10-14 a server drain piled this
+# onto the surviving 2 GiB servers and each ran out of memory in turn. PREFER
+# the platform pool; the control-plane toleration above stays as the fallback so
+# a drain with no platform capacity cannot strand it Pending.
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: gardenio.io/role
+              operator: In
+              values: ["platform"]
+
+rbac:
+  create: true
+
+# No cloud credentials are mounted; the pod uses the node instance role.

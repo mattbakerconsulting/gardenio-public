@@ -1,0 +1,357 @@
+{{- /*
+gardenio.edgeContainment.rules — the webhooks-edge 404-wall containment-breach
+alert (task ka-0000001162, epic ka-0000000572). A SINGLE inverse rule that pages
+the instant the public webhooks entrypoint stops turning EVERY off-apex request
+away with a bare 404.
+
+The public webhooks edge is a containment WALL: the sanctioned apex
+(gardenio.example.com) is the ONLY Host that may match a
+Traefik router; every other Host must fall through to no router and get a 404.
+Two things break that invariant, and this one rule catches both:
+  - a DEFAULT-HOST router appears — an off-apex request now MATCHES a router
+    (RouterName is set on an off-apex row); or
+  - the wall starts ANSWERING off-apex requests with a non-404 status
+    (DownstreamStatus != wallStatus off-apex).
+
+Reads ONLY RequestHost / RouterName / DownstreamStatus from the Traefik JSON
+access log (L0 transport traefikLogShipper -> vlsingle) — NOT geo/ASN — so it is
+fully functional the moment the edge store is populated, independent of the geo
+enrichment blind spot (ka-0000004770 / ka-0000007314). Prototyped LIVE against
+prod VictoriaLogs 2026-08-14 = 0 hits/7d.
+
+Scope is the webhooks entrypoint ONLY, and that scope is carried by a POSITIVE
+`entryPointName:webhooks` anchor, not by the negated apex predicate. A negated
+LogsQL match also matches rows where the field is ABSENT, so the negated
+predicate alone would let in any other stream in the same vlsingle store (no
+RequestHost/RouterName/DownstreamStatus) as a breach (bug ka-0000004436). Keep
+the anchor.
+
+Fires through the vmalert-logs -> gardenio-alertmanager -> Slack path.
+*/ -}}
+{{- define "gardenio.edgeContainment.rules" -}}
+{{- $cfg := .Values.edgeContainment -}}
+{{- $win := $cfg.window | default "5m" -}}
+{{- $f := $cfg.fields -}}
+{{- $host := $f.requestHost | default "RequestHost" -}}
+{{- $router := $f.routerName | default "RouterName" -}}
+{{- $status := $f.downstreamStatus | default "DownstreamStatus" -}}
+{{- $apex := $cfg.apexHost | default "gardenio.example.com" -}}
+{{- $wall := $cfg.wallStatus | default "404" -}}
+{{- /*
+  POSITIVE entrypoint anchor — load-bearing, do NOT drop it as redundant.
+  A negated LogsQL predicate also matches rows where the field is ABSENT, so
+  `-RequestHost:~apex` alone does not scope this rule to the Traefik edge: a row
+  from another stream with none of RequestHost/RouterName/DownstreamStatus would
+  satisfy both halves of the breach disjunction (bug ka-0000004436).
+*/ -}}
+{{- $epField := $cfg.entryPointField | default "entryPointName" -}}
+{{- $epScope := "" -}}
+{{- if $cfg.entryPoint -}}
+{{- $epScope = printf " %s:%s" $epField $cfg.entryPoint -}}
+{{- end -}}
+{{- /*
+  Catch-all coupling (task ka-0000007813, operator decision ka-0000001217).
+  When the webhooks default-host catch-all is LIVE it SETS RouterName + returns a
+  non-404 on EVERY off-apex request, which would otherwise trip this inverse rule
+  on every scanner probe. So when webhooksEdgeCatchall.enabled=true we subtract
+  the sanctioned catch-all router from the predicate: any request that hit OUR
+  catch-all router is doing exactly its job (it can only close, never proxy a
+  backend), so it is not a breach. The rule STILL fires for any OTHER off-apex
+  router or a non-404 status that did NOT come from the catch-all. When the
+  catch-all is OFF this clause is empty, so the expr is byte-identical.
+*/ -}}
+{{- $catchallExcl := "" -}}
+{{- if .Values.webhooksEdgeCatchall.enabled -}}
+{{- $rm := (($cfg.catchAll) | default dict).routerMatch | default "webhooks-catchall" -}}
+{{- $catchallExcl = printf " -%s:~%s" $router ($rm | quote) -}}
+{{- end -}}
+- alert: EdgeContainmentBreach
+  # ★ The inverse containment rule. Every OFF-apex request (Host NOT the apex)
+  # that either matched a router (RouterName present) OR did not get the wall's
+  # 404 is a breach. With an empty result the rule is silent; a single surviving
+  # group means the wall regressed. Expected rate ~0/week (prod-verified).
+  # When the webhooks catch-all is enabled the sanctioned catch-all router is
+  # subtracted so its own close does not page (see the coupling note above).
+  expr: |
+    _time:{{ $win }}{{ $epScope }} -{{ $host }}:~{{ $apex | quote }}{{ $catchallExcl }} ({{ $router }}:* OR -{{ $status }}:{{ $wall }})
+    | stats by ({{ $host }}, {{ $router }}, {{ $status }}) count() as hits
+    | filter hits:>{{ $cfg.thresholds.breach | default 0 }}
+  for: {{ $cfg.for | default "5m" | quote }}
+  labels:
+    severity: {{ $cfg.severity | default "page" | quote }}
+    component: edge
+    subsystem: intrusion-detection
+    detection: containment-breach
+    {{- with $cfg.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    summary: "Webhooks-edge containment wall breached (off-apex request not 404-walled)"
+    description: |
+      Over the last {{ $win }} the public webhooks edge served an OFF-apex
+      request (Host is NOT {{ $apex }}) that either matched a Traefik router
+      (a default-host router appeared) or was answered with a status other than
+      the wall's {{ $wall }} (task ka-0000001162, epic ka-0000000572). The public
+      webhooks entrypoint is a containment WALL: nothing behind it is reachable
+      off-apex, so every off-apex request must fall through to no router and get
+      a bare {{ $wall }}. A surviving group means that invariant regressed — a
+      new default-host router was introduced, or the wall started answering
+      off-apex traffic. Expected rate is ~0/week, so a single fire is a real
+      config regression, not noise. The alert carries the offending
+      {RequestHost, RouterName, DownstreamStatus} as labels: inspect the Traefik
+      router config for a Host-less / catch-all rule and remove it. Scope is the
+      webhooks entrypoint only; the apex path has its own detections.
+    runbook_url: {{ $cfg.runbookURL | quote }}
+    {{- if $cfg.planBead }}
+    bead: {{ include "gardenio.link.beadURL" (dict "ctx" $ "id" $cfg.planBead) | quote }}
+    {{- end }}
+    {{- with $cfg.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- /*
+gardenio.scannerSurge.rules — the off-domain source-IP SURGE step-change ticket
+(task ka-0000007505, epic ka-0000000572). A SINGLE `type: vlogs` rule that
+TICKETS — never pages — when the count of DISTINCT off-apex source IPs in the
+window crosses a high multiple of the steady background hum.
+
+The public webhooks edge sees a constant ~59-IP/day background of internet
+scanner noise (unauthenticated probes bouncing off the 404 wall — the very
+traffic the containment wall already contains). That steady radiation MUST NOT
+page anyone. What DOES warrant a human's eventual attention is a coordinated
+SURGE: many times more distinct off-apex source IPs than the baseline in a
+single window — a botnet sweep or a targeted campaign, a trend signal, not an
+active breach (the breach is caught by gardenio.edgeContainment.rules).
+
+Reads ONLY RequestHost / ClientHost (the raw Traefik L4 peer, ka-0000006176)
+from the Traefik JSON access log — NOT geo/ASN — so it is fully functional the
+moment the edge store is populated, independent of the geo enrichment blind spot
+(ka-0000004770 / ka-0000007314). Scope is the webhooks entrypoint ONLY: the
+negated apex predicate excludes the AVA apex by construction, so only off-domain
+scanner traffic is counted.
+
+Off by default and TICKET severity by design: a single fire is trend visibility,
+not an incident, so it routes quietly to slack-security-warn (never @-mentions).
+Page-rate target «1/week. Enable only if operators want the trend signal. Fires
+through the SAME vmalert-logs -> gardenio-alertmanager -> Slack path as the
+edgeContainment rule above.
+*/ -}}
+{{- define "gardenio.scannerSurge.rules" -}}
+{{- $cfg := .Values.scannerSurge -}}
+{{- $win := $cfg.window | default "1d" -}}
+{{- $f := $cfg.fields -}}
+{{- $host := $f.requestHost | default "RequestHost" -}}
+{{- $client := $f.clientHost | default "ClientHost" -}}
+{{- $apex := $cfg.apexHost | default "gardenio.example.com" -}}
+- alert: ScannerSourceIPSurge
+  # ★ The step-change ticket. Count the DISTINCT off-apex source IPs over the
+  # window; fire only when that count crosses `surgeThreshold` — set well above
+  # the ~59-IP steady background so the day-to-day scanner hum stays silent and
+  # only a coordinated surge (a botnet sweep / targeted campaign) tickets.
+  expr: |
+    _time:{{ $win }} -{{ $host }}:~{{ $apex | quote }}
+    | stats by ({{ $client }}) count() as n
+    | stats count() as distinct_src
+    | filter distinct_src:>{{ $cfg.thresholds.surge | default 300 }}
+  for: {{ $cfg.for | default "0s" | quote }}
+  labels:
+    severity: {{ $cfg.severity | default "ticket" | quote }}
+    component: edge
+    subsystem: intrusion-detection
+    detection: scanner-surge
+    {{- with $cfg.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    summary: "Off-domain scanner source-IP surge (coordinated step-change, not background hum)"
+    description: |
+      Over the last {{ $win }} the public webhooks edge saw more than
+      {{ $cfg.thresholds.surge | default 300 }} DISTINCT off-apex source IPs
+      (Host is NOT {{ $apex }}) — a coordinated SURGE well above the steady
+      ~59-IP/day background of internet scanner noise (task ka-0000007505, epic
+      ka-0000000572). This is a TREND signal — a botnet sweep or a targeted
+      campaign against the containment wall — not an active breach; the wall
+      itself is still turning every off-apex request away with a 404 (that
+      invariant is guarded separately by EdgeContainmentBreach). It TICKETS, it
+      does NOT page: no action is required beyond noting the trend. If surges
+      become routine background, raise scannerSurge.thresholds.surge; a
+      persistent high floor is a re-baselining task, not an incident.
+    runbook_url: {{ $cfg.runbookURL | quote }}
+    {{- if $cfg.planBead }}
+    bead: {{ include "gardenio.link.beadURL" (dict "ctx" $ "id" $cfg.planBead) | quote }}
+    {{- end }}
+    {{- with $cfg.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- /*
+gardenio.edgeShipperLiveness.rules — the DEAD-MAN'S-SWITCH for the edge log
+shippers (task ka-0000006616, epic ka-0000000472; sibling bug ka-0000002843), as
+a YAML list of `type: vlogs` rule items. One EdgeLogShipperStalled rule per
+enabled shipper.
+
+WHY: an edge log shipper (traefik-log-shipper) can be Running 1/1 and still
+deliver ZERO rows (ka-0000002843). Process liveness != shipper liveness, so a
+silent detective control must read as a dead one (ka-0000007287 L3 guardrails).
+
+THE SIGNAL IS ROWS DELIVERED — a count that INCREMENTS ON SUCCESS (advice
+ka-0000002586). Each rule counts the shipper's own rows in VictoriaLogs over the
+staleness window with a shipper-specific LogsQL selector and fires when the count
+is AT/BELOW `floor`. A bare `stats count() as rows` (NOT `stats by`) is used
+deliberately: VictoriaLogs emits a 0-row from a bare count even when the selector
+field is entirely absent, so `filter rows:<=floor` fires on a FULLY-GONE pipeline
+too — `stats by` would be silent on empty input (the silent no-op trap). This is
+the END-TO-END net: it fires no matter which link broke (pod-log stream
+failing, source empty, pod gone), and it fires even while the
+shipper pod itself is perfectly healthy — the exact blind spot pod-liveness
+cannot see.
+
+NO up{}==0 EXPORTER-DOWN LAYER: the shippers dial OUT only (no in-cluster
+listener, not prometheus-scraped, no kube-state-metrics), so no up{} series
+exists for them and an exporter-down rule could never fire — a silent no-op
+giving false confidence. The rows-delivered stall net is the load-bearing and
+ONLY valid layer here.
+
+Fires through the SAME vmalert-logs -> gardenio-alertmanager -> Slack path as
+the edgeContainment / scannerSurge LogsQL rules above. Off by default;
+byte-identical chart until an overlay opts in.
+*/ -}}
+{{- define "gardenio.edgeShipperLiveness.rules" -}}
+{{- $cfg := .Values.edgeShipperLiveness -}}
+{{- $win := $cfg.stalenessWindow | default "15m" -}}
+{{- /* Render one rule per shipper, gated on BOTH the per-shipper toggle AND the
+       shipper's own chart enable flag, so a rule is never shipped for a shipper
+       that is not deployed (its series would be legitimately absent and the rule
+       would false-fire forever). $gate maps each shipper key to its chart toggle. */ -}}
+{{- $gate := dict "traefik" .Values.traefikLogShipper.enabled -}}
+{{- range $name, $s := $cfg.shippers }}
+{{- if and $s.enabled (index $gate $name) }}
+{{- $floor := $s.floor | default 0 }}
+{{- /* Per-shipper stalenessWindow overrides the top-level default. A safe window is
+       a property of THIS shipper's own traffic shape and must be measured per
+       shipper (bug ka-0000006504). */ -}}
+{{- $win := $s.stalenessWindow | default $win }}
+- alert: EdgeLogShipperStalled
+  # DEAD-MAN'S-SWITCH for the {{ $name }} edge log shipper. Rows delivered to
+  # VictoriaLogs over {{ $win }} at/below {{ $floor }} => the shipper has gone
+  # silent: a shipper Running 1/1 delivering zero rows (ka-0000002843). Watches rows DELIVERED
+  # (increments on success), never a static liveness field (advice ka-0000002586).
+  # Bare `stats count()` (not `stats by`) so the count emits a 0-row even when the
+  # selector field is absent — that is what lets the floor fire on a fully-gone
+  # pipeline.
+  expr: |
+    _time:{{ $win }} {{ $s.selector }}
+    | stats count() as rows
+    | filter rows:<={{ $floor }}
+  for: {{ $cfg.for | default "10m" | quote }}
+  labels:
+    severity: {{ $cfg.severity | default "page" | quote }}
+    component: edge
+    subsystem: intrusion-detection
+    detection: shipper-stalled
+    shipper: {{ $name | quote }}
+    {{- with $cfg.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    summary: "Edge log shipper {{ $name }} has STOPPED delivering rows — a detective control is blind"
+    description: |
+      The {{ $name }} edge log shipper delivered {{ $floor }} or fewer rows to
+      VictoriaLogs over the last {{ $win }} (selector `{{ $s.selector }}`). A
+      shipper can be Running 1/1 and still deliver ZERO rows (ka-0000002843).
+      Process liveness is NOT shipper liveness, so do NOT read a quiet shipper as healthy while this fires — the edge
+      detective pipeline it feeds is now SILENT-BECAUSE-BLIND, not
+      silent-because-quiet. Triage: confirm rows stopped in Grafana / VictoriaLogs
+      (`{{ $s.selector }} | stats count()` over {{ $win }}); check the
+      {{ $name }}-log-shipper pod LOGS (not just its 1/1 status) for a repeating
+      stream/deliver failure; confirm the vlsingle sink is reachable. See runbook.
+    runbook_url: {{ $cfg.runbookURL | quote }}
+    {{- if $cfg.planBead }}
+    bead: {{ include "gardenio.link.beadURL" (dict "ctx" $ "id" $cfg.planBead) | quote }}
+    {{- end }}
+    {{- with $cfg.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /*
+  vmalert-logs rules ConfigMap — the ONLY render path for the LogsQL detections
+  (there is no PrometheusRule CRD analog: PrometheusRule/VMRule carry PromQL,
+  not `type: vlogs` LogsQL). Loaded by the dedicated vmalert-logs Deployment's
+  -rule=/config/*.yaml glob. Alerting rules require a notifier — vmalert
+  crashloops if it loads alerting rules with neither -notifier.url nor
+  -notifier.blackhole set — so the rule key is gated on a notifier being wired
+  (alertmanager.enabled OR vmalertLogs.notifierURL OR vmalertLogs.notifierBlackhole),
+  exactly as the vmalert gap-alerts keys are.
+*/ -}}
+{{- if .Values.vmalertLogs.enabled }}
+{{- $notifier := include "gardenio.vmalertLogs.effectiveNotifierURL" . }}
+{{- $notifierAvailable := or $notifier .Values.vmalertLogs.notifierBlackhole }}
+{{- /* The edge-shipper dead-man's-switch key renders only when the feature is on
+       AND at least one shipper is BOTH toggled on AND actually deployed (its own
+       chart enable flag). Rendering a rule for an undeployed shipper would
+       false-fire forever on a legitimately-absent series, so gate the whole key
+       on there being a renderable rule — otherwise the group would be empty. */ -}}
+{{- $slCfg := .Values.edgeShipperLiveness }}
+{{- $slGate := dict "traefik" .Values.traefikLogShipper.enabled }}
+{{- $slAny := false }}
+{{- range $name, $s := $slCfg.shippers }}{{- if and $s.enabled (index $slGate $name) }}{{- $slAny = true }}{{- end }}{{- end }}
+{{- $edgeShipperRenderable := and $slCfg.enabled $slAny $notifierAvailable }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.vmalertLogs.rulesConfigMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmalertLogs.labels" . | nindent 4 }}
+data:
+  # A placeholder recording group is intentionally absent — vmalert-logs is an
+  # alerting-only evaluator. Each enabled detection below adds one key of shared
+  # `type: vlogs` rules that the -rule=/config/*.yaml glob loads, once a notifier
+  # is wired.
+  {{- if and .Values.edgeContainment.enabled $notifierAvailable }}
+  # Webhooks-edge 404-wall containment-breach alert (LogsQL) — see the shared
+  # define above and templates/vmalert-logs/ for the full rationale.
+  edge-containment-logsql.yaml: |
+    groups:
+      - name: gardenio.edge_containment
+        type: vlogs
+        interval: {{ .Values.edgeContainment.interval | default "1m" | quote }}
+        rules:
+          {{- include "gardenio.edgeContainment.rules" . | nindent 10 }}
+  {{- end }}
+  {{- if and .Values.scannerSurge.enabled $notifierAvailable }}
+  # Off-domain scanner source-IP surge ticket (LogsQL) — see the shared define
+  # above and templates/vmalert-logs/ for the full rationale. Tickets, never
+  # pages; off by default (trend visibility only).
+  scanner-surge-logsql.yaml: |
+    groups:
+      - name: gardenio.scanner_surge
+        type: vlogs
+        interval: {{ .Values.scannerSurge.interval | default "5m" | quote }}
+        rules:
+          {{- include "gardenio.scannerSurge.rules" . | nindent 10 }}
+  {{- end }}
+  {{- if $edgeShipperRenderable }}
+  # Edge log-shipper dead-man's-switch (LogsQL) — one EdgeLogShipperStalled rule
+  # per enabled+deployed shipper. See the shared define above and
+  # templates/vmalert-logs/ for the full rationale (task ka-0000006616).
+  edge-shipper-liveness-logsql.yaml: |
+    groups:
+      - name: gardenio.edge_shipper_liveness
+        type: vlogs
+        interval: {{ .Values.edgeShipperLiveness.interval | default "1m" | quote }}
+        rules:
+          {{- include "gardenio.edgeShipperLiveness.rules" . | nindent 10 }}
+  {{- end }}
+  {{- if not (or (and .Values.edgeContainment.enabled $notifierAvailable) (and .Values.scannerSurge.enabled $notifierAvailable) $edgeShipperRenderable) }}
+  # No detections enabled and/or no notifier wired: emit an empty-but-valid
+  # ConfigMap so the Deployment's rules mount always exists (vmalert tolerates a
+  # rules dir with no alerting rules — it just evaluates nothing). Keeping the
+  # object present avoids a mount-missing crashloop when enabled ahead of the
+  # detections/notifier.
+  placeholder.yaml: |
+    # intentionally empty — no LogsQL rules active
+  {{- end }}
+{{- end }}

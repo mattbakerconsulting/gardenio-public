@@ -1,0 +1,90 @@
+# rule_files is rewritten at runtime by TestPostgresS3BackupAlert_Fires
+# (postgres_s3_backup_alert_test.go): the placeholder is replaced with the
+# PostgresS3Backup* rules extracted from the rendered gap-alerts.yaml key.
+#
+# gd-Li0fBnupv2. The series value is the CronJob's lastSuccessfulTime (unix
+# seconds) and promtool's time() is the eval offset from 0, so a value of 0 is
+# "the last success finished at t=0". Stale: > 14400 s for 15m. Unmonitored:
+# absent for 4h.
+rule_files:
+  - __RULES_FILE__
+
+evaluation_interval: 1m
+
+tests:
+  # Last success at t=0. At 4h20m the age has been > 4h for 20m: fires.
+  # At 4h10m it is only 10m past 4h, still inside `for: 15m`: quiet.
+  - name: stale_backup_fires_after_4h_plus_for
+    interval: 1m
+    input_series:
+      - series: 'kube_cronjob_status_last_successful_time{namespace="gardenio-system", cronjob="test-postgres-s3-backup"}'
+        values: '0x300'
+    alert_rule_test:
+      - eval_time: 250m
+        alertname: PostgresS3BackupStale
+        exp_alerts: []
+      - eval_time: 260m
+        alertname: PostgresS3BackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              component: postgres
+              subsystem: backup
+              namespace: gardenio-system
+              cronjob: test-postgres-s3-backup
+      - eval_time: 260m
+        alertname: PostgresS3BackupUnmonitored
+        exp_alerts: []
+
+  # Healthy 2-hourly cadence: successes complete at 1h, 3h30m (a slow run)
+  # and 5h. The newest success is never more than 2h30m old: quiet.
+  - name: healthy_cadence_stays_quiet
+    interval: 30m
+    input_series:
+      # One sample per 30m: 0 until the first success, then the completion time.
+      - series: 'kube_cronjob_status_last_successful_time{namespace="gardenio-system", cronjob="test-postgres-s3-backup"}'
+        values: '0 0 3600 3600 3600 3600 3600 12600 12600 12600 18000 18000 18000 18000 18000'
+    alert_rule_test:
+      # At 6h30m the last success (5h) is 1h30m old.
+      - eval_time: 390m
+        alertname: PostgresS3BackupStale
+        exp_alerts: []
+      # Just before the slow run's sample lands, the 1h success is ~2h30m old.
+      - eval_time: 209m
+        alertname: PostgresS3BackupStale
+        exp_alerts: []
+
+  # Last success 3h30m ago and holding: below the 4h threshold, quiet.
+  - name: three_and_a_half_hours_is_quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_cronjob_status_last_successful_time{namespace="gardenio-system", cronjob="test-postgres-s3-backup"}'
+        values: '3600x300'
+    alert_rule_test:
+      - eval_time: 270m
+        alertname: PostgresS3BackupStale
+        exp_alerts: []
+
+  # A different CronJob going stale must not page as the postgres backup, and
+  # leaves the backup series absent: Unmonitored fires once 4h have passed.
+  - name: absent_series_fires_unmonitored_after_4h
+    interval: 1m
+    input_series:
+      - series: 'kube_cronjob_status_last_successful_time{namespace="gardenio-system", cronjob="test-release-deployer"}'
+        values: '0x300'
+    alert_rule_test:
+      - eval_time: 230m
+        alertname: PostgresS3BackupUnmonitored
+        exp_alerts: []
+      - eval_time: 245m
+        alertname: PostgresS3BackupUnmonitored
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              component: postgres
+              subsystem: backup
+              namespace: gardenio-system
+              cronjob: test-postgres-s3-backup
+      - eval_time: 260m
+        alertname: PostgresS3BackupStale
+        exp_alerts: []

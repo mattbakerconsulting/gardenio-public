@@ -1,0 +1,335 @@
+{{- if .Values.gitlabBridge.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.fullname" . }}-gitlab-bridge
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gitlab-bridge
+spec:
+  replicas: {{ .Values.gitlabBridge.replicaCount | default 1 }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gitlab-bridge
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: gitlab-bridge
+      annotations:
+        # Scrape the internal :9092 /metrics endpoint. gitlab-bridge runs a
+        # gardener-firing TriggerEngine, so the gardener-loop resume metrics
+        # (gardener_resume_total / gardener_resumes_without_progress, bead
+        # ka-0000005353) can be produced here. Mirrors the slack-bridge
+        # pod-annotation scrape pattern (decision ka-0000006918).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9092"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: gitlab-bridge
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.gitlabBridge.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.gitlabBridge.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8092
+              protocol: TCP
+            - name: metrics
+              containerPort: 9092
+              protocol: TCP
+          env:
+            {{- include "gardenio.otelTracingEnv" . | nindent 12 }}
+            # Beads daemon connection
+            - name: BEADS_HTTP_ADDR
+              value: "http://{{ include "gardenio.beads.host" . }}:{{ include "gardenio.beads.httpPort" . }}"
+            {{- /* Bridge auth (ka-0000005187 / decision ka-0000001054): when a
+                   bridge token secret is set, use the per-bridge token so kbeads
+                   attributes writes as fleet:gitlab-bridge. Falls back to the
+                   static daemon token when unset (legacy / dev). Secret name
+                   resolves via the fleet→bridge rename helper (ka-0000005788). */}}
+            {{- $bridgeTokenSecret := include "gardenio.beads.bridgeTokenSecretName" . }}
+            - name: BEADS_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  {{- if $bridgeTokenSecret }}
+                  name: {{ $bridgeTokenSecret }}
+                  key: gitlab-bridge
+                  {{- else }}
+                  name: {{ .Values.beads.tokenSecret | default "kd-beads-token" }}
+                  key: token
+                  {{- end }}
+            # GitLab connection
+            {{- if .Values.gitlabBridge.gitlab.baseURL }}
+            - name: GITLAB_BASE_URL
+              value: {{ .Values.gitlabBridge.gitlab.baseURL | quote }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.gitlab.apiToken }}
+            {{- fail "gitlabBridge.gitlab.apiToken plaintext value is removed for security (AUDIT §J6) — use gitlabBridge.gitlab.secretName pointing at a K8s Secret." }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.gitlab.secretName }}
+            - name: GITLAB_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gitlabBridge.gitlab.secretName }}
+                  key: {{ .Values.gitlabBridge.gitlab.secretKey | default "token" }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.gitlab.webhookSecret }}
+            {{- fail "gitlabBridge.gitlab.webhookSecret plaintext value is removed for security (AUDIT §J6) — use gitlabBridge.gitlab.webhookSecretName pointing at a K8s Secret." }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.gitlab.webhookSecretName }}
+            - name: GITLAB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gitlabBridge.gitlab.webhookSecretName }}
+                  key: {{ .Values.gitlabBridge.gitlab.webhookSecretKey | default "webhook-secret" }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.gitlab.groupID }}
+            - name: GITLAB_GROUP_ID
+              value: {{ .Values.gitlabBridge.gitlab.groupID | quote }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.gitlab.pollInterval }}
+            - name: GITLAB_POLL_INTERVAL
+              value: {{ .Values.gitlabBridge.gitlab.pollInterval | quote }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.triggerPollInterval }}
+            - name: TRIGGER_POLL_INTERVAL
+              value: {{ .Values.gitlabBridge.triggerPollInterval | quote }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.gitlab.botUsername }}
+            - name: GITLAB_BOT_USERNAME
+              value: {{ .Values.gitlabBridge.gitlab.botUsername | quote }}
+            {{- end }}
+            # Deep-link bases for the managed MR-description "Agent Context"
+            # block: the Bead line links into beads-viewer and the JIRA line
+            # links to the issue. Empty falls back to plain-text refs.
+            # See docs/design/bead-linking-in-gitlab.md (Gap 1a).
+            {{- $beadsViewerURL := include "gardenio.link.beadsViewerURL" . -}}
+            {{- if ne $beadsViewerURL "" }}
+            - name: BEADS_VIEWER_URL
+              value: {{ $beadsViewerURL | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.baseURL }}
+            - name: JIRA_BASE_URL
+              value: {{ .Values.jiraBridge.jira.baseURL | quote }}
+            {{- end }}
+            - name: LISTEN_ADDR
+              value: ":8092"
+            - name: STATE_PATH
+              value: "/data/gitlab-bridge-state.json"
+            {{- if .Values.gitlabBridge.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.gitlabBridge.logLevel | quote }}
+            {{- end }}
+            {{- if .Values.global.humanOperator.mode }}
+            # Human-operator spawn gate posture (rollout ka-0000004589) for the
+            # gitlab @-mention resolver. "warn" logs a gap but never refuses;
+            # "enforce" fail-closes a mention whose author can't be mapped to a
+            # human. Flip fleet-wide only once M8/M9 residual is clean. The
+            # gitlab-bridge has no default-operator fallback (it resolves the
+            # human from the GitLab user map). Empty ⇒ code default (warn).
+            - name: GARDENIO_REQUIRE_HUMAN_OPERATOR
+              value: {{ .Values.global.humanOperator.mode | quote }}
+            {{- end }}
+            # AI-authored MR human-approval enforcement (DEVOPS-730). Opt-in:
+            # off unless aiApproval.enabled. When on, every MR opened by a
+            # configured bot user gets an idempotent approval rule requiring N
+            # human approvals from the configured reviewer group/users.
+            {{- if .Values.gitlabBridge.aiApproval.enabled }}
+            - name: AI_APPROVAL_ENABLED
+              value: "true"
+            {{- if .Values.gitlabBridge.aiApproval.ruleName }}
+            - name: AI_APPROVAL_RULE_NAME
+              value: {{ .Values.gitlabBridge.aiApproval.ruleName | quote }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.aiApproval.approvalsRequired }}
+            - name: AI_APPROVAL_REQUIRED
+              value: {{ .Values.gitlabBridge.aiApproval.approvalsRequired | quote }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.aiApproval.botUsernames }}
+            - name: AI_APPROVAL_BOT_USERNAMES
+              value: {{ .Values.gitlabBridge.aiApproval.botUsernames | quote }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.aiApproval.reviewerGroupIDs }}
+            - name: AI_APPROVAL_REVIEWER_GROUP_IDS
+              value: {{ .Values.gitlabBridge.aiApproval.reviewerGroupIDs | quote }}
+            {{- end }}
+            {{- if .Values.gitlabBridge.aiApproval.reviewerUserIDs }}
+            - name: AI_APPROVAL_REVIEWER_USER_IDS
+              value: {{ .Values.gitlabBridge.aiApproval.reviewerUserIDs | quote }}
+            {{- end }}
+            {{- end }}
+            # Release-drought deadman watchdog (ka-0000002594). Opt-in per
+            # env — enable on exactly ONE bridge per watched release lane.
+            {{- with .Values.gitlabBridge.releaseDrought }}
+            {{- if .enabled }}
+            - name: RELEASE_DROUGHT_ENABLED
+              value: "true"
+            {{- if .project }}
+            - name: RELEASE_DROUGHT_PROJECT
+              value: {{ .project | quote }}
+            {{- end }}
+            {{- if .threshold }}
+            - name: RELEASE_DROUGHT_THRESHOLD
+              value: {{ .threshold | quote }}
+            {{- end }}
+            {{- if .interval }}
+            - name: RELEASE_DROUGHT_INTERVAL
+              value: {{ .interval | quote }}
+            {{- end }}
+            {{- if .repeat }}
+            - name: RELEASE_DROUGHT_REPEAT
+              value: {{ .repeat | quote }}
+            {{- end }}
+            {{- if not .createBead }}
+            - name: RELEASE_DROUGHT_CREATE_BEAD
+              value: "false"
+            {{- end }}
+            {{- if .beadProject }}
+            - name: RELEASE_DROUGHT_BEAD_PROJECT
+              value: {{ .beadProject | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            # Escalation auto-reaper (ka-0000004105 + ka-0000007203): MR-witness
+            # + orchestration-layer detectors. ON by default in code
+            # (ESCALATION_REAP != "off"); set enabled:false to opt out, or
+            # dryRun:true to log intended reaps without closing during rollout.
+            {{- with .Values.gitlabBridge.escalationReaper }}
+            {{- if not .enabled }}
+            - name: ESCALATION_REAP
+              value: "off"
+            {{- else }}
+            {{- if .interval }}
+            - name: ESCALATION_REAP_INTERVAL
+              value: {{ .interval | quote }}
+            {{- end }}
+            {{- if .dryRun }}
+            - name: ESCALATION_REAP_DRY_RUN
+              value: "true"
+            {{- end }}
+            {{- if .mrGroupNamespace }}
+            - name: ESCALATION_MR_GROUP_NAMESPACE
+              value: {{ .mrGroupNamespace | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            # CI/CD compute-minutes metrics collector (Phase G, ka-0000002378).
+            # Opt-in per series. Publishes gardenio_cicd_* on the :9092 /metrics
+            # endpoint (already annotation-scraped above). The first-party
+            # GraphQL series needs a group-owner token (escalation
+            # ka-0000006982); until it lands, leave firstPartyEnabled off.
+            {{- with .Values.gitlabBridge.cicdMetrics }}
+            {{- if .jobDurationEnabled }}
+            - name: CICD_GITLAB_METRICS_ENABLED
+              value: "true"
+            {{- end }}
+            {{- if .firstPartyEnabled }}
+            - name: CICD_GITLAB_FIRSTPARTY_ENABLED
+              value: "true"
+            {{- end }}
+            {{- if .projects }}
+            - name: CICD_METRICS_PROJECTS
+              value: {{ join "," .projects | quote }}
+            {{- end }}
+            {{- if .interval }}
+            - name: CICD_METRICS_INTERVAL
+              value: {{ .interval | quote }}
+            {{- end }}
+            {{- if .window }}
+            - name: CICD_METRICS_WINDOW
+              value: {{ .window | quote }}
+            {{- end }}
+            {{- if .firstPartyNamespaceID }}
+            - name: CICD_FIRSTPARTY_NAMESPACE_ID
+              value: {{ .firstPartyNamespaceID | quote }}
+            {{- end }}
+            {{- if .firstPartyGroupPath }}
+            - name: CICD_FIRSTPARTY_GROUP_PATH
+              value: {{ .firstPartyGroupPath | quote }}
+            {{- end }}
+            {{- if .lookbackMonths }}
+            - name: CICD_LOOKBACK_MONTHS
+              value: {{ .lookbackMonths | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: "{{ .Values.global.coverage.mountPath }}/gitlab-bridge"
+            {{- end }}
+          # startupProbe gates livenessProbe: while it is failing, K8s does
+          # not run livenessProbe and will not restart the container. With
+          # failureThreshold:30 + periodSeconds:5 the bridge has up to 150s
+          # to come up before liveness can kill it. Avoids early-startup
+          # CrashLoopBackOff during helm upgrade --wait. (ka-0000007729)
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: state
+              mountPath: /data
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.gitlabBridge.resources | nindent 12 }}
+      {{- if .Values.global.coverage.enabled }}
+      terminationGracePeriodSeconds: 45
+      {{- end }}
+      volumes:
+        - name: state
+          {{- if .Values.gitlabBridge.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.fullname" . }}-gitlab-bridge-state
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.gitlabBridge.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.gitlabBridge.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.gitlabBridge.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

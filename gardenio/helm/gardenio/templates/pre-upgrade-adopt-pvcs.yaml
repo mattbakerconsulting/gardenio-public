@@ -1,0 +1,195 @@
+{{- /*
+Pre-upgrade hook: ensure PVCs exist and carry Helm ownership metadata.
+
+Two behaviors, in order of operation per PVC name:
+  1. Adopt: if the PVC exists but lacks Helm ownership labels/annotations,
+     stamp them so helm upgrade does not bail with
+     "invalid ownership metadata".
+  2. Create-if-missing: if the PVC does NOT exist, render and apply a
+     minimal manifest now. This guards against drift where the manifest
+     was rendered correctly but never reached the API server (helm
+     upgrade race, partial apply, accidental kubectl delete), which left
+     gitlab-bridge wedged in Pending after 2026.137.6 (ka-0000004481).
+
+Only enabled PVCs are templated into the list below; the chart's regular
+PVC templates remain the source of truth on the next reconcile.
+
+The Job runs before every upgrade and is automatically deleted after 5m.
+*/ -}}
+{{- $release := .Release.Name -}}
+{{- $defaultSC := .Values.global.storageClass | default "" -}}
+{{- $pvcs := list -}}
+{{- if and .Values.slackBridge.enabled .Values.slackBridge.persistence.enabled -}}
+  {{- $sc := .Values.slackBridge.persistence.storageClass | default $defaultSC -}}
+  {{- $pvcs = append $pvcs (dict "name" (printf "%s-slack-bridge-state" $release) "size" (.Values.slackBridge.persistence.size | default "100Mi") "storageClass" $sc) -}}
+{{- end -}}
+{{- if and .Values.gitlabBridge.enabled .Values.gitlabBridge.persistence.enabled -}}
+  {{- $sc := .Values.gitlabBridge.persistence.storageClass | default $defaultSC -}}
+  {{- $pvcs = append $pvcs (dict "name" (printf "%s-gitlab-bridge-state" $release) "size" (.Values.gitlabBridge.persistence.size | default "100Mi") "storageClass" $sc) -}}
+{{- end -}}
+{{- if and .Values.jiraBridge.enabled .Values.jiraBridge.persistence.enabled -}}
+  {{- $sc := .Values.jiraBridge.persistence.storageClass | default $defaultSC -}}
+  {{- $pvcs = append $pvcs (dict "name" (printf "%s-jira-bridge-state" $release) "size" (.Values.jiraBridge.persistence.size | default "100Mi") "storageClass" $sc) -}}
+{{- end -}}
+{{- if and .Values.triggerEngine.enabled .Values.triggerEngine.reconcile.stateFile .Values.triggerEngine.reconcile.persistence.enabled -}}
+  {{- $sc := .Values.triggerEngine.reconcile.persistence.storageClass | default $defaultSC -}}
+  {{- $pvcs = append $pvcs (dict "name" (printf "%s-trigger-engine-state" $release) "size" (.Values.triggerEngine.reconcile.persistence.size | default "100Mi") "storageClass" $sc) -}}
+{{- end -}}
+{{- if and .Values.coopmux.enabled .Values.coopmux.persistence.enabled -}}
+  {{- $sc := .Values.coopmux.persistence.storageClass | default $defaultSC -}}
+  {{- $pvcs = append $pvcs (dict "name" (printf "%s-coopmux-credentials" $release) "size" .Values.coopmux.persistence.size "storageClass" $sc) -}}
+{{- end -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gardenio.fullname" . }}-adopt-pvcs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "gardenio.fullname" . }}-adopt-pvcs
+      restartPolicy: OnFailure
+      {{- /* Global tolerations only — same rationale as the psa-labels hook:
+             tolerate an autoscaling-pool taint so this pre-upgrade hook is not
+             pinned to exhausted static nodes (ka-0000005127). Inert
+             (byte-identical) when global.tolerations is empty. */}}
+      {{- if .Values.global.tolerations }}
+      {{- include "gardenio.tolerations" (dict "global" .Values.global.tolerations) | nindent 6 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with include "gardenio.hookPriorityClassName" $ }}
+      {{ . }}
+      {{- end }}
+      containers:
+        - name: adopt
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.kubectlImage "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.kubectlImage.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          env:
+            - name: RELEASE
+              value: {{ .Release.Name | quote }}
+            - name: NS
+              value: {{ .Release.Namespace | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              ensure_pvc() {
+                local name="$1" size="$2" sc="$3"
+                if kubectl get pvc "$name" -n "$NS" >/dev/null 2>&1; then
+                  echo "Adopting PVC $name..."
+                  kubectl label pvc "$name" -n "$NS" \
+                    "app.kubernetes.io/managed-by=Helm" --overwrite
+                  kubectl annotate pvc "$name" -n "$NS" \
+                    "meta.helm.sh/release-name=$RELEASE" \
+                    "meta.helm.sh/release-namespace=$NS" --overwrite
+                  echo "  adopted."
+                  return 0
+                fi
+                echo "Creating missing PVC $name (size=$size sc=${sc:-<default>})..."
+                {
+                  echo "apiVersion: v1"
+                  echo "kind: PersistentVolumeClaim"
+                  echo "metadata:"
+                  echo "  name: $name"
+                  echo "  namespace: $NS"
+                  echo "  labels:"
+                  echo "    app.kubernetes.io/managed-by: Helm"
+                  echo "  annotations:"
+                  echo "    meta.helm.sh/release-name: $RELEASE"
+                  echo "    meta.helm.sh/release-namespace: $NS"
+                  echo "spec:"
+                  echo "  accessModes:"
+                  echo "    - ReadWriteOnce"
+                  if [ -n "$sc" ]; then
+                    echo "  storageClassName: $sc"
+                  fi
+                  echo "  resources:"
+                  echo "    requests:"
+                  echo "      storage: $size"
+                } | kubectl apply -n "$NS" -f -
+                echo "  created."
+              }
+              {{- range $pvcs }}
+              ensure_pvc {{ .name | quote }} {{ .size | quote }} {{ .storageClass | quote }}
+              {{- end }}
+              echo "Done."
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "gardenio.fullname" . }}-adopt-pvcs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "gardenio.fullname" . }}-adopt-pvcs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "patch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "gardenio.fullname" . }}-adopt-pvcs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "gardenio.fullname" . }}-adopt-pvcs
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.fullname" . }}-adopt-pvcs
+    namespace: {{ .Release.Namespace }}

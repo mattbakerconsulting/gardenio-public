@@ -1,0 +1,113 @@
+# obs-pii-catalog.yaml — pii-gateway redaction catalog
+#
+# Schema and operating principles: gardenio/docs/research/obs-centralization-w2-pii.md §6.
+# Loaded by the pii-gateway OTEL collector (doc §4) and rendered into its
+# `attributes`/`transform` processors at chart-render time. Every entry is one
+# match selector → one class → one action.
+#
+# This is the DEFENSE-IN-DEPTH catch-all tier (doc §1.2): producers may emit raw,
+# the gateway re-applies these rules to the entire payload regardless, and the
+# common collector downstream sees only post-redaction telemetry. The gb
+# producer-side sanitiser (gardenio/controller/internal/obspii) and the vmagent
+# metric_relabel backstop (helm vmagent configmap) are the other two layers; none
+# trusts the others to have done its job.
+#
+# Catalog changes require a @security reviewer (doc §4.5 → .gitlab/CODEOWNERS).
+
+version: 1
+default_class: free-text       # unmatched attributes → placeholder (doc §2.6, default-deny)
+default_action: placeholder
+
+rules:
+  # ---------------------------------------------------------------------------
+  # pii-direct.operator.email — the W2 §6 catch-all this task adds (ka-0000007286).
+  #
+  # Defense-in-depth catch-all: ANY operator-keyed metric label that carries an
+  # email shape is HMAC-hashed before it reaches vmsingle / the common collector.
+  # pii-direct's default action is `hash` (doc §2.2 / §2.7) — it preserves
+  # cardinality for "how many distinct operators" while preventing replay to
+  # cleartext. Scoped to signals=[metrics] because metric labels are the worst
+  # place to leak PII (they explode cardinality and persist for the full
+  # retention window — doc §3.6).
+  # ---------------------------------------------------------------------------
+  - id: pii-direct.operator.email
+    description: "Operator email accidentally emitted as a metric label — hash before vmsingle (W2 §6 catch-all)"
+    class: pii-direct
+    action: hash
+    match:
+      # Catches operator.email, slack.user.email, *.operator.email, user.email,
+      # oidc_email, viewer_email, and any *email* metric label on an operator
+      # series. Positive-only matcher (doc §6.5): we hash on email-keyed labels
+      # rather than carve exceptions.
+      attribute_key_regex: "(?i)(^|[._])(operator[._]?email|oidc[._]?email|viewer[._]?email|user[._]?email|slack[._]user[._]email|email)$"
+    applies_to:
+      services: "*"
+      signals: ["metrics"]
+    audit:
+      sample_rate: 0.01
+      encrypt_value: false       # never store operator email cleartext, even encrypted (doc §5.3)
+    references:
+      - "ka-0000007286"
+      - "ka-0000004202"          # Epic: Customer-1 telemetry privacy enforcement
+      - "obs-centralization-w2-pii.md#6"
+
+  # Companion drop rules for the explicit metric-label deny-list (doc §3.6 — these
+  # are person-identifying or unbounded and have no business on an operator
+  # counter; drop outright rather than hash since cardinality is not wanted).
+  - id: pii-direct.operator.slack-user-id
+    description: "Raw Slack user id on an operator metric label — drop"
+    class: pii-direct
+    action: drop
+    match:
+      attribute_key_regex: "(?i)(^|[._])slack[._]?user[._]?id$"
+    applies_to:
+      services: "*"
+      signals: ["metrics"]
+    audit:
+      sample_rate: 0.01
+      encrypt_value: false
+
+  - id: pii-direct.operator.display
+    description: "Operator display / display_name on a metric label — drop"
+    class: pii-direct
+    action: drop
+    match:
+      attribute_key_regex: "(?i)(^|[._])display(_name)?$"
+    applies_to:
+      services: "*"
+      signals: ["metrics"]
+    audit:
+      sample_rate: 0.01
+      encrypt_value: false
+
+  - id: free-text.operator.raw-url
+    description: "Raw URL on a metric label — drop (use bounded route_template instead, doc §3.6)"
+    class: free-text
+    action: drop
+    match:
+      attribute_key_regex: "(?i)(^|[._])(raw_url|url)$"
+    applies_to:
+      services: "*"
+      signals: ["metrics"]
+    audit:
+      sample_rate: 0.001
+      encrypt_value: false
+
+  - id: pii-direct.operator.session-id-on-counter
+    description: "session_id on an operator-keyed counter — drop (legitimate only on per-session push metrics, doc §3.6)"
+    class: pii-direct
+    action: drop
+    match:
+      # Matches the operator counters by name-prefix; session_id is unbounded and
+      # must not key per-operator aggregates.
+      attribute_key: "session_id"
+    applies_to:
+      # Operator/security series only; the per-session push metrics
+      # (gardenio_session_*) legitimately carry session_id and are not operator-keyed.
+      services: ["gardenio", "kbeads", "slack-bridge", "beads-viewer"]
+      signals: ["metrics"]
+    audit:
+      sample_rate: 0.0
+      encrypt_value: false
+    references:
+      - "ka-0000007286"

@@ -1,0 +1,154 @@
+# trigger-source-gitlab-fires.toml
+#
+# Claudeless scenario: trigger:gitlab beads fire once each for BOTH event
+# shapes — merge_request and pipeline — recording an audit bead with
+# outcome=allow.
+#
+# Epic ka-0000004568 / task ka-0000003167:
+#   "claudeless coverage for gitlab MR/pipeline source fire."
+#
+# Like the jira source, the GitLab source needs a live GitLabClient HTTP API
+# the standalone `trigger-engine` binary does not own. This scenario drives it
+# through the `trigger-probe` test binary (gardenio/controller/cmd/trigger-probe),
+# which wires the REAL GitLabTriggerSource + REAL TriggerEngine + REAL
+# beadsapi.Client against a stub GitLab HTTP server returning one canned MR (for
+# --source=gitlab-mr) or one canned pipeline (for --source=gitlab-pipeline).
+# Both run the genuine evaluateMergeRequests / evaluatePipelines →
+# fireAction → recordTriggerAudit loop — the same code gitlab-bridge runs.
+#
+# Steps (run twice, once per event_type):
+#   1. Create a trigger:gitlab bead via `gb trigger create gitlab-mr` /
+#      `gb trigger create gitlab-pipeline` (action=notify).
+#   2. Run the probe against $BEADS_HTTP_URL (sentinel-seeded, one EvaluateSource).
+#   3. Assert an audit bead (type=event, label=trigger:<id>, outcome=allow,
+#      source=gitlab) exists.
+#
+# Skips gracefully when go / sources / daemon env are unavailable.
+
+[claude]
+session_id = "e2e00000-000a-4000-a000-000000000011"
+username = "e2e-trigger-gitlab-fires"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 60000
+
+[[responses]]
+on = "*"
+say = "Running trigger-source-gitlab-fires: MR + pipeline match → notify action observed."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-probe ─────────────────────
+PROBE_BIN=""
+if command -v trigger-probe >/dev/null 2>&1; then
+  PROBE_BIN=$(command -v trigger-probe)
+elif [ -x /usr/local/bin/trigger-probe ]; then
+  PROBE_BIN=/usr/local/bin/trigger-probe
+elif [ -x /tmp/trigger-probe ]; then
+  PROBE_BIN=/tmp/trigger-probe
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-probe from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-probe ./cmd/trigger-probe/ ) || {
+    echo "SKIP: trigger-probe build failed"; exit 0;
+  }
+  PROBE_BIN=/tmp/trigger-probe
+else
+  echo "SKIP: trigger-probe binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-probe: $PROBE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then echo "SKIP: BEADS_HTTP_URL not set"; exit 0; fi
+if [ -z "${BEADS_TOKEN:-}" ]; then echo "SKIP: BEADS_TOKEN not set"; exit 0; fi
+if ! command -v gb >/dev/null 2>&1; then echo "SKIP: gb not present"; exit 0; fi
+
+TRIG_IDS=""
+cleanup() {
+  for tid in $TRIG_IDS; do
+    gb trigger disable "$tid" --http-url "$BEADS_HTTP_URL" >/dev/null 2>&1 || true
+    for bid in $(kd list --type=event -l "trigger:$tid" --json 2>/dev/null | jq -r '.[].id'); do
+      kd close "$bid" >/dev/null 2>&1 || true
+    done
+    kd close "$tid" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+# fire_gitlab <probe-source> <create-subcmd-args...> — create a trigger:gitlab
+# bead, fire it via the probe, and assert an outcome=allow audit bead.
+fire_gitlab() {
+  local probe_source="$1"; shift
+  local tag="e2e-gl-${probe_source}-$$-$(date +%s)"
+  echo "── $probe_source ── tag: $tag"
+
+  local out tid
+  out=$(gb trigger create "$@" \
+    --http-url "$BEADS_HTTP_URL" \
+    --title "$tag" \
+    --action notify \
+    --prompt "gitlab {{gitlab_key}}" \
+    --label "e2e:claudeless" \
+    --label "e2e-tag:$tag" \
+    --json 2>&1) || { fail "gb trigger create ($probe_source)" "$out"; return 1; }
+  tid=$(echo "$out" | jq -r '.id // .ID // empty')
+  if [ -z "$tid" ]; then fail "extract trigger id ($probe_source)" "out=$out"; return 1; fi
+  TRIG_IDS="$TRIG_IDS $tid"
+  echo "  trigger: $tid"
+
+  local plog=/tmp/trigger-probe-${probe_source}-$$.log
+  if ! "$PROBE_BIN" \
+      --source="$probe_source" \
+      --trigger="$tid" \
+      --http-url="$BEADS_HTTP_URL" \
+      --token="$BEADS_TOKEN" >"$plog" 2>&1; then
+    fail "trigger-probe exited non-zero ($probe_source)"
+    echo "--- probe log ---"; cat "$plog"; echo "--- end ---"
+    return 1
+  fi
+  pass "trigger-probe ran one $probe_source EvaluateSource cycle"
+
+  local deadline=$(( $(date +%s) + 20 )) audit=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    audit=$(kd list --type=event -l "trigger:$tid" --json 2>/dev/null | \
+      jq -c '[.[] | select(.fields.outcome=="allow" and .fields.source=="gitlab")][0] // empty' 2>/dev/null)
+    if [ -n "$audit" ] && [ "$audit" != "null" ]; then
+      pass "$probe_source audit bead recorded with outcome=allow"
+      echo "  audit: $(echo "$audit" | jq -c '{id, fields: {source: .fields.source, action: .fields.action, outcome: .fields.outcome, match_key: .fields.match_key}}')"
+      return 0
+    fi
+    sleep 1
+  done
+  fail "$probe_source trigger fired within 20s"
+  echo "--- probe log ---"; cat "$plog"; echo "--- end ---"
+  return 1
+}
+
+# event_type=merge_request — stub server returns one opened MR.
+fire_gitlab "gitlab-mr" gitlab-mr --project "Acme/probe/repo" --state opened || true
+
+# event_type=pipeline — stub server returns one failed pipeline on main.
+fire_gitlab "gitlab-pipeline" gitlab-pipeline --project "Acme/probe/repo" --status failed --ref main || true
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "trigger-source-gitlab-fires: MR + pipeline match → notify action observed OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "trigger-source-gitlab-fires scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

@@ -1,0 +1,95 @@
+{{- /*
+HA-drill node/pod mutation identity: the internal access boundary for the
+scripted cordon+drain proof (gardenio/scripts/ha-drill-drain.sh, HA under
+spot churn epic gd-StII9fmzym, Phase 3 drill 1).
+
+Root cause this closes (gd-JCLx5RLG1I): the drill's task premise assumed the
+"k8s-live" role already mounted a privileged token scoped for node
+cordon/drain. Live verification showed it does not — k8s-live's policy of
+record ("run the Gas City live k8s provider suite ... and nothing else",
+role bead gd-gi5v71wMMo) bounds its blast radius to the gc-dogfood namespace
+by design, and must not be granted anything outside it. So this is a NEW,
+separate identity, not an expansion of k8s-live.
+
+A dedicated ServiceAccount, NOT the default agent SA, bound to:
+  - a cluster-wide ClusterRole: nodes get/list/watch/patch (cordon/uncordon
+    only — no delete, no nodes/status, no other cluster-scoped resource).
+  - a namespaced Role in this release's namespace: pods get/list (find what
+    is running on the target node) and pods/eviction create (drain). No
+    pods delete, no exec/attach/portforward/log, no other namespace.
+
+The token is only mounted into pods whose ROLE bead sets needs_k8s_api=true
+and service_account=<this SA>; every other agent pod stays token-less.
+*/ -}}
+{{- if and .Values.agents.enabled .Values.agents.haDrillOperator.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.agents.haDrillOperator.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: ha-drill-operator
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.agents.haDrillOperator.name }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: ha-drill-operator
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.agents.haDrillOperator.name }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: ha-drill-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.agents.haDrillOperator.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.agents.haDrillOperator.name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.agents.haDrillOperator.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: ha-drill-operator
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.agents.haDrillOperator.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: ha-drill-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.agents.haDrillOperator.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.agents.haDrillOperator.name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

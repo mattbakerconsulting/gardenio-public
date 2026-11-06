@@ -1,0 +1,109 @@
+{{- if .Values.mcpVictoriaLogs.enabled }}
+{{- /*
+  Standalone VictoriaLogs MCP server (Track A, task ka-0000006956; operator
+  directive decision ka-0000006492 "Enhance to use Victorialog also since that's
+  what we have"). One pod runs the official ghcr.io/victoriametrics/mcp-victorialogs
+  image and exposes the VictoriaLogs read-only query tools over streamable-HTTP
+  on a ClusterIP Service, so crew agents query the in-cluster vlsingle store
+  without any Loki datasource (which VictoriaLogs cannot back). Mirrors the
+  mcp-grafana Track A deploy shape; configured entirely via ENV (not args) per
+  the upstream server, so no command/entrypoint override is needed.
+*/ -}}
+{{- $vlEntrypoint := include "gardenio.mcpVictoriaLogs.vlEntrypoint" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.mcpVictoriaLogs.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.mcpVictoriaLogs.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.mcpVictoriaLogs.replicaCount | default 1 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "gardenio.mcpVictoriaLogs.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.mcpVictoriaLogs.selectorLabels" . | nindent 8 }}
+    spec:
+      # mcp-victorialogs talks to VictoriaLogs over HTTP only; it needs no
+      # Kubernetes API access.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # The upstream image declares no USER (runs as root by default), but the
+      # server is a static Go binary that listens on a high port and writes
+      # nothing to disk — pin it non-root + read-only rootfs like the mcp-grafana
+      # sidecar.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: mcp-victorialogs
+          # Upstream OSS image (Apache-2.0), pulled DIRECT from GHCR.
+          image: "{{ .Values.mcpVictoriaLogs.image.repository }}:{{ .Values.mcpVictoriaLogs.image.tag }}"
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.mcpVictoriaLogs.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          # Configured entirely via ENV (the image's baked `mcp-victorialogs`
+          # entrypoint reads these); no command/args override needed.
+          env:
+            {{- if $vlEntrypoint }}
+            - name: VL_INSTANCE_ENTRYPOINT
+              value: {{ $vlEntrypoint | quote }}
+            {{- end }}
+            # Streamable-HTTP transport (image default is stdio on localhost:8081);
+            # bind 0.0.0.0 so the ClusterIP Service can reach the listener.
+            - name: MCP_SERVER_MODE
+              value: "http"
+            - name: MCP_LISTEN_ADDR
+              value: "0.0.0.0:{{ .Values.mcpVictoriaLogs.listenPort }}"
+            - name: VL_DEFAULT_TENANT_ID
+              value: {{ .Values.mcpVictoriaLogs.tenantId | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mcpVictoriaLogs.listenPort }}
+              protocol: TCP
+          # Upstream serves GET /health/liveness and /health/readiness in http mode.
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/liveness
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.mcpVictoriaLogs.resources | nindent 12 }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.mcpVictoriaLogs.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.mcpVictoriaLogs.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.mcpVictoriaLogs.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

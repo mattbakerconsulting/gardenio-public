@@ -1,0 +1,103 @@
+{{define "plans_bulk_toolbar"}}
+{{/* Sticky bulk action bar for the /plans index (step "bulk", ka-0000004771).
+     Mirrors trigger_bulk_toolbar exactly — the SHIPPED /triggers pattern — so the
+     control-room "disable all of Matt's monorepo gardeners" verb reuses the same
+     scope-aware project_bulk.js selection model. Stays hidden until project_bulk.js
+     (scope=plans) sees at least one [.plans-row-select:checked], then shows the
+     count and the Select-all / Enable / Disable / Clear affordances.
+
+     The included checkboxes carry the PLAN-EPIC id as their value (re-keyed from
+     the gardener trigger-bead id by the close-out work ka-0000005361 — 48 of 56
+     live open plans have no bound gardener, so the old key hid the selection model
+     on 86% of the board). Enable/Disable resolve epic→gardener server-side and
+     flip that bead's `enabled` field via the shared setGardenerEnabledCore;
+     Complete retires the plan itself via the shared completePlanCore. The
+     response is the cleared bar (this partial, hx-target=#plans-bulk-bar
+     outerHTML) plus OOB plan_card rows for every affected plan, so the unified
+     state chip + switch update live.
+
+     Confirm-over threshold: over 5 selected rows, project_bulk.js's htmx:confirm
+     listener requires window.confirm() before the request goes out (the verb +
+     noun are interpolated into the prompt).
+
+     Data shape: {BasePath: string, ErrMsg: string} — ErrMsg renders inline when
+     set, used by the bulk endpoints to surface per-request partial-failure
+     feedback. */}}
+<div id="plans-bulk-bar"
+     class="project-bulk-bar plans-bulk-bar"
+     data-bulk-scope="plans"
+     hidden>
+  <span class="project-bulk-count" data-bulk-count>0 selected</span>
+  <button type="button" class="bead-action" data-bulk-select-all aria-pressed="false">Select all</button>
+  <form class="project-bulk-form plans-bulk-disable"
+        hx-post="{{.BasePath}}/plans/bulk/disable"
+        hx-include=".plans-row-select:checked"
+        hx-target="#plans-bulk-bar"
+        hx-swap="outerHTML"
+        hx-disabled-elt="find button"
+        data-bulk-confirm-over="5"
+        data-bulk-confirm-verb="disable"
+        data-bulk-confirm-noun="plan gardeners">
+    <button type="submit" class="bead-action">Disable</button>
+  </form>
+  <form class="project-bulk-form plans-bulk-enable"
+        hx-post="{{.BasePath}}/plans/bulk/enable"
+        hx-include=".plans-row-select:checked"
+        hx-target="#plans-bulk-bar"
+        hx-swap="outerHTML"
+        hx-disabled-elt="find button"
+        data-bulk-confirm-over="5"
+        data-bulk-confirm-verb="enable"
+        data-bulk-confirm-noun="plan gardeners">
+    <button type="submit" class="bead-action">Enable</button>
+  </form>
+  {{/* Bulk Mark complete — the close-out verb (task ka-0000005361; Matt's ask,
+       thread ka-0000001785). Retires every selected plan in ONE POST through the
+       same completePlanCore the per-plan lever uses: "retire 20 plans in one POST
+       instead of 20 clicks".
+
+       This uses htmx's NATIVE hx-confirm rather than the bar's shared
+       data-bulk-confirm-over threshold, deliberately: that gate only fires when
+       the selection EXCEEDS the number (project_bulk.js: `if (n <= over) return`),
+       so the smallest usable threshold of 1 would let a single-plan complete
+       through with NO prompt at all. Completing CLOSES a plan, so unlike a
+       reversible pause/resume every invocation deserves the prompt. project_bulk.js
+       returns early when no data-bulk-confirm-over is present, leaving htmx's own
+       confirm in charge — so exactly one prompt fires, at every size.
+
+       A selected plan whose lifecycle cannot legally reach complete (draft/ready —
+       see plans_closeout.go) is refused per-plan with a named reason rather than
+       failing the batch. Rendered last so the destructive verb is not adjacent to
+       the frequently-used Disable. */}}
+  <form class="project-bulk-form plans-bulk-complete"
+        hx-post="{{.BasePath}}/plans/bulk/complete"
+        hx-include=".plans-row-select:checked"
+        hx-target="#plans-bulk-bar"
+        hx-swap="outerHTML"
+        hx-disabled-elt="find button"
+        hx-confirm="Mark every selected plan complete? This closes each plan and stops its gardener. You can Reopen any of them later.">
+    <button type="submit" class="bead-action plans-bulk-complete-btn"
+            title="Mark every selected plan complete — closes each plan and disables its bound gardener (Reopen restores one)">&#x2713; Mark complete</button>
+  </form>
+  {{/* Bulk Abandon — the stale-sweep retire verb (task ka-0000004351, epic
+       ka-0000007470). The ?status=stale sweep surfaces idle plans that are mostly
+       draft/ready (never approved for build), which CANNOT legally reach complete
+       (plans_closeout.go's legality table). Abandon is their honest terminal — a
+       plan given up on WITHOUT finishing — and the daemon accepts
+       draft/ready/building→abandoned, so it retires the whole swept pile where
+       Mark complete would refuse most of it. Like complete it CLOSES the plan
+       (Reopen restores), so it uses htmx's native hx-confirm at every size. */}}
+  <form class="project-bulk-form plans-bulk-abandon"
+        hx-post="{{.BasePath}}/plans/bulk/abandon"
+        hx-include=".plans-row-select:checked"
+        hx-target="#plans-bulk-bar"
+        hx-swap="outerHTML"
+        hx-disabled-elt="find button"
+        hx-confirm="Abandon every selected plan? This marks each as given-up-on (not done), closes it, and stops its gardener. You can Reopen any of them later.">
+    <button type="submit" class="bead-action plans-bulk-abandon-btn"
+            title="Abandon every selected plan — marks each given-up-on (not done), closes it, and disables its bound gardener (Reopen restores one). The honest exit for a never-approved stale plan.">&#x2717; Abandon</button>
+  </form>
+  <button type="button" class="bead-action project-bulk-clear" data-bulk-clear>Clear</button>
+  {{if .ErrMsg}}<span class="bead-actions-error" role="alert">{{.ErrMsg}}</span>{{end}}
+</div>
+{{end}}

@@ -1,0 +1,75 @@
+# gitleaks configuration for the gardenio monorepo.
+#
+# Extends the upstream default ruleset (generic API keys, AWS, GCP, Slack, etc.)
+# and adds an allowlist for known false positives in this repo.
+#
+# Used by:
+#   - Local pre-commit hook (see scripts/hooks/pre-commit + `make hooks`)
+#   - CI: the `gitleaks history` job in .github/workflows/checks.yml
+#     (scripts/security/gitleaks-history.sh)
+
+[extend]
+useDefault = true
+
+# --- custom rules (defense-in-depth beyond the upstream defaults) ---
+
+# Inline VictoriaMetrics/Traces/Logs basic-auth credential VALUE (ka-0000004092).
+# A live dev vmauth credential once leaked as
+# `VICTORIA_METRICS_DEV_PASSWORD=<high-entropy>` into an advice bead + its committed
+# catalog snapshot. The upstream `generic-api-key` rule technically flagged it, but as
+# 1 of ~53 mostly-benign hits it was invisible in the noise. This dedicated rule names
+# the shape so a recurrence is unambiguous. The value class excludes `$` (bare
+# `$VICTORIA_..._PASSWORD` env refs), `<` (redacted placeholders), and quotes — so
+# legitimate env-var-NAME references never trip it.
+[[rules]]
+id = "victoria-basic-auth-credential"
+description = "VictoriaMetrics/Traces/Logs basic-auth credential value"
+regex = '''VICTORIA_[A-Z]+(?:_[A-Z]+)*_(?:USERNAME|PASSWORD)=[^<$"'\s]\S*'''
+tags = ["credential", "victoria", "vmauth"]
+
+[allowlist]
+description = "Global false-positive allowlist for the gardenio monorepo"
+
+# Files / paths that are known-clean despite tripping default rules.
+paths = [
+  # litellm model alias list — opaque provider identifiers, not secrets
+  '''gardenio/controller/cmd/controller/litellm_aliases\.go''',
+
+  # Public OAuth client id for the Claude first-party app — not a secret
+  '''gardenio/images/agent/entrypoint\.sh''',
+
+  # Built webpack bundles — minified, full of opaque strings
+  '''coop/crates/web/dist/.*''',
+
+  # Negative-path OIDC auth test; contains fake tokens by design
+  '''gardenio/tests/e2e/scripts/test-oidc-auth\.sh''',
+
+  # security-poison fixtures: PLANTED fake credentials the security-poison
+  # self-test feeds to gitleaks to prove the scanner is wired (ka-0000007861).
+  # They MUST fire when the self-test scans them in isolation, but MUST NOT red
+  # the repo-wide CI / Gitleaks job — hence this path allowlist.
+  '''scripts/security/poison/.*''',
+
+  # gitleaks config itself (don't flag our own example patterns)
+  '''\.gitleaks\.toml''',
+]
+
+# Regexes for common non-secret strings that sneak past the defaults.
+# These apply globally (placeholders show up in docs, helm values, shell
+# fixtures, and tests alike). Real-looking secrets in _test.go files are
+# intentionally NOT blanket-allowlisted — only the placeholder patterns
+# below match, so a leaked real credential will still trip gitleaks.
+regexes = [
+  # Generic placeholder values
+  '''(?i)(dummy|placeholder|example|fake|test)[-_]?(token|secret|key|password)''',
+
+  # Exact fake or public values in files that cannot carry a gitleaks:allow
+  # comment (JSON fixtures, lines ending in a shell continuation) (gd-F4f7SsBRBC).
+  # Fake bearer token in the deathtranscript redaction fixture (hook_events.jsonl).
+  '''^sk-abcdefghijklmnopqrstuvwxyz0123456789$''',
+  # The RFC 6455 sample Sec-WebSocket-Key nonce (tests/e2e/edge-auth).
+  '''^dGhlIHNhbXBsZSBub25jZQ==$''',
+  # Jira Automation export clientKey (tests/e2e/fixtures/outbox-rules): a site
+  # identifier, not a credential.
+  '''^0b13362f-4593-49ca-a308-7e52393734ea$''',
+]

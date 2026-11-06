@@ -1,0 +1,414 @@
+{{- /*
+gVisor freeze/thaw substrate namespace (fix-substrate; bug ka-0000004301,
+epic ka-0000008224).
+
+The main release namespace enforces PodSecurity `baseline`, which forbids BOTH:
+  - the per-agent thaw-state hostPath every runsc pod carries
+    (podmanager/volumes.go:177), and
+  - the privileged hostPID/hostPath gvisor-probe pod the controller exec's into
+    to drive `runsc checkpoint|restore` (podmanager/freezethaw_exec.go).
+Managed EKS does not expose the apiserver PodSecurity AdmissionConfiguration, so
+a cluster-level `exemptions.runtimeClasses: [runsc]` is unavailable. The only way
+to admit runsc freeze/thaw workloads without relaxing the security posture of the
+namespace every other agent runs in is to give them a dedicated PSA-privileged
+namespace plus a probe DaemonSet on the gVisor node.
+
+Everything here is gated on `gvisor.enabled` AND `gvisor.namespace.name`, and the
+heavier objects additionally on per-object `create` flags (mirroring
+runtimeClass.create / nodePool.create) so an operator can adopt pre-existing
+substrate without an upgrade collision. DEFAULT OFF — values.yaml ships
+gvisor.namespace.name="" so this whole file renders nothing.
+
+The controller is told about this namespace via GVISOR_NAMESPACE
+(controller/deployment.yaml). When set, runsc agents are scheduled here, the
+freeze/thaw ProbeNodeExecutor targets this namespace, and the status reporter
+sweeps it so a runsc agent's bead still gets phase updates.
+*/ -}}
+{{- if and .Values.gvisor.enabled .Values.gvisor.namespace.name }}
+{{- $ns := .Values.gvisor.namespace }}
+{{- $nsName := $ns.name }}
+{{- if $ns.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $nsName }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    # PSA privileged — admits the runsc thaw-state hostPath and the privileged
+    # gvisor-probe. Scoped to THIS namespace only; the main namespace keeps its
+    # baseline enforcement untouched.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+  annotations:
+    # Keep the namespace across a flip to gvisor.enabled=false so a half-frozen
+    # agent's thaw-state survives an accidental rollback toggle.
+    "helm.sh/resource-policy": keep
+{{- end }}{{/* end if namespace.create */}}
+---
+{{/*
+Agent ServiceAccount in the gVisor namespace. A runsc agent pod is scheduled
+here (controller GVISOR_NAMESPACE routing) and sets
+spec.serviceAccountName = gardenio.coop.serviceAccountName — the SAME SA name as
+in .Release.Namespace. K8s requires that SA to exist in the pod's own namespace:
+with agents.needsK8sAPI / NeedsK8sAPI the pod automounts a SA token, so a missing
+SA wedges the pod (kubelet cannot mint the projected token). The IRSA role-arn
+annotation is mirrored from agents.agentServiceAccount.annotations so S3 session
+archival (agents.s3.bucket) keeps working — provided the IAM role's trust policy
+admits system:serviceaccount:<gVisor-ns>:<sa> (see gvisor-runsc-prod.md; a
+trust-policy scoped only to the main namespace must be widened out-of-band).
+Gated on namespace.create so an operator adopting a pre-existing namespace can
+manage the SA themselves.
+*/ -}}
+{{- if $ns.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "gardenio.coop.serviceAccountName" . }}
+  namespace: {{ $nsName }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+  {{- with .Values.agents.agentServiceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}{{/* end if namespace.create (agent SA) */}}
+{{/*
+Cluster-admin agent ServiceAccount in the gVisor namespace. Same requirement as
+the default agent SA above, for the OTHER SA a pod can select: a project that
+opts into elevated cluster access (project bead `service_account:
+<release>-agent-cluster-admin`, see agent-cluster-rbac.yaml) still gets its
+runsc-tagged agents routed HERE by GVISOR_NAMESPACE. K8s requires the SA to
+exist in the pod's own namespace, so without this mirror every runsc agent of an
+opted-in project is rejected at admission ("error looking up service account")
+while its non-runsc siblings schedule fine — a silent, per-channel wedge.
+
+The ClusterRoleBinding in agent-cluster-rbac.yaml lists this SA as a subject, and
+the IRSA trust policy must admit
+system:serviceaccount:<gVisor-ns>:<cluster-admin-SA> or S3 session archival
+breaks for exactly these pods.
+
+Gated on agents.clusterAdmin.enabled so clusters that never opted in render
+nothing extra.
+*/ -}}
+{{- if and $ns.create .Values.agents.enabled .Values.agents.clusterAdmin.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "gardenio.coop.clusterAdminServiceAccountName" . }}
+  namespace: {{ $nsName }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+  {{- with .Values.agents.clusterAdmin.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}{{/* end if cluster-admin SA mirror */}}
+{{/*
+Controller cross-namespace RBAC. The controller runs as
+gardenio.agents.serviceAccountName in .Release.Namespace but must manage runsc
+agent pods (create/delete), exec into the probe (pods/exec), and provision
+per-agent token Secrets + PVCs in the gVisor namespace. A namespaced Role +
+RoleBinding here grants exactly that, scoped to the gVisor namespace.
+*/ -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-gvisor
+  namespace: {{ $nsName }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  # Pod lifecycle for runsc agents + probe discovery. `update`/`patch` are
+  # required for the warm-B placeholder pool: promoting a Ready placeholder into
+  # a live thawed agent pod is an in-place Pods().Update() of its labels
+  # (poolmanager.markPromoted / markClaimed). Without these verbs every warm-B
+  # claim is forbidden and Thaw silently falls back to the slow
+  # create-placeholder-Pod-B + waitPodReady path (~70s), defeating the
+  # sub-second resume fast path entirely (ka-0000000706).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Freeze/Thaw node-exec into the privileged gvisor-probe pod.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # PVC lifecycle for runsc agent workspaces (podmanager create/get/update/delete).
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "create", "update", "delete"]
+  # Per-agent token Secrets are minted into the agent's own namespace.
+  # update/list: GitHub App token refresh + sweep (agents.githubApp.enabled).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "delete"{{ if .Values.agents.githubApp.enabled }}, "update", "list"{{ end }}]
+  {{- if .Values.gvisor.freezeThaw.postThawTokenRefresh.enabled }}
+  # Post-thaw credential refresher (bug ka-0000000518): thawed runsc agents
+  # routed to this namespace need their SA/IRSA warm-copy tokens re-minted before
+  # the ~1h post-thaw expiry. The refresher mints against the agent pod's SA in
+  # THIS namespace via the TokenRequest API. Granted ONLY when the refresher is
+  # enabled (default-off), mirroring the main-namespace Role.
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+  {{- end }}
+  # ExternalSecret CRDs: the controller's secret-reconciler mirrors every
+  # managed ExternalSecret into the gVisor namespace too (extraNamespaces in
+  # internal/secretreconciler), so a runsc agent routed here can resolve its
+  # project/account credential secrets. The same reconcile loop also UPDATES a
+  # managed ExternalSecret in place when it drifts from desired spec
+  # (reconcileNamespace -> client.Update); without `update` that drift branch
+  # 403s ~12x/cycle here as pure log-spam (bug ka-0000002732). create/list let
+  # it materialize + reap; delete reaps orphans. No watch/patch — the
+  # reconciler polls, it does not run an informer.
+  # Mirrors the main-namespace gardenio-agents Role (controller/rbac.yaml).
+  - apiGroups: ["external-secrets.io"]
+    resources: ["externalsecrets"]
+    verbs: ["get", "list", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-gvisor
+  namespace: {{ $nsName }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "gardenio.agents.fullname" . }}-gvisor
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.agents.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.gvisor.probe.create }}
+---
+{{/*
+gvisor-probe DaemonSet — one privileged pod per gVisor node. The controller's
+ProbeNodeExecutor selects it by `app=gvisor-probe` + spec.nodeName and runs
+`chroot /host bash -c <runsc checkpoint|restore>`. hostPID + hostPath / give it
+the node's process tree and the containerd runsc runtime root. Pinned to the
+gVisor pool via nodeSelector + toleration so it lands only on runsc nodes.
+*/ -}}
+{{- $probe := .Values.gvisor.probe }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gvisor-probe
+  namespace: {{ $nsName }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app: gvisor-probe
+spec:
+  selector:
+    matchLabels:
+      app: gvisor-probe
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.labels" . | nindent 8 }}
+        app: gvisor-probe
+    spec:
+      hostPID: true
+      hostNetwork: true
+      nodeSelector:
+        {{- toYaml ($probe.nodeSelector | default (dict "gvisor" "enabled")) | nindent 8 }}
+      tolerations:
+        {{- toYaml ($probe.tolerations | default (list (dict "key" "gvisor" "operator" "Equal" "value" "enabled" "effect" "NoSchedule"))) | nindent 8 }}
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: probe
+          {{- /* Pin by digest when set (P3.5 ka-0000006978, exposure-hardening
+                 F13): the probe is node-root (privileged + hostPath / + hostPID)
+                 and pulls an external image, so a mutable tag is the highest-value
+                 supply-chain target on the box. probe.digest renders
+                 image@sha256:… and overrides any tag. */}}
+          {{- $probeImage := $probe.image | default "public.ecr.aws/docker/library/ubuntu:22.04" }}
+          {{- if $probe.digest }}
+          image: {{ printf "%s@%s" $probeImage $probe.digest | quote }}
+          {{- else }}
+          image: {{ $probeImage | quote }}
+          {{- end }}
+          command: ["sleep", "infinity"]
+          securityContext:
+            privileged: true
+          {{- with $probe.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: host
+              mountPath: /host
+            - name: run
+              mountPath: /run
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+        - name: run
+          hostPath:
+            path: /run
+{{- end }}{{/* end if probe.create */}}
+{{- /*
+GitHub App private key: NEVER mirrored into the gVisor namespace (plan §6). The
+key mints unlimited installation tokens for every repo the App is installed on;
+the gVisor namespace hosts agent pods. Only the controller reads it, in the
+release namespace. Reject any mirror that names the key Secret or its SSM path,
+so a values edit cannot widen it (tests/github_app_key_exclusion_test.go).
+*/ -}}
+{{- $ghKeySecret := .Values.agents.githubApp.privateKeySecret }}
+{{- range $i, $m := .Values.gvisor.namespace.secretMirrors }}
+{{- if or (eq $m.name $ghKeySecret) (contains "github-app" (lower (toString $m.remoteRef))) (contains "github-app" (lower (toString $m.name))) }}
+{{- fail (printf "gvisor.namespace.secretMirrors[%d] (%s <- %s): the GitHub App private key must never be mirrored into the gVisor namespace" $i $m.name $m.remoteRef) }}
+{{- end }}
+{{- end }}
+{{- /* The Lands provisioner's Keycloak client secret (step 8.6) manages every
+land's groups; like the App keys, only the controller reads it. */ -}}
+{{- $landsKCSecret := .Values.agents.lands.provisioner.keycloak.clientSecretSecret }}
+{{- range $i, $m := .Values.gvisor.namespace.secretMirrors }}
+{{- if or (eq $m.name $landsKCSecret) (contains "lands-provisioner" (lower (toString $m.remoteRef))) (contains "lands-provisioner" (lower (toString $m.name))) }}
+{{- fail (printf "gvisor.namespace.secretMirrors[%d] (%s <- %s): the Lands provisioner's Keycloak client secret must never be mirrored into the gVisor namespace" $i $m.name $m.remoteRef) }}
+{{- end }}
+{{- end }}
+{{- /* The Lands App private key mints tokens for every tenant repo. Keyed on
+the configured Secret name, not on a "github-app" substring the name need not
+carry (gd-q8nBnOP65d). */ -}}
+{{- $landsAppSecret := lower (toString .Values.agents.lands.provisioner.githubApp.privateKeySecret) }}
+{{- range $i, $m := .Values.gvisor.namespace.secretMirrors }}
+{{- if and $landsAppSecret (eq (lower (toString $m.name)) $landsAppSecret) }}
+{{- fail (printf "gvisor.namespace.secretMirrors[%d] (%s <- %s): the Lands App private key must never be mirrored into the gVisor namespace" $i $m.name $m.remoteRef) }}
+{{- end }}
+{{- end }}
+{{- /* The controller's Keycloak credentials: each gardenio machine client's
+secret (gardenio-machine-gardenio-<client>) and realm admin. The same markers
+the controller's agent-pod check refuses (gd-q8nBnOP65d). */ -}}
+{{- range $i, $m := .Values.gvisor.namespace.secretMirrors }}
+{{- $n := printf "%s %s" (lower (toString $m.name)) (lower (toString $m.remoteRef)) }}
+{{- if or (contains "machine-gardenio-" $n) (contains "keycloak-runtime-admin" $n) (contains "keycloak-first-admin" $n) }}
+{{- fail (printf "gvisor.namespace.secretMirrors[%d] (%s <- %s): the controller's Keycloak credentials must never be mirrored into the gVisor namespace" $i $m.name $m.remoteRef) }}
+{{- end }}
+{{- end }}
+{{- range $i, $m := .Values.gvisor.namespace.secretMirrors }}
+---
+{{/*
+Secret mirror into the gVisor namespace. A runsc agent pod references the same
+Claude OAuth / git-credentials / NATS-token Secrets as a normal agent, but those
+live in .Release.Namespace and a Secret cannot be referenced across namespaces.
+Each entry mirrors a source Secret in the secret store into the gVisor namespace
+via ExternalSecret, so the controller can wire the agent pod to it. Requires
+external-secrets installed and externalSecrets.enabled.
+
+Two extraction shapes (bug ka-0000005152):
+  - Default: dataFrom.extract pulls every JSON property out of the SM value.
+    Correct for SM values that ARE JSON objects (the Claude OAuth secrets,
+    git-credentials, github/gitlab/mezmo tokens — their main-ns
+    ExternalSecrets declare remoteRef.property, i.e. the SM value is JSON).
+  - secretKey set: render a single-key data entry instead. Required when the
+    SM value is a PLAIN STRING (e.g. gardenio/kd-beads-token is a raw token,
+    not JSON). dataFrom.extract json.Unmarshals the value and emits zero keys
+    for a plain string, so the target Secret never materializes and the runsc
+    pod defers forever on "secret not yet synced". With secretKey the whole SM
+    value (or remoteRef.property when also set) maps to that one key — matching
+    how the source secret's own ExternalSecret is shaped.
+*/ -}}
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: {{ $m.name }}
+  namespace: {{ $nsName }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+spec:
+  refreshInterval: {{ $m.refreshInterval | default "15m" }}
+  secretStoreRef:
+    kind: {{ $.Values.externalSecrets.secretStoreKind | default "ClusterSecretStore" }}
+    name: {{ $.Values.externalSecrets.secretStoreName }}
+  target:
+    name: {{ $m.name }}
+    creationPolicy: Owner
+{{- if $m.secretKey }}
+  data:
+    - secretKey: {{ $m.secretKey | quote }}
+      remoteRef:
+        key: {{ $m.remoteRef | quote }}
+        {{- if $m.property }}
+        property: {{ $m.property | quote }}
+        {{- end }}
+{{- else }}
+  dataFrom:
+    - extract:
+        key: {{ $m.remoteRef | quote }}
+{{- end }}
+{{- end }}{{/* end range secretMirrors */}}
+{{- /*
+Image-pull secret(s) into the gVisor namespace (bug ka-0000003245). A runsc
+agent pod lists imagePullSecrets (e.g. registry-pull-secret) exactly like a
+normal agent, but those dockerconfigjson Secrets are created by
+registry-external-secrets.yaml only in .Release.Namespace. A Secret cannot be
+referenced across namespaces, so without this block the controller's
+verifySecretsExist gate defers the runsc pod forever ("registry-pull-secret not
+yet synced in namespace <gVisor ns>"). We re-render the SAME registrySecrets
+ExternalSecrets here, targeted at the gVisor namespace, so the pull secret
+exists where the runsc pod actually schedules. Gated on registrySecrets.enabled
+(same condition as the main-namespace render).
+*/ -}}
+{{- if and .Values.registrySecrets .Values.registrySecrets.enabled }}
+{{- $storeName := .Values.registrySecrets.secretStoreName | default "aws-secretsmanager" }}
+{{- $storeKind := .Values.registrySecrets.secretStoreKind | default "ClusterSecretStore" }}
+{{- $refreshInterval := .Values.registrySecrets.refreshInterval | default (include "gardenio.externalSecrets.refreshInterval" (dict "category" "static" "root" .)) }}
+{{- range $name, $reg := .Values.registrySecrets.registries }}
+{{- if and $reg.enabled $reg.remoteRef }}
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: {{ $name }}-auth
+  namespace: {{ $nsName }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+spec:
+  refreshInterval: {{ $refreshInterval }}
+  secretStoreRef:
+    kind: {{ $storeKind }}
+    name: {{ $storeName }}
+  target:
+    name: {{ $name }}
+    creationPolicy: Owner
+    deletionPolicy: Retain
+    template:
+      type: kubernetes.io/dockerconfigjson
+      metadata: {}
+      data:
+        .dockerconfigjson: |
+          {
+            "auths": {
+              {{- $first := true }}
+              {{- range $host := $reg.hosts }}
+              {{- if not $first }},{{ end }}
+              "{{ $host }}": {
+                "username": "{{`{{ .username }}`}}",
+                "password": "{{`{{ .password }}`}}",
+                "auth": "{{`{{ (printf "%s:%s" .username .password) | b64enc }}`}}"
+              }
+              {{- $first = false }}
+              {{- end }}
+            }
+          }
+  data:
+    - secretKey: username
+      remoteRef:
+        key: {{ $reg.remoteRef }}
+        property: {{ $reg.usernameProperty | default "username" }}
+    - secretKey: password
+      remoteRef:
+        key: {{ $reg.remoteRef }}
+        property: {{ $reg.passwordProperty | default "password" }}
+{{- end }}
+{{- end }}
+{{- end }}{{/* end if registrySecrets.enabled */}}
+{{- end }}{{/* end if gvisor.enabled and gvisor.namespace.name */}}

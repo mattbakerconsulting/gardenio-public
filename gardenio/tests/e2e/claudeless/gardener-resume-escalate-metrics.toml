@@ -1,0 +1,357 @@
+# gardener-resume-escalate-metrics.toml
+#
+# Claudeless scenario: the gardener terminal_goal master gate's
+# RESUME-OR-ESCALATE loop + its metrics/observability, end to end against a live
+# beads daemon (bead ka-0000005353, decision ka-0000006918).
+#
+# Task gd-H25qwM9YZt. The existing gardener-stop-* scenarios only assert the
+# stop-close paths (no_progress/wall_clock/hard_stop) and never the RE-ARM path;
+# fleet-metrics only covers kbeads gauges; and the gardener-stop-* scenarios
+# INJECT a stop spec rather than exercising the default blob `gb gardener start`
+# emits. This module fills all four gaps:
+#
+#   Leg 1 — RESUME (re-arm): a gardener with an unmet terminal_goal whose resume
+#     budget is NOT spent hits a premature max_runs stop → gardenerResumeOrEscalate
+#     re-arms it (run_budget refilled, resumes_without_progress bumped) and leaves
+#     it OPEN. Asserted on the live bead's post-state (blob + resume comment).
+#   Leg 2 — DORMANT (budget spent): the SAME gardener, now with its resume budget
+#     exhausted, hits the premature stop again → the gate stamps the
+#     gardener-stuck-escalate label and parks it dormant on plan activity
+#     (dormant_blocker_kind=resume_budget_spent), leaving the bead OPEN; it never
+#     closes a plan gardener on a spent budget (gd-dNxyjFLGRJ). Asserted on the
+#     live label, status and blob.
+#   Leg 3 — METRICS: the escalate probe serves the in-process default prometheus
+#     registry on /metrics after firing; scrape it and assert gardener_resume_total
+#     carries this gardener's action=dormant,reason=max_runs series (the counter
+#     the metric layer exists to expose). NOTE the counter is per-process, so this
+#     scrape sees the dormant increment from THIS probe run — leg 1's re-arm
+#     increment lived in that (separate, already-exited) process. The re-arm
+#     itself is asserted structurally in leg 1 via the live bead post-state.
+#   Leg 4 — OWNER BLOB: `gb gardener start` with a human slack: operator stamps a
+#     resolved slack_user_id into the DEFAULT gardener stop blob, while an empty /
+#     sentinel operator stays intentionally ownerless (ka-0000003284). This is
+#     the default-blob owner attribution the gardener-stop-* injected-spec
+#     scenarios never exercise.
+#
+# The resume-or-escalate gate runs inside evalOne's gardenerPreFireCheck, which
+# the fleet-wide EvaluateSource fires against EVERY live gardener. Driving that
+# loop directly would have an unacceptable blast radius, so this scenario uses
+# the test-only `trigger-probe --source=gardener` mode: it drives
+# TriggerEngine.ProbeGardenerResumeOrEscalate against exactly ONE named gardener
+# trigger bead (the one we create here) and nothing else. Same real gate, same
+# real daemon writes, same real metric increments — just scoped to our bead.
+#
+# Skips gracefully when go / trigger-probe / gb / daemon env are unavailable.
+
+[claude]
+session_id = "e2e00000-000d-4000-a000-00000000000c"
+username = "e2e-gardener-resume-escalate"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 120000
+
+[[responses]]
+on = "*"
+say = "Running gardener-resume-escalate-metrics: premature stop → re-arm → dormant park + scrape gardener_resume_total + default-blob owner attribution."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-probe ─────────────────────
+PROBE_BIN=""
+if command -v trigger-probe >/dev/null 2>&1; then
+  PROBE_BIN=$(command -v trigger-probe)
+elif [ -x /usr/local/bin/trigger-probe ]; then
+  PROBE_BIN=/usr/local/bin/trigger-probe
+elif [ -x /tmp/trigger-probe ]; then
+  PROBE_BIN=/tmp/trigger-probe
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-probe from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-probe ./cmd/trigger-probe/ ) || {
+    echo "SKIP: trigger-probe build failed"; exit 0;
+  }
+  PROBE_BIN=/tmp/trigger-probe
+else
+  echo "SKIP: trigger-probe binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-probe: $PROBE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then echo "SKIP: BEADS_HTTP_URL not set"; exit 0; fi
+if [ -z "${BEADS_TOKEN:-}" ]; then echo "SKIP: BEADS_TOKEN not set"; exit 0; fi
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if ! command -v gb >/dev/null 2>&1; then echo "SKIP: gb not present"; exit 0; fi
+if ! command -v curl >/dev/null 2>&1; then echo "SKIP: curl not present"; exit 0; fi
+
+TAG="e2e-cre-$$-$(date +%s)"
+METRICS_PORT="${GARDENER_PROBE_METRICS_PORT:-19194}"
+METRICS_ADDR="127.0.0.1:${METRICS_PORT}"
+echo "tag: $TAG  metrics: $METRICS_ADDR"
+
+# ── Setup: an epic + a gardener trigger bead with an UNMET terminal_goal ──
+# The bead carries a real gardener blob: terminal_goal set, run_budget exhausted
+# (runs_spawned>=run_budget) so a max_runs premature stop is what the gate sees,
+# resume_budget=2 with resumes_without_progress=0 so leg 1 re-arms. We seed the
+# blob directly (not via `gb gardener start`) because we need to control the
+# resume counters precisely; leg 4 below exercises the `gb gardener start` blob.
+EPIC_ID=$(kd create "gardener-resume-epic-$TAG" --type=epic \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+echo "epic: $EPIC_ID"
+
+# An OPEN child keeps the frontier non-empty so the budget-spent path (leg 2)
+# parks on plan activity (resume_budget_spent) rather than the operator-wedge
+# park, which needs the frontier wedged behind an OPEN escalation/decision.
+CHILD_ID=$(kd create "gardener-resume-child-$TAG" --type=task \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -n "$CHILD_ID" ]; then
+  kd dep add "$CHILD_ID" "$EPIC_ID" --type parent-child >/dev/null 2>&1 || true
+fi
+
+# resume_budget=2, resumes_without_progress starts at 0 → leg 1 re-arms to 1.
+CAP_BLOB=$(cat <<JSON
+{"terminal_goal":"drive $EPIC_ID children to closed","assign_bead":"$EPIC_ID","run_budget":1,"max_runs":1,"runs_spawned":1,"resume_budget":2,"resumes_without_progress":0,"stop":{"loop_end":{"any":[{"kind":"max_runs"}]}}}
+JSON
+)
+
+# The fixture:e2e: label is LOAD-BEARING for safety: the live in-cluster
+# trigger-engine's schedule-source LoadTriggers skips any bead carrying a
+# fixture:e2e: prefixed label (isE2EFixture), so the fleet engine NEVER fires,
+# heals, or mutates this gardener — only our probe touches it. Without it a
+# concurrent reconcile could race our re-arm/escalate assertions or cron-fire a
+# throwaway crew agent. cron is 0 0 1 1 * (Jan 1) as a second belt.
+CAP_ID=$(kd create "gardener-resume-trig-$TAG" --type=trigger --kind=data \
+  -l "trigger:schedule" -l "role:gardener" -l "gardener-epic:$EPIC_ID" \
+  -l "fixture:e2e:gardener-resume" -l "e2e:claudeless" -l "e2e-tag:$TAG" \
+  -f "enabled=true" -f "role=gardener" -f "assign_bead=$EPIC_ID" \
+  -f "cron=0 0 1 1 *" -f "timezone=UTC" \
+  -f "gardener=$CAP_BLOB" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$CAP_ID" ]; then fail "create gardener trigger"; exit 1; fi
+echo "gardener: $CAP_ID"
+
+# Track any user + owner gardener from leg 4 so cleanup always reaches them.
+OWNER_CAP_ID=""
+OWNERLESS_CAP_ID=""
+OWNER_EPIC_ID=""
+OWNERLESS_EPIC_ID=""
+
+cleanup() {
+  [ -n "${PROBE_PID:-}" ] && kill "$PROBE_PID" 2>/dev/null || true
+  # Disable + close the gardener(s) so the in-cluster engine ignores them.
+  for id in "$CAP_ID" "$OWNER_CAP_ID" "$OWNERLESS_CAP_ID"; do
+    [ -z "$id" ] && continue
+    kd update "$id" -f "enabled=false" >/dev/null 2>&1 || true
+    kd close "$id" >/dev/null 2>&1 || true
+  done
+  for id in "$CHILD_ID" "$EPIC_ID" "$OWNER_EPIC_ID" "$OWNERLESS_EPIC_ID"; do
+    [ -z "$id" ] && continue
+    kd close "$id" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+# ════════════════════════════════════════════════════════════════════
+# Leg 1 — RESUME (re-arm): budget remaining → re-arm, do NOT close.
+# ════════════════════════════════════════════════════════════════════
+PROBE_LOG=/tmp/gardener-probe-rearm-$$.log
+if ! "$PROBE_BIN" --source=gardener --trigger="$CAP_ID" --gardener-kind=max_runs \
+    --http-url="$BEADS_HTTP_URL" --token="$BEADS_TOKEN" >"$PROBE_LOG" 2>&1; then
+  fail "trigger-probe (re-arm) exited non-zero"
+  echo "--- probe log ---"; cat "$PROBE_LOG"; echo "--- end ---"
+  exit 1
+fi
+pass "trigger-probe drove the resume-or-escalate gate (re-arm leg)"
+
+# Post-state: gardener still OPEN, blob shows resumes_without_progress=1 and a
+# refilled run_budget. Poll briefly for the daemon write to land.
+DEADLINE=$(( $(date +%s) + 20 ))
+REARMED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  STATUS=$(kd show "$CAP_ID" --json 2>/dev/null | jq -r '.status // empty')
+  RWP=$(kd show "$CAP_ID" --json 2>/dev/null | jq -r '.fields.gardener // "{}"' | jq -r '.resumes_without_progress // 0' 2>/dev/null)
+  if [ "$STATUS" != "closed" ] && [ "$RWP" = "1" ]; then
+    REARMED=1
+    break
+  fi
+  sleep 2
+done
+if [ "$REARMED" = "1" ]; then
+  pass "gardener re-armed: still open, resumes_without_progress=1"
+else
+  fail "gardener re-arm" "status=$STATUS resumes_without_progress=$RWP"
+  kd show "$CAP_ID" 2>/dev/null | grep -iE "status|gardener|resume" | head -20 || true
+fi
+
+# The re-arm comment names the premature stop + the re-arm.
+if kd show "$CAP_ID" 2>/dev/null | grep -qiE "resumed|re-armed"; then
+  pass "gardener re-arm left a resume comment"
+else
+  echo "  (note) no resume comment found — non-fatal (comment forwarding may lag)"
+fi
+
+# ════════════════════════════════════════════════════════════════════
+# Leg 2 + 3 — DORMANT at budget + scrape gardener_resume_total.
+# ════════════════════════════════════════════════════════════════════
+# Push resumes_without_progress to the budget (2) so the next probe parks it.
+# Read the current blob, bump the counter, write it back.
+CUR_BLOB=$(kd show "$CAP_ID" --json 2>/dev/null | jq -r '.fields.gardener // empty')
+if [ -z "$CUR_BLOB" ]; then fail "read gardener blob before escalate"; exit 1; fi
+ESC_BLOB=$(echo "$CUR_BLOB" | jq -c '.resumes_without_progress=2 | .run_budget=(.runs_spawned // 1)')
+kd update "$CAP_ID" -f "gardener=$ESC_BLOB" >/dev/null 2>&1 || { fail "seed budget-spent blob"; exit 1; }
+
+# This probe run serves /metrics so we can scrape both series after escalate.
+PROBE_LOG2=/tmp/gardener-probe-escalate-$$.log
+"$PROBE_BIN" --source=gardener --trigger="$CAP_ID" --gardener-kind=max_runs \
+  --metrics-addr="$METRICS_ADDR" --serve-timeout=25s \
+  --http-url="$BEADS_HTTP_URL" --token="$BEADS_TOKEN" >"$PROBE_LOG2" 2>&1 &
+PROBE_PID=$!
+
+# Wait for the probe to serve /metrics.
+MDEADLINE=$(( $(date +%s) + 20 ))
+SERVING=0
+while [ "$(date +%s)" -lt "$MDEADLINE" ]; do
+  if curl -sf --max-time 1 -o /dev/null "http://${METRICS_ADDR}/metrics" 2>/dev/null; then
+    SERVING=1; break
+  fi
+  # Bail early if the probe died.
+  if ! kill -0 "$PROBE_PID" 2>/dev/null; then break; fi
+  sleep 1
+done
+if [ "$SERVING" = "1" ]; then
+  pass "trigger-probe served /metrics (escalate leg)"
+else
+  fail "trigger-probe /metrics did not come up"
+  echo "--- probe log ---"; cat "$PROBE_LOG2"; echo "--- end ---"
+fi
+
+METRICS=$(curl -s --max-time 5 "http://${METRICS_ADDR}/metrics" 2>/dev/null || true)
+
+# Leg 3a: the family exists at all.
+if echo "$METRICS" | grep -q '^gardener_resume_total'; then
+  pass "gardener_resume_total family present on /metrics"
+else
+  fail "gardener_resume_total family present"
+  echo "$METRICS" | grep -i "gardener" | head -10 || true
+fi
+
+# Leg 3b: this gardener's dormant series is present with reason=max_runs.
+if echo "$METRICS" | grep -E "gardener_resume_total\\{" | grep -q "$CAP_ID" \
+   && echo "$METRICS" | grep -E "gardener_resume_total\\{" | grep "$CAP_ID" | grep -q 'action="dormant"' \
+   && echo "$METRICS" | grep -E "gardener_resume_total\\{" | grep "$CAP_ID" | grep -q 'reason="max_runs"'; then
+  pass "gardener_resume_total has action=dormant reason=max_runs for $CAP_ID"
+else
+  fail "gardener_resume_total dormant series"
+  echo "$METRICS" | grep -E "gardener_resume_total\\{" | grep "$CAP_ID" || echo "  (no series for $CAP_ID)"
+fi
+
+# Leg 3c: the fruitless-resume gauge is published for this gardener.
+if echo "$METRICS" | grep -E "gardener_resumes_without_progress\\{" | grep -q "$CAP_ID"; then
+  pass "gardener_resumes_without_progress gauge published for $CAP_ID"
+else
+  echo "  (note) gardener_resumes_without_progress not found for $CAP_ID — non-fatal"
+fi
+
+# Leg 2: the spent budget parked the bead dormant (still open) + stamped the
+# stuck-escalate label.
+EDEADLINE=$(( $(date +%s) + 20 ))
+ESCALATED=0
+while [ "$(date +%s)" -lt "$EDEADLINE" ]; do
+  STATUS=$(kd show "$CAP_ID" --json 2>/dev/null | jq -r '.status // empty')
+  LABELS=$(kd show "$CAP_ID" --json 2>/dev/null | jq -r '(.labels // [])[]' 2>/dev/null)
+  DKIND=$(kd show "$CAP_ID" --json 2>/dev/null | jq -r '.fields.gardener // "{}"' | jq -r '.dormant_blocker_kind // empty' 2>/dev/null)
+  if [ "$STATUS" != "closed" ] && [ "$DKIND" = "resume_budget_spent" ] && echo "$LABELS" | grep -q "gardener-stuck-escalate"; then
+    ESCALATED=1; break
+  fi
+  sleep 2
+done
+if [ "$ESCALATED" = "1" ]; then
+  pass "gardener parked dormant on plan activity: open + gardener-stuck-escalate label"
+else
+  fail "gardener dormant park" "status=$STATUS kind=$DKIND labels=[$(echo "$LABELS" | tr '\\n' ' ')]"
+fi
+
+# Stop serving /metrics now that we've scraped.
+kill "$PROBE_PID" 2>/dev/null || true
+wait "$PROBE_PID" 2>/dev/null || true
+PROBE_PID=""
+
+# ════════════════════════════════════════════════════════════════════
+# Leg 4 — DEFAULT-BLOB OWNER ATTRIBUTION via `gb gardener start`.
+# ════════════════════════════════════════════════════════════════════
+# 4a: a human slack: operator → slack_user_id stamped into the default blob.
+OWNER_EPIC_ID=$(kd create "gardener-owner-epic-$TAG" --type=epic \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "project:gardenio" --json 2>&1 | jq -r '.id // empty')
+if [ -n "$OWNER_EPIC_ID" ]; then
+  OWNER_OUT=$(gb gardener start "$OWNER_EPIC_ID" --project gardenio \
+    --i-read-the-gardener-instructions \
+    --operated-by "slack:U0PROBEE2E" --label "fixture:e2e:gardener-resume" \
+    --http-url "$BEADS_HTTP_URL" --json 2>&1)
+  OWNER_CAP_ID=$(echo "$OWNER_OUT" | jq -r '.id // empty' 2>/dev/null)
+  if [ -z "$OWNER_CAP_ID" ]; then
+    # Non-JSON output path: scrape the "Created gardener trigger <id>" line.
+    OWNER_CAP_ID=$(echo "$OWNER_OUT" | grep -oE 'kd-[A-Za-z0-9]+' | head -n1)
+  fi
+  if [ -n "$OWNER_CAP_ID" ]; then
+    OWNER_SUID=$(kd show "$OWNER_CAP_ID" --json 2>/dev/null | jq -r '.fields.gardener // "{}"' | jq -r '.slack_user_id // empty' 2>/dev/null)
+    if [ "$OWNER_SUID" = "U0PROBEE2E" ]; then
+      pass "gb gardener start with slack: operator stamped slack_user_id into default blob"
+    else
+      fail "owner slack_user_id in default blob" "got=[$OWNER_SUID]"
+    fi
+  else
+    fail "gb gardener start (owner) produced no gardener id" "out=$OWNER_OUT"
+  fi
+else
+  echo "  (note) could not create owner epic — skipping leg 4a"
+fi
+
+# 4b: an empty/sentinel operator → the gardener stays intentionally ownerless.
+OWNERLESS_EPIC_ID=$(kd create "gardener-ownerless-epic-$TAG" --type=epic \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "project:gardenio" --json 2>&1 | jq -r '.id // empty')
+if [ -n "$OWNERLESS_EPIC_ID" ]; then
+  # A non-human sentinel operator resolves to ("","") → ownerless.
+  OWNERLESS_OUT=$(gb gardener start "$OWNERLESS_EPIC_ID" --project gardenio \
+    --i-read-the-gardener-instructions \
+    --operated-by "system:e2e-sentinel" --label "fixture:e2e:gardener-resume" \
+    --http-url "$BEADS_HTTP_URL" --json 2>&1)
+  OWNERLESS_CAP_ID=$(echo "$OWNERLESS_OUT" | jq -r '.id // empty' 2>/dev/null)
+  if [ -z "$OWNERLESS_CAP_ID" ]; then
+    OWNERLESS_CAP_ID=$(echo "$OWNERLESS_OUT" | grep -oE 'kd-[A-Za-z0-9]+' | head -n1)
+  fi
+  if [ -n "$OWNERLESS_CAP_ID" ]; then
+    OL_SUID=$(kd show "$OWNERLESS_CAP_ID" --json 2>/dev/null | jq -r '.fields.gardener // "{}"' | jq -r '.slack_user_id // empty' 2>/dev/null)
+    if [ -z "$OL_SUID" ]; then
+      pass "gb gardener start with sentinel operator stayed ownerless (no slack_user_id)"
+    else
+      fail "sentinel operator should stay ownerless" "got slack_user_id=[$OL_SUID]"
+    fi
+  else
+    echo "  (note) gb gardener start (ownerless) produced no gardener id — non-fatal: out=$OWNERLESS_OUT"
+  fi
+else
+  echo "  (note) could not create ownerless epic — skipping leg 4b"
+fi
+
+# ── Summary ─────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "gardener-resume-escalate-metrics: re-arm → dormant → metrics + default-blob owner attribution OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-resume-escalate-metrics scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

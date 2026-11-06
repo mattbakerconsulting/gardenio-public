@@ -1,0 +1,150 @@
+{{- if .Values.agents.metrics.prometheusRule.operatedBy.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.operatedBy }}
+# PrometheusRule for the kbeads operated_by attribution rollout (R9 §4.3).
+# Four alerts:
+#   - OperatedByResolverErrors: nonzero rate of resolver errors → rollback signal
+#   - OperatedByEmptyWriteRate: real-write ratio dropped below 0.95 post-flip
+#   - OperatedByAmbiguousAgent: any increment is a hard page (R7 §6.6)
+#   - LegacySentinelWriteAfterCutover: any write bound to the
+#     system:legacy-pre-attribution sentinel after the R6 cut-over
+#     (ka-0000006798) — always a hard page (an unmigrated write path)
+#
+# Severity for the first two is configurable per env via
+# .Values.agents.metrics.prometheusRule.operatedBy.severity
+# (R9 §4.3: page in prod, ticket in e2e, silenced in dev). The M5 ambiguous-agent
+# and R6 legacy-sentinel alerts are always page — both must sit at zero.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}-operated-by
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: kbeads.operated_by
+      interval: 30s
+      rules:
+        - alert: OperatedByResolverErrors
+          expr: sum(rate(gardenio_beads_operated_by_resolver_errors_total[5m])) > 0
+          for: 10m
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: kbeads
+            subsystem: operated_by
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "kbeads operated_by resolver is erroring"
+            description: |
+              Sustained nonzero resolver-error rate for 10m. error_type breakdown:
+              {{`{{ with printf "sum by (error_type) (rate(gardenio_beads_operated_by_resolver_errors_total[5m]))" | query }}{{ range . }}  - {{ .Labels.error_type }}: {{ .Value | printf "%.4f" }}/s
+              {{ end }}{{ end }}`}}
+              Direct rollback signal per R9 §4.3.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/research/human-attribution-rollout.md#43-alerts"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: OperatedByEmptyWriteRate
+          # Fires when post-flip the real/total ratio drops below 0.95 for
+          # 30m. The clause `gardenio_beads_operated_by_writes_total{kind="real"} > 0`
+          # gates this on the flag actually being on — a fully-empty writes
+          # series (kind=real == 0 throughout) is the pre-flip state and
+          # must NOT page.
+          expr: |
+            (
+              sum(rate(gardenio_beads_operated_by_writes_total{kind="real"}[5m]))
+              /
+              clamp_min(sum(rate(gardenio_beads_operated_by_writes_total[5m])), 1)
+            ) < 0.95
+            and
+            sum(increase(gardenio_beads_operated_by_writes_total{kind="real"}[1h])) > 0
+          for: 30m
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: kbeads
+            subsystem: operated_by
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "kbeads operated_by real-write ratio < 0.95"
+            description: |
+              The fraction of audit-row writes that resolve to a real operator
+              (slack:|oidc:) has dropped below the soak threshold (R9 §3.3).
+              Either CLI plumbing regressed (X-Operated-By stopped flowing)
+              or the agent-bead fallback started missing slack_user_id.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/research/human-attribution-rollout.md#43-alerts"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: OperatedByAmbiguousAgent
+          expr: increase(gardenio_beads_operated_by_ambiguous_agent_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: page
+            component: kbeads
+            subsystem: operated_by
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "kbeads detected an ambiguous agent name"
+            description: |
+              R7 §6.6 invariant violated: an agent name was re-used across
+              spawns. This silently corrupts operated_by attribution. The
+              counter must always be 0 — investigate the offline backfill
+              tool emit site immediately.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/research/human-attribution-rollout.md#43-alerts"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: LegacySentinelWriteAfterCutover
+          # R6 cut-over (ka-0000006798, epic ka-0000006809 surface 6): after the
+          # declared cut-over date NO new write may bind operated_by =
+          # system:legacy-pre-attribution. Every historical sentinel-bound row
+          # was migrated by the ka-0000001880 cleanup track, so ANY non-zero
+          # increment of the counter after the cut-over is an unmigrated write
+          # path — the server-side gate refuses it (outcome=rejected), but the
+          # page is what makes an operator find and fix the caller.
+          #
+          # Both outcome series are summed and gated by `time() >= cutoverUnix`
+          # so the alert stays silent before the date (pre-cut-over sentinel
+          # binds are the expected outcome=accepted state) and pages on the
+          # first sentinel write on/after it — including the belt-and-suspenders
+          # case where BEADS_LEGACY_SENTINEL_CUTOVER was forced OFF past the
+          # date (accepted still increments), which is itself a misconfiguration
+          # worth paging. cutoverUnix MUST equal the server's
+          # legacySentinelCutoverDate (kbeads audit.go).
+          expr: |
+            sum(increase(gardenio_beads_operated_by_legacy_sentinel_total[15m])) > 0
+            and on() (time() >= {{ $cfg.legacySentinelCutoverUnix | int64 }})
+          for: 0m
+          labels:
+            severity: page
+            component: kbeads
+            subsystem: operated_by
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "kbeads bound the legacy-pre-attribution sentinel after the R6 cut-over"
+            description: |
+              A write resolved to operated_by=system:legacy-pre-attribution on
+              or after the R6 cut-over date. The server gate refuses these with
+              a 4xx (resolver_source=legacy_sentinel_cutover), but a non-zero
+              counter means a write path is STILL routing to the historical
+              sink after every legacy row was migrated (ka-0000001880). Find the
+              caller from structured logs (resolver_source) and attribute it to
+              a real human operator. Outcome breakdown:
+              {{`{{ with printf "sum by (outcome) (increase(gardenio_beads_operated_by_legacy_sentinel_total[15m]))" | query }}{{ range . }}  - {{ .Labels.outcome }}: {{ .Value | printf "%.0f" }}
+              {{ end }}{{ end }}`}}
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/docs/user-guide/01-overview.md#beads (archived bead ka-0000006798)"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

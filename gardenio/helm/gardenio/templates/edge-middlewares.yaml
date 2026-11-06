@@ -1,0 +1,67 @@
+{{- /*
+  Edge middlewares — NEW global concurrency + request-body caps (task
+  ka-0000006519; research doc §4, ka-0000002581 G4/G5).
+
+  Neither of these existed in the chart before. They are cheap, global, and
+  belong default-on at the edge of a small single-box install (Gardenio-in-a-Box)
+  to protect the node from a single client exhausting concurrency or memory.
+
+    * edge.inFlightReq — Traefik inFlightReq middleware. Caps the number of
+      simultaneous in-flight requests; excess requests get a 429. Tune
+      `amount` 20–100 to the box size.
+    * edge.buffering — Traefik buffering middleware. Caps the request body
+      Traefik will accept (maxRequestBodyBytes → 413 when exceeded) and the
+      amount buffered in memory before spilling to disk (memRequestBodyBytes).
+      Raise per-route for legitimate large uploads.
+
+  Both are gated and DEFAULT OFF in the base chart: a global concurrency
+  ceiling of ~50 and a 2 MB body cap are correct for a single small box but
+  would wrongly throttle a multi-replica, ALB-fronted prod/e2e deployment
+  before they are tuned. The Gardenio-in-a-Box overlay
+  (deploy-values/gardenio-inbox.yaml) flips edge.inFlightReq.enabled and
+  edge.buffering.enabled on; the helper "gardenio.edgeMiddlewares" then
+  prepends these to every rendered IngressRoute's middleware chain.
+
+  Rendered only when traefik.enabled and at least one of the two is enabled.
+*/ -}}
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.edge (or (and .Values.edge.inFlightReq .Values.edge.inFlightReq.enabled) (and .Values.edge.buffering .Values.edge.buffering.enabled)) }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- if and .Values.edge.buffering .Values.edge.buffering.enabled }}
+# ── Edge buffering Middleware (request-body cap) ─────────────────────────────
+# Caps the request body Traefik accepts before forwarding upstream. Bodies
+# larger than maxRequestBodyBytes get a 413; memRequestBodyBytes controls how
+# much is held in memory before spilling to a temp file on disk.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-edge-buffering
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: edge-buffering
+spec:
+  buffering:
+    maxRequestBodyBytes: {{ .Values.edge.buffering.maxRequestBodyBytes | int64 }}
+    memRequestBodyBytes: {{ .Values.edge.buffering.memRequestBodyBytes | int64 }}
+{{- end }}
+{{- if and .Values.edge.inFlightReq .Values.edge.inFlightReq.enabled }}
+{{- if and .Values.edge.buffering .Values.edge.buffering.enabled }}
+---
+{{- end }}
+# ── Edge inFlightReq Middleware (concurrency cap) ────────────────────────────
+# Global ceiling on simultaneously in-flight requests. Excess requests are
+# rejected with 429. Protects a small box from a single client (or a thundering
+# herd) saturating all worker capacity.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-edge-inflightreq
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: edge-inflightreq
+spec:
+  inFlightReq:
+    amount: {{ .Values.edge.inFlightReq.amount | int }}
+{{- end }}
+{{- end }}

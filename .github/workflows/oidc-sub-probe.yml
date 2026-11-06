@@ -1,0 +1,60 @@
+# Throwaway probe (gd-VAyugfDaI5): print the `sub` claim of this repo's GitHub
+# OIDC token, decoded, and check it starts with the prefix the ECR CI roles
+# trust (local.github_oidc_sub_prefix, gardenio/terraform/composition/gardenio/ci_ecr.tf).
+# The repo has use_immutable_subject on, so the sub carries owner and repo IDs;
+# a trust policy written against the names never matches.
+#
+# Prints the decoded sub, aud, ref and event_name ONLY. The token itself is
+# masked and never printed or written anywhere. Runs on a pull request that
+# touches this file or ci_ecr.tf (sub ...:pull_request) and on dispatch (sub
+# ...:ref:refs/heads/<branch>). Delete once A3 (gd-PLuPV7okCI) assumes both
+# roles in CI.
+name: oidc-sub-probe
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/oidc-sub-probe.yml
+      - gardenio/terraform/composition/gardenio/ci_ecr.tf
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # mint the OIDC token; nothing here calls AWS
+
+jobs:
+  probe:
+    name: decoded OIDC sub
+    # Same-repo PRs only: a fork PR gets no id-token.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: gardenio-k3s-light # light ARC scale set (gardenio/helm/ci); python3 only, no docker
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: gardenio/terraform/composition/gardenio/ci_ecr.tf
+          sparse-checkout-cone-mode: false
+      - name: Decode the sub claim (never the token)
+        shell: python3 {0}
+        run: |
+          import base64, json, os, re, sys, urllib.parse, urllib.request
+
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=" + urllib.parse.quote("sts.amazonaws.com")
+          req = urllib.request.Request(url, headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          token = json.load(urllib.request.urlopen(req, timeout=30))["value"]
+          print("::add-mask::" + token)
+          payload = token.split(".")[1]
+          claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+          del token, payload
+
+          for k in ("sub", "aud", "ref", "event_name"):
+              print(f"{k}: {claims.get(k)}")
+
+          src = open("gardenio/terraform/composition/gardenio/ci_ecr.tf").read()
+          m = re.search(r'^\s*github_oidc_sub_prefix\s*=\s*"([^"]+)"', src, re.M)
+          if not m:
+              sys.exit("::error::github_oidc_sub_prefix not found in ci_ecr.tf")
+          prefix = m.group(1)
+          if not claims["sub"].startswith(prefix + ":"):
+              sys.exit(f"::error::sub does not start with the trusted prefix {prefix}:")
+          print(f"OK: sub starts with the trusted prefix {prefix}:")

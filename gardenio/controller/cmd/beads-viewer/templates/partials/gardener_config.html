@@ -1,0 +1,422 @@
+{{define "gardener_config"}}
+{{- /* Inline gardener config-edit form for /gardener/{id}. Revealed by the
+       "Edit config" lever; persists to POST /gardener/{id}/config (operator-
+       gated). Only operator-editable knobs are exposed — the engine-owned
+       runtime counters (runs spawned/completed, last agent, progress state)
+       are preserved server-side and never clobbered by a save.
+
+       The stop spec is authored through the schema-driven GardenerStopSpecBuilder
+       (task ka-0000000897 / I2.3): guided rows per condition type with a
+       human-readable summary and no-silent-no-op validation, plus a raw-JSON
+       escape hatch for advanced authors. */ -}}
+{{with .Config}}
+<form id="gardener-config-form" class="gardener-config-form"
+      hx-post="{{$.BasePath}}/gardener/{{.ID}}/config"
+      hx-target="#gardener-config-host" hx-swap="innerHTML"
+      hx-disabled-elt="find button[type=submit]">
+  <div class="gardener-config-head">
+    <h2 class="gardener-config-heading">Edit gardener config</h2>
+    <button type="button" class="gardener-ctl gardener-ctl-edit"
+            onclick="document.getElementById('gardener-config-host').innerHTML=''"
+            aria-label="Close editor">Close</button>
+  </div>
+
+  {{if .Saved}}
+  <p class="gardener-config-saved" role="status">Saved. The engine reads the new spec on its next pass.</p>
+  {{end}}
+  {{if .Error}}
+  <p class="gardener-config-error" role="alert">{{.Error}}</p>
+  {{end}}
+
+  {{- /* Run prompt (bug ka-0000003596): the per-run `prompt` is the operative
+         instruction sent verbatim to every run the gardener spawns — the single
+         most behavior-defining knob, yet the one field the editor could not
+         view or edit. It leads the form for that reason. Top-level trigger-bead
+         field, persisted via setSchedField (not the gardener blob). */ -}}
+  <label class="gardener-config-field">
+    <span>Run prompt <span class="meta">— sent verbatim to every run</span></span>
+    <textarea name="prompt" rows="8" class="gardener-config-prompt"
+              placeholder="What should every run this gardener spawns do?">{{.Prompt}}</textarea>
+  </label>
+
+  <label class="gardener-config-field">
+    <span>Terminal goal</span>
+    <textarea name="terminal_goal" rows="3"
+              placeholder="What does &ldquo;done&rdquo; look like for this gardener?">{{.TerminalGoal}}</textarea>
+  </label>
+
+  <div class="gardener-config-row">
+    <label class="gardener-config-field">
+      <span>Exit condition</span>
+      <input type="text" name="exit_condition" value="{{.ExitCondition}}" autocomplete="off">
+    </label>
+    <label class="gardener-config-field">
+      <span>On exit</span>
+      <input type="text" name="on_exit" value="{{.OnExit}}" autocomplete="off">
+    </label>
+  </div>
+
+  <div class="gardener-config-row">
+    <label class="gardener-config-field">
+      <span>Run budget</span>
+      <input type="number" name="run_budget" value="{{.RunBudget}}" min="0" step="1"
+             placeholder="0 = unlimited">
+    </label>
+    <label class="gardener-config-field">
+      <span>Max runs</span>
+      <input type="number" name="max_runs" value="{{.MaxRuns}}" min="0" step="1"
+             placeholder="0 = unlimited">
+    </label>
+    <label class="gardener-config-field">
+      <span>Max retries</span>
+      <input type="number" name="max_retries" value="{{.MaxRetries}}" min="0" step="1">
+    </label>
+  </div>
+
+  <div class="gardener-config-row">
+    <label class="gardener-config-field">
+      <span>Run timeout</span>
+      <input type="text" name="run_timeout" value="{{.RunTimeout}}" autocomplete="off"
+             placeholder="e.g. 30m">
+    </label>
+    <label class="gardener-config-field">
+      <span>Timeout</span>
+      <input type="text" name="timeout" value="{{.Timeout}}" autocomplete="off"
+             placeholder="e.g. 2h">
+    </label>
+  </div>
+
+  <div class="gardener-config-checks">
+    <label class="gardener-config-check">
+      <input type="checkbox" name="retry_on_failure" value="1"{{if .RetryOnFailure}} checked{{end}}>
+      <span>Retry on failure</span>
+    </label>
+    <label class="gardener-config-check">
+      <input type="checkbox" name="one_spawn_at_a_time" value="1"{{if .OneSpawnAtATime}} checked{{end}}>
+      <span>One spawn at a time</span>
+    </label>
+  </div>
+
+  {{- /* Scheduling knobs — top-level trigger-bead fields (cadence + fire caps),
+         distinct from the gardener-goal knobs above. These govern WHEN and HOW
+         OFTEN the gardener fires (ka-0000006347, I2.2). */ -}}
+  <div class="gardener-config-row">
+    <label class="gardener-config-field">
+      <span>Cron cadence</span>
+      <input type="text" name="cron" value="{{.Cron}}" autocomplete="off"
+             placeholder="default */30 * * * *">
+    </label>
+    <label class="gardener-config-field">
+      <span>Cooldown (minutes)</span>
+      <input type="number" name="cooldown_minutes" value="{{.Cooldown}}" min="0" step="1"
+             placeholder="default 5">
+    </label>
+    <label class="gardener-config-field">
+      <span>Max concurrent</span>
+      <input type="number" name="max_concurrent" value="{{.MaxConcurrent}}" min="0" step="1"
+             placeholder="default 3">
+    </label>
+  </div>
+
+  <label class="gardener-config-field">
+    <span>Conditions (pre-flight gate, JSON array)</span>
+    <textarea name="conditions" rows="4" class="gardener-config-json" spellcheck="false"
+              placeholder="[]">{{.Conditions}}</textarea>
+  </label>
+
+  {{- /* Guided stop-condition builder (task ka-0000000897 / I2.3): replaces the
+         standalone raw stop_json textarea. The raw JSON survives as the builder's
+         advanced escape hatch. */ -}}
+  {{template "gardener_stop_builder" .StopBuilder}}
+
+  <label class="gardener-config-field">
+    <span>Progress spec (JSON)</span>
+    <textarea name="progress_json" rows="6" class="gardener-config-json" spellcheck="false"
+              placeholder="{}">{{.ProgressJSON}}</textarea>
+  </label>
+
+  <div class="gardener-config-actions">
+    <button type="submit" class="gardener-ctl gardener-ctl-save">Save config</button>
+  </div>
+</form>
+{{end}}
+{{end}}
+
+{{- /* GardenerStopSpecBuilder — schema-driven stop-condition authoring component
+       (task ka-0000000897 / I2.3). Dot is a stopSpecBuilderView. Renders:
+         - a live human-readable summary of the current spec,
+         - blocking validation errors + soft advisories,
+         - three slot sections (loop_end / hard_stop / run_end), each with
+           guided rows and an "add condition" menu,
+         - a hidden <template> per kind the client clones to add a fresh row,
+         - a raw-JSON escape hatch (<details>).
+       The hidden marker `stop_builder` tells the save handler to parse rows. */ -}}
+{{define "gardener_stop_builder"}}
+<fieldset class="stop-builder" data-stop-builder>
+  <legend class="stop-builder-legend">Stop conditions</legend>
+  <input type="hidden" name="stop_builder" value="1">
+  <p class="stop-builder-intro meta">
+    When should this gardener stop? Add guided conditions per slot. Any condition
+    firing in a slot triggers it. The builder blocks conditions that would
+    silently never fire.
+  </p>
+
+  {{- /* Live human-readable summary + validation feedback. */ -}}
+  <div class="stop-builder-summary" data-stop-summary>
+    {{if .Summary}}
+    <ul class="stop-summary-list">
+      {{range .Summary}}<li>{{.}}</li>{{end}}
+    </ul>
+    {{else}}
+    <p class="meta stop-summary-empty">No stop conditions — this gardener has no declared exit. (A run budget + a hard wall-clock stop is strongly recommended.)</p>
+    {{end}}
+  </div>
+  {{if .Errors}}
+  <ul class="stop-builder-errors" role="alert">
+    {{range .Errors}}<li>{{.}}</li>{{end}}
+  </ul>
+  {{end}}
+  {{if .Advisories}}
+  <ul class="stop-builder-advisories">
+    {{range .Advisories}}<li>{{.}}</li>{{end}}
+  </ul>
+  {{end}}
+
+  {{- /* One section per slot. */ -}}
+  {{range .Slots}}
+  <section class="stop-slot" data-slot="{{.Slot}}">
+    <header class="stop-slot-head">
+      <h3 class="stop-slot-title">{{.Label}}</h3>
+      <p class="stop-slot-help meta">{{.Help}}</p>
+    </header>
+    <div class="stop-slot-rows" data-slot-rows>
+      {{range .Rows}}
+      {{template "gardener_stop_row" .}}
+      {{end}}
+    </div>
+    <div class="stop-slot-add">
+      <select class="stop-add-kind" data-add-kind aria-label="Condition type to add">
+        <option value="">+ Add condition…</option>
+        {{$slot := .Slot}}
+        {{range $.Kinds}}
+        {{if .ValidInSlot $slot}}<option value="{{.Kind}}">{{.Label}}</option>{{end}}
+        {{end}}
+      </select>
+    </div>
+  </section>
+  {{end}}
+
+  {{- /* On-loop-end action. */ -}}
+  <label class="gardener-config-field stop-builder-onloopend">
+    <span>When the loop ends</span>
+    <select name="on_loop_end">
+      <option value="close"{{if or (eq .OnLoopEnd "close") (eq .OnLoopEnd "")}} selected{{end}}>Close the gardener (default)</option>
+      <option value="notify_slack"{{if eq .OnLoopEnd "notify_slack"}} selected{{end}}>Notify Slack (do not close)</option>
+      <option value="spawn_followup"{{if eq .OnLoopEnd "spawn_followup"}} selected{{end}}>Spawn a follow-up</option>
+    </select>
+  </label>
+
+  {{- /* Hidden row templates the client clones per kind. Rendered inert (no
+         name attrs — the JS stamps slot/index-scoped names on clone). */ -}}
+  <div class="stop-row-templates" hidden aria-hidden="true">
+    {{range .Kinds}}
+    <template data-kind-template="{{.Kind}}"
+              data-kind-label="{{.Label}}"
+              data-kind-help="{{.Help}}"
+              data-kind-advisory="{{.Advisory}}">
+      {{range .Fields}}
+      <div class="stop-field" data-field="{{.Name}}"
+           data-field-type="{{.Type}}"
+           data-field-label="{{.Label}}"
+           data-field-placeholder="{{.Placeholder}}"
+           data-field-help="{{.Help}}"
+           data-field-required="{{if .Required}}1{{end}}"
+           data-field-options="{{range $i, $o := .Options}}{{if $i}},{{end}}{{$o}}{{end}}"></div>
+      {{end}}
+    </template>
+    {{end}}
+  </div>
+
+  {{- /* Advanced escape hatch: raw JSON, still validated as JSON on save when
+         the builder marker is absent. Kept for power authors round-tripping a
+         spec the guided rows do not yet cover. */ -}}
+  <details class="stop-builder-raw">
+    <summary>Advanced: raw stop JSON</summary>
+    <p class="meta">Editing here is only used if you clear all guided rows and remove the builder. Prefer the guided rows above.</p>
+    <textarea name="stop_json" rows="6" class="gardener-config-json" spellcheck="false"
+              placeholder="{}">{{.RawJSON}}</textarea>
+  </details>
+</fieldset>
+<script>
+(function () {
+  // GardenerStopSpecBuilder client (task ka-0000000897 / I2.3). Progressive
+  // enhancement only: with JS off, the server-rendered rows still submit and
+  // validate; this just lets an operator ADD a fresh row and REMOVE one without
+  // a round-trip. Server-side parseStopSpecFromForm + validateStopSpec remain
+  // authoritative — the client never persists.
+  var root = document.querySelector('[data-stop-builder]');
+  if (!root || root.dataset.enhanced) return;
+  root.dataset.enhanced = '1';
+
+  function fieldControl(fd, prefix) {
+    var name = prefix + fd.dataset.field;
+    var type = fd.dataset.fieldType;
+    var opts = (fd.dataset.fieldOptions || '').split(',').filter(Boolean);
+    var el;
+    if (type === 'select') {
+      el = document.createElement('select');
+      el.name = name;
+      opts.forEach(function (o) {
+        var opt = document.createElement('option');
+        opt.value = o; opt.textContent = o;
+        el.appendChild(opt);
+      });
+    } else {
+      el = document.createElement('input');
+      el.type = (type === 'int') ? 'number' : 'text';
+      if (type === 'int') el.step = '1';
+      el.name = name;
+      el.autocomplete = 'off';
+      if (fd.dataset.fieldPlaceholder) el.placeholder = fd.dataset.fieldPlaceholder;
+    }
+    return el;
+  }
+
+  function buildRow(slot, index, tmpl) {
+    var prefix = 'stop_' + slot + '_' + index + '_';
+    var row = document.createElement('div');
+    row.className = 'stop-row';
+    row.setAttribute('data-stop-row', '');
+    row.setAttribute('data-slot', slot);
+
+    var head = document.createElement('div');
+    head.className = 'stop-row-head';
+    var hidden = document.createElement('input');
+    hidden.type = 'hidden';
+    hidden.name = prefix + 'kind';
+    hidden.value = tmpl.dataset.kindTemplate;
+    hidden.setAttribute('data-row-kind', '');
+    var label = document.createElement('span');
+    label.className = 'stop-row-label';
+    label.textContent = tmpl.dataset.kindLabel;
+    var rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'stop-row-remove';
+    rm.setAttribute('data-row-remove', '');
+    rm.setAttribute('aria-label', 'Remove condition');
+    rm.textContent = 'Remove';
+    head.appendChild(hidden); head.appendChild(label); head.appendChild(rm);
+    row.appendChild(head);
+
+    if (tmpl.dataset.kindHelp) {
+      var help = document.createElement('p');
+      help.className = 'stop-row-help meta';
+      help.textContent = tmpl.dataset.kindHelp;
+      row.appendChild(help);
+    }
+    if (tmpl.dataset.kindAdvisory) {
+      var adv = document.createElement('p');
+      adv.className = 'stop-row-advisory';
+      adv.textContent = tmpl.dataset.kindAdvisory;
+      row.appendChild(adv);
+    }
+
+    var fieldDefs = tmpl.content.querySelectorAll('.stop-field');
+    if (fieldDefs.length) {
+      var wrap = document.createElement('div');
+      wrap.className = 'stop-row-fields';
+      fieldDefs.forEach(function (fd) {
+        var lbl = document.createElement('label');
+        lbl.className = 'stop-field';
+        if (fd.dataset.fieldHelp) lbl.title = fd.dataset.fieldHelp;
+        var span = document.createElement('span');
+        span.textContent = fd.dataset.fieldLabel + (fd.dataset.fieldRequired ? ' *' : '');
+        lbl.appendChild(span);
+        lbl.appendChild(fieldControl(fd, prefix));
+        wrap.appendChild(lbl);
+      });
+      row.appendChild(wrap);
+    }
+    return row;
+  }
+
+  // Next free row index within a slot: max existing index + 1, so removed rows
+  // never collide and the server's gap-tolerant scan stays correct.
+  function nextIndex(rowsEl, slot) {
+    var max = -1;
+    rowsEl.querySelectorAll('[data-row-kind]').forEach(function (h) {
+      var m = /^stop_[a-z_]+_(\d+)_kind$/.exec(h.name);
+      if (m) max = Math.max(max, parseInt(m[1], 10));
+    });
+    return max + 1;
+  }
+
+  root.addEventListener('change', function (ev) {
+    var sel = ev.target.closest('[data-add-kind]');
+    if (!sel || !sel.value) return;
+    var section = sel.closest('.stop-slot');
+    var slot = section.getAttribute('data-slot');
+    var rowsEl = section.querySelector('[data-slot-rows]');
+    var tmpl = root.querySelector('template[data-kind-template="' + sel.value + '"]');
+    if (tmpl) {
+      rowsEl.appendChild(buildRow(slot, nextIndex(rowsEl, slot), tmpl));
+    }
+    sel.value = '';
+  });
+
+  root.addEventListener('click', function (ev) {
+    var btn = ev.target.closest('[data-row-remove]');
+    if (!btn) return;
+    ev.preventDefault();
+    var row = btn.closest('[data-stop-row]');
+    if (row) row.remove();
+  });
+})();
+</script>
+{{end}}
+
+{{- /* One guided condition row. Dot is a stopRowView. Field names are
+       slot/index-scoped (stop_<slot>_<i>_<field>) so the server parses them
+       back into the right slot + entry. */ -}}
+{{define "gardener_stop_row"}}
+{{$p := printf "stop_%s_%d_" .Slot .Index}}
+<div class="stop-row{{if not .KindOK}} stop-row-unknown{{end}}" data-stop-row data-slot="{{.Slot}}">
+  <div class="stop-row-head">
+    <input type="hidden" name="{{$p}}kind" value="{{.Kind}}" data-row-kind>
+    <span class="stop-row-label">{{.Label}}</span>
+    <button type="button" class="stop-row-remove" data-row-remove aria-label="Remove condition">Remove</button>
+  </div>
+  {{if .Help}}<p class="stop-row-help meta">{{.Help}}</p>{{end}}
+  {{if .Advisory}}<p class="stop-row-advisory">{{.Advisory}}</p>{{end}}
+  {{if .Summary}}<p class="stop-row-summary meta">{{.Summary}}</p>{{end}}
+  {{if .Fields}}
+  <div class="stop-row-fields">
+    {{range .Fields}}
+    <label class="stop-field" title="{{.Help}}">
+      <span>{{.Label}}{{if .Required}} <abbr title="required">*</abbr>{{end}}</span>
+      {{if eq (printf "%s" .Type) "select"}}
+      <select name="{{$p}}{{.Name}}">
+        {{$val := .Value}}
+        {{range .Options}}<option value="{{.}}"{{if eq . $val}} selected{{end}}>{{.}}</option>{{end}}
+      </select>
+      {{else if eq (printf "%s" .Type) "int"}}
+      <input type="number" name="{{$p}}{{.Name}}" value="{{.Value}}" step="1"
+             placeholder="{{.Placeholder}}" autocomplete="off">
+      {{else}}
+      <input type="text" name="{{$p}}{{.Name}}" value="{{.Value}}"
+             placeholder="{{.Placeholder}}" autocomplete="off">
+      {{end}}
+    </label>
+    {{end}}
+  </div>
+  {{end}}
+</div>
+{{end}}
+
+{{- /* Friendly operator-only note served in place of the config form when a
+       non-operator (or unauthenticated caller) reaches GET /gardener/{id}/edit
+       directly — instead of a bare 401 or an editable form the save would
+       refuse (bug ka-0000005377). */ -}}
+{{define "gardener_operator_note"}}
+<p class="gardener-operator-note" role="status">Editing a gardener's config requires the operator role. Sign in as an operator to change the goal, budget, or stop spec.</p>
+{{end}}

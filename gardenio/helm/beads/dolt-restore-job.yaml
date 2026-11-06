@@ -1,0 +1,94 @@
+# Restore/import one database from S3 into the running server.
+# Usage (see docs/beads-on-k3s.md "Restore"):
+#   DB=<db>; sed -e "s/DBNAME/$DB/g" -e "s/JOBSUFFIX/${DB//_/-}/g" dolt-restore-job.yaml | kubectl apply -f -
+# Expects a Dolt backup (the layout `dolt backup` / DOLT_BACKUP writes) at
+# s3://gardenio-hq-backups-360190250083/k3s-dolt/restore/<db>/. The job
+# pulls it to the shared /backups volume and runs DOLT_CLONE on the server;
+# it refuses if the database already exists (drop it first, deliberately).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dolt-restore-JOBSUFFIX
+  namespace: beads
+  labels:
+    app: dolt-restore
+    app.kubernetes.io/part-of: gas-city
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: dolt-restore
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: s3-pull
+        image: amazon/aws-cli:2.36.48
+        env:
+        - name: HOME
+          value: /tmp
+        - name: AWS_REGION
+          value: us-east-1
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+        command:
+        - sh
+        - -ec
+        - |
+          mkdir -p /backups/restore/DBNAME
+          aws s3 sync s3://gardenio-hq-backups-360190250083/k3s-dolt/restore/DBNAME/ /backups/restore/DBNAME/ --no-progress --only-show-errors
+          ls -la /backups/restore/DBNAME
+        volumeMounts:
+        - name: dolt-backups
+          mountPath: /backups
+        - name: tmp
+          mountPath: /tmp
+      containers:
+      - name: dolt-clone
+        image: dolthub/dolt:2.3.5
+        env:
+        - name: HOME
+          value: /tmp
+        - name: DOLT_CLI_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: dolt-root
+              key: password
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+        command:
+        - sh
+        - -ec
+        - |
+          dolt config --global --add metrics.disabled true >/dev/null
+          q() { dolt --host=dolt --port=3306 --user=root --no-tls sql -r csv -q "$1"; }
+          if q "SHOW DATABASES" | grep -qx 'DBNAME'; then
+            echo "database DBNAME already exists on the server; refusing to overwrite"; exit 1
+          fi
+          q "CALL DOLT_CLONE('file:///backups/restore/DBNAME', 'DBNAME')"
+          q "USE \`DBNAME\`; SELECT 'tables', COUNT(*) FROM information_schema.tables WHERE table_schema='DBNAME'; SELECT * FROM metadata"
+        volumeMounts:
+        - name: dolt-backups
+          mountPath: /backups
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: dolt-backups
+        persistentVolumeClaim:
+          claimName: dolt-backups

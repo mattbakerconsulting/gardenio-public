@@ -1,0 +1,129 @@
+# What should a release tag's browser gate diff against? (gd-rmHsVjmKse)
+#
+# Owner 2026-11-01 (Phase 8 gd-ujp9ttPCjd): "We can skip tests even on release
+# cut unless relevant files are impacted". A calver tag push runs every heavy
+# job of ci.yml, and the gardenhub browser suite is the longest of them. This
+# action lets ci.yml's `gate` skip it on a tag when no `gardenhub_browser`
+# path changed since a tag whose suite PASSED. coop and lands-conformance
+# stay forced on for every tag; this answers for the browser suite only.
+#
+# The base is the commit of the newest EARLIER calver tag whose ci.yml tag
+# run has the job `gardenhub browser (chromium)` concluded `success` (its
+# latest attempt). `skipped` does not count: tag 2 skips because tag 1
+# passed, so tag 3 must diff from tag 1, or a UI change in tag 2 would never
+# be tested. A red, cancelled or never-run suite does not count either. That
+# is an ACCEPT-list, PASSED below, so a conclusion this file has not heard of
+# widens the diff instead of opening a hole.
+#
+# ── FAILING OPEN ────────────────────────────────────────────────────────────
+# `base` is a sha only when it is proven safe: this push is a calver tag,
+# such a tag run was found among the newest 100 ci.yml push runs, and
+# `compare` says this tag's commit descends from (or is) the base. Every
+# other path -- any event but push, a branch or non-calver ref, an API error,
+# no earlier tag whose suite passed, a tag off another line of history --
+# leaves `base` EMPTY, and ci.yml then runs the suite. ci.yml runs this step
+# with continue-on-error, so the step failing outright reads the same.
+# scripts/check-main-concurrency.py guards the accept-list and the wiring,
+# and its _test.py runs this script against mocked runs when node is there.
+name: last-tag-base
+description: For a calver tag push, the commit of the newest earlier calver tag whose ci.yml browser suite passed; empty means run the suite
+
+outputs:
+  base:
+    description: 'Sha to diff this tag against for the gardenhub_browser paths, or empty: run the suite.'
+    value: ${{ steps.base.outputs.base }}
+  tag:
+    description: 'The calver tag `base` is the commit of, or empty.'
+    value: ${{ steps.base.outputs.tag }}
+
+runs:
+  using: composite
+  steps:
+    - id: base
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const WORKFLOW = 'ci.yml';
+          const JOB = 'gardenhub browser (chromium)';
+          // An accept-list, never a deny-list: see the header.
+          const PASSED = ['success'];
+          const CALVER = /^20\d{2}\.\d+\.\d+$/;
+          // Each tag run inspected costs one jobs call; past this, fail open.
+          const MAX_TAG_RUNS = 30;
+          // Every return goes through here, so both outputs are always set.
+          const answer = (sha, tag, why) => {
+            core.setOutput('base', sha);
+            core.setOutput('tag', tag);
+            core.info(`base=${sha || '(empty)'} tag=${tag || '(none)'} -- ${why}`);
+          };
+          // Calver order, numerically per part: 2026.308.10 is after 2026.308.9.
+          const calver = (t) => t.split('.').map(Number);
+          const before = (a, b) => {
+            const [x, y] = [calver(a), calver(b)];
+            for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i];
+            return false;
+          };
+
+          if (context.eventName !== 'push') {
+            return answer('', '', `event is ${context.eventName}; only a tag push diffs against a tag`);
+          }
+          if (!context.ref.startsWith('refs/tags/')) {
+            return answer('', '', `FAIL OPEN: ref ${context.ref} is not a tag`);
+          }
+          const tag = context.ref.slice('refs/tags/'.length);
+          if (!CALVER.test(tag)) {
+            return answer('', '', `FAIL OPEN: tag ${tag} is not a calver release tag`);
+          }
+          const { owner, repo } = context.repo;
+
+          let earlier;
+          try {
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: WORKFLOW, event: 'push', per_page: 100,
+            });
+            // A tag push run's head_branch is the tag name.
+            earlier = data.workflow_runs
+              .filter((r) => CALVER.test(r.head_branch || '') && before(r.head_branch, tag))
+              .sort((a, b) => before(a.head_branch, b.head_branch) ? 1
+                : before(b.head_branch, a.head_branch) ? -1 : b.run_number - a.run_number);
+          } catch (e) {
+            return answer('', '', `FAIL OPEN: could not list ${WORKFLOW} runs (${e.message})`);
+          }
+
+          let found = null;
+          for (const cand of earlier.slice(0, MAX_TAG_RUNS)) {
+            let jobs;
+            try {
+              jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+                { owner, repo, run_id: cand.id, filter: 'latest', per_page: 100 });
+            } catch (e) {
+              return answer('', '', `FAIL OPEN: could not list jobs of run ${cand.id} (${e.message})`);
+            }
+            const job = jobs.find((j) => j.name === JOB);
+            const concl = job ? job.conclusion : 'absent';
+            if (job && PASSED.includes(job.conclusion)) { found = cand; break; }
+            core.info(`  ${cand.head_branch} run ${cand.id}: ${JOB} ${concl}; stepped over, ` +
+              `its changes stay inside this diff`);
+          }
+          if (!found) {
+            return answer('', '', `FAIL OPEN: no earlier calver tag among the newest ` +
+              `${Math.min(earlier.length, MAX_TAG_RUNS)} tag run(s) has ${JOB} passed`);
+          }
+
+          let cmp;
+          try {
+            cmp = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${found.head_sha}...${context.sha}`,
+            });
+          } catch (e) {
+            return answer('', '', `FAIL OPEN: compare with ${found.head_branch} failed (${e.message})`);
+          }
+          // 'ahead': this tag descends from the base, so base..tag is every
+          // commit since the suite last passed. 'identical': the suite passed
+          // on this very commit.
+          if (!['ahead', 'identical'].includes(cmp.data.status)) {
+            return answer('', '', `FAIL OPEN: ${found.head_branch} (${found.head_sha.slice(0, 9)}) is ` +
+              `${cmp.data.status} of ${tag}, not an ancestor`);
+          }
+          return answer(found.head_sha, found.head_branch, `${found.head_branch} (run ${found.id}) is ` +
+            `the newest earlier calver tag whose ${JOB} passed; ${cmp.data.total_commits} commit(s) since`);

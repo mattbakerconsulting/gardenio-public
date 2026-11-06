@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright (c) 2026 Matt Baker <fimbaz@gmail.com>
+
+use bytes::Bytes;
+use coop::backend::spawn::NativePty;
+use coop::backend::{Backend, BackendInput};
+use coop::ring::RingBuffer;
+use coop::screen::Screen;
+use tokio::sync::mpsc;
+
+#[tokio::test]
+async fn spawn_and_capture() {
+    let (output_tx, mut output_rx) = mpsc::channel(64);
+    let (_input_tx, input_rx) = mpsc::channel::<BackendInput>(64);
+    let (_resize_tx, resize_rx) = mpsc::channel(4);
+
+    let mut pty =
+        NativePty::spawn(&["echo".into(), "hello".into()], 80, 24, &[]).expect("spawn failed");
+
+    assert!(pty.child_pid().is_some());
+
+    let status = pty.run(output_tx, input_rx, resize_rx).await.expect("run failed");
+    assert_eq!(status.code, Some(0));
+    assert_eq!(status.signal, None);
+
+    let mut output = Vec::new();
+    while let Ok(chunk) = output_rx.try_recv() {
+        output.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("hello"), "expected 'hello' in output: {text:?}");
+}
+
+#[tokio::test]
+async fn input_delivery() {
+    let (output_tx, mut output_rx) = mpsc::channel(64);
+    let (input_tx, input_rx) = mpsc::channel::<BackendInput>(64);
+    let (_resize_tx, resize_rx) = mpsc::channel(4);
+
+    let mut pty = NativePty::spawn(&["/bin/cat".into()], 80, 24, &[]).expect("spawn failed");
+
+    let handle = tokio::spawn(async move { pty.run(output_tx, input_rx, resize_rx).await });
+
+    // Write data with newline, then Ctrl-D on empty line to signal EOF
+    input_tx.send(BackendInput::Write(Bytes::from_static(b"ping\n"))).await.expect("send failed");
+    // Short delay so cat processes the line before we send EOF
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    input_tx.send(BackendInput::Write(Bytes::from_static(b"\x04"))).await.expect("send eof failed");
+    drop(input_tx);
+
+    let status = handle.await.expect("join").expect("run");
+    assert_eq!(status.code, Some(0));
+
+    let mut output = Vec::new();
+    while let Ok(chunk) = output_rx.try_recv() {
+        output.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("ping"), "expected 'ping' in output: {text:?}");
+}
+
+#[tokio::test]
+async fn resize_no_error() {
+    let pty = NativePty::spawn(&["/bin/sh".into(), "-c".into(), "sleep 0.1".into()], 80, 24, &[])
+        .expect("spawn failed");
+
+    pty.resize(40, 10).expect("resize failed");
+}
+
+#[tokio::test]
+async fn resize_via_channel() -> anyhow::Result<()> {
+    let (output_tx, mut output_rx) = mpsc::channel(64);
+    let (_input_tx, input_rx) = mpsc::channel::<BackendInput>(64);
+    let (resize_tx, resize_rx) = mpsc::channel(4);
+
+    // stty size prints "<rows> <cols>\n" on the PTY
+    let mut pty = NativePty::spawn(
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            // Wait for SIGWINCH, then query terminal size
+            "trap 'stty size' WINCH; sleep 5 & wait".into(),
+        ],
+        80,
+        24,
+        &[],
+    )?;
+
+    let handle = tokio::spawn(async move { pty.run(output_tx, input_rx, resize_rx).await });
+
+    // Give the shell time to set up the trap
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Send resize through the channel (like session would)
+    resize_tx.send((120, 40)).await?;
+
+    // Collect output until we see the expected dimensions or timeout
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut output = Vec::new();
+    loop {
+        tokio::select! {
+            chunk = output_rx.recv() => {
+                match chunk {
+                    Some(data) => output.extend_from_slice(&data),
+                    None => break,
+                }
+                let text = String::from_utf8_lossy(&output);
+                if text.contains("40 120") {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                break;
+            }
+        }
+    }
+
+    // Clean up
+    drop(resize_tx);
+    drop(_input_tx);
+    handle.abort();
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("40 120"), "expected '40 120' (rows cols) in output: {text:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn screen_integration() {
+    let (output_tx, mut output_rx) = mpsc::channel(64);
+    let (_input_tx, input_rx) = mpsc::channel::<BackendInput>(64);
+    let (_resize_tx, resize_rx) = mpsc::channel(4);
+
+    let mut pty =
+        NativePty::spawn(&["echo".into(), "hello".into()], 80, 24, &[]).expect("spawn failed");
+    let _ = pty.run(output_tx, input_rx, resize_rx).await;
+
+    let mut screen = Screen::new(80, 24);
+    while let Ok(chunk) = output_rx.try_recv() {
+        screen.feed(&chunk);
+    }
+
+    let snap = screen.snapshot();
+    let joined = snap.lines.join("\n");
+    assert!(joined.contains("hello"), "expected 'hello' in screen: {joined:?}");
+}
+
+/// Verify `COOP_PTY_TRACE_FILE` writes a v1-header trace with hex records
+/// for both `BackendInput::Write` data and PTY master output reads.
+///
+/// Diagnostic facility for ka-0000002034: the E2E harness runs the agent
+/// with this env set so the byte stream that flows through coop's PTY can
+/// be diffed against the passing isolated repro (MR !2662).
+struct EnvGuard {
+    key: &'static str,
+}
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.key);
+    }
+}
+
+#[tokio::test]
+async fn pty_trace_file_records_writes_and_reads() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let trace_path = dir.path().join("pty.trace");
+    std::env::set_var("COOP_PTY_TRACE_FILE", &trace_path);
+    let _guard = EnvGuard { key: "COOP_PTY_TRACE_FILE" };
+
+    let (output_tx, mut output_rx) = mpsc::channel(64);
+    let (input_tx, input_rx) = mpsc::channel::<BackendInput>(64);
+    let (_resize_tx, resize_rx) = mpsc::channel(4);
+
+    let mut pty = NativePty::spawn(&["/bin/cat".into()], 80, 24, &[]).expect("spawn failed");
+    let handle = tokio::spawn(async move { pty.run(output_tx, input_rx, resize_rx).await });
+
+    input_tx.send(BackendInput::Write(Bytes::from_static(b"ping\n"))).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    input_tx.send(BackendInput::Write(Bytes::from_static(b"\x04"))).await?;
+    drop(input_tx);
+    let _ = handle.await?;
+    while output_rx.try_recv().is_ok() {}
+
+    let body = std::fs::read_to_string(&trace_path)?;
+    assert!(body.starts_with("# coop pty trace v1 pid="), "missing v1 header: {body:?}");
+    // "ping" + newline → 70 69 6e 67 0a should appear in a W record.
+    let ping_hex = "70696e670a";
+    assert!(
+        body.lines().any(|l| {
+            let mut cols = l.splitn(3, '\t');
+            cols.next();
+            cols.next() == Some("W") && cols.next().is_some_and(|hex| hex.contains(ping_hex))
+        }),
+        "expected W record containing {ping_hex} (ping\\n) — body:\n{body}"
+    );
+    // /bin/cat echoes; expect at least one R record.
+    assert!(
+        body.lines().any(|l| {
+            let mut cols = l.splitn(3, '\t');
+            cols.next();
+            cols.next() == Some("R")
+        }),
+        "expected at least one R record — body:\n{body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ring_buffer_integration() {
+    let (output_tx, mut output_rx) = mpsc::channel(64);
+    let (_input_tx, input_rx) = mpsc::channel::<BackendInput>(64);
+    let (_resize_tx, resize_rx) = mpsc::channel(4);
+
+    let mut pty =
+        NativePty::spawn(&["echo".into(), "hello".into()], 80, 24, &[]).expect("spawn failed");
+    let _ = pty.run(output_tx, input_rx, resize_rx).await;
+
+    let mut ring = RingBuffer::new(4096);
+    while let Ok(chunk) = output_rx.try_recv() {
+        ring.write(&chunk);
+    }
+
+    assert!(ring.total_written() > 0);
+    let (a, b) = ring.read_from(0).expect("should be readable");
+    let mut data = a.to_vec();
+    data.extend_from_slice(b);
+    let text = String::from_utf8_lossy(&data);
+    assert!(text.contains("hello"), "expected 'hello' in ring buffer: {text:?}");
+}

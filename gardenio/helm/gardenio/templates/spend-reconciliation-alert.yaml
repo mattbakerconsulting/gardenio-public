@@ -1,0 +1,77 @@
+{{- if .Values.agents.metrics.prometheusRule.spendReconciliation.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.spendReconciliation }}
+# PrometheusRule for E3 spend-as-counter reconciliation (timeseries plan §2.E3,
+# bead ka-0000004289). The counter half of E3 (gardenio_agent_spend_usd_total,
+# incremented per turn by the controller's NATS->metrics spend forwarder) is the
+# fast per-agent/per-hour signal; the 5-min spendSync against LiteLLM /key/info
+# (gardenio_account_cost_usd, a cumulative per-account gauge) is the authoritative
+# backstop. This alert fires when the two diverge by more than `driftThreshold`
+# over 1h for an account whose LiteLLM-reported 1h spend exceeds `minSpendUSD`.
+#
+# Why the `or (... * 0)` on the counter side: it materializes a $0 counter delta
+# for every account the gauge knows about, so an account where the forwarder
+# emits nothing at all (e.g. the forwarder is undeployed or wedged) reads as 100%
+# drift and pages — that is the precise regression this backstop exists to catch.
+# The `minSpendUSD` floor suppresses noise from near-idle accounts where a few
+# cents of rounding is >1% in relative terms.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.fullname" . }}-spend-reconciliation
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.spend_reconciliation
+      interval: 1m
+      rules:
+        - alert: SpendCounterDriftFromLiteLLM
+          # |counter_1h - litellm_1h| / litellm_1h > driftThreshold, gated on the
+          # account having meaningful 1h LiteLLM spend so tiny accounts don't page.
+          expr: |
+            (
+              abs(
+                (
+                  sum by (account) (increase(gardenio_agent_spend_usd_total[1h]))
+                  or
+                  (sum by (account) (delta(gardenio_account_cost_usd[1h])) * 0)
+                )
+                -
+                sum by (account) (delta(gardenio_account_cost_usd[1h]))
+              )
+              /
+              clamp_min(sum by (account) (delta(gardenio_account_cost_usd[1h])), {{ $cfg.minSpendUSD }})
+            ) > {{ $cfg.driftThreshold }}
+            and
+            sum by (account) (delta(gardenio_account_cost_usd[1h])) > {{ $cfg.minSpendUSD }}
+          for: {{ $cfg.for | default "15m" | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: gardenio
+            subsystem: spend
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "Counter spend drifts >{{ $cfg.driftThreshold }} from LiteLLM for account {{`{{ $labels.account }}`}}"
+            description: |
+              The counter-derived 1h spend
+              (increase(gardenio_agent_spend_usd_total[1h])) for account
+              {{`{{ $labels.account }}`}} diverges by more than {{ $cfg.driftThreshold }}
+              from the LiteLLM /key/info-backed 1h delta
+              (delta(gardenio_account_cost_usd[1h])).
+
+              A near-zero counter against nonzero LiteLLM spend means the
+              controller spend forwarder (NATS->metrics, E3.2) is not emitting —
+              check the controller logs for "spend forwarder" and that coop usage
+              events carry response_cost (E3.1). A counter ahead of LiteLLM
+              suggests double-counting or a stale /key/info read.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/plans/timeseries-platform.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

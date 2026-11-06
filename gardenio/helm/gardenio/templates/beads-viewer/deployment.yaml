@@ -1,0 +1,964 @@
+{{- if .Values.beadsViewer.enabled }}
+{{- /* Edge bearer roles (gd-BmYmugDc4x): with the dev bypass behind the
+     viewer-authproxy edge (devAuthProxySecret set), the viewer verifies the
+     Keycloak access token the edge forwards and attaches its realm roles. The
+     issuer and audience default to the realm issuer and keycloak.oidcAudience,
+     the pair kbeads verifies the same token against. Discovery goes over the
+     in-cluster Service (and its CA) only when the issuer is the derived one. */}}
+{{- $bearerRoles := .Values.beadsViewer.devAuthBearerRoles | default dict }}
+{{- $bearerIssuer := "" }}
+{{- $bearerAudience := "" }}
+{{- $bearerDiscovery := "" }}
+{{- $bearerCA := false }}
+{{- if and .Values.beadsViewer.devAuthBypass ((.Values.beadsViewer.devAuthProxySecret | default dict).secretName) $bearerRoles.enabled .Values.keycloak.enabled }}
+{{- if $bearerRoles.issuerURL }}
+{{- $bearerIssuer = $bearerRoles.issuerURL }}
+{{- else }}
+{{- $bearerIssuer = include "gardenio.keycloak.issuerURL" . }}
+{{- $bearerDiscovery = include "gardenio.keycloak.discoveryURL" . }}
+{{- $bearerCA = and $bearerDiscovery (include "gardenio.keycloak.inClusterCA" .) }}
+{{- end }}
+{{- if $bearerRoles.audience }}
+{{- $bearerAudience = $bearerRoles.audience }}
+{{- else }}
+{{- $bearerAudience = .Values.keycloak.oidcAudience | default "" }}
+{{- end }}
+{{- if not (and $bearerIssuer $bearerAudience) }}
+{{- $bearerIssuer = "" }}
+{{- $bearerCA = false }}
+{{- end }}
+{{- end }}
+{{- $kcCAMount := and (include "gardenio.keycloak.inClusterCA" .) (or .Values.beadsViewer.machinePrincipal.enabled $bearerCA) }}
+{{- /* The Lands plot application and the Lands App's setup leg (step 7.7 /
+       7.6, decision gd-j3EiWECejv "chart"). The Gate writes only as the
+       machine principal, so enabling it without one is refused at render
+       time rather than logged and ignored at start. Its applicant mails ride
+       agents.mailer, the controller's mailer, mirrored here when the Gate is
+       on: the same MAILER_* env and the same read-only SES key files. */}}
+{{- $landsApply := .Values.beadsViewer.landsApply | default dict }}
+{{- $landsApp := .Values.beadsViewer.landsGithubApp | default dict }}
+{{- if and $landsApply.enabled (not .Values.beadsViewer.machinePrincipal.enabled) }}
+{{- fail "beadsViewer.landsApply.enabled requires beadsViewer.machinePrincipal.enabled: the Lands Gate files plot applications only as the viewer's machine principal" }}
+{{- end }}
+{{- $viewerMail := and $landsApply.enabled .Values.agents.mailer.enabled }}
+{{- $viewerMailSES := and $viewerMail .Values.agents.mailer.credentialsSecret.name }}
+{{- $viewerVolumes := or .Values.global.coverage.enabled .Values.beadsViewer.machinePrincipal.enabled $kcCAMount $landsApp.enabled $viewerMailSES }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.fullname" . }}-beads-viewer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beads-viewer
+spec:
+  replicas: {{ .Values.beadsViewer.replicaCount | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: beads-viewer
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: beads-viewer
+      {{- /*
+        prometheus.io/scrape pod annotations (ka-0000006752). The view-
+        engagement counter + request-latency histogram (view_telemetry.go)
+        are served on the internal `metrics` port, but until now nothing in
+        prod scraped them: prod's gardenio-vmagent discovers targets via these
+        prometheus.io/scrape annotations (a static promscrape.config), NOT via
+        the VMServiceScrape CRD this component also ships — that CRD is gated
+        on monitoring.victoriaMetrics.enabled (default false, off in prod), so
+        it is inert there. Result: gardenio_operator_activity_total's
+        {activity_type=view,surface=web} slice and gardenio_user_request_latency_seconds
+        never reached the TSDB. Every scraped sibling (beads/slack-bridge/
+        agents/gitlab-bridge/coopmux) carries these three annotations; the
+        beads-viewer pod was the sole gap. keep_if_equal in the vmagent
+        relabel config dedupes this pod's two containerPorts to the single
+        annotated metrics port, so only /metrics on 9095 is scraped.
+      */}}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.beadsViewer.metrics.port | default 9095 }}"
+        prometheus.io/path: "/metrics"
+    spec:
+      {{- /*
+        ka-0000003642: beads-viewer needs IRSA credentials to stream private
+        S3 objects through the /image/{key...} proxy (ka-0000006131). Reuse
+        the controller's ServiceAccount — it already carries the
+        eks.amazonaws.com/role-arn annotation pointing at the gardenio-agents-s3
+        role, which has GetObject on the coop/sessions/* prefix. The IRSA
+        webhook injects the projected web-identity token even when
+        automountServiceAccountToken=false, so the default SA token stays
+        unmounted (no K8s API access) while AWS SigV4 still works.
+      */}}
+      serviceAccountName: {{ include "gardenio.agents.auxServiceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: beads-viewer
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.beadsViewer.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.beadsViewer.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: {{ .Values.beadsViewer.service.port | default 8095 }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.beadsViewer.metrics.port | default 9095 }}
+              protocol: TCP
+          env:
+            - name: BEADS_HTTP_ADDR
+              value: "http://{{ include "gardenio.beads.host" . }}:{{ include "gardenio.beads.httpPort" . }}"
+            - name: METRICS_LISTEN_ADDR
+              value: ":{{ .Values.beadsViewer.metrics.port | default 9095 }}"
+            {{- /* BOAT_PROJECT labels the gardenio_operator_activity_total view
+                   counter (ka-0000006752). Falls back to the global project.
+                   Also scopes the /claude-config effective-config resolution
+                   (spec 2026-09-21-project-scope-hardening-design §2). */}}
+            {{- with (.Values.beadsViewer.project | default .Values.global.project) }}
+            - name: BOAT_PROJECT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- /* No shared static token (gd-j9uB0cduHA, boundary §6 step 4):
+                   BEADS_DAEMON_TOKEN is never injected, whatever
+                   beads.tokenSecret says. Human requests ride the user's own
+                   bearer; the SSE streams, system reads, health/charts proxies
+                   and gb prime authenticate as the machine principal below
+                   (gd-glMVEH8phE). With the principal off the viewer holds no
+                   daemon credential at all, so no UI bug can lend one to a
+                   tenant. */}}
+            {{- /* Machine principal (gd-Hc34EENbO9): the plan-label / plan-step
+                 reactors authenticate as the Keycloak service account of
+                 beadsViewer.machinePrincipal.clientId. The secret is a file,
+                 never an env var; its Secret is operator-created and optional,
+                 so a missing Secret still starts the pod — the reactors' writes
+                 then fail closed (auth_unavailable in the log). Same contract
+                 as templates/controller/deployment.yaml. */}}
+            {{- if .Values.beadsViewer.machinePrincipal.enabled }}
+            - name: BEADS_OIDC_TOKEN_URL
+              value: {{ include "gardenio.keycloak.tokenURL" . | quote }}
+            - name: BEADS_OIDC_CLIENT_ID
+              value: {{ .Values.beadsViewer.machinePrincipal.clientId | quote }}
+            - name: BEADS_OIDC_CLIENT_SECRET_FILE
+              value: /var/run/secrets/gardenio-machine/clientSecret
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            # The token URL is the keycloak-runtime https port: trust its CA
+            # (gd-lYPZlslOM7).
+            - name: BEADS_OIDC_CA_FILE
+              value: {{ include "gardenio.keycloakRuntime.caFile" . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Write-bearer enforcement (ka-0000006379): when true, mutating
+                   daemon calls fail closed unless they carry the human user's
+                   own OIDC bearer, which then overrides the daemon read token
+                   on the wire so writes authenticate + attribute AS THE USER,
+                   and any static token here is used for reads only. On by
+                   default (gd-eXNRKIIyzD); hosts that forward no bearer (AVA,
+                   the plain ziti listener) are read-only under it. */}}
+            {{- if .Values.beadsViewer.requireUserBearerForWrites }}
+            - name: BEADS_VIEWER_REQUIRE_USER_BEARER_WRITES
+              value: "1"
+            {{- end }}
+            {{- /* Read-bearer enforcement (gd-akDjTS2eh7): the read-side twin.
+                   Reads authenticate as the user's bearer; a bearer-less read
+                   fails closed unless it is marked as a system read. */}}
+            {{- if .Values.beadsViewer.requireUserBearerForReads }}
+            - name: BEADS_VIEWER_REQUIRE_USER_BEARER_READS
+              value: "1"
+            {{- end }}
+            {{- /* Edge-auth HMAC envelope signing (decision ka-0000000960 →
+                   edge-auth-envelope; task ka-0000000898). When the dedicated
+                   beadsViewer.edgeAuthSigning flag is on AND edge-auth is
+                   enabled, hand the viewer the shared HMAC key so viewer writes
+                   sign an envelope asserting the verified human operator; the
+                   daemon then stamps AuthIdentity{Type:"edge", Subject:oidc:<user>}.
+                   Same secret as DAEMON_HMAC_KEY on the beads daemon so the
+                   envelope round-trips. Unlike the slack-bridge signer this is
+                   NOT auto-wired on edgeAuth.enabled — it is a separate opt-in so
+                   it stays OFF in prod until the staging burn-in clears (the
+                   signing change must not land with the prod token downscope). */}}
+            {{- if and .Values.beadsViewer.edgeAuthSigning .Values.edgeAuth.enabled }}
+            - name: BEADS_VIEWER_EDGE_AUTH_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.edgeAuth.hmacSecretName" . }}
+                  key: {{ .Values.edgeAuth.hmacKey.secretKey | default "hmac-key" }}
+                  {{- /* dryRun: secret may not exist yet — optional so the pod
+                         still starts before the operator provisions the
+                         edge-auth HMAC secret (mirrors slack-bridge). */}}
+                  optional: {{ .Values.edgeAuth.dryRun | default false }}
+            {{- end }}
+            - name: LISTEN_ADDR
+              value: ":{{ .Values.beadsViewer.service.port | default 8095 }}"
+            {{- if .Values.beadsViewer.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.beadsViewer.logLevel | quote }}
+            {{- end }}
+            {{- /* Viewer look (S1j, gd-cxU8eyiGyR): "plain" is the runtime kill
+                   switch for the Dawn Meadow theme; unset/"meadow" is the default
+                   scene, so no env is rendered unless the operator sets a value. */}}
+            {{- if .Values.beadsViewer.theme }}
+            - name: BEADS_VIEWER_THEME
+              value: {{ .Values.beadsViewer.theme | quote }}
+            {{- end }}
+            {{- /* Local-dev / Ziti-only OIDC bypass (ka-0000002068). Renders
+                   BEADS_VIEWER_DEV_AUTH_BYPASS=1 to disable OIDC entirely.
+                   Safe to bind on the pod network only because this pod sets
+                   automountServiceAccountToken:false, so the SA-token guard in
+                   dev_auth.go does not trip and LISTEN_ADDR is NOT forced to
+                   loopback (we never set the ACK env). When on, the OIDC_* env
+                   below is suppressed so the rendered Deployment carries no
+                   misleading issuer. POC/Ziti only — never publicly routed. */}}
+            {{- if .Values.beadsViewer.devAuthBypass }}
+            - name: BEADS_VIEWER_DEV_AUTH_BYPASS
+              value: "1"
+            {{- /* gd-kRyMsWiDNZ: with the bypass on, the pod trusts
+                   X-Auth-Request-Email, which any pod that dials the Service
+                   directly can forge. When devAuthProxySecret.secretName is
+                   set the viewer promotes that header only if the request also
+                   carries the matching X-Authproxy-Secret (stamped by the
+                   viewer-authproxy edge). Not optional: a missing Secret must
+                   fail the pod rather than silently fall back to trusting the
+                   raw header. */}}
+            {{- with .Values.beadsViewer.devAuthProxySecret }}
+            {{- if .secretName }}
+            - name: BEADS_VIEWER_DEV_AUTH_PROXY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName | quote }}
+                  key: {{ .key | default "secret" | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if $bearerIssuer }}
+            - name: BEADS_VIEWER_DEV_AUTH_BEARER_ISSUER_URL
+              value: {{ $bearerIssuer | quote }}
+            - name: BEADS_VIEWER_DEV_AUTH_BEARER_AUDIENCE
+              value: {{ $bearerAudience | quote }}
+            {{- if $bearerDiscovery }}
+            - name: BEADS_VIEWER_DEV_AUTH_BEARER_DISCOVERY_URL
+              value: {{ $bearerDiscovery | quote }}
+            {{- end }}
+            {{- if $bearerCA }}
+            - name: BEADS_VIEWER_DEV_AUTH_BEARER_CA_FILE
+              value: {{ include "gardenio.keycloakRuntime.caFile" . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if and (not .Values.beadsViewer.devAuthBypass) .Values.beadsViewer.oidc.enabled }}
+            - name: OIDC_ISSUER_URL
+              {{- if .Values.beadsViewer.oidc.issuerURL }}
+              value: {{ .Values.beadsViewer.oidc.issuerURL | quote }}
+              {{- else }}
+              value: {{ include "gardenio.keycloak.issuerURL" . | quote }}
+              {{- end }}
+            - name: OIDC_CLIENT_ID
+              value: {{ .Values.beadsViewer.oidc.clientID | quote }}
+            {{- if .Values.beadsViewer.oidc.requiredRole }}
+            - name: OIDC_REQUIRED_ROLE
+              value: {{ .Values.beadsViewer.oidc.requiredRole | quote }}
+            {{- end }}
+            {{- if .Values.beadsViewer.oidc.allowedEmailDomains }}
+            - name: OIDC_ALLOWED_EMAIL_DOMAINS
+              value: {{ .Values.beadsViewer.oidc.allowedEmailDomains | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* AVA pod-side JWT verification is gated on trustSigner presence, NOT
+                   avaIngress.enabled: the viewer still verifies the AVA JWT when reached
+                   via the unified host (gardenio.app/beads) even after the bare AVA host
+                   route is retired (avaIngress.enabled:false). Coupling these stripped the
+                   AVA env on route retirement and forced a manual pod patch (ka-0000000606). */}}
+            {{- if and .Values.beadsViewer.avaIngress .Values.beadsViewer.avaIngress.trustSigner }}
+            - name: AVA_TRUST_SIGNER
+              value: {{ .Values.beadsViewer.avaIngress.trustSigner | quote }}
+            {{- if .Values.beadsViewer.avaIngress.region }}
+            - name: AVA_REGION
+              value: {{ .Values.beadsViewer.avaIngress.region | quote }}
+            {{- end }}
+            {{- if .Values.beadsViewer.avaIngress.defaultRole }}
+            - name: AVA_DEFAULT_ROLE
+              value: {{ .Values.beadsViewer.avaIngress.defaultRole | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* EKS ServiceAccount-token machine-identity branch (ka-0000006288).
+                   Default OFF: k8sSA.enabled false renders NONE of this block, so an
+                   unconfigured deploy is byte-identical and no second issuer exists.
+                   When enabled, beads-viewer accepts an audience-pinned projected SA
+                   token from the EKS OIDC issuer as a SECOND verified issuer (real
+                   JWKS + iss + aud + exp), mapping an allow-listed sub to a synthetic
+                   domain-valid email + role floor so new-prod audit pods can drive the
+                   authenticated-self-view dimensions. It is ADDITIVE to the human
+                   AVA/Keycloak path — oidcauth.Validate refuses it without one, and the
+                   synthetic domain must be one of oidc.allowedEmailDomains. */}}
+            {{- if .Values.beadsViewer.k8sSA.enabled }}
+            - name: K8S_SA_ISSUER_URL
+              value: {{ required "beadsViewer.k8sSA.issuerURL is required when k8sSA.enabled" .Values.beadsViewer.k8sSA.issuerURL | quote }}
+            - name: K8S_SA_AUDIENCE
+              value: {{ required "beadsViewer.k8sSA.audience is required when k8sSA.enabled" .Values.beadsViewer.k8sSA.audience | quote }}
+            - name: K8S_SA_ALLOWED_SUBJECTS
+              value: {{ required "beadsViewer.k8sSA.allowedSubjects is required when k8sSA.enabled" (join "," .Values.beadsViewer.k8sSA.allowedSubjects) | quote }}
+            - name: K8S_SA_SYNTHETIC_EMAIL_DOMAIN
+              value: {{ required "beadsViewer.k8sSA.syntheticEmailDomain is required when k8sSA.enabled" .Values.beadsViewer.k8sSA.syntheticEmailDomain | quote }}
+            - name: K8S_SA_ROLE_FLOOR
+              value: {{ .Values.beadsViewer.k8sSA.roleFloor | default "gardenio-viewer" | quote }}
+            {{- end }}
+            {{- if .Values.beadsViewer.mattEmail }}
+            - name: GARDENIO_VIEWER_MATT_EMAIL
+              value: {{ .Values.beadsViewer.mattEmail | quote }}
+            {{- end }}
+            {{- if .Values.beadsViewer.allowedCIDRs }}
+            - name: ALLOWED_CIDRS
+              value: {{ .Values.beadsViewer.allowedCIDRs | quote }}
+            {{- end }}
+            {{- if .Values.beadsViewer.trustedProxyHops }}
+            - name: TRUSTED_PROXY_HOPS
+              value: {{ .Values.beadsViewer.trustedProxyHops | quote }}
+            {{- end }}
+            {{- /*
+              BASE_PATH — derived via gardenio.unified.beadsBasePath
+              (R3, ka-0000006743): returns paths.beads when unifiedHost is on
+              (BASE_PATH == Traefik strip-prefix by construction), else today's
+              hand-set beadsViewer.ingress.pathPrefix. Byte-identical while
+              unifiedHost.enabled=false.
+            */ -}}
+            {{- $beadsBasePath := include "gardenio.unified.beadsBasePath" . -}}
+            {{- if ne $beadsBasePath "" }}
+            - name: BASE_PATH
+              value: {{ $beadsBasePath | quote }}
+            {{- end }}
+            {{- /*
+              ka-0000003642: wire the /image/{key...} proxy (ka-0000006131) by
+              forwarding the same S3 settings used to upload images from agent
+              pods. Without these the renderer's rewriteSessionImageURL returns
+              "" → falls through to the link card → user sees access-denied.
+            */}}
+            {{- if .Values.agents.s3.bucket }}
+            - name: COOP_S3_BUCKET
+              value: {{ .Values.agents.s3.bucket }}
+            {{- end }}
+            {{- if .Values.agents.s3.prefix }}
+            - name: COOP_S3_PREFIX
+              value: {{ .Values.agents.s3.prefix }}
+            {{- end }}
+            {{- /* gd-3Vgzf25MZY: Commons attachments in their own bucket (no
+                   ILM expiry, own quota); unset keeps them under commons/files/
+                   in COOP_S3_BUCKET. */}}
+            {{- if and .Values.objectStore.enabled .Values.objectStore.commonsFiles.bucket }}
+            - name: COMMONS_FILES_BUCKET
+              value: {{ .Values.objectStore.commonsFiles.bucket | quote }}
+            {{- end }}
+            {{- /* gd-CmjVAU3vgd: the /image/ proxy reads the images bucket
+                   first and falls back to COOP_S3_BUCKET on a miss. */}}
+            {{- with include "gardenio.objectStore.imagesBucket" . }}
+            - name: COOP_S3_IMAGES_BUCKET
+              value: {{ . | quote }}
+            {{- end }}
+            {{- /* gd-na5unRTCaP: Commons card actions. POST /garden/c/action|submit
+                   go to the bridge's /api/conversation/inbound on the person's
+                   own bearer; unset, they answer 501. */}}
+            {{- if and .Values.slackBridge.enabled .Values.slackBridge.commonsActions.enabled }}
+            - name: SLACK_BRIDGE_URL
+              value: {{ include "gardenio.slackBridge.serviceURL" . | quote }}
+            {{- end }}
+            {{- if .Values.agents.s3.region }}
+            - name: COOP_S3_REGION
+              value: {{ .Values.agents.s3.region }}
+            {{- end }}
+            {{- if .Values.agents.s3.endpoint }}
+            # In-box object store (ka-0000004955): S3-compatible endpoint
+            # override (e.g. in-cluster MinIO) so the /image proxy resolves
+            # against the same store agents upload to. Path-style addressing.
+            - name: COOP_S3_ENDPOINT
+              value: {{ .Values.agents.s3.endpoint }}
+            {{- if .Values.objectStore.enabled }}
+            # In-box MinIO static creds via the default AWS credential chain.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.secretName" . }}
+                  key: accesskey
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.secretName" . }}
+                  key: secretkey
+            {{- end }}
+            {{- end }}
+            {{- if .Values.beadsViewer.slackWorkspaceDomain }}
+            - name: SLACK_WORKSPACE_DOMAIN
+              value: {{ .Values.beadsViewer.slackWorkspaceDomain | quote }}
+            {{- end }}
+            {{- /* Bird captions (plan gd-jMl4oF2cJO; spec 2026-10-28-bird-captions-design.md
+                   sections 8 and 14, step 10 gd-FOzMlrXga6). FARM_CAPTIONS=off is the
+                   kill switch for every caption (the wire before captions);
+                   FARM_CAPTION_HAIKU=on only when captions, haiku.enabled and the key
+                   Secret are all set, since captioner.ConfigFromEnv needs the key and
+                   LITELLM_URL too. The bounds are always rendered, so the pod spec
+                   says what the viewer runs with. */}}
+            {{- with .Values.beadsViewer.captions }}
+            - name: FARM_CAPTIONS
+              value: {{ ternary "on" "off" (ne .enabled false) | quote }}
+            - name: FARM_CAPTION_WIRE_CAP
+              value: {{ .wireCap | default 80 | quote }}
+            - name: FARM_CAPTION_HAIKU
+              value: {{ ternary "on" "off" (and (ne .enabled false) .haiku.enabled (ne (.haiku.secretName | default "") "")) | quote }}
+            - name: FARM_CAPTION_HAIKU_RATE_PER_MINUTE
+              value: {{ .haiku.ratePerMinute | default 30 | quote }}
+            - name: FARM_CAPTION_HAIKU_CONCURRENCY
+              value: {{ .haiku.concurrency | default 4 | quote }}
+            - name: FARM_CAPTION_HAIKU_TIMEOUT
+              value: {{ .haiku.timeout | default "3s" | quote }}
+            - name: FARM_CAPTION_HAIKU_DAILY_MAX
+              value: {{ .haiku.dailyMax | default 5000 | quote }}
+            - name: FARM_CAPTION_HAIKU_CACHE_SIZE
+              value: {{ .haiku.cacheSize | default 4096 | quote }}
+            {{- end }}
+            - name: FARM_TRANSCRIPT_ROWS
+              value: {{ .Values.beadsViewer.transcript.rows | default 200 | quote }}
+            {{- /* Bird captions Haiku fallback key (gd-TBAYacR31x). */}}
+            {{- with .Values.beadsViewer.captions.haiku }}
+            {{- if .secretName }}
+            - name: FARM_CAPTION_LITELLM_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName | quote }}
+                  key: {{ .secretKey | default "api-key" | quote }}
+            {{- if $.Values.agents.litellmURL }}
+            - name: LITELLM_URL
+              value: {{ $.Values.agents.litellmURL | quote }}
+            {{- else }}
+            - name: LITELLM_URL
+              value: "http://{{ include "gardenio.litellm.fullname" $ }}:{{ $.Values.litellm.port | default 4000 }}"
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.beadsViewer.gitlab }}
+            {{- if .baseURL }}
+            - name: GITLAB_BASE_URL
+              value: {{ .baseURL | quote }}
+            {{- end }}
+            {{- if .secretName }}
+            - name: GITLAB_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .secretKey | default "api-token" }}
+            {{- end }}
+            {{- $project := .projectPath | default $.Values.global.gitlabProject -}}
+            {{- if $project }}
+            - name: GARDENIO_GITLAB_PROJECT
+              value: {{ $project | quote }}
+            {{- end }}
+            {{- if .projectURL }}
+            - name: GARDENIO_GITLAB_PROJECT_URL
+              value: {{ .projectURL | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.beadsViewer.jira }}
+            {{- if .baseURL }}
+            - name: BEADS_VIEWER_JIRA_BASE_URL
+              value: {{ .baseURL | quote }}
+            {{- end }}
+            {{- if .projectKeys }}
+            - name: BEADS_VIEWER_JIRA_PROJECT_KEYS
+              value: {{ .projectKeys | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.coopmux.enabled }}
+            - name: COOPMUX_URL
+              value: {{ include "gardenio.coopmux.serviceURL" . | quote }}
+            - name: COOP_MUX_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.coopmux.authTokenSecretName" . }}
+                  key: token
+            {{- /* Glass relay key (Lands 6.3 gd-O31EYiDGzm, ruling
+                   gd-9ZGh01W5ub). The relay opens coopmux /ws/{session} with an
+                   edge-auth v2 envelope naming the human watching, signed with
+                   the relay key, which only coopmux verifies (its
+                   DAEMON_HMAC_KEY_RELAY) and only for that watch upgrade. It is
+                   never the shared or v2 key: those are what the beads daemon
+                   trusts. Unset, every Glass stream ends "unavailable". It
+                   renders with edge-auth off too (relay-only, ruling
+                   gd-P2Ybp03DPh): the viewer names the human from its own
+                   OIDC session, so no shim is needed in front of it. */}}
+            {{- with .Values.edgeAuth.hmacKey.secretKeyRelay }}
+            {{- if or (eq . ($.Values.edgeAuth.hmacKey.secretKey | default "hmac-key")) (eq . $.Values.edgeAuth.hmacKey.secretKeyV2) }}
+            {{- fail "edgeAuth.hmacKey.secretKeyRelay must name its own key, not secretKey or secretKeyV2: beads-viewer would hold a key the beads daemon trusts (gd-9ZGh01W5ub)." }}
+            {{- end }}
+            - name: COOPMUX_RELAY_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.edgeAuth.hmacSecretName" $ }}
+                  key: {{ . }}
+                  optional: {{ and $.Values.edgeAuth.enabled ($.Values.edgeAuth.dryRun | default false) }}
+            {{- end }}
+            {{- /*
+              COOPMUX_PUBLIC_URL — derived via gardenio.link.coopmuxPublicURL
+              (R3, ka-0000006743). Byte-identical while unifiedHost.enabled=false
+              (falls to legacy https://<coopmux.ingress.host>/mux).
+            */ -}}
+            {{- $coopmuxPublicURL := include "gardenio.link.coopmuxPublicURL" . -}}
+            {{- if ne $coopmuxPublicURL "" }}
+            - name: COOPMUX_PUBLIC_URL
+              value: {{ $coopmuxPublicURL | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /*
+              GRAFANA_BASE_URL drives the "Open in Grafana ↗" link on /charts
+              (task ka-0000006706, epic ka-0000007895). Derived via
+              gardenio.link.grafanaBaseURL (R3, ka-0000006743): explicit
+              beadsViewer.grafanaBaseURL wins; otherwise derive
+              https://<unifiedHost.host><paths.grafana> only when grafana is
+              actually served under the unified host's /grafana subpath — so
+              envs without Grafana never render a dead link. Pure refactor —
+              identical output (this is the reference pattern the helper lifts).
+            */ -}}
+            {{- $grafanaBaseURL := include "gardenio.link.grafanaBaseURL" . -}}
+            {{- if ne $grafanaBaseURL "" }}
+            - name: GRAFANA_BASE_URL
+              value: {{ $grafanaBaseURL | quote }}
+            {{- end }}
+            {{- /*
+              GRAFANA_UPSTREAM_URL wires the AVA-authenticated /grafana reverse
+              proxy (grafana_proxy.go; Option C, decision ka-0000004242, epic
+              ka-0000000746). Explicit beadsViewer.grafanaUpstreamURL wins;
+              otherwise, when grafana.enabled AND grafana.auth.proxy.enabled
+              (the config that makes Grafana trust the stamped auth-proxy header),
+              default to the in-cluster Grafana Service so the same-origin
+              /grafana subpath comes up without hand-wiring a URL. Empty in every
+              env that has not opted in ⇒ no var ⇒ the /grafana routes stay in
+              degraded mode (503). The auth.proxy.enabled gate is deliberate:
+              stamping the auth-proxy header at Grafana only authenticates when Grafana
+              runs its header auth-proxy, so we do not front a Grafana that would
+              bounce every proxied request to its own login form.
+            */ -}}
+            {{- $grafanaUpstream := .Values.beadsViewer.grafanaUpstreamURL | default "" -}}
+            {{- if and (eq $grafanaUpstream "") .Values.grafana.enabled .Values.grafana.auth.proxy.enabled -}}
+            {{- $grafanaUpstream = include "gardenio.grafana.serviceURL" . -}}
+            {{- end -}}
+            {{- if ne $grafanaUpstream "" }}
+            - name: GRAFANA_UPSTREAM_URL
+              value: {{ $grafanaUpstream | quote }}
+            {{- end }}
+            {{- /*
+              GRAFANA_AUTH_PROXY_HEADER is the header the /grafana proxy stamps
+              the verified email into. It must equal Grafana's
+              GF_AUTH_PROXY_HEADER_NAME, so pass grafana.auth.proxy.headerName
+              (default X-Auth-Request-Email) whenever auth.proxy is on. Without
+              it the proxy stamps X-WEBAUTH-USER, which Grafana ignores, and the
+              proxied page lands anonymous or on the login form (gd-lHJot24kJu).
+            */ -}}
+            {{- if and (ne $grafanaUpstream "") .Values.grafana.auth.proxy.enabled .Values.grafana.auth.proxy.headerName }}
+            - name: GRAFANA_AUTH_PROXY_HEADER
+              value: {{ .Values.grafana.auth.proxy.headerName | quote }}
+            {{- end }}
+            {{- /*
+              ESCALATION_REVIEW_URL drives the "Review →" deep link on the
+              escalations health card (cmd/beads-viewer/escalations.go
+              buildEscalationReviewURL; task ka-0000003740, epic ka-0000006413;
+              R3 design §8.2). Unset in every env today, so the link-out is
+              silently suppressed everywhere. Explicit beadsViewer.escalationReviewURL
+              wins (tier-1); otherwise derive
+              https://<unifiedHost.host><paths.escalations> only when unified is on
+              AND the /escalations route is actually served under that path
+              (paths.escalations non-empty) — so envs without the route never
+              render a dead link. SAFE/additive: both default to "" today ⇒ no env
+              var emitted ⇒ no behaviour change. Mirrors the GRAFANA_BASE_URL
+              tier-1/tier-2 pattern above; the R3 helper refactor (ka-0000003816
+              step 1) can later fold this into gardenio.link.escalationReviewURL.
+            */ -}}
+            {{- $escalationReviewURL := .Values.beadsViewer.escalationReviewURL | default "" -}}
+            {{- if eq $escalationReviewURL "" -}}
+            {{- $escalationsUnifiedPath := (.Values.unifiedHost.paths | default dict).escalations | default "" -}}
+            {{- if and .Values.unifiedHost.enabled .Values.unifiedHost.host (ne $escalationsUnifiedPath "") -}}
+            {{- $escalationReviewURL = printf "https://%s%s" .Values.unifiedHost.host $escalationsUnifiedPath -}}
+            {{- end -}}
+            {{- end }}
+            {{- if ne $escalationReviewURL "" }}
+            - name: ESCALATION_REVIEW_URL
+              value: {{ $escalationReviewURL | quote }}
+            {{- end }}
+            {{- if .Values.beadsViewer.loginPicker.enabled }}
+            - name: LOGIN_PICKER_ENABLED
+              value: "true"
+            - name: LOGIN_PICKER_FORWARDAUTH_URL
+              value: {{ include "gardenio.beadsViewer.loginPicker.forwardAuthURL" . | quote }}
+            - name: LOGIN_PICKER_KEYCLOAK_LOCAL_ENABLED
+              value: {{ .Values.beadsViewer.loginPicker.keycloakLocal.enabled | quote }}
+            - name: LOGIN_PICKER_KEYCLOAK_LOCAL_LABEL
+              value: {{ .Values.beadsViewer.loginPicker.keycloakLocal.label | quote }}
+            - name: LOGIN_PICKER_GITLAB_ENABLED
+              value: {{ .Values.beadsViewer.loginPicker.gitlab.enabled | quote }}
+            - name: LOGIN_PICKER_GITLAB_LABEL
+              value: {{ .Values.beadsViewer.loginPicker.gitlab.label | quote }}
+            {{- end }}
+            {{- /* The demo land's /lands/demo door (gd-c6LzZkk0qy, runbook
+                 docs/lands/demo-land.md). Empty land renders nothing. The
+                 daemon URL check mirrors landsDemoFromEnv, so a bad URL fails
+                 here instead of leaving the door closed at viewer start. */}}
+            {{- $demo := .Values.agents.lands.demo | default dict }}
+            {{- if $demo.land }}
+            {{- $demoURL := required "agents.lands.demo.daemonURL is required when agents.lands.demo.land is set (the https daemon URL strangers point gb at)" $demo.daemonURL }}
+            {{- $demoParsed := urlParse $demoURL }}
+            {{- if not (and (eq $demoParsed.scheme "https") $demoParsed.host) }}
+            {{- fail (printf "agents.lands.demo.daemonURL must be an https URL, got %q" $demoURL) }}
+            {{- end }}
+            - name: LANDS_DEMO_LAND
+              value: {{ $demo.land | quote }}
+            - name: LANDS_DEMO_DAEMON_URL
+              value: {{ $demoURL | quote }}
+            {{- with $demo.maxGuests }}
+            - name: LANDS_DEMO_MAX_GUESTS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $demo.guestTTL }}
+            - name: LANDS_DEMO_GUEST_TTL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with (.Values.agents.lands | default dict).livePlanURL }}
+            - name: LANDS_LIVE_PLAN_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with (.Values.agents.lands | default dict).liveFarmURL }}
+            - name: LANDS_LIVE_FARM_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- /* The plot application (lands_apply.go). Off renders nothing
+                 and every /lands/apply route answers 503. */}}
+            {{- if $landsApply.enabled }}
+            - name: LANDS_APPLY_ENABLED
+              value: "true"
+            {{- with $landsApply.approver }}
+            - name: LANDS_APPROVER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $landsApply.dailyLimit }}
+            - name: LANDS_APPLY_DAILY_LIMIT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $landsApply.defaultCredits }}
+            - name: LANDS_APPLY_DEFAULT_CREDITS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* The Lands App's setup leg (lands_github.go,
+                 docs/lands/github-app.md). The key and client secret are the
+                 files mounted below, never env values. */}}
+            {{- if $landsApp.enabled }}
+            {{- $landsAppDir := $landsApp.mountPath | trimSuffix "/" }}
+            - name: LANDS_GITHUB_APP_ID
+              value: {{ required "beadsViewer.landsGithubApp.appId is required when beadsViewer.landsGithubApp.enabled" $landsApp.appId | quote }}
+            - name: LANDS_GITHUB_APP_CLIENT_ID
+              value: {{ required "beadsViewer.landsGithubApp.clientId is required when beadsViewer.landsGithubApp.enabled" $landsApp.clientId | quote }}
+            - name: LANDS_GITHUB_APP_SLUG
+              value: {{ required "beadsViewer.landsGithubApp.slug is required when beadsViewer.landsGithubApp.enabled" $landsApp.slug | quote }}
+            - name: LANDS_GITHUB_APP_PRIVATE_KEY_PATH
+              value: {{ printf "%s/private-key" $landsAppDir | quote }}
+            - name: LANDS_GITHUB_APP_CLIENT_SECRET_PATH
+              value: {{ printf "%s/client-secret" $landsAppDir | quote }}
+            {{- with $landsApp.apiUrl }}
+            - name: LANDS_GITHUB_APP_API_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $landsApp.webUrl }}
+            - name: LANDS_GITHUB_APP_WEB_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if and (hasKey $landsApp "allowPrivateRepos") (not $landsApp.allowPrivateRepos) }}
+            - name: LANDS_GITHUB_ALLOW_PRIVATE_REPOS
+              value: "false"
+            {{- end }}
+            {{- if and (hasKey $landsApp "maxRepoSizeMB") (ne (toString $landsApp.maxRepoSizeMB) "") }}
+            - name: LANDS_MAX_REPO_SIZE_MB
+              value: {{ $landsApp.maxRepoSizeMB | toString | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* The Gate's applicant mails: agents.mailer, as the controller
+                 renders it (templates/controller/deployment.yaml). Only with
+                 the Gate on; off is the no-op mailer, and the pages say
+                 nothing about email. */}}
+            {{- if $viewerMail }}
+            - name: MAILER_ENABLED
+              value: "true"
+            - name: MAILER_FROM
+              value: {{ required "agents.mailer.from is required when agents.mailer.enabled" .Values.agents.mailer.from | quote }}
+            - name: MAILER_BASE_URL
+              value: {{ required "agents.mailer.baseUrl is required when agents.mailer.enabled" .Values.agents.mailer.baseUrl | quote }}
+            {{- with .Values.agents.mailer.replyTo }}
+            - name: MAILER_REPLY_TO
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agents.mailer.sesRegion }}
+            - name: MAILER_SES_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agents.mailer.configurationSet }}
+            - name: MAILER_SES_CONFIGURATION_SET
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $viewerMailSES }}
+            - name: MAILER_SES_CREDENTIALS_DIR
+              value: /var/run/secrets/gardenio-mailer-ses
+            {{- end }}
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: "{{ .Values.global.coverage.mountPath }}/beads-viewer"
+            {{- end }}
+            {{- /*
+              NATS connection backs the telepathy thinking-trace feed
+              (epic ka-0000007154, task ka-0000007528). NewThinkingHub subscribes
+              coop.events.messages.*.thinking and fans each agent thinking block
+              out to the /telepathy SSE page. Mirrors the slack-bridge hookstream
+              env pair exactly (NATS_URL + COOP_NATS_TOKEN). When unset the hub is
+              nil and the page degrades gracefully to a "feed disabled" banner.
+            */ -}}
+            {{- if .Values.beadsViewer.natsURL }}
+            - name: NATS_URL
+              value: {{ .Values.beadsViewer.natsURL | quote }}
+            {{- else if .Values.nats.enabled }}
+            - name: NATS_URL
+              value: {{ include "gardenio.natsURL" . | quote }}
+            {{- end }}
+            {{- if .Values.agents.natsTokenSecret }}
+            - name: COOP_NATS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.agents.natsTokenSecret }}
+                  key: token
+                  optional: true
+            {{- else if .Values.nats.auth.subjectIsolation.enabled }}
+            {{- /* Telepathy hub subscribes coop.events.messages.*.thinking —
+                   cross-agent read, so infra token (ka-0000006513). The
+                   username makes the shared secret a user PASSWORD: multi-user
+                   server entries only support user/password (ka-0000000002). */}}
+            - name: COOP_NATS_USER
+              value: infra
+            - name: COOP_NATS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.fullname" . }}-nats-infra-creds
+                  key: token
+            {{- end }}
+          {{- /*
+            startupProbe (ka-0000004213): beads-viewer's main() does blocking
+            startup work BEFORE the /healthz HTTP server goroutine starts
+            listening — OIDC provider discovery (oidcauth.New →
+            newProviderWithRetry, a bounded ~15s of exponential backoff +
+            network round-trips), the synchronous config-watcher first load
+            against the beads daemon, the S3 image-proxy client build, and the
+            NATS thinking-hub connect. In a cold ephemeral namespace, where
+            those dependencies are still coming up and the 200m CPU limit CFS-
+            throttles the cold-start burst, that work can run well past the
+            liveness window. Without a startupProbe the liveness probe (which
+            also has only the default 1s timeoutSeconds) starts failing ~5s in
+            and the kubelet restarts the container before /healthz ever answers
+            → CrashLoopBackOff with escalating backoff → helm
+            --wait --timeout 15m trips "context deadline exceeded" and the whole
+            RWX-era deploy job failed (recurring on tags 164.6 / 164.9 / 165.4).
+
+            The startupProbe suspends BOTH the liveness and readiness probes
+            until /healthz first answers, giving the binary up to
+            failureThreshold*periodSeconds = 5m to finish starting (mirrors the
+            litellm startupProbe idiom). /healthz is a static handler with no
+            dependency on beads/OIDC, so it answers as soon as the HTTP server
+            goroutine is up; /readyz (OIDC-gated) then converges quickly because
+            the ephemeral issuer is the long-lived shared `gardenio` realm.
+            timeoutSeconds:5 on all three probes matches litellm so a single
+            slow response on a throttled pod does not trip the default 1s
+            timeout.
+
+            ka-0000001405 (recurrence of ka-0000007858 / ka-0000004213): the
+            startupProbe alone did NOT stop the recurring cold-start
+            CrashLoopBackOff. After the startupProbe hands off, the livenessProbe
+            kept killing the container even though /healthz is a dependency-free
+            static handler — the only way that handler can fail is CPU
+            starvation, not a sick dependency. On a cold ephemeral node the 200m
+            CPU limit (relieved in values.yaml) CFS-throttles the post-startup
+            burst, the kubelet's probe request cannot be answered within the 5s
+            timeout, and the OLD window of periodSeconds:15 × default
+            failureThreshold:3 gave only ~45s of slack before a SIGTERM kill →
+            CrashLoopBackOff → helm --wait --timeout trips "context deadline
+            exceeded". The kill is graceful (main() catches SIGTERM via
+            signal.NotifyContext and shuts down cleanly) so the container exits 0
+            with little/no log output — exactly the "exits 0, empty logs"
+            signature the watchdog saw and misread as a self-exit. Widen the
+            liveness window to periodSeconds:30 × failureThreshold:3 = 90s,
+            matching the proven beads-daemon and litellm idioms, so a
+            throttled-but-healthy cold-start pod rides out the burst instead of
+            crashlooping. failureThreshold is pinned explicitly on liveness +
+            readiness (was relying on the implicit default of 3) so the tolerance
+            is self-documenting and cannot silently shrink.
+          */}}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.beadsViewer.resources | nindent 12 }}
+          {{- if $viewerVolumes }}
+          volumeMounts:
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+            {{- if .Values.beadsViewer.machinePrincipal.enabled }}
+            - name: machine-client-secret
+              mountPath: /var/run/secrets/gardenio-machine
+              readOnly: true
+            {{- end }}
+            {{- if $kcCAMount }}
+            {{- include "gardenio.keycloakRuntime.caVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- if $landsApp.enabled }}
+            - name: lands-github-app
+              mountPath: {{ $landsApp.mountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if $viewerMailSES }}
+            - name: mailer-ses-credentials
+              mountPath: /var/run/secrets/gardenio-mailer-ses
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if .Values.global.coverage.enabled }}
+      terminationGracePeriodSeconds: 45
+      {{- end }}
+      {{- if $viewerVolumes }}
+      volumes:
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+        {{- if .Values.beadsViewer.machinePrincipal.enabled }}
+        # Machine-principal client secret (gd-Hc34EENbO9). optional: the operator
+        # creates the Secret by hand; without it the pod still starts and the
+        # reactors' writes fail closed with auth_unavailable in the log.
+        - name: machine-client-secret
+          secret:
+            secretName: {{ .Values.beadsViewer.machinePrincipal.secretName | quote }}
+            optional: true
+        {{- end }}
+        {{- if $kcCAMount }}
+        {{- include "gardenio.keycloakRuntime.caVolume" . | nindent 8 }}
+        {{- end }}
+        {{- if $landsApp.enabled }}
+        # The Lands App's private key and OAuth client secret as read-only
+        # files (docs/lands/github-app.md). optional: the operator creates the
+        # Secret by hand; without it the pod still starts and the setup leg
+        # stays closed.
+        - name: lands-github-app
+          secret:
+            secretName: {{ required "beadsViewer.landsGithubApp.secretName is required when beadsViewer.landsGithubApp.enabled" $landsApp.secretName | quote }}
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: private-key
+                path: private-key
+              - key: client-secret
+                path: client-secret
+        {{- end }}
+        {{- if $viewerMailSES }}
+        {{- with .Values.agents.mailer.credentialsSecret }}
+        # The mailer's own SES keys (gd-kSLbp23ekV), the controller's
+        # contract: optional, read-only files, never env.
+        - name: mailer-ses-credentials
+          secret:
+            secretName: {{ .name | quote }}
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: {{ required "agents.mailer.credentialsSecret.accessKeyIdKey is required when credentialsSecret.name is set" .accessKeyIdKey | quote }}
+                path: accessKeyId
+              - key: {{ required "agents.mailer.credentialsSecret.secretAccessKeyKey is required when credentialsSecret.name is set" .secretAccessKeyKey | quote }}
+                path: secretAccessKey
+        {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.beadsViewer.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- /* HA spread (gd-27vcHmrurh). Only rendered at replicaCount > 1 — see
+             templates/litellm/deployment.yaml for the rationale this mirrors.
+             Selector uses the same gardenio.selectorLabels + component label
+             pair as this Deployment's own selector above. */}}
+      {{- if gt (int (.Values.beadsViewer.replicaCount | default 1)) 1 }}
+      {{- with .Values.beadsViewer.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew | default 1 }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable | default "ScheduleAnyway" }}
+          labelSelector:
+            matchLabels:
+              {{- include "gardenio.selectorLabels" $ | nindent 14 }}
+              app.kubernetes.io/component: beads-viewer
+        {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.beadsViewer.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- /* Explicit affinity always wins outright. Otherwise, beadsViewer.nodeAffinity
+             (e.g. a soft lifecycle=spot preference, gd-cTobdw0kAL) layers onto the
+             default soft pod anti-affinity at replicas>1 rather than replacing it —
+             the two express independent concerns (which nodes vs. spreading across
+             them) and neither should silently suppress the other. */}}
+      {{- if .Values.beadsViewer.affinity }}
+      affinity:
+        {{- toYaml .Values.beadsViewer.affinity | nindent 8 }}
+      {{- else if or .Values.beadsViewer.nodeAffinity (and (gt (int (.Values.beadsViewer.replicaCount | default 1)) 1) .Values.beadsViewer.podAntiAffinity.enabled) }}
+      affinity:
+        {{- with .Values.beadsViewer.nodeAffinity }}
+        nodeAffinity:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- if and (gt (int (.Values.beadsViewer.replicaCount | default 1)) 1) .Values.beadsViewer.podAntiAffinity.enabled }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: {{ .Values.beadsViewer.podAntiAffinity.weight | default 100 }}
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "gardenio.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: beads-viewer
+        {{- end }}
+      {{- end }}
+{{- end }}

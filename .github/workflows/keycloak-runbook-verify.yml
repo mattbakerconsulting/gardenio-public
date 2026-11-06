@@ -1,0 +1,48 @@
+# Keycloak passkey runbook verification (gd-diK82eIdBJ; plan gd-QXq1fjYuRD, S3b).
+#
+# Runs the recipes in gardenio/docs/keycloak-passkeys-runbook.md against a
+# throwaway Keycloak container and captures `kcadm.sh <cmd> --help`, so a flag the
+# runbook gets wrong fails here, not during a lockout. See
+# scripts/keycloak-runbook-verify/run.sh.
+#
+# Never a required check and never on a PR (it pulls a ~235 MB image). Doors:
+# workflow_dispatch, and push to agent/kc-runbook/** (a new workflow's dispatch
+# trigger does not exist until the file is on main; same reason as
+# keycloak-upgrade-preflight.yml).
+name: keycloak-runbook-verify
+
+on:
+  push:
+    branches: ['agent/kc-runbook/**']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Keycloak tag to verify against (what keycloak.runtime.image.tag pins)'
+        required: false
+        default: '26.7.5'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: gardenio-k3s # dind sidecar: the job drives `docker run`
+    timeout-minutes: 20
+    env:
+      KC_TAG: ${{ inputs.tag || '26.7.5' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify runbook against Keycloak ${{ env.KC_TAG }}
+        run: |
+          echo "$KC_TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' # the value reaches `docker run` as an image tag
+          OUT="$PWD/runbook-out" scripts/keycloak-runbook-verify/run.sh "$KC_TAG"
+      - name: summary
+        if: always()
+        run: |
+          [ -f runbook-out/summary.md ] && cat runbook-out/summary.md >>"$GITHUB_STEP_SUMMARY" || echo "no summary produced" >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runbook-verify
+          path: runbook-out/
+          if-no-files-found: warn

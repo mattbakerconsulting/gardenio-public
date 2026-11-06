@@ -1,0 +1,660 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "type": "dashboard",
+        "name": "Annotations & Alerts",
+        "enable": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" }
+      },
+      {
+        "name": "gardenio rollout",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "semi-dark-orange",
+        "expr": "count(changes(process_start_time_seconds{namespace=\"gardenio-system\",component!=\"\"}[$__interval]) > 0) >= 3",
+        "step": "1m",
+        "titleFormat": "gardenio rollout",
+        "textFormat": "3+ gardenio-system components restarted at once - a release deploy or chart apply. Check this marker before hunting a code cause for a step change on this board."
+      },
+      {
+        "name": "component restart",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "enable": false,
+        "hide": false,
+        "iconColor": "semi-dark-blue",
+        "expr": "changes(process_start_time_seconds{namespace=\"gardenio-system\",component!=\"\"}[$__interval]) > 0",
+        "step": "1m",
+        "tagKeys": "component",
+        "titleFormat": "{{component}} restarted",
+        "textFormat": "gardenio-system/{{component}} moved its process start time - deploy, OOM-kill or crash-loop. Off by default: ~22 single-component restarts/day fleet-wide would bury the rollout markers."
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "title": "All gardenio boards",
+      "type": "dashboards",
+      "tags": [
+        "gardenio"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Every gardenio board, with this board's time range carried over"
+    },
+    {
+      "title": "System health",
+      "type": "link",
+      "url": "/grafana/d/gardenio-system-health",
+      "icon": "external link",
+      "tooltip": "The alert-target board: every signal an alert fires on, in one place",
+      "targetBlank": false,
+      "keepTime": true
+    },
+    {
+      "title": "Fleet lifecycle",
+      "type": "link",
+      "url": "/grafana/d/gardenio-fleet-lifecycle",
+      "icon": "external link",
+      "tooltip": "Session outcome mix (done / failed / killed) and freeze/thaw throughput for the whole fleet",
+      "targetBlank": false,
+      "keepTime": true
+    },
+    {
+      "title": "Formula step dispatch",
+      "type": "link",
+      "url": "/grafana/d/gardenio-formula-step-dispatch",
+      "icon": "external link",
+      "tooltip": "Formula step dispatcher throughput and stalls - the orchestration layer above the fleet",
+      "targetBlank": false,
+      "keepTime": true
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": ["gardenio", "liveness", "starvation", "control-plane", "health"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "name": "DS_PROMETHEUS",
+        "query": "prometheus",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Gardenio — Control-plane Liveness & Starvation",
+  "uid": "gardenio-control-plane-liveness",
+  "description": "The silent-dark failure class the fleet keeps rediscovering, on one board: dark gardeners holding a cooldown lease forever (advice ka-0000002229), a frozen account-probe loop showing stale capacity numbers, an upstream (Anthropic) flap's blast radius over time, and the warm-assign SLO that says whether the prewarmed pool is actually paying off. Panels grounded in metrics verified to have live series (GRADE 2026-08-18, feature ka-0000007265). NONE of these are drawn as a dedicated liveness view anywhere else.",
+  "panels": [
+    {
+      "type": "text",
+      "title": "Why this board",
+      "id": 1,
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Control-plane liveness & starvation** — the failures that read GREEN on every other surface while work silently stops.\n\n- **#12 Probe-loop dead-man**: `gardenio_probe_loop_seconds_since_last_tick` climbing without bound = the account-capacity guardian froze and every capacity number is now stale (ka-0000001889).\n- **#4 Trigger starvation**: a gardener/trigger stuck at the cooldown gate holds its `max_concurrent=1` lease forever — dark for days while `enabled=true` reads healthy (advice ka-0000002229); the skip-streak leaderboard surfaces it *before* 40h of missed fires.\n- **#1 Upstream-error blast radius**: how many agents an Anthropic/upstream flap took down, over time.\n- **#3 Prewarm-assign SLO**: warm-path p95 — is the prewarmed pool actually saving spin-up time?"
+      }
+    },
+
+    {
+      "type": "stat",
+      "title": "#12 Probe-loop dead-man — seconds since last tick",
+      "description": "gardenio_probe_loop_seconds_since_last_tick{env}: seconds since the rate-limit probe RunLoop last completed a tick (ka-0000001889). Steady-state hovers near the ~60s tick interval; a value climbing without bound is a WEDGED loop — capacity data is going stale silently and the account-capacity board is then showing frozen numbers. The 2026-07-05 freeze went undetected for ~24h; this is the direct dead-man. Amber at 600s (the watchdog stall threshold), red at 1800s.",
+      "id": 2,
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_probe_loop_seconds_since_last_tick series — the dead-man itself is dark, which is strictly WORSE than a large staleness number: the controller is not scraped at all. Check up{component=\"agents\"} on Gardenio — System Health.",
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 600 },
+              { "color": "red", "value": 1800 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "max by (env) (gardenio_probe_loop_seconds_since_last_tick)",
+          "legendFormat": "{{ env }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "#12 Probe-loop tick rate (second, independent liveness measure)",
+      "description": "rate(gardenio_probe_loop_ticks_total[$__rate_interval]): the probe loop MUST advance ~1 tick/min while the controller is alive. This is the independent counter-side derivation of the dead-man gauge to the left (two-measures principle, advice ka-0000005924) — a flatlined tick rate WITH a climbing seconds-since-tick is the unambiguous wedged-loop signature. gardenio_probe_loop_stalls_detected_total (right axis) counts each time the watchdog caught the loop going stale; it is an only-on-stall counter that emits no series until the loop wedges. That leg plots an EARNED flat 0: it is baselined off `sum(rate(gardenio_probe_loop_ticks_total[...])) * 0`, so a 0 stalls/min line only appears while the tick counter on the left axis is demonstrably advancing — i.e. 'zero stalls detected, and we can prove we were watching'. If the controller stops exporting, the anchor vanishes with it and both legs go empty rather than the stalls leg painting a confident 0 (ka-0000006531, replaces `or vector(0)`). A non-zero red line means the loop wedged.",
+      "id": 3,
+      "gridPos": { "h": 5, "w": 18, "x": 6, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_probe_loop_ticks_total series — the counter is absent, so the loop has never ticked since this controller booted (or the controller is not being scraped). Empty is NOT a 0/min tick rate: a live-but-stalled loop renders a flat 0 line, a dark controller renders this.",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "cps",
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "stalls detected/min" },
+            "properties": [
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "unit", "value": "cpm" },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "none" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "max"]
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (env) (rate(gardenio_probe_loop_ticks_total[$__rate_interval]))",
+          "legendFormat": "ticks/s {{ env }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "expr": "sum (rate(gardenio_probe_loop_stalls_detected_total[$__rate_interval])) * 60 or (sum(rate(gardenio_probe_loop_ticks_total[$__rate_interval])) * 0)",
+          "legendFormat": "stalls detected/min",
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+
+    {
+      "type": "table",
+      "title": "#4 Trigger cooldown-skip leaderboard (top 15 — silently dark gardeners)",
+      "description": "topk(15, gardenio_trigger_cooldown_skip_streak{source,trigger}): consecutive trigger-engine cycles that ended at the cooldown gate, per trigger. A high, growing streak is a gardener/trigger stuck behind its own cooldown lease — the exact 'dark gardener holds its max_concurrent=1 lease forever' failure (advice ka-0000002229). The `starved` column joins gardenio_trigger_starved (1 = the streak has outlived what the trigger's own cooldown can explain AND upstream still has matter to fire on). Sorted by streak so the darkest trigger is on top — surfaces it before 40h of missed fires.",
+      "id": 4,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_trigger_cooldown_skip_streak series — the trigger engine is not publishing streaks at all. This is NOT “no trigger is cooldown-skipping” (that renders rows with streak 0): it means the trigger engine is dark. Check up{component=\"trigger-engine\"} on Gardenio — System Health.",
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "skip streak" },
+            "properties": [
+              { "id": "unit", "value": "none" },
+              { "id": "decimals", "value": 0 },
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "yellow", "value": 30 },
+                    { "color": "red", "value": 90 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "starved" },
+            "properties": [
+              { "id": "mappings", "value": [
+                { "type": "value", "options": { "0": { "text": "—", "color": "green" } } },
+                { "type": "value", "options": { "1": { "text": "STARVED", "color": "red" } } }
+              ] },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [ { "displayName": "skip streak", "desc": true } ]
+      },
+      "targets": [
+        {
+          "expr": "topk(15, max by (source, trigger) (gardenio_trigger_cooldown_skip_streak))",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "expr": "max by (source, trigger) (gardenio_trigger_starved)",
+          "refId": "B",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true },
+            "indexByName": {
+              "source": 0,
+              "trigger": 1,
+              "Value #A": 2,
+              "Value #B": 3
+            },
+            "renameByName": {
+              "source": "source",
+              "trigger": "trigger",
+              "Value #A": "skip streak",
+              "Value #B": "starved"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "#4 Starved triggers (should-have-fired but didn't)",
+      "description": "sum by (trigger, source) (gardenio_trigger_starved): 1 while a trigger has only cooldown-skipped for longer than its own cooldown can explain and its source still matches upstream items — the cross-env cooldown-starvation symptom (epic ka-0000005107). Any band lit here is a trigger that SHOULD have fired and didn't; correlate with the leaderboard's skip-streak to see how long it has been dark.",
+      "id": 5,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no starved triggers rendered. The panel filters gardenio_trigger_starved > 0, so empty is AMBIGUOUS and this panel cannot resolve it: either every trigger that had work fired (or sits inside its own cooldown), or the trigger engine published nothing at all. Resolve with the independent target “#4 Trigger cooldown-skip leaderboard” to the left — if that renders rows, the engine is live and this really is zero starved.",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" }
+          },
+          "unit": "none",
+          "decimals": 0,
+          "color": { "mode": "palette-classic" },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "sum by (trigger, source) (gardenio_trigger_starved) > 0",
+          "legendFormat": "{{ source }}/{{ trigger }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+
+    {
+      "type": "state-timeline",
+      "title": "#1 Upstream-error blast radius — agents in error, by category",
+      "description": "sum by (category) (gardenio_agent_upstream_error_active): live count of agents currently sitting on an upstream provider error, rendered as a timeline so you see the BLAST RADIUS over time — how many agents an Anthropic/upstream flap took down and for how long. category mirrors coop's error_category enum (server_error/rate_limited/model_rate_limited/no_internet/out_of_credits/budget_exceeded/unauthorized/other). Leg A of the Claude-outage detector (ka-0000000487): System Health shows the binary; this shows the shape.",
+      "id": 6,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_agent_upstream_error_active series. The reporter Reset()s this gauge every sweep and re-Sets only (category, project, role) keys with an agent actually in error, so empty means no agent is in an upstream provider error RIGHT NOW — not a window with no errors, and not proof the reporter ran. Confirm with the probe dead-man above: ticking ⇒ genuinely clean.",
+          "custom": { "lineWidth": 0, "fillOpacity": 85, "spanNulls": false, "insertNulls": false },
+          "color": { "mode": "continuous-GrYlRd" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          },
+          "unit": "none",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": false,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.9,
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (category) (gardenio_agent_upstream_error_active)",
+          "legendFormat": "{{ category }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "#1 Agents in upstream error now",
+      "description": "sum(gardenio_agent_upstream_error_active): total agents currently failing on an upstream provider error across all categories. The single-number blast-radius headline; amber >0, red at 5 (the server_error paging threshold neighbourhood).",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_agent_upstream_error_active series. This is a Reset-every-sweep snapshot gauge, so empty reads as 0 agents in upstream error right now — but a dark reporter renders exactly the same nothing. If the probe dead-man above is also empty, treat this as “controller dark”, not clean.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(gardenio_agent_upstream_error_active)",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "#1 Upstream-error entries per interval (edge-triggered)",
+      "description": "sum by (category) (increase(gardenio_agent_upstream_error_transitions_total[$__rate_interval])): agents ENTERING an upstream error category, counted once per entry — the independent second derivation of the active gauge (advice ka-0000005924). A burst here with the state-timeline lighting up together = a flap arriving; a climbing counter with a zero gauge = agents recovering quickly (healthy).",
+      "id": 8,
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_agent_upstream_error_transitions_total series — no agent has ENTERED an upstream error category since boot, so the counter was never created. Healthy; the panel lights up on the first entry.",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "stacking": { "mode": "normal", "group": "A" }
+          },
+          "unit": "none",
+          "decimals": 0,
+          "color": { "mode": "palette-classic" },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "max"]
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (category) (increase(gardenio_agent_upstream_error_transitions_total[$__rate_interval]))",
+          "legendFormat": "{{ category }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+
+    {
+      "type": "heatmap",
+      "title": "#3 Prewarm-assign latency heatmap (warm path)",
+      "description": "sum by (le) (rate(gardenio_prewarmed_assign_duration_seconds_bucket[$__rate_interval])): the warm-assign latency distribution — seconds a single AssignPrewarmed call spends turning a warm pool member into an assigned agent (bead scan + atomic agent_state flip). The WARM-path counterpart to the ~27s cold microvm launch (epic ka-0000004145). A bright band creeping upward means the warm fast path is losing its edge — the pool is no longer saving spin-up time.",
+      "id": 9,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 29 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": { "mode": "scheme", "scheme": "Spectral", "steps": 64, "reverse": true, "exponent": 0.5, "fill": "dark-orange" },
+        "yAxis": { "unit": "s", "axisPlacement": "left" },
+        "rowsFrame": { "layout": "auto" },
+        "tooltip": { "mode": "single", "show": true, "yHistogram": true },
+        "legend": { "show": true },
+        "exemplars": { "color": "rgba(255,0,255,0.7)" },
+        "filterValues": { "le": 1e-09 },
+        "cellValues": {}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_prewarmed_assign_duration_seconds_bucket samples in this range — no warm-pod assignment was attempted in the window (the histogram only observes on an AssignPrewarmed call). Widen the range; a persistently empty heatmap on a busy fleet means the warm path is not being exercised at all.",
+          "custom": {
+            "scaleDistribution": { "type": "linear" },
+            "hideFrom": { "tooltip": false, "viz": false, "legend": false }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (le) (rate(gardenio_prewarmed_assign_duration_seconds_bucket[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{ le }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "#3 Prewarm-assign p95 (warm-path SLO)",
+      "description": "histogram_quantile(0.95, sum by (le) (rate(gardenio_prewarmed_assign_duration_seconds_bucket[$__rate_interval]))): p95 warm-assign latency. The direct warm-path payoff signal — the pool exists to keep this in the sub-second bead-flip regime (buckets are dense 5ms..2s). Amber at 500ms, red at 1s: a p95 climbing toward the coarse tail means the warm assign is stalling on a slow daemon list/update and the pool's advantage over the ~27s cold path is eroding.",
+      "id": 10,
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 29 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no warm-assign observations in this range — histogram_quantile has no buckets to read, so p95 is UNDEFINED, not fast. Widen the range; if the heatmap to the left is also empty, no warm assignment happened in the window.",
+          "unit": "s",
+          "decimals": 3,
+          "min": 0,
+          "max": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gardenio_prewarmed_assign_duration_seconds_bucket[$__rate_interval])))",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "#3 Warm-assign outcome rate (hit vs empty vs error)",
+      "description": "sum by (outcome) (rate(gardenio_prewarmed_assigns_total[$__rate_interval])): AssignPrewarmed attempts by outcome. hit = a warm pod was atomically assigned; empty = no assignable candidate for the (project,role) so the caller paid a cold mint; error = list/update failure. The empty rate is the how-often-a-mention-cold-starts signal (ka-0000000550) — a rising empty share means the pool is under-provisioned and the p95/heatmap only tell half the story.",
+      "id": 11,
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 29 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_prewarmed_assigns_total series — AssignPrewarmed has not been called since this controller booted, so no outcome counter exists. Note the difference between this (no attempts) and an outcome=\"empty\" line (attempts that found no warm pod).",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "stacking": { "mode": "normal", "group": "A" }
+          },
+          "unit": "cps",
+          "color": { "mode": "palette-classic" },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byFrameRefID", "options": "A" },
+            "properties": []
+          },
+          {
+            "matcher": { "id": "byName", "options": "hit" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "empty" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "error" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "max"]
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(gardenio_prewarmed_assigns_total[$__rate_interval]))",
+          "legendFormat": "{{ outcome }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "#3 Prewarm-assign latency fan — p50 / p90 / p99 (warm path)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 37 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "no prewarm-assignment latency samples in this window — either the warm path was idle, or the histogram is not being scraped",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 5 },
+              { "color": "red", "value": 15 }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": { "mode": "dashed" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(gardenio_prewarmed_assign_duration_seconds_bucket[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(gardenio_prewarmed_assign_duration_seconds_bucket[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "p90"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gardenio_prewarmed_assign_duration_seconds_bucket[$__rate_interval])))",
+          "refId": "C",
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "The heatmap left of this shows the SHAPE of the warm-path assign latency; this shows how it MOVES. The p95 gauge is a single number against the SLO — a p99 that climbs while p50 stays flat is a minority of spawns falling off the warm path, which is exactly the failure the gauge averages away."
+    }
+  ]
+}

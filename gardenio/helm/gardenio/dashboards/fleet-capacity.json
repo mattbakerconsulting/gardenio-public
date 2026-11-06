@@ -1,0 +1,664 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "type": "dashboard",
+        "name": "Annotations & Alerts",
+        "enable": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" }
+      },
+      {
+        "name": "gardenio rollout",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "semi-dark-orange",
+        "expr": "count(changes(process_start_time_seconds{namespace=\"gardenio-system\",component!=\"\"}[$__interval]) > 0) >= 3",
+        "step": "1m",
+        "titleFormat": "gardenio rollout",
+        "textFormat": "3+ gardenio-system components restarted at once - a release deploy or chart apply. Check this marker before hunting a code cause for a step change on this board."
+      },
+      {
+        "name": "component restart",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "enable": false,
+        "hide": false,
+        "iconColor": "semi-dark-blue",
+        "expr": "changes(process_start_time_seconds{namespace=\"gardenio-system\",component!=\"\"}[$__interval]) > 0",
+        "step": "1m",
+        "tagKeys": "component",
+        "titleFormat": "{{component}} restarted",
+        "textFormat": "gardenio-system/{{component}} moved its process start time - deploy, OOM-kill or crash-loop. Off by default: ~22 single-component restarts/day fleet-wide would bury the rollout markers."
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "title": "All gardenio boards",
+      "type": "dashboards",
+      "tags": [
+        "gardenio"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Every gardenio board, with this board's time range carried over"
+    },
+    {
+      "title": "Fleet lifecycle",
+      "type": "link",
+      "url": "/grafana/d/gardenio-fleet-lifecycle",
+      "icon": "external link",
+      "tooltip": "Session outcome mix (done / failed / killed) and freeze/thaw throughput for the whole fleet",
+      "targetBlank": false,
+      "keepTime": true
+    },
+    {
+      "title": "Memory right-sizing",
+      "type": "link",
+      "url": "/grafana/d/gardenio-vpa-right-sizing",
+      "icon": "external link",
+      "tooltip": "Actual vs requested crew memory - the OOM-kill precursor behind involuntary deaths",
+      "targetBlank": false,
+      "keepTime": true
+    },
+    {
+      "title": "Involuntary deaths",
+      "type": "link",
+      "url": "/grafana/d/gardenio-involuntary-deaths",
+      "icon": "external link",
+      "tooltip": "Agents killed mid-work, by cause - what a spike in failed sessions actually was",
+      "targetBlank": false,
+      "keepTime": true
+    },
+    {
+      "title": "Account capacity",
+      "type": "link",
+      "url": "/grafana/d/gardenio-account-capacity",
+      "icon": "external link",
+      "tooltip": "Per-account rate-limit headroom - a throttled account shows up as latency and retry cost",
+      "targetBlank": false,
+      "keepTime": true
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": ["gardenio", "capacity", "placement", "fleet", "scheduling"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "name": "DS_PROMETHEUS",
+        "query": "prometheus",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Gardenio — Fleet Capacity & Placement",
+  "uid": "gardenio-fleet-capacity",
+  "description": "The placement-side companion to control-plane-liveness (feature ka-0000000905, GRADE 2026-08-19). Answers one operator question — can the fleet actually PLACE the agents it wants to run right now, and is the thing that places them alive? Pod-phase flow (Pending->Running->Succeeded) surfaces a stuck-Pending backlog before it is a capacity incident; the pending-pod gauge is the saturation headline; node-lifecycle churn shows Karpenter turning nodes over underneath; the reconcile dead-man is the second, independent liveness of the controller that drives placement; and the compaction leaderboard shows which agents are burning turns (and therefore holding capacity) on context compaction. Every panel is grounded in a metric with live series verified against gardenio-vmsingle this iteration.",
+  "panels": [
+    {
+      "type": "text",
+      "title": "Why this board",
+      "id": 1,
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Fleet capacity & placement** — can the fleet place the agents it wants to run, and is the placer alive? **#6 Pending-pod saturation**: `gardenio_agent_pods_pending` climbing = we are running out of node capacity to place agent pods. **#4 Pod-phase flow**: `gardenio_agent_pod_phase_transitions_total` — watch `Pending->Running` keep pace with spawns; a stuck-`Pending` backlog is a capacity incident forming. **#9 Node churn**: `gardenio_node_lifecycle_events_total{reason}` — Karpenter deleting/disrupting/terminating nodes underneath the fleet. **#5 Reconcile dead-man**: `gardenio_reconcile_total` — the reconciler that drives placement MUST tick ~1/min; a flatlined counter means placement has silently stopped (second independent liveness, advice ka-0000005924). **#1 Compaction pressure**: `gardenio_agent_compactions_current` — which agents are burning turns on context compaction and holding capacity."
+      }
+    },
+
+    {
+      "type": "stat",
+      "title": "#6 Agent pods Pending now (placement saturation)",
+      "description": "sum(gardenio_agent_pods_pending): total agent pods currently stuck in the Pending phase across all (project, role) — i.e. desired but not yet placed onto a node. This is the headline capacity-saturation number: a non-zero value that persists means Karpenter/the scheduler cannot find room and new agents are queueing behind node provisioning. Amber >0 (something is waiting), red at 5 (a real placement backlog). Pairs with the deferred-wait SLO.",
+      "id": 2,
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_agent_pods_pending series. Empty is AMBIGUOUS here and this panel cannot resolve it: the reconciler Reset()s the gauge every sweep and re-Sets only (project, role) keys that actually have Pending pods, so an idle-healthy fleet and a dark reconciler render the same nothing. Resolve with the independent target “#5 Reconcile dead-man — reconciles/min” to the right — if that is ticking, this really is zero pods pending.",
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(gardenio_agent_pods_pending)",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "#5 Reconcile dead-man — reconciles/min",
+      "description": "sum(rate(gardenio_reconcile_total[10m])) * 60: the agent controller's reconcile loop rate, per minute. The reconciler is what turns desired agents into placed pods, so this is a direct liveness signal for placement itself — steady-state is ~1 reconcile/min (the controller's resync cadence). A value at or near ZERO while agents are still desired means the placer has silently stopped: pods will sit un-created with no error anywhere (the second, independent control-plane liveness measure, advice ka-0000005924). Thresholds INVERT the usual sense — red at 0 (dead), amber below 0.1/min, green once it is ticking.",
+      "id": 3,
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_reconcile_total series — the reconcile loop has not incremented since this controller booted, or the controller is not being scraped. Empty is strictly worse than a 0/min reading: the dead-man itself is blind. Check up{component=\"agents\"} on Gardenio — System Health.",
+          "unit": "cpm",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.1 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(gardenio_reconcile_total[10m])) * 60",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "#6 Pending agent pods by project × role",
+      "description": "sum by (project, role) (gardenio_agent_pods_pending): the pending-pod saturation broken out by (project, role) so a placement backlog can be attributed — e.g. a single greedy project's crew pods soaking up all the newly-provisioned capacity, or a role whose resource request no nodepool can satisfy. A band that stays lit for minutes (rather than a brief spike while a node spins up) is the signature of a genuine capacity shortfall for that slice.",
+      "id": 4,
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no (project, role) row rendered. The panel filters gardenio_agent_pods_pending > 0 and the reconciler Reset()s that gauge every sweep, so empty is AMBIGUOUS and this panel cannot resolve it: either nothing is pending, or nothing was swept. Resolve with the independent target “#5 Reconcile dead-man — reconciles/min” — if it is ticking, this really is zero pending pods.",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" }
+          },
+          "unit": "none",
+          "decimals": 0,
+          "color": { "mode": "palette-classic" },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "sum by (project, role) (gardenio_agent_pods_pending) > 0",
+          "legendFormat": "{{ project }}/{{ role }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "#4 Pod-phase flow — transitions/min into each phase",
+      "description": "sum by (phase_to) (rate(gardenio_agent_pod_phase_transitions_total[$__rate_interval])) * 60: the rate at which agent pods are ENTERING each lifecycle phase. Pending = new spawns landing; Running = successful placements; Succeeded = clean completions. In a healthy fleet the Running line tracks the Pending line with only a short placement lag; a Pending line that outruns Running for a sustained window is the leading indicator of a stuck-Pending backlog — a capacity incident forming — before the pending-pod gauge above even saturates.",
+      "id": 5,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_agent_pod_phase_transitions_total series — no agent pod has changed phase since this controller booted, so the counter does not exist. On an idle fleet this is legitimate; on a busy one it means the controller is dark (check the dead-man above).",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "stacking": { "mode": "none", "group": "A" }
+          },
+          "unit": "cpm",
+          "decimals": 2,
+          "color": { "mode": "palette-classic" },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Running" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Pending" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Failed" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "max"]
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (phase_to) (rate(gardenio_agent_pod_phase_transitions_total[$__rate_interval])) * 60",
+          "legendFormat": "{{ phase_to }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "#4 Pod-phase transition matrix (this range)",
+      "description": "sum by (phase_from, phase_to) (increase(gardenio_agent_pod_phase_transitions_total[$__range])): the full from->to transition count over the selected window, so the SHAPE of the flow is legible at a glance. Pending->Running dominating is healthy churn. A material Running->Pending count is pods being evicted/rescheduled (node churn or preemption — cross-check #9). Rows are sorted by count so the dominant transition is on top.",
+      "id": 6,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no pod-phase transitions in the selected range — no agent pod started or stopped in the window. Widen the range; the matrix is a $__range increase(), so a short window on a quiet fleet is legitimately empty.",
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "transitions" },
+            "properties": [
+              { "id": "unit", "value": "none" },
+              { "id": "decimals", "value": 0 },
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "yellow", "value": 1 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [ { "displayName": "transitions", "desc": true } ]
+      },
+      "targets": [
+        {
+          "expr": "sum by (phase_from, phase_to) (increase(gardenio_agent_pod_phase_transitions_total[$__range]))",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "component": true,
+              "instance": true,
+              "instance_name": true,
+              "job": true,
+              "namespace": true,
+              "pod": true
+            },
+            "indexByName": {
+              "phase_from": 0,
+              "phase_to": 1,
+              "Value": 2
+            },
+            "renameByName": {
+              "phase_from": "from",
+              "phase_to": "to",
+              "Value": "transitions"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "#9 Node lifecycle churn by reason",
+      "description": "sum by (reason) (rate(gardenio_node_lifecycle_events_total[$__rate_interval])) * 60: how fast agent nodes are turning over, split by reason (deleting / disrupting / not_ready / terminated). This is Karpenter and the kubelet moving the ground underneath the fleet — a burst here that lines up with Running->Pending in the transition matrix (#4) or a spike in the pending gauge (#6) is node churn evicting running agents and forcing re-placement. Correlate with involuntary-deaths to see whether churn is costing agent lives.",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_node_lifecycle_events_total series — no agent node was created, disrupted or deleted since this controller booted. Stable capacity is the healthy reading; corroborate with the reconcile dead-man before calling it stable.",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" }
+          },
+          "unit": "cpm",
+          "decimals": 3,
+          "color": { "mode": "palette-classic" },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "terminated" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "not_ready" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "sum"] }
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(gardenio_node_lifecycle_events_total[$__rate_interval])) * 60",
+          "legendFormat": "{{ reason }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "#5 Reconcile rate by result (second liveness measure)",
+      "description": "sum by (result) (rate(gardenio_reconcile_total[$__rate_interval])) * 60: the reconcile loop rate over time, split by result (ok / error). This is the timeseries counterpart to the reconcile dead-man stat — it plots the loop actually ticking and surfaces a rising error result before the overall rate flatlines. A line that drops to and stays at zero while agents are still desired is the unambiguous 'placer wedged' signature (advice ka-0000005924: measure the same liveness two independent ways).",
+      "id": 8,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_reconcile_total series — the same absence the dead-man stat reports, seen over time. A live reconciler always draws a result=\"ok\" line; empty means the controller is not being scraped, not that reconciles are failing.",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "cpm",
+          "decimals": 2,
+          "color": { "mode": "palette-classic" },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "error" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "ok" },
+            "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "none" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "max"]
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(gardenio_reconcile_total[$__rate_interval])) * 60",
+          "legendFormat": "{{ result }}",
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    },
+
+    {
+      "type": "table",
+      "title": "#1 Compaction pressure leaderboard (agents compacting now)",
+      "description": "topk(15, gardenio_agent_compactions_current): the agents currently mid-compaction, ranked. Compaction is a direct token-cost and latency tax — an agent compacting is burning turns re-summarising its own context instead of doing work, and it holds its pod (and therefore capacity) for longer while it does. No other board surfaces this PER-AGENT; cost-overview and context-observability only show the fleet-wide aggregate. A recurring offender here is a candidate for a tighter prompt or a smaller advice footprint (advice-hygiene). Sorted by compaction count, hottest agent on top.",
+      "id": 9,
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "no gardenio_agent_compactions_current series. This is NOT “no agent is compacting”: the controller publishes one series per agent in its sweep — value 0 for an agent that has never compacted — so a live controller over a live fleet always renders rows. Empty means no agents were swept at all, or the controller is dark. Corroborate with “#5 Reconcile dead-man — reconciles/min” below.",
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "compactions" },
+            "properties": [
+              { "id": "unit", "value": "none" },
+              { "id": "decimals", "value": 0 },
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "yellow", "value": 1 },
+                    { "color": "red", "value": 3 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [ { "displayName": "compactions", "desc": true } ]
+      },
+      "targets": [
+        {
+          "expr": "topk(15, gardenio_agent_compactions_current)",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "component": true,
+              "instance": true,
+              "instance_name": true,
+              "job": true,
+              "namespace": true,
+              "pod": true
+            },
+            "indexByName": {
+              "agent": 0,
+              "project": 1,
+              "role": 2,
+              "Value": 3
+            },
+            "renameByName": {
+              "agent": "agent",
+              "project": "project",
+              "role": "role",
+              "Value": "compactions"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Pressure distribution & per-role saturation",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "#6 Pending-pod pressure distribution over the window — p50 / p95 / p99 / max",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "the pending gauge is not reporting — placement pressure is UNKNOWN, not zero",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 3 },
+              { "color": "red", "value": 10 }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": { "mode": "dashed" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "quantile_over_time(0.5, sum(gardenio_agent_pods_pending)[$__range:5m])",
+          "refId": "A",
+          "legendFormat": "p50 pending"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "quantile_over_time(0.95, sum(gardenio_agent_pods_pending)[$__range:5m])",
+          "refId": "B",
+          "legendFormat": "p95 pending"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "quantile_over_time(0.99, sum(gardenio_agent_pods_pending)[$__range:5m])",
+          "refId": "C",
+          "legendFormat": "p99 pending"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "max_over_time(sum(gardenio_agent_pods_pending)[$__range:5m])",
+          "refId": "D",
+          "legendFormat": "max pending"
+        }
+      ],
+      "description": "The Pending stat at the top is an instant: it reads 0 the moment a backlog drains, so chronic saturation and a momentary blip look identical. These quantiles are taken over the whole dashboard range, so a p50 above zero means the fleet is CONSTANTLY waiting on placement, while p50 at zero with a high max is one spike worth ignoring."
+    },
+    {
+      "type": "bargauge",
+      "title": "#6 Pending agent pods by role (now)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 3 },
+              { "color": "red", "value": 10 }
+            ]
+          },
+          "noValue": "nothing Pending right now, or the pending gauge is not reporting — the reconcile dead-man stat at the top of the board says which"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        },
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum by (role) (gardenio_agent_pods_pending) > 0",
+          "refId": "A",
+          "legendFormat": "{{role}}"
+        }
+      ],
+      "description": "Which workload class is waiting for a node right now, ranked. The timeseries above splits by project × role over time; this is the one-glance 'who is stuck' read that goes with the Pending stat at the top."
+    }
+  ]
+}

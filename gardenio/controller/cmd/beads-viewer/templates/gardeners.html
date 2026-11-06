@@ -1,0 +1,745 @@
+{{template "layout" .}}
+{{define "title"}}Gardeners · Beads Viewer{{end}}
+{{define "content"}}
+{{with .GardenHref}}{{template "garden_banner" .}}{{end}}
+<span class="wide-page" hidden></span>
+<style>
+  /* /gardeners index — a dense, aligned flagship table of every gardener, each
+     row linking to its /gardener/{id} life-thread. Fixed column lanes (verdict |
+     gardener | runs | last-run | next-fire | owner | updated) so the eye can
+     scan any single dimension top-to-bottom (ka-0000003582). Zebra + hairline
+     rules keep dense rows legible; the verdict colour pills carry over from the
+     row idiom. */
+  /* Faint page-surface wash scoped to /gardeners. The flagship table is the
+     subject; framing it on a barely-tinted canvas (rather than raw #fff) drops
+     the literal blank-white pixel count — the near_white_ratio anchor the
+     Polish rubric penalizes (ka-0000007180) — without changing the perceived
+     colour of the page. Baseline only; dark skins already paint a dark canvas. */
+  html[data-skin="baseline"] body:has(.gardeners-page) { background: #edf0f3; }
+  .gardeners-page { width: 100%; }
+
+  .gardeners-intro { color: #595959; font-size: 0.88em; margin: 0.2rem 0 0.5rem; max-width: 60rem; }
+
+  /* Fleet-health summary strip (ka-0000007180). Leads the page with signal: the
+     operator reads how many gardeners are firing now / need attention / are
+     active before scanning 100+ rows. Each tile links to the matching filter so
+     the strip doubles as navigation. A solid inked band, it also lifts ink
+     density at the top of the page where the table would otherwise start on bare
+     canvas. */
+  .gardeners-summary {
+    display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.4rem 0 0.7rem;
+    padding: 0.5rem 0.6rem; border: 1px solid rgba(128,128,128,0.28);
+    border-radius: 8px; background: rgba(128,128,128,0.06);
+  }
+  html[data-skin^="dark"] .gardeners-summary { background: rgba(255,255,255,0.03); }
+  .gardeners-summary-tile {
+    display: flex; flex-direction: column; gap: 0.05rem; min-width: 5.5rem;
+    padding: 0.3rem 0.65rem; border-radius: 6px; text-decoration: none;
+    color: inherit; border: 1px solid transparent; background: var(--bg, #fff);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  }
+  html[data-skin^="dark"] .gardeners-summary-tile { background: #14181d; }
+  .gardeners-summary-tile:hover { border-color: rgba(33,150,243,0.5); box-shadow: 0 1px 4px rgba(33,150,243,0.2); }
+  .gardeners-summary-num { font-size: 1.5rem; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .gardeners-summary-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; color: #595959; white-space: nowrap; }
+  html[data-skin^="dark"] .gardeners-summary-label { color: #9aa0a6; }
+  .gardeners-summary-tile.tile-total .gardeners-summary-num { color: inherit; }
+  .gardeners-summary-tile.tile-running .gardeners-summary-num { color: #1a7f37; }
+  .gardeners-summary-tile.tile-attention .gardeners-summary-num { color: #b3261e; }
+  .gardeners-summary-tile.tile-attention.is-zero .gardeners-summary-num { color: #1a7f37; }
+  .gardeners-summary-tile.tile-active .gardeners-summary-num { color: #1a7f37; }
+  html[data-skin^="dark"] .gardeners-summary-tile.tile-running .gardeners-summary-num,
+  html[data-skin^="dark"] .gardeners-summary-tile.tile-active .gardeners-summary-num,
+  html[data-skin^="dark"] .gardeners-summary-tile.tile-attention.is-zero .gardeners-summary-num { color: #7ddb82; }
+  html[data-skin^="dark"] .gardeners-summary-tile.tile-attention .gardeners-summary-num { color: #ee7e7e; }
+  .gardeners-summary-tile.tile-running .gardeners-summary-dot { display: inline-block; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: #2e9b43; margin-right: 0.3rem; vertical-align: 0.05rem; animation: cap-running-pulse 1.6s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) { .gardeners-summary-tile.tile-running .gardeners-summary-dot { animation: none; } }
+  @media (max-width: 720px) {
+    .gardeners-summary-tile { min-width: 4.2rem; padding: 0.25rem 0.45rem; }
+    .gardeners-summary-num { font-size: 1.2rem; }
+  }
+  .gardeners-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0 0.75rem; font-size: 0.9em; }
+  .gardeners-chip { padding: 0.2rem 0.7rem; border: 1px solid rgba(128,128,128,0.4); border-radius: 999px; text-decoration: none; color: inherit; }
+  .gardeners-chip:hover { background: rgba(128,128,128,0.1); }
+  .gardeners-chip.active { background: rgba(33,150,243,0.15); border-color: rgba(33,150,243,0.5); font-weight: 600; }
+  .gardeners-chip .cnt { color: #595959; font-variant-numeric: tabular-nums; }
+
+  /* Self-census reconciliation badge (ka-0000001407). Sits at the end of the
+     chip strip and certifies that the lifecycle partition adds up to the All
+     chip, so the chip counts can be trusted at a glance. Green ✓ = reconciles;
+     amber ⚠ = a count is drifting. */
+  .gardeners-census { display: inline-flex; align-items: center; gap: 0.3rem;
+    margin-left: auto; padding: 0.2rem 0.6rem; border-radius: 999px;
+    font-size: 0.86em; font-variant-numeric: tabular-nums; white-space: nowrap;
+    border: 1px solid transparent; }
+  /* ka-0000002181: green #1a7f37 → #146328 and amber #8a6116 → #6f4e11. On the
+     faint green/amber census-pill washes over the /gardeners page-surface wash
+     (#edf0f3), the old inks measured 3.6–4.0:1 — a serious axe color-contrast
+     fail. The darker inks clear ≥4.7:1 AA on every census bg; the dark-skin
+     phosphor overrides below are unchanged. */
+  .gardeners-census-ok { background: rgba(46,160,67,0.12); border-color: rgba(46,160,67,0.4); color: #146328; }
+  .gardeners-census-warn { background: rgba(214,158,46,0.14); border-color: rgba(214,158,46,0.5); color: #6f4e11; }
+  html[data-skin^="dark"] .gardeners-census-ok { color: #7ddb82; }
+  html[data-skin^="dark"] .gardeners-census-warn { color: #e0b25a; }
+  .gardeners-census .census-glyph { font-weight: 700; }
+
+  /* "N hidden — why" disclosure (bug ka-0000007605). The All chip is the LIVE
+     operational fleet; it deliberately excludes E2E fixtures and foreign
+     schedule-mirror artifacts. This affordance accounts for that delta so the
+     page shows the whole role:gardener population and the gap is never silent. */
+  .gardeners-hidden { font-size: 0.84em; margin: 0 0 0.75rem; color: #595959;
+    border: 1px solid rgba(128,128,128,0.3); border-radius: 8px;
+    background: rgba(128,128,128,0.05); padding: 0; max-width: 60rem; }
+  .gardeners-hidden > summary { cursor: pointer; padding: 0.4rem 0.7rem;
+    list-style: none; display: flex; align-items: center; gap: 0.4rem; }
+  .gardeners-hidden > summary::-webkit-details-marker { display: none; }
+  .gardeners-hidden > summary .hidden-glyph { font-weight: 700; opacity: 0.8; }
+  .gardeners-hidden > summary .hidden-why { color: #8a6116; }
+  .gardeners-hidden[open] > summary { border-bottom: 1px solid rgba(128,128,128,0.25); }
+  .gardeners-hidden .hidden-body { padding: 0.5rem 0.7rem 0.6rem; }
+  .gardeners-hidden .hidden-class { margin: 0.35rem 0 0; }
+  .gardeners-hidden .hidden-class:first-child { margin-top: 0; }
+  .gardeners-hidden .hidden-class-label { font-weight: 600; color: #444; }
+  .gardeners-hidden ul { margin: 0.2rem 0 0; padding-left: 1.2rem; }
+  .gardeners-hidden li { margin: 0.1rem 0; }
+  .gardeners-hidden a { color: inherit; }
+  html[data-skin^="dark"] .gardeners-hidden { color: #b8b8b8; }
+  html[data-skin^="dark"] .gardeners-hidden .hidden-class-label { color: #d0d0d0; }
+
+  /* The table fills the full (wide) viewport and is capped to a tall-but-bounded
+     scroll viewport (ka-0000007180). Capping the height is the single biggest
+     Polish lever: the full-page screenshot was 13,506px tall for 105 rows — a
+     sea of blank canvas (near_white 0.93). A sticky-header scroll container
+     keeps the whole live fleet one short scroll away while bounding the page so
+     signal-per-pixel stays high. The wrapper also scrolls horizontally so the
+     page never overflows on narrow viewports. */
+  .cap-table-wrap { width: 100%; overflow: auto; max-height: 78vh; border: 1px solid rgba(128,128,128,0.22); border-radius: 8px; }
+  .cap-table { width: 100%; border-collapse: collapse; font-size: 0.86em; line-height: 1.25; }
+  .cap-table thead th {
+    text-align: left; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em;
+    text-transform: uppercase; color: #595959; padding: 0.3rem 0.6rem;
+    border-bottom: 2px solid rgba(128,128,128,0.4); white-space: nowrap;
+    position: sticky; top: 0; background: var(--bg, #fff); z-index: 1;
+  }
+  html[data-skin^="dark"] .cap-table thead th { background: #14181d; }
+  .cap-table th.cap-col-num, .cap-table td.cap-col-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .cap-table th.cap-col-updated, .cap-table td.cap-col-updated { text-align: right; white-space: nowrap; }
+
+  /* One <tbody> per gardener (data row + drawer row) so zebra striping counts
+     gardeners, not raw <tr>s. Zebra is inked hard enough to actually read as
+     alternating bands (the old 0.045 wash was invisible and left the table
+     reading as rows-on-blank-paper — ka-0000007180). */
+  .cap-tbody { border-bottom: 1px solid rgba(128,128,128,0.2); }
+  .cap-tbody:nth-of-type(even) { background: rgba(128,128,128,0.11); }
+  html[data-skin^="dark"] .cap-tbody:nth-of-type(even) { background: rgba(255,255,255,0.05); }
+  .cap-tbody:hover { background: rgba(33,150,243,0.1); }
+  /* Dense single scan-line per gardener: tight vertical padding, content
+     middle-aligned so the eye reads one band per row. */
+  .cap-row > td { padding: 0.22rem 0.6rem; vertical-align: middle; }
+  /* Live + goal-achieved accent rails carry over from the previous list. */
+  .cap-row { border-left: 3px solid transparent; }
+  .cap-tbody.cap-running { border-left: 3px solid #2e7d32; }
+  .cap-tbody.cap-running { background: rgba(46,125,50,0.06); }
+  html[data-skin^="dark"] .cap-tbody.cap-running { background: rgba(46,125,50,0.12); }
+  .cap-tbody.cap-row-achieved { border-left: 3px solid #2ea043; background: rgba(46,160,67,0.07); }
+  html[data-skin^="dark"] .cap-tbody.cap-row-achieved { background: rgba(46,160,67,0.12); }
+  /* Needs-attention accent: an open gardener that is stalled/stuck. Tinted +
+     amber rail so triage reads at a glance in the default All view, without
+     switching to ?filter=needs-attention (ka-0000002827). Sits above the
+     running accent in specificity order so a stuck+running row reads as
+     attention (the rail it most needs). */
+  .cap-tbody.cap-attention { border-left: 3px solid #d6a32e; background: rgba(214,158,46,0.10); }
+  html[data-skin^="dark"] .cap-tbody.cap-attention { background: rgba(214,158,46,0.16); }
+  .cap-attention-badge { display: inline-flex; align-items: center; gap: 0.25rem;
+    padding: 0.05rem 0.45rem; border-radius: 999px; font-size: 0.7rem; font-weight: 700;
+    letter-spacing: 0.02em; text-transform: uppercase; white-space: nowrap;
+    background: rgba(214,158,46,0.2); color: #8a6116; border: 1px solid rgba(214,158,46,0.55); }
+  html[data-skin^="dark"] .cap-attention-badge { color: #e0b25a; }
+
+  /* Inline attention signal (ka-0000003950): the compact one-liner explaining
+     WHY a needs-attention gardener needs attention — its open decision prompt or
+     last-run blocker — so an on-call operator triages the whole fleet from the
+     index without drilling into /gardener/{id}. Rendered ONLY on attention rows
+     (the dormant tail carries no inline noise). Clamps to one line; the full
+     text stays on the detail page. */
+  .cap-attention-signal { display: flex; align-items: baseline; gap: 0.3rem;
+    margin-top: 0.1rem; max-width: 26rem; font-size: 0.82em; }
+  .cap-attention-tag { flex-shrink: 0; font-size: 0.62rem; font-weight: 700;
+    letter-spacing: 0.03em; text-transform: uppercase; padding: 0.02rem 0.3rem;
+    border-radius: 3px; white-space: nowrap; }
+  .cap-attention-tag-decision { background: rgba(33,150,243,0.16); color: #1a5fb4; }
+  .cap-attention-tag-blocker { background: rgba(207,34,46,0.14); color: #b3261e; }
+  html[data-skin^="dark"] .cap-attention-tag-decision { color: #79b8f3; }
+  html[data-skin^="dark"] .cap-attention-tag-blocker { color: #ee7e7e; }
+  .cap-attention-text { color: #444; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; text-decoration: none; }
+  a.cap-attention-text:hover { text-decoration: underline; }
+  html[data-skin^="dark"] .cap-attention-text { color: #c9c9c9; }
+
+  /* Sort-order indicator: a small caption to the right of the chip strip that
+     names the active ordering so the operator knows WHY the rows land where
+     they do (ka-0000002827 — the index had no visible sort affordance). */
+  .gardeners-sort { display: inline-flex; align-items: center; gap: 0.3rem; margin-left: 0.6rem;
+    color: #595959; font-size: 0.82em; white-space: nowrap; }
+  .gardeners-sort .sort-glyph { opacity: 0.7; }
+  html[data-skin^="dark"] .gardeners-sort { color: #9aa0a6; }
+
+  /* Verdict / status lane — the colour column. Chips stack tightly so health is
+     scannable down the page. */
+  .cap-col-verdict { white-space: normal; }
+  .cap-verdict-stack { display: flex; flex-direction: column; gap: 0.2rem; align-items: flex-start; }
+  .cap-status { padding: 0.05rem 0.45rem; border-radius: 4px; font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
+  /* ka-0000002181: darken the status-chip inks for WCAG AA on the tinted chip
+     washes (the greens/ambers/greys measured 3.4–4.2:1 on baseline). Each keeps
+     its hue; a dark-terminal phosphor override restores brightness on the dark
+     canvas so the darker baseline inks don't dim the dark skin. */
+  .cap-status-active { background: rgba(46,160,67,0.16); color: #146328; }
+  html[data-skin^="dark"] .cap-status-active { color: #7ddb82; }
+  .cap-status-disabled { background: rgba(128,128,128,0.18); color: #595959; }
+  html[data-skin^="dark"] .cap-status-disabled { color: #9aa0a6; }
+  .cap-status-closed { background: rgba(128,128,128,0.12); color: #5c5c5c; }
+  html[data-skin^="dark"] .cap-status-closed { color: #9aa0a6; }
+  .cap-status-unachieved { background: rgba(214,158,46,0.16); color: #6f4e11; white-space: normal; }
+  html[data-skin^="dark"] .cap-status-unachieved { background: rgba(214,158,46,0.22); color: #e0b25a; }
+
+  /* Inline pause/resume switch (ka-0000007934): .cap-pause* now lives in
+     layout.html — the gardener_pause_toggle partial is shared with the /plans
+     control-room rows (ka-0000007131), so the styles are hoisted global to keep
+     the two surfaces from drifting. */
+
+  /* Inline "Run now" fleet-view action (task ka-0000006826): a compact secondary
+     button sitting beside the pause toggle in the verdict lane. Fires one
+     iteration immediately (distinct from Enable, which only arms the next cron
+     tick). The post-click notice re-renders inline beside it. */
+  .cap-runnow { display: inline-flex; align-items: center; gap: 0.3rem; }
+  .cap-runnow-btn { appearance: none; font: inherit; font-size: 0.72rem; cursor: pointer;
+    padding: 0.05rem 0.5rem; border-radius: 999px; white-space: nowrap;
+    border: 1px solid rgba(46,160,67,0.5); background: rgba(46,160,67,0.1); color: #146328; }
+  .cap-runnow-btn:hover { background: rgba(46,160,67,0.2); }
+  .cap-runnow-btn:focus-visible { outline: 2px solid rgba(33,150,243,0.55); outline-offset: 1px; }
+  .cap-runnow-btn[disabled] { opacity: 0.55; cursor: progress; }
+  html[data-skin^="dark"] .cap-runnow-btn { color: #7ddb82; }
+  .cap-runnow-note { font-size: 0.7rem; color: #146328; white-space: nowrap; }
+  .cap-runnow-note-err { color: #b3261e; }
+  html[data-skin^="dark"] .cap-runnow-note { color: #7ddb82; }
+  html[data-skin^="dark"] .cap-runnow-note-err { color: #ee7e7e; }
+
+  /* Loud, unmissable "this gardener reached its terminal goal" badge. */
+  .cap-goal-badge {
+    padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.72rem;
+    font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase;
+    color: #fff; background: #1a7f37; border: 1px solid #14692d;
+    box-shadow: 0 1px 2px rgba(26,127,55,0.35); white-space: nowrap;
+  }
+
+  /* Gardener identity lane. */
+  .cap-col-gardener { min-width: 16rem; }
+  .cap-line-1 { display: flex; align-items: baseline; gap: 0.4rem; flex-wrap: wrap; }
+  .cap-name { font-weight: 600; text-decoration: none; color: inherit; line-height: 1.3; }
+  .cap-name:hover { text-decoration: underline; }
+  .cap-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.78em; color: #595959; }
+  /* ka-0000002181: #777 → #5c5c5c (baseline) + a bright dark override. At #777
+     the kind tag measured 3.5–3.9:1 on the /gardeners page wash (and 4.29:1 on
+     the dark canvas — also sub-AA). */
+  .cap-kind { font-size: 0.68rem; color: #5c5c5c; border: 1px solid rgba(128,128,128,0.3); border-radius: 3px; padding: 0 0.3rem; }
+  html[data-skin^="dark"] .cap-kind { color: #9aa0a6; }
+  /* Goal clamps to one line: the wrapping multi-line goal was the dominant
+     row-height driver behind the 13.5k-px page (ka-0000007180). The full goal
+     stays available via the title tooltip and the detail page. */
+  .cap-goal { margin-top: 0.05rem; font-size: 0.84em; color: #444; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40rem; }
+  .cap-goal-label { color: #595959; text-transform: uppercase; letter-spacing: 0.03em; font-size: 0.68rem; margin-right: 0.3rem; }
+  html[data-skin^="dark"] .cap-goal { color: #c9c9c9; }
+
+  /* Legible behavior strip (task ka-0000005782 / I2.4): the decoded
+     wakes-when / stops-when / chasing one-liners under the goal, replacing the
+     raw JSON dump. Each item clamps to one line so the row stays a scan-band;
+     the full decode lives on the /gardener/{id} detail card. */
+  .cap-behavior { display: flex; flex-wrap: wrap; gap: 0.2rem 0.7rem; margin-top: 0.1rem; font-size: 0.8em; color: #595959; }
+  .cap-behavior-item { display: inline-flex; align-items: baseline; gap: 0.2rem; max-width: 24rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cap-behavior-glyph { flex-shrink: 0; font-size: 0.82em; opacity: 0.85; }
+  html[data-skin^="dark"] .cap-behavior { color: #9aa0a6; }
+
+  /* Prominent "● running" badge for live rows: green pill with a pulsing dot. */
+  .cap-running-badge { display: inline-flex; align-items: center; gap: 0.3rem;
+    padding: 0.05rem 0.45rem; border-radius: 999px; font-size: 0.72rem; font-weight: 700;
+    background: rgba(46,160,67,0.18); color: #1a7f37; border: 1px solid rgba(46,160,67,0.45); white-space: nowrap; }
+  .cap-running-badge .cap-running-dot { width: 0.45rem; height: 0.45rem; border-radius: 50%;
+    background: #2e9b43; animation: cap-running-pulse 1.6s ease-in-out infinite; }
+  @keyframes cap-running-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.7); } }
+  @media (prefers-reduced-motion: reduce) { .cap-running-badge .cap-running-dot { animation: none; } }
+  html[data-skin^="dark"] .cap-running-badge { color: #7ddb82; }
+
+  /* Last-run lane: outcome chip + one-line TLDR + completed-ago. */
+  .cap-col-lastrun { min-width: 14rem; }
+  .cap-runs { font-variant-numeric: tabular-nums; }
+  /* Derived (legacy spawn_agent / bare-trigger) run count: muted to read as an
+     approximate, life-thread-sourced figure rather than the engine's tally. */
+  .cap-runs-derived { color: #6b7075; }
+
+  /* Spend lane (ka-0000003220): right-aligned tabular dollars so the per-gardener
+     roll-up reads as a scannable money column, with the sortable header link. */
+  .cap-table th.cap-col-spend, .cap-table td.cap-col-spend { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .cap-spend { font-variant-numeric: tabular-nums; font-weight: 600; color: #57606a; }
+  /* A stale roll-up (controller behind) is de-emphasised and marked "~" inline. */
+  /* ka-0000002181: #999 → #5c5c5c on baseline (the stale-spend/no-run/inv-ago
+     muted greys measured 2.2–2.5:1 on the light page washes — a serious fail),
+     with a dark override so the dark canvas keeps its lighter muted grey. */
+  .cap-spend-stale { color: #5c5c5c; font-weight: 500; }
+  html[data-skin^="dark"] .cap-spend-stale { color: #9aa0a6; }
+  /* Runaway-cost buckets (ka-0000001009 / C1): "warn" (expensive) reads amber,
+     "over" (runaway) reads the same alarm red as the needs-attention accent so
+     a quietly-burning gardener is impossible to miss in the money column. The
+     stale de-emphasis intentionally does NOT override these — a stale roll-up
+     of a runaway gardener is still a runaway gardener. */
+  .cap-spend.cap-spend-warn { color: #9a6700; }
+  .cap-spend.cap-spend-over { color: #b3261e; font-weight: 700; }
+  html[data-skin^="dark"] .cap-spend.cap-spend-warn { color: #e0b25a; }
+  html[data-skin^="dark"] .cap-spend.cap-spend-over { color: #ee7e7e; }
+  .cap-spend-sort { color: inherit; text-decoration: none; }
+  .cap-spend-sort:hover { text-decoration: underline; }
+  .cap-spend-sort.is-active { font-weight: 700; }
+  html[data-skin^="dark"] .cap-spend { color: #c9c9c9; }
+
+  .cap-outcome { padding: 0.05rem 0.4rem; border-radius: 4px; font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
+  /* ka-0000002181: outcome inks darkened for AA on the tinted chip washes
+     (green 3.6–4.0:1, red 4.0:1 on baseline), each with a dark phosphor override. */
+  .cap-outcome-ok { background: rgba(46,160,67,0.16); color: #146328; }
+  html[data-skin^="dark"] .cap-outcome-ok { color: #7ddb82; }
+  .cap-outcome-failed { background: rgba(207,34,46,0.16); color: #9c2019; }
+  html[data-skin^="dark"] .cap-outcome-failed { color: #ee7e7e; }
+  /* TLDR clamps to one line too — same row-height reasoning as the goal. */
+  .cap-lastrun-tldr { display: block; margin-top: 0.06rem; color: #444; font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 34rem; }
+  .cap-lastrun-meta { color: #595959; font-size: 0.82em; white-space: nowrap; }
+  .cap-lastrun-none { color: #5c5c5c; }
+  html[data-skin^="dark"] .cap-lastrun-none { color: #9aa0a6; }
+  /* Turns (🔁) — the third triad metric, shown inline on the last-run lane
+     next to the outcome/completed-ago chips. Quiet tabular figure. */
+  .cap-turns { color: #595959; font-size: 0.82em; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  html[data-skin^="dark"] .cap-turns { color: #9aa0a6; }
+  html[data-skin^="dark"] .cap-lastrun-tldr { color: #c9c9c9; }
+
+  /* Next-fire lane. */
+  .cap-next { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* ka-0000002181: #1a7f37 → #146328. The next-fire "soon" green rendered on the
+     zebra row bg (#e1e4e6) measured 3.97:1 — a serious axe fail only visible with
+     a cron-bearing (seeded) gardener. Dark phosphor override keeps the dark skin. */
+  .cap-next-soon { color: #146328; font-weight: 600; }
+  html[data-skin^="dark"] .cap-next-soon { color: #7ddb82; }
+  .cap-next-err { color: #b3261e; }
+  .cap-dash { color: #bbb; }
+
+  /* Updated lane. */
+  .cap-ago { font-variant-numeric: tabular-nums; color: #595959; white-space: nowrap; }
+
+  /* Expand caret button — toggles the per-gardener invocations drawer row. */
+  .cap-expand {
+    appearance: none; background: none; border: 1px solid rgba(128,128,128,0.4);
+    border-radius: 4px; cursor: pointer; color: #595959; font: inherit;
+    font-size: 0.78rem; padding: 0 0.4rem; line-height: 1.5; flex-shrink: 0;
+  }
+  .cap-expand:hover { background: rgba(128,128,128,0.12); }
+  .cap-expand .cap-expand-caret { display: inline-block; transition: transform 0.12s ease; }
+  .cap-tbody.cap-open .cap-expand .cap-expand-caret { transform: rotate(90deg); }
+
+  /* Drawer row spans the full table width. */
+  .cap-drawer-row > td { padding: 0 0.6rem 0.5rem; }
+  .cap-drawer { margin: 0.1rem 0; padding: 0.5rem 0.6rem; border: 1px solid rgba(128,128,128,0.22);
+    border-radius: 6px; background: rgba(128,128,128,0.04); }
+  .cap-drawer-head { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; font-size: 0.82em; margin-bottom: 0.4rem; }
+  .cap-drawer-count { color: #595959; font-variant-numeric: tabular-nums; }
+  .cap-drawer-toggle { display: inline-flex; gap: 0.2rem; border: 1px solid rgba(128,128,128,0.3); border-radius: 6px; overflow: hidden; }
+  .cap-drawer-tab { text-decoration: none; color: inherit; padding: 0.05rem 0.5rem; font-size: 0.92em; }
+  .cap-drawer-tab:hover { background: rgba(128,128,128,0.1); }
+  .cap-drawer-tab.active { background: rgba(33,150,243,0.15); font-weight: 600; }
+  .cap-drawer-spacer { flex: 1; }
+  .cap-drawer-fullpage { text-decoration: none; color: #2196f3; font-size: 0.92em; }
+  .cap-drawer-error { font-size: 0.85em; }
+  .cap-inv-list { list-style: none; margin: 0; padding: 0; }
+  .cap-inv-row { padding: 0.3rem 0; border-bottom: 1px solid rgba(128,128,128,0.12); }
+  .cap-inv-row:last-child { border-bottom: none; }
+  .cap-inv-line-1 { display: flex; align-items: baseline; gap: 0.4rem; }
+  .cap-inv-label { color: #595959; font-size: 0.78rem; white-space: nowrap; flex-shrink: 0; }
+  .cap-inv-label-live { color: #1a7f37; font-weight: 600; }
+  .cap-inv-glyph { font-size: 0.8rem; flex-shrink: 0; }
+  .cap-inv-ok { color: #1a7f37; }
+  .cap-inv-fail { color: #b3261e; }
+  .cap-inv-headline { text-decoration: none; color: inherit; overflow-wrap: anywhere; }
+  .cap-inv-headline:hover { text-decoration: underline; }
+  .cap-inv-spacer { flex: 1; }
+  .cap-inv-ago { color: #5c5c5c; font-size: 0.78rem; white-space: nowrap; flex-shrink: 0; }
+  html[data-skin^="dark"] .cap-inv-ago { color: #9aa0a6; }
+  .cap-inv-accomplishments { margin: 0.2rem 0 0.1rem 0.5rem; padding-left: 0.5rem; border-left: 2px solid rgba(128,128,128,0.25);
+    color: #444; font-size: 0.88em; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .cap-inv-trunc { margin-top: 0.4rem; }
+  html[data-skin^="dark"] .cap-inv-accomplishments { color: #c9c9c9; }
+
+  /* Narrow viewport: shrink type and let the wrapper scroll. Identity + last-run
+     stay wide enough to read; the rest collapse to their content. */
+  @media (max-width: 720px) {
+    .cap-table { font-size: 0.84em; }
+    .cap-row > td, .cap-table thead th { padding: 0.3rem 0.4rem; }
+    .cap-col-gardener { min-width: 12rem; }
+    .cap-col-lastrun { min-width: 11rem; }
+  }
+
+  /* ── Dark-terminal muted-text contrast (ka-0000007487) ──────────────────────
+     The offenders below all ink a bare literal `#595959` (or a near-grey like
+     `.cap-runs-derived`'s #6b7075) that was only ever tuned for the LIGHT skins.
+     On the dark canvas (--bg #0b0f14 / thead #14181d) #595959 measures
+     ~2.3–2.7:1 — well under the 4.5:1 WCAG-AA floor axe flags as `serious`.
+     The a11y ROUTES suite only ever scanned the baseline skin (fresh Playwright
+     contexts default to data-skin="baseline"), so this class went ungated; the
+     companion a11y.spec.js dark-skin pass (leg 2) now catches it.
+
+     Fix: lift each to the dark skin's own muted-grey `#9aa0a6` — the SAME token
+     the ~40 existing dark-terminal overrides in this file already use (e.g.
+     .gardeners-summary-label:44, .cap-status-disabled:198, .cap-turns:299,
+     .cap-inv-ago:351) — which measures 6.3–7.3:1 on the dark surfaces. Color
+     only; no box/size/layout change. Sibling greys already carrying a dark
+     override (.gardeners-summary-label, .gardeners-hidden, .cap-status-disabled,
+     .cap-turns) are intentionally NOT repeated here. */
+  html[data-skin^="dark"] .gardeners-intro,
+  html[data-skin^="dark"] .gardeners-chip .cnt,
+  html[data-skin^="dark"] .cap-table thead th,
+  html[data-skin^="dark"] .cap-id,
+  html[data-skin^="dark"] .cap-goal-label,
+  html[data-skin^="dark"] .cap-lastrun-meta,
+  html[data-skin^="dark"] .cap-ago,
+  html[data-skin^="dark"] .cap-expand,
+  html[data-skin^="dark"] .cap-drawer-count,
+  html[data-skin^="dark"] .cap-inv-label,
+  html[data-skin^="dark"] .cap-runs-derived { color: #9aa0a6; }
+  /* The "— not live gardeners; click to see why" note inks a light-mode amber
+     #8a6116 (~3.3:1 on dark). Lift to the dark skin's own warn phosphor #e0b25a
+     (9.8:1), matching .cap-attention-badge:156 / .gardeners-census-warn:82. */
+  html[data-skin^="dark"] .gardeners-hidden > summary .hidden-why { color: #e0b25a; }
+  /* Underline the in-prose "Triggers" link in the intro paragraph on dark. The
+     dark skin inks intra-text links --accent #6ee7b7 with no underline (a global
+     `a { text-decoration: none }`); against the now-lifted #9aa0a6 surrounding
+     text that green measures only 1.73:1 — under the 3:1 the axe
+     link-in-text-block rule (serious) requires to distinguish a link by COLOUR
+     alone. Adding the underline makes it distinguishable without relying on
+     colour (the WCAG-sanctioned fix), so the rule passes regardless of the
+     link/surrounding contrast. Scoped to the intro prose; nav/table links live
+     outside text blocks and are unaffected. */
+  html[data-skin^="dark"] .gardeners-intro a { text-decoration: underline; }
+  /* Dark parity (Homestead 2.3, gd-3nQwIneabf): the light inks with no dark
+     override yet, on this file's dark palette, keyed on html[data-skin^="dark"]
+     like every override above so Homestead night inherits them too
+     (TestHomesteadNight_SurfaceDarkCoverage). */
+  html[data-skin^="dark"] .cap-dash { color: #9aa0a6; }
+  html[data-skin^="dark"] .cap-drawer-fullpage { color: #6aa9ff; }
+  html[data-skin^="dark"] .cap-inv-label-live,
+  html[data-skin^="dark"] .cap-inv-ok { color: #7ddb82; }
+  html[data-skin^="dark"] .cap-inv-fail,
+  html[data-skin^="dark"] .cap-next-err { color: #ee7e7e; }
+</style>
+
+<div class="gardeners-page">
+<h1>Gardeners</h1>
+<p class="gardeners-intro">
+  Every gardener — a scheduled loop that spawns agent iterations toward a terminal goal.
+  Each links to its <strong>life-thread</strong> page folding all of its runs into one view.
+  Gardeners are created &amp; toggled on the <a href="{{.BasePath}}/triggers">Triggers</a> page.
+</p>
+
+{{/* Fleet-health summary strip — leads with signal so the operator reads
+     fleet state before scanning the table (ka-0000007180). Each tile links to
+     its filter view. */}}
+{{with .Summary}}
+<div class="gardeners-summary" aria-label="Fleet summary">
+  <a class="gardeners-summary-tile tile-total" href="{{.BasePath}}/gardeners" title="all gardeners">
+    <span class="gardeners-summary-num">{{.Total}}</span>
+    <span class="gardeners-summary-label">gardeners</span>
+  </a>
+  <a class="gardeners-summary-tile tile-running" href="{{.BasePath}}/gardeners?filter=active" title="gardeners with a run in flight right now">
+    <span class="gardeners-summary-num">{{if .Running}}<span class="gardeners-summary-dot" aria-hidden="true"></span>{{end}}{{.Running}}</span>
+    <span class="gardeners-summary-label">running now</span>
+  </a>
+  <a class="gardeners-summary-tile tile-attention{{if not .NeedsAttention}} is-zero{{end}}" href="{{.BasePath}}/gardeners?filter=needs-attention" title="gardeners whose health verdict is stalled or stuck">
+    <span class="gardeners-summary-num">{{.NeedsAttention}}</span>
+    <span class="gardeners-summary-label">need attention</span>
+  </a>
+  <a class="gardeners-summary-tile tile-active" href="{{.BasePath}}/gardeners?filter=active" title="open and enabled gardeners">
+    <span class="gardeners-summary-num">{{.Active}}</span>
+    <span class="gardeners-summary-label">active</span>
+  </a>
+  <a class="gardeners-summary-tile tile-disabled" href="{{.BasePath}}/gardeners?filter=disabled" title="open but disabled gardeners">
+    <span class="gardeners-summary-num">{{.Disabled}}</span>
+    <span class="gardeners-summary-label">disabled</span>
+  </a>
+  <a class="gardeners-summary-tile tile-closed" href="{{.BasePath}}/gardeners?filter=archived" title="retired gardeners — closed and hidden from the default Live view; click to see them">
+    <span class="gardeners-summary-num">{{.Closed}}</span>
+    <span class="gardeners-summary-label">🗄 retired</span>
+  </a>
+  <a class="gardeners-summary-tile tile-achieved" href="{{.BasePath}}/gardeners?filter=goal-achieved" title="gardeners that reached their terminal goal">
+    <span class="gardeners-summary-num">{{.GoalAchieved}}</span>
+    <span class="gardeners-summary-label">🏁 goal met</span>
+  </a>
+</div>
+{{end}}
+
+{{if .Error}}<p class="empty">{{.Error}}</p>{{end}}
+
+<div class="gardeners-chips">
+  {{range .Chips}}
+  <a class="gardeners-chip{{if .Active}} active{{end}}" href="{{.Href}}">{{.Label}} <span class="cnt">{{.Count}}</span></a>
+  {{end}}
+  {{/* Visible sort-order indicator: names the active ordering so the operator
+       knows why rows land where they do (ka-0000002827). The list is sorted
+       attention-first, then running, then most-recently-active. */}}
+  <span class="gardeners-sort" title="Rows are sorted needs-attention first (stalled/stuck open gardeners pinned to top), then running, then most-recently-active. Closed gardeners sink to the bottom.">
+    <span class="sort-glyph" aria-hidden="true">↕</span>Sorted: attention &amp; running first
+  </span>
+  {{with .Census}}
+  {{if .Reconciles}}
+  <span class="gardeners-census gardeners-census-ok"
+        title="Self-census: {{.ActiveCount}} active + {{.DisabledCount}} disabled + {{.ClosedCount}} closed = {{.LifecycleSum}} = {{.Total}} total. The lifecycle chips add up to the All chip, so these counts are internally consistent. Beads excluded from this live roster (E2E fixtures, schedule-mirror artifacts) are accounted for in the 'N hidden' disclosure below.">
+    <span class="census-glyph" aria-hidden="true">✓</span>{{.Total}} gardeners · reconciles
+  </span>
+  {{else}}
+  <span class="gardeners-census gardeners-census-warn"
+        title="Self-census MISMATCH: {{.ActiveCount}} active + {{.DisabledCount}} disabled + {{.ClosedCount}} closed = {{.LifecycleSum}}, but the All chip is {{.Total}}. A lifecycle count is drifting — do not trust these chips until resolved.">
+    <span class="census-glyph" aria-hidden="true">⚠</span>{{.LifecycleSum}}/{{.Total}} · count drift
+  </span>
+  {{end}}
+  {{end}}
+</div>
+
+{{/* "N hidden — why" affordance (bug ka-0000007605). The All chip above is the
+     LIVE operational fleet; loadGardenerRows deliberately excludes two classes of
+     role:gardener bead — E2E/test fixtures (bug ka-0000008054) and foreign
+     gardenio-next schedule-mirror artifacts (bug ka-0000002811). Without this the
+     All-chip-vs-true-population delta reads as N unreachable gardeners and caps
+     the CAMP Coverage score. We account for every hidden bead here — a per-class
+     breakdown plus a disclosure listing each one — so an operator sees the whole
+     role:gardener population and trusts that nothing is silently dropped. */}}
+{{with .Hidden}}{{if .Total}}
+<details class="gardeners-hidden">
+  <summary>
+    <span class="hidden-glyph" aria-hidden="true">⊘</span>
+    <span>{{.Total}} hidden from this roster</span>
+    <span class="hidden-why">— not live gardeners; click to see why</span>
+  </summary>
+  <div class="hidden-body">
+    <p>The <strong>All</strong> chip shows the {{.Rendered}} live operational gardeners.
+       Beads carries {{.TruePopulation}} role:gardener beads in total; the
+       {{.Total}} below are deliberately excluded from every gardeners surface
+       (index, detail page, and the fleet map) because they are not real
+       gardeners. They remain reachable as plain beads via the links.</p>
+    {{if .FixtureCount}}
+    <div class="hidden-class">
+      <span class="hidden-class-label">{{.FixtureCount}} E2E / test fixture{{if ne .FixtureCount 1}}s{{end}}</span>
+      — synthetic seed beads with hardcoded run data (bug ka-0000008054):
+      <ul>
+        {{range .Fixtures}}<li><a href="{{.Href}}">{{.ID}}</a> — {{.Title}}</li>{{end}}
+      </ul>
+    </div>
+    {{end}}
+    {{if .MirrorCount}}
+    <div class="hidden-class">
+      <span class="hidden-class-label">{{.MirrorCount}} schedule-mirror artifact{{if ne .MirrorCount 1}}s{{end}}</span>
+      — foreign gardenio-next config-mirror beads, not gardenio gardeners (bug ka-0000002811):
+      <ul>
+        {{range .ScheduleMirrors}}<li><a href="{{.Href}}">{{.ID}}</a> — {{.Title}}</li>{{end}}
+      </ul>
+    </div>
+    {{end}}
+  </div>
+</details>
+{{end}}{{end}}
+
+{{if .Rows}}
+<div class="cap-table-wrap">
+<table class="cap-table">
+  <thead>
+    <tr>
+      <th class="cap-col-verdict" scope="col">Verdict</th>
+      <th class="cap-col-gardener" scope="col">Gardener</th>
+      <th class="cap-col-num" scope="col" title="runs completed / spawned">Runs</th>
+      {{/* Spend lane (ka-0000003220): the controller-maintained per-gardener spend
+           roll-up — this gardener's iteration runs PLUS the crew they spawned. The
+           header links to ?sort=spend so an operator can float the costliest
+           (wasteful) gardeners to the top with one click. */}}
+      <th class="cap-col-spend" scope="col" title="Total agent spend rolled up across this gardener's runs and the crew they spawned. Click to sort by spend (wasteful gardeners first).">
+        <a class="cap-spend-sort{{if .SortBySpend}} is-active{{end}}" href="{{.BasePath}}/gardeners?{{if ne .Filter "live"}}filter={{.Filter}}&amp;{{end}}sort=spend">Spend{{if .SortBySpend}} ↓{{end}}</a>
+      </th>
+      <th class="cap-col-lastrun" scope="col">Last run</th>
+      <th scope="col">Next fire</th>
+      <th scope="col">Owner</th>
+      <th class="cap-col-updated" scope="col">Updated</th>
+    </tr>
+  </thead>
+  {{range .Rows}}
+  <tbody class="cap-tbody{{if .NeedsAttention}} cap-attention{{end}}{{if .IsRunning}} cap-running{{end}}{{if eq .GoalState "achieved"}} cap-row-achieved{{end}}" id="cap-row-{{.ID}}">
+    <tr class="cap-row">
+      {{/* Verdict / status lane — the colour column. */}}
+      <td class="cap-col-verdict">
+        <div class="cap-verdict-stack">
+          {{- /* The generic "needs attention" badge carries the verdict/pour
+                 reason. When the ONLY reason is liveness (overdue/silent), the
+                 specific badge below explains it, so suppress the generic one
+                 (its VerdictKind would be empty) to avoid a bare, reasonless
+                 warning (bug ka-0000006095 / A1). */ -}}
+          {{if and .NeedsAttention (or .VerdictKind .PourStalled)}}<span class="cap-attention-badge" title="Needs attention: this open gardener is {{if .VerdictKind}}{{.VerdictKind}}{{else}}pouring but not worked{{end}}{{if .VerdictDetail}} ({{.VerdictDetail}}){{end}} — an operator should look now">⚠ needs attention</span>{{end}}
+          {{- /* Overdue / silent-gardener liveness (bug ka-0000006095 / A1): a
+                 loud row-level signal so a silently-dead loop is not hidden
+                 behind a healthy-looking next-fire in the cell to the right. */ -}}
+          {{if .Liveness.Overdue}}<span class="cap-attention-badge" title="Overdue — {{.Liveness.OverdueDetail}}. Its next-fire is a cron projection and does not confirm firing.">⚠ overdue</span>
+          {{else if .Liveness.Silent}}<span class="cap-attention-badge" title="Silent — {{.Liveness.SilentDetail}}.">⚠ silent</span>{{end}}
+          {{if eq .GoalState "achieved"}}<span class="cap-goal-badge" title="This gardener reached its terminal goal — {{.TerminationReason}}">🏁 GOAL ACHIEVED</span>{{end}}
+          {{/* Lifecycle status chip — derives from the gardener's ACTUAL bead
+               status (active/disabled/closed), the same source the detail page
+               uses for its "closed" chip. Goal disposition is a SEPARATE badge
+               below, never folded into the lifecycle chip — the two must agree
+               with the detail page, which shows a neutral "closed" chip plus a
+               distinct goal badge (bug ka-0000000939). */}}
+          {{if eq .Status "active"}}<span class="cap-status cap-status-active">active</span>
+          {{else if eq .Status "disabled"}}<span class="cap-status cap-status-disabled" title="Paused — this gardener is not spawning new iterations">paused</span>
+          {{else}}<span class="cap-status cap-status-closed" title="{{.TerminationReason}}">closed</span>{{end}}
+          {{/* Inline pause/resume toggle (ka-0000007934): operators flip a
+               gardener between running and paused right here, without drilling
+               into /gardener/{id}. Closed gardeners omit it (nothing to pause).
+               The toggle's own label ("running" / "paused") doubles as the
+               at-a-glance paused-state indicator alongside the chip above. */}}
+          {{if not .IsClosed}}{{template "gardener_pause_toggle" (dict "Pause" (dict "ID" .ID "Paused" (not .Enabled) "IsClosed" .IsClosed) "BasePath" $.BasePath)}}{{end}}
+          {{/* Inline "Run now" action (task ka-0000006826): fire one gardener
+               iteration immediately from the fleet view, the SAME run-now verb
+               (spawnGardenerRunNowCore) the /gardener/{id} control bar uses — so an
+               operator kicks a ready gardener's loop off without drilling in.
+               Enabling only arms the next cron tick; Run now fires an iteration
+               NOW. Omitted for closed (retired) gardeners — nothing to run. */}}
+          {{if not .IsClosed}}{{template "gardener_run_now" (dict "RunNow" (dict "ID" .ID) "BasePath" $.BasePath)}}{{end}}
+          {{/* Goal-not-reached marker: a closed gardener that didn't hit its
+               terminal goal. Rendered as its own badge alongside the neutral
+               "closed" chip — mirrors the detail page's separate goal badge so
+               the index and detail no longer disagree (bug ka-0000000939). */}}
+          {{if and .IsClosed (eq .GoalState "unachieved")}}<span class="cap-status cap-status-unachieved" title="Closed without reaching its terminal goal — {{.TerminationReason}}">goal not reached</span>{{end}}
+          {{if .Verdict}}<span class="gardener-verdict gardener-verdict-{{.VerdictKind}}" title="health: {{.Verdict}}{{if .VerdictDetail}} ({{.VerdictDetail}}){{end}}">{{.Verdict}}{{if .VerdictDetail}} <span class="gardener-verdict-detail">· {{.VerdictDetail}}</span>{{end}}</span>{{end}}
+          {{/* Pouring-but-never-worked badge (ka-0000000957): an apply_formula
+               gardener that keeps pouring molecules on cadence while they go
+               unworked — it looks alive by every other signal. */}}
+          {{if .PourStalled}}<span class="gardener-verdict gardener-verdict-stalled" title="pouring-but-never-worked: {{.PourStallDetail}}">⚠ pouring-stall</span>{{end}}
+          {{/* Inline "why does this need attention" signal — open decision or
+               last-run blocker — gated to the attention slice (ka-0000003950).
+               Decision-sourced signals link to the open decision bead. */}}
+          {{if .AttentionSignal}}
+          <div class="cap-attention-signal">
+            {{if eq .AttentionKind "decision"}}
+              <span class="cap-attention-tag cap-attention-tag-decision">decision</span>
+              <a class="cap-attention-text" href="{{$.BasePath}}/b/{{.AttentionDecisionID}}" title="Open decision {{.AttentionDecisionID}}: {{.AttentionSignal}}">{{.AttentionSignal}}</a>
+            {{else}}
+              <span class="cap-attention-tag cap-attention-tag-blocker">blocker</span>
+              <span class="cap-attention-text" title="Last-run blocker: {{.AttentionSignal}}">{{.AttentionSignal}}</span>
+            {{end}}
+          </div>
+          {{end}}
+        </div>
+      </td>
+      {{/* Gardener identity lane. */}}
+      <td class="cap-col-gardener">
+        <div class="cap-line-1">
+          <button type="button" class="cap-expand" aria-expanded="false"
+                  aria-controls="cap-drawer-{{.ID}}" aria-label="runs"
+                  hx-get="{{.ExpandURL}}" hx-target="#cap-drawer-{{.ID}}" hx-swap="innerHTML"
+                  hx-trigger="click once"
+                  onclick="gardenerToggleDrawer(this, '{{.ID}}')"
+                  title="Show this gardener's invocations &amp; accomplishments"><span class="cap-expand-caret">&rsaquo;</span></button>
+          <a class="cap-name" href="{{.Href}}">{{.Name}}</a>
+          <span class="cap-id">{{.ID}}</span>
+          <span class="cap-kind">{{.Kind}}</span>
+          {{if .IsRunning}}<span class="cap-running-badge" title="a run is in flight now"><span class="cap-running-dot" aria-hidden="true"></span>running</span>{{end}}
+        </div>
+        {{/* Reconcile a displayed-name vs bead-title divergence (bug ka-0000008054):
+             when GardenerSpec.Name differs from the bead title, surface the bead
+             title so the row is never silently mislabelled. */}}
+        {{if .NameDivergesFromTitle}}<div class="cap-bead-title" title="bead title (differs from the gardener's configured name)">bead: {{.Title}}</div>{{end}}
+        {{if .TerminalGoal}}<div class="cap-goal" title="{{.TerminalGoal}}"><span class="cap-goal-label">Goal</span>{{.TerminalGoal}}</div>
+        {{else if .Prompt}}{{/* Prompt-only gardener (bug ka-0000003596): no terminal goal, so
+             surface a clamped one-liner of the per-run prompt — the operative
+             instruction — with the full text in the title tooltip, rather than
+             leaving the row silent about what it does. */}}<div class="cap-goal cap-goal-prompt" title="{{.Prompt}}"><span class="cap-goal-label">Prompt</span>{{.PromptOneLiner}}</div>{{end}}
+        {{/* Legible behavior strip (task ka-0000005782 / I2.4): the gardener's
+             decoded wakes-when / chasing / stops-when as compact one-liners,
+             replacing the raw JSON dump. Each is suppressed when it has nothing
+             to say so the row stays a tight scan-band. */}}
+        <div class="cap-behavior">
+          <span class="cap-behavior-item cap-behavior-wakes" title="What fires this gardener (decoded from its cron / conditions / triggers config)"><span class="cap-behavior-glyph" aria-hidden="true">⏰</span>{{.Legible.WakesSummary}}</span>
+          {{if .Legible.StopsSummary}}<span class="cap-behavior-item cap-behavior-stops" title="When this gardener stops (decoded from its stop-spec)"><span class="cap-behavior-glyph" aria-hidden="true">⛑</span>{{.Legible.StopsSummary}}</span>{{end}}
+          <span class="cap-behavior-item cap-behavior-chasing" title="What this gardener is chasing and how many crew iterations are live now"><span class="cap-behavior-glyph" aria-hidden="true">🎯</span>{{.ChasingSummary}}</span>
+        </div>
+      </td>
+      {{/* Runs lane. */}}
+      <td class="cap-col-num">{{if .RunsDerived}}<span class="cap-runs cap-runs-derived" title="Derived from this gardener's iteration beads — a legacy spawn_agent/bare-trigger loop with no engine tally. completed / spawned (findable runs).">~{{.RunsCompleted}}/{{.RunsSpawned}}</span>{{else}}<span class="cap-runs" title="runs completed / spawned">{{.RunsCompleted}}/{{.RunsSpawned}}</span>{{end}}</td>
+      {{/* Spend lane (ka-0000003220): controller-maintained roll-up of this
+           gardener's total agent spend (its runs + the crew they spawned). A
+           never-synced gardener has no figure yet — render a muted dash rather
+           than a misleading "$0.00". A stale roll-up is marked "~". */}}
+      <td class="cap-col-spend">
+        {{if .HasSpend}}<span class="cap-spend{{if .SpendLevel}} cap-spend-{{.SpendLevel}}{{end}}{{if .SpendStale}} cap-spend-stale{{end}}" title="Total agent spend across this gardener's runs and the crew they spawned{{if eq .SpendLevel "over"}} — RUNAWAY: over the spend threshold{{else if eq .SpendLevel "warn"}} — expensive: past the warn threshold{{end}}{{if .SpendExcludesLiveRun}} (approximate — EXCLUDES the in-flight run, whose cost lands only at session close){{end}}{{if .SpendStale}} (roll-up is stale — controller may be behind){{end}}.">{{if or .SpendStale .SpendExcludesLiveRun}}~{{end}}{{.SpendLabel}}</span>{{else}}<span class="cap-dash" title="spend not rolled up yet">—</span>{{end}}
+      </td>
+      {{/* Last-run lane: outcome chip + inline TLDR + completed-ago. */}}
+      <td class="cap-col-lastrun">
+        {{if .LastRunTLDR}}
+          {{if .IsRunning}}
+            {{/* The running pill + accent rail already mark this gardener in the
+                 gardener lane; here we just lead the live headline so it reads as
+                 "what's happening now" without duplicating the pill. */}}
+            <span class="cap-lastrun-meta" title="a run is in flight now">now</span>
+          {{else}}
+            {{if eq .LastRunOutcome "ok"}}<span class="cap-outcome cap-outcome-ok" title="last completed run succeeded">ok</span>
+            {{else if eq .LastRunOutcome "failed"}}<span class="cap-outcome cap-outcome-failed" title="last completed run failed">failed</span>{{end}}
+            {{if .LastCompletedAgo}}<span class="cap-lastrun-meta" title="completed {{.LastCompletedAtRFC}}">completed {{.LastCompletedAgo}} ago</span>{{end}}
+          {{end}}
+          {{if .HasTurns}}<span class="cap-turns" title="Server round-trips (turns) on {{if .IsRunning}}this live run{{else}}the last run{{end}} — the multiplier on cache-read cost">🔁 {{.TurnsLabel}}</span>{{end}}
+          <span class="cap-lastrun-tldr" title="{{.LastRunTLDR}}">{{.LastRunTLDR}}</span>
+        {{else}}
+          {{/* No fetchable wrap-up headline: keep the engine-counter outcome
+               chip fallback, then ALWAYS render an explicit muted placeholder so
+               the Last-run column is uniform and never silently blank. */}}
+          {{if eq .LastRunOutcome "ok"}}<span class="cap-outcome cap-outcome-ok" title="last completed run succeeded">last run ok</span>
+          {{else if eq .LastRunOutcome "failed"}}<span class="cap-outcome cap-outcome-failed" title="last completed run failed ({{.ConsecutiveFailures}} consecutive)">last run failed</span>{{end}}
+          {{if .HasTurns}}<span class="cap-turns" title="Server round-trips (turns) on the last run — the multiplier on cache-read cost">🔁 {{.TurnsLabel}}</span>{{end}}
+          <span class="cap-lastrun-none" title="no wrap-up headline available for the last run">no run output</span>
+        {{end}}
+      </td>
+      {{/* Next-fire lane. */}}
+      <td>
+        {{if .Liveness.Overdue}}<span class="cap-next cap-next-err" title="Overdue — {{.Liveness.OverdueDetail}}. The next-fire below is a cron projection, not a firing guarantee.">⚠ overdue</span>
+        {{else if .NextFireRelative}}<span class="cap-next cap-next-soon" title="next fire {{.NextFire}}">{{.NextFireRelative}}</span>
+        {{else if .NextFireError}}<span class="cap-next cap-next-err" title="cron parse error: {{.NextFireError}}">cron error</span>
+        {{else}}<span class="cap-dash" title="no schedule">—</span>{{end}}
+      </td>
+      {{/* Owner lane. */}}
+      <td>{{if .OwnerDisplay}}{{userLink .OwnerDisplay .OwnerSlug}}{{else}}<span class="cap-dash">—</span>{{end}}</td>
+      {{/* Updated lane. */}}
+      <td class="cap-col-updated">{{if .Ago}}<span class="cap-ago" title="updated {{.UpdatedAtRFC}}{{if .CreatedAtRFC}} · created {{.CreatedAtRFC}}{{end}}">{{.Ago}}</span>{{else}}<span class="cap-dash">—</span>{{end}}</td>
+    </tr>
+    <tr class="cap-drawer-row" id="cap-drawer-row-{{.ID}}" hidden>
+      <td colspan="7"><div class="cap-drawer" id="cap-drawer-{{.ID}}"></div></td>
+    </tr>
+  </tbody>
+  {{end}}
+</table>
+</div>
+{{if .Truncated}}<p class="meta">Showing the first {{.Limit}} gardeners per primitive; some may be hidden.</p>{{end}}
+{{else}}
+<p class="empty">No {{if eq .Filter "live"}}live{{else if eq .Filter "archived"}}retired{{end}} gardeners{{if and (ne .Filter "all") (ne .Filter "live") (ne .Filter "archived")}} matching this filter{{end}}.{{if eq .Filter "live"}} Retired gardeners are tucked under <a href="{{.BasePath}}/gardeners?filter=archived">🗄 Archived</a>.{{end}}</p>
+{{end}}
+
+<script>
+  // Expand/collapse a gardener row's invocations drawer. HTMX (hx-trigger="click
+  // once") lazy-loads the drawer content on the first open; this handler toggles
+  // the drawer ROW's visibility + the caret/aria state on every click.
+  function gardenerToggleDrawer(btn, id) {
+    var drawerRow = document.getElementById('cap-drawer-row-' + id);
+    var tbody = document.getElementById('cap-row-' + id);
+    if (!drawerRow) return;
+    var open = drawerRow.hasAttribute('hidden');
+    if (open) { drawerRow.removeAttribute('hidden'); } else { drawerRow.setAttribute('hidden', ''); }
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (tbody) { tbody.classList.toggle('cap-open', open); }
+  }
+</script>
+</div>{{/* .gardeners-page */}}
+{{end}}

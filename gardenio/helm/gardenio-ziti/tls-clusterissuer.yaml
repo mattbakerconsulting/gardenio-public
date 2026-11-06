@@ -1,0 +1,87 @@
+# A real Let's Encrypt certificate for the ziti-only front door.
+#
+# WHY DNS-01 AND NOT HTTP-01
+# gardenio has no public endpoint, so there is nothing for an HTTP-01 challenge
+# to reach. DNS-01 only needs a temporary TXT record, which is why it works for
+# a host that is deliberately unreachable from the internet.
+#
+# NO PUBLIC A RECORD IS EVER CREATED. `gardenio.clonk.tv` resolves only inside
+# the OpenZiti tunnel, where ziti-edge-tunnel intercepts the name and maps it to
+# a 100.64.0.0/10 address. With the tunnel down the name does not resolve at
+# all. So the certificate is publicly trusted while the service stays private —
+# that combination is the whole point.
+#
+# CREDENTIALS: no secret, no IRSA. cert-manager is installed with
+# --issuer-ambient-credentials, so the route53 solver uses the AWS SDK default
+# chain and picks up the k3s NODE instance role via IMDS. That role already
+# carries route53:ChangeResourceRecordSets on this exact zone (Sid JoinRecord in
+# modules/k3s, originally for the k3s join record), so ACME needed no new IAM.
+#
+# Consequence worth stating: ambient credentials mean any ClusterIssuer in this
+# cluster can edit the clonk.tv zone. That is bounded to one zone, but it is
+# wider than a per-issuer secret would be.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-dns01
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: matthewbaker1110@gmail.com
+    privateKeySecretRef:
+      name: letsencrypt-dns01-account-key
+    solvers:
+      - selector:
+          dnsZones:
+            - clonk.tv
+        dns01:
+          route53:
+            region: us-east-1
+            hostedZoneID: Z06751983610G78SSP15R
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gardenio-front-door
+  namespace: gardenio
+spec:
+  secretName: gardenio-front-door-tls
+  # 90-day LE cert; cert-manager renews at ~60 days unattended.
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  dnsNames:
+    - gardenio.clonk.tv
+  issuerRef:
+    name: letsencrypt-dns01
+    kind: ClusterIssuer
+---
+# Second front-door certificate, for the coopmux terminal host.
+#
+# Separate hostname rather than a path on gardenio.clonk.tv because the
+# beads-viewer and coopmux BOTH serve routes under /api/v1/ (see
+# viewer-authproxy.yaml for the full list) — one hostname means one of them
+# shadows the other, permanently.
+#
+# Same DNS-01 solver as the gardenio host above. This certificate serves the
+# ziti path only; the internet path is the public-edge certificate (S4b,
+# gd-0e6aSFhxM5), where mux.clonk.tv has a public A record.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gardenio-mux-front-door
+  namespace: gardenio
+spec:
+  secretName: gardenio-mux-front-door-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  dnsNames:
+    - mux.clonk.tv
+  issuerRef:
+    name: letsencrypt-dns01
+    kind: ClusterIssuer

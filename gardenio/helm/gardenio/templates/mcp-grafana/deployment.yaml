@@ -1,0 +1,122 @@
+{{- if .Values.mcpGrafana.enabled }}
+{{- /*
+  Standalone grafana/mcp-grafana server (Track A A1, task ka-0000004361; deploy
+  shape pinned by NB1 ka-0000006144). One pod holds the scoped Grafana VIEWER
+  service-account token (A2) and exposes the MCP tools over streamable-HTTP on a
+  ClusterIP Service, so agents reach Grafana observability tools without the
+  token ever entering an agent .mcp.json. Read-only first slice
+  (decision ka-0000007279): --disable-write + a Viewer token that cannot write.
+*/ -}}
+{{- $grafanaURL := include "gardenio.mcpGrafana.grafanaURL" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.mcpGrafana.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.mcpGrafana.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.mcpGrafana.replicaCount | default 1 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "gardenio.mcpGrafana.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.mcpGrafana.selectorLabels" . | nindent 8 }}
+    spec:
+      # mcp-grafana talks to the Grafana API over a Bearer token only; it needs
+      # no Kubernetes API access.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: mcp-grafana
+          # Upstream OSS image, pulled DIRECT from Docker Hub (like grafana/grafana).
+          image: "{{ .Values.mcpGrafana.image.repository }}:{{ .Values.mcpGrafana.image.tag }}"
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.mcpGrafana.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          # Override the baked ENTRYPOINT (which hardcodes `--transport sse
+          # --address 0.0.0.0:8000`) so our args fully REPLACE it rather than
+          # append to it — otherwise the process gets a contradictory
+          # `--transport sse … -t streamable-http` line that only works by
+          # last-wins flag parsing. command: makes the args below authoritative.
+          command: ["/app/mcp-grafana"]
+          args:
+            # Transport + listen wiring (NB1). The image defaults to stdio and
+            # endpoint-path "/", and binds localhost — all three are pinned
+            # explicitly: streamable-HTTP at the chosen path, bound 0.0.0.0 so
+            # the ClusterIP Service can reach the listener.
+            - "-t"
+            - "streamable-http"
+            - "--address"
+            - "0.0.0.0:{{ .Values.mcpGrafana.listenPort }}"
+            - "--endpoint-path"
+            - {{ .Values.mcpGrafana.endpointPath | quote }}
+            {{- if .Values.mcpGrafana.disableWrite }}
+            # Read-only first slice (decision ka-0000007279). A3 layers an
+            # --enabled-tools allowlist on top via the claude-mcp config bead.
+            - "--disable-write"
+            {{- end }}
+          env:
+            {{- if $grafanaURL }}
+            - name: GRAFANA_URL
+              value: {{ $grafanaURL | quote }}
+            {{- end }}
+            {{- if .Values.mcpGrafana.token.secretName }}
+            - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.mcpGrafana.token.secretName }}
+                  key: token
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mcpGrafana.listenPort }}
+              protocol: TCP
+          # mcp-grafana serves GET /healthz (→ 200 "ok") under SSE/streamable-http.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.mcpGrafana.resources | nindent 12 }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.mcpGrafana.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.mcpGrafana.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.mcpGrafana.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

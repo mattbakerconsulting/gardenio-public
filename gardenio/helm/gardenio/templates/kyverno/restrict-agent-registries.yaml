@@ -1,0 +1,83 @@
+{{- /*
+Kyverno ClusterPolicy — restrict AGENT pod images to the gardenio registry
+allow-list. Admission starter set, audit finding F5 (ka-0000002606).
+
+Agent pods run untrusted, LLM-generated workloads. Their specs are assembled by
+the controller but seeded from bead fields an agent (or a malicious teammate /
+bead) can influence, so nothing structurally prevents a crafted spec from
+pulling an arbitrary image from an arbitrary registry — the base for a
+supply-chain or data-exfil payload (attacker paths A3/A5). This policy denies
+admission of any agent pod (selected by the gardenio.io/agent label every spawned
+agent pod carries — podmanager.LabelAgent) whose images do not come from the
+allow-list. Scoped to agent pods ONLY, so the gardenio-system spine and
+third-party mirror images are untouched.
+
+DEFAULT OFF. This is a Kyverno CRD (kyverno.io/v1 ClusterPolicy); it renders
+nothing unless the operator sets global.admissionPolicies.restrictRegistries.enabled
+AND Kyverno is installed. prod-gardenio-eks does not run Kyverno today, so an
+unconditional render would break `helm upgrade` on a missing CRD — mirrors the
+sibling verify-image-signatures / disallow-cover-images policies. Canonical
+cluster-agnostic source: policy/kyverno/restrict-agent-registries.yaml. See
+gardenio/docs/admission-policies.md.
+*/}}
+{{- if .Values.global.admissionPolicies.restrictRegistries.enabled }}
+{{- $rr := .Values.global.admissionPolicies.restrictRegistries }}
+{{- $regexes := $rr.allowedImageRegexes | default (list "^ghcr\\.io/mattbakerconsulting/gardenio/.*") }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ include "gardenio.fullname" . }}-restrict-agent-registries
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission-starter
+  annotations:
+    policies.kyverno.io/title: Restrict agent pod images to the gardenio registry allow-list
+    policies.kyverno.io/category: gardenio-admission-starter
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Agent pods (gardenio.io/agent) run untrusted, LLM-generated workloads. This
+      policy denies admission of any agent pod whose container/initContainer
+      images do not come from the gardenio registry allow-list, blocking a
+      crafted spec from pulling an arbitrary supply-chain/exfil image (A3/A5,
+      F5). See policy/kyverno/restrict-agent-registries.yaml.
+spec:
+  # Audit = report-only (starter posture). Flip to Enforce after the
+  # PolicyReport is clean of legitimate off-allow-list images.
+  validationFailureAction: {{ $rr.validationFailureAction | default "Audit" }}
+  background: true
+  rules:
+    - name: agent-images-from-allowlist
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              selector:
+                matchExpressions:
+                  - key: gardenio.io/agent
+                    operator: Exists
+      validate:
+        message: >-
+          Agent pod images must come from the gardenio registry allow-list. See
+          policy/kyverno/restrict-agent-registries.yaml.
+        foreach:
+          - list: request.object.spec.containers
+            deny:
+              conditions:
+                all:
+                  {{- range $regexes }}
+                  - key: "{{ printf "{{ regex_match('%s', '{{ element.image }}') }}" . }}"
+                    operator: Equals
+                    value: false
+                  {{- end }}
+          - list: request.object.spec.initContainers || []
+            deny:
+              conditions:
+                all:
+                  {{- range $regexes }}
+                  - key: "{{ printf "{{ regex_match('%s', '{{ element.image }}') }}" . }}"
+                    operator: Equals
+                    value: false
+                  {{- end }}
+{{- end }}

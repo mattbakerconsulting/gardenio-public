@@ -1,0 +1,240 @@
+name: reachability
+
+# Reachability data for the audit-and-shrink plan (gd-eRFLdnAEeB, task
+# gd-Nd2ciHTvTE): which functions no shipped binary reaches, which are reached
+# only by tests, statement coverage per package, and code size per component
+# (gd-OxJf5mmbEQ), the numbers gardenio/docs/code-reduction-targets.md holds
+# the plan to. Agent pods OOM on a
+# whole-module build at 2Gi (advice gd-QLhMjEsBsR), so this runs here on the
+# heavy pool and hands the result back as one workflow artifact.
+#
+# Never on a pull request (owner rule 2026-10-31, root CLAUDE.md "CI on pull
+# requests"; task gd-yqSVQsjtyW). It runs nightly on main, at the hour of
+# ci.yml's and checks.yml's nightly full run, and on demand
+# (workflow_dispatch): a crew changing scripts/reachability/ dispatches it on
+# its branch (`gh workflow run reachability.yml --ref <branch>`).
+#
+# The shipped-main defaults are the binaries deploy-values/gardenio-k3s.yaml
+# turns on (controller, slack-bridge, grafana-bridge, trigger-engine,
+# landgate, beads-viewer; kbeads runs `kd serve`) plus the gb and kd CLIs.
+# coopmux is Rust and out of deadcode's reach. The deploy inventory
+# (gd-YzJ9Jj4gmR) owns the authoritative list; pass a narrower or wider one
+# through the dispatch inputs. Every other cmd/ main still gets a no-test
+# dead list (the `other` legs) so the inventory can narrow it later.
+#
+# Artifact `reachability` (one per run):
+#   SUMMARY.md                      also written to the run's step summary
+#   <module>/dead/<main>.tsv        unreachable from that main, no tests
+#   <module>/test-only/<main>.tsv   reached only once tests are roots
+#   <module>/dead-with-tests/...    the -test run the difference came from
+#   <module>/packages-*.txt         whole packages no (shipped) main imports
+#   coverage/<module>.{out,tsv}     raw profile + per-package table
+#   size/components.tsv             lines, long and complex funcs per component
+#   size/{long,complex}-funcs.tsv   the funcs behind those counts
+# File formats: header comments of scripts/reachability/*.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      controller_mains:
+        description: Shipped mains in gardenio/controller (module-relative, space-separated)
+        required: false
+        default: cmd/controller cmd/slack-bridge cmd/grafana-bridge cmd/github-bridge cmd/trigger-engine cmd/landgate cmd/beads-viewer cmd/gb
+        type: string
+      kbeads_mains:
+        description: Shipped mains in kbeads (module-relative, space-separated)
+        required: false
+        default: cmd/kd
+        type: string
+  schedule:
+    - cron: '43 10 * * *'
+
+permissions:
+  contents: read
+
+env:
+  # Same exact patch as ci.yml and checks.yml; see the note there.
+  GO_VERSION: "1.25.14"
+  # Newest x/tools whose go.mod accepts go 1.25 (v0.50.0 wants 1.26).
+  DEADCODE_VERSION: v0.49.0
+  GOCYCLO_VERSION: v0.6.0
+  CGO_ENABLED: 0
+  # schedule runs carry no inputs; these mirror the dispatch defaults.
+  CONTROLLER_MAINS_DEFAULT: cmd/controller cmd/slack-bridge cmd/grafana-bridge cmd/github-bridge cmd/trigger-engine cmd/landgate cmd/beads-viewer cmd/gb
+  KBEADS_MAINS_DEFAULT: cmd/kd
+
+jobs:
+  deadcode:
+    name: deadcode (${{ matrix.leg }})
+    runs-on: gardenio-k3s # heavy: a -test run holds SSA for a whole module + its tests
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The controller's no-test legs for ~40 unshipped mains are as long
+          # as its shipped -test legs, so they get their own runner.
+          - { leg: controller-shipped, module: controller, dir: gardenio/controller, parts: shipped }
+          - { leg: controller-other, module: controller, dir: gardenio/controller, parts: other }
+          - { leg: kbeads, module: kbeads, dir: kbeads, parts: shipped other }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: install deadcode
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go install "golang.org/x/tools/cmd/deadcode@${DEADCODE_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: deadcode
+        env:
+          SHIPPED_MAINS: ${{ matrix.module == 'kbeads' && (inputs.kbeads_mains || env.KBEADS_MAINS_DEFAULT) || (inputs.controller_mains || env.CONTROLLER_MAINS_DEFAULT) }}
+          PARTS: ${{ matrix.parts }}
+        run: |
+          set -euo pipefail
+          read -r -a mains <<<"$SHIPPED_MAINS"
+          for part in $PARTS; do
+            scripts/reachability/deadcode.sh "${{ matrix.dir }}" out "$part" "${mains[@]}"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reachability-deadcode-${{ matrix.leg }}
+          path: out/
+          if-no-files-found: warn
+          retention-days: 30
+
+  coverage:
+    name: coverage (${{ matrix.module }})
+    runs-on: ${{ matrix.module == 'kbeads' && 'gardenio-k3s-medium' || 'gardenio-k3s' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { module: controller, dir: gardenio/controller, slug: gardenio-controller }
+          - { module: kbeads, dir: kbeads, slug: kbeads }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # Some controller tests need node (GARDENIO_NODE_REQUIRED, as in ci.yml).
+      # Best effort: a nodejs.org flake (HTTP/2 stream reset after 10 minutes
+      # on the first run; gd-OJQWL1W3S3) should cost those tests, not the
+      # whole coverage table. HTTP/1.1 and a hard time cap for the same reason.
+      - name: node (pinned tarball, sha256-verified)
+        id: node
+        if: matrix.module == 'controller'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          . gardenio/images/agent/install/versions.env
+          . gardenio/images/agent/install/checksums.env
+          curl -fsSL --http1.1 --retry 4 --retry-all-errors --connect-timeout 20 --max-time 180 "https://nodejs.org/dist/v${NODE_FULL_VERSION}/node-v${NODE_FULL_VERSION}-linux-x64.tar.gz" -o /tmp/node.tar.gz
+          echo "${NODE_SHA256_X64_TARGZ}  /tmp/node.tar.gz" | sha256sum -c --status -
+          sudo tar -xz --strip-components=1 -C /usr/local -f /tmp/node.tar.gz
+          node --version
+
+      # The flags of the module Makefiles' `test` target, which `make
+      # coverage-go` drives, minus -race and -v: -race needs cgo (off here,
+      # as in ci.yml) and the coverage numbers do not depend on it. A failing
+      # test does not stop the profile; it is reported and the run carries on,
+      # because a red test says nothing about which code it reached.
+      - name: go test -coverprofile
+        working-directory: ${{ matrix.dir }}
+        env:
+          GARDENIO_NODE_REQUIRED: ${{ matrix.module == 'controller' && steps.node.outcome == 'success' && '1' || '' }}
+        run: |
+          mkdir -p coverage
+          if ! go test -covermode=atomic -coverpkg=./... -coverprofile=coverage/unit.out \
+               ./... -skip 'TestRealCatalogSnapshotFreshness' >coverage/test.log 2>&1; then
+            echo "::warning::go test failed in ${{ matrix.dir }}; coverage still summarised. Failures:"
+            grep -E '^(--- FAIL|FAIL|panic:)' coverage/test.log || tail -n 50 coverage/test.log
+          fi
+          test -s coverage/unit.out
+
+      # Same repo-relative naming as `make coverage-go` (.coverage/unit/<slug>.out).
+      - name: per-package table
+        run: |
+          mkdir -p out/coverage
+          cp "${{ matrix.dir }}/coverage/unit.out" "out/coverage/${{ matrix.slug }}.out"
+          cp "${{ matrix.dir }}/coverage/test.log" "out/coverage/${{ matrix.slug }}.test.log"
+          scripts/reachability/coverage-by-package.sh "out/coverage/${{ matrix.slug }}.out" >"out/coverage/${{ matrix.slug }}.tsv"
+          tail -n 1 "out/coverage/${{ matrix.slug }}.tsv"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reachability-coverage-${{ matrix.module }}
+          path: out/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Parses source, builds nothing: a light runner is enough.
+  size:
+    name: code size
+    runs-on: gardenio-k3s-light
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: install gocyclo
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go install "github.com/fzipp/gocyclo/cmd/gocyclo@${GOCYCLO_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: code-size.sh
+        run: scripts/reachability/code-size.sh . out/size
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reachability-size
+          path: out/
+          retention-days: 30
+
+  summary:
+    name: summary + artifact
+    runs-on: gardenio-k3s-light
+    timeout-minutes: 10
+    needs: [deadcode, coverage, size]
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/reachability
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reachability-*
+          path: reachability
+          merge-multiple: true
+
+      - name: SUMMARY.md
+        run: |
+          scripts/reachability/summarize.sh reachability >reachability/SUMMARY.md
+          cat reachability/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reachability
+          path: reachability/
+          retention-days: 90

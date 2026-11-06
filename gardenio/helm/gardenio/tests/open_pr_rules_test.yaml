@@ -1,0 +1,91 @@
+# rule_files is rewritten at runtime by TestOpenPRAlerts_Fires
+# (open_pr_alerts_test.go): the placeholder is replaced with the OpenPR* rules
+# extracted from the rendered gap-alerts.yaml key.
+#
+# gd-Pt8ztuasTE. The gauges hold the PR sweeper's last hourly count, so a value
+# is flat for an hour at a time. The timestamp gauge is unix seconds, and
+# promtool's time() is the eval offset from 0.
+rule_files:
+  - __RULES_FILE__
+
+evaluation_interval: 1m
+
+tests:
+  # 6 orphans fire once the 5m hold has passed; 5 do not.
+  - name: six_orphans_fire_five_do_not
+    interval: 1m
+    input_series:
+      - series: 'gardenio_open_prs{state="orphaned", job="gardenio-controller"}'
+        values: '5x30 6x30'
+      - series: 'gardenio_open_pr_health_timestamp_seconds{job="gardenio-controller"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: OpenPROrphansHigh
+        exp_alerts: []
+      - eval_time: 33m
+        alertname: OpenPROrphansHigh
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: OpenPROrphansHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              component: pr-sweeper
+              subsystem: open-prs
+
+  # An oldest open PR of 47h is quiet; 49h fires.
+  - name: oldest_open_pr_past_48h_fires
+    interval: 1m
+    input_series:
+      - series: 'gardenio_open_pr_oldest_age_hours{state="open", job="gardenio-controller"}'
+        values: '47x30 49x30'
+      - series: 'gardenio_open_pr_oldest_age_hours{state="orphaned", job="gardenio-controller"}'
+        values: '100x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: OpenPROldestOverdue
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: OpenPROldestOverdue
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              component: pr-sweeper
+              subsystem: open-prs
+
+  # The last count was taken at t=0 and never refreshed: quiet at 4h, firing
+  # at 4h10m (4h plus the 5m hold).
+  - name: frozen_count_fires_stale_after_4h
+    interval: 1m
+    input_series:
+      - series: 'gardenio_open_pr_health_timestamp_seconds{job="gardenio-controller"}'
+        values: '0x300'
+    alert_rule_test:
+      - eval_time: 240m
+        alertname: OpenPRHealthStale
+        exp_alerts: []
+      - eval_time: 250m
+        alertname: OpenPRHealthStale
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              component: pr-sweeper
+              subsystem: open-prs
+
+  # Before the sweeper records a run the gauges are absent: nothing fires.
+  - name: no_record_is_quiet
+    interval: 1m
+    input_series:
+      - series: 'gardenio_agents_active{project="gardenio", role="crew", state="working"}'
+        values: '1x300'
+    alert_rule_test:
+      - eval_time: 250m
+        alertname: OpenPROrphansHigh
+        exp_alerts: []
+      - eval_time: 250m
+        alertname: OpenPROldestOverdue
+        exp_alerts: []
+      - eval_time: 250m
+        alertname: OpenPRHealthStale
+        exp_alerts: []

@@ -1,0 +1,373 @@
+{{- if .Values.jiraBridge.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.fullname" . }}-jira-bridge
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jira-bridge
+spec:
+  replicas: {{ .Values.jiraBridge.replicaCount | default 1 }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: jira-bridge
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: jira-bridge
+      annotations:
+        # Path A: in-chart vmagent discovers the :9093 /metrics endpoint via
+        # these pod annotations (prod gardenio ns has no vm-operator). Mirrors
+        # slack-bridge. The VMServiceScrape (vmservicescrape.yaml) is Path B for
+        # operator clusters; the two paths are independent and can coexist.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9093"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: jira-bridge
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.jiraBridge.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.jiraBridge.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8091
+              protocol: TCP
+            - name: metrics
+              containerPort: 9093
+              protocol: TCP
+          env:
+            {{- include "gardenio.otelTracingEnv" . | nindent 12 }}
+            # Beads daemon connection
+            - name: BEADS_HTTP_ADDR
+              value: "http://{{ include "gardenio.beads.host" . }}:{{ include "gardenio.beads.httpPort" . }}"
+            {{- /* Bridge auth (ka-0000005187 / decision ka-0000001054): when a
+                   bridge token secret is set, use the per-bridge token so kbeads
+                   attributes writes as fleet:jira-bridge. Falls back to the
+                   static daemon token when unset (legacy / dev). Secret name
+                   resolves via the fleet→bridge rename helper (ka-0000005788). */}}
+            {{- $bridgeTokenSecret := include "gardenio.beads.bridgeTokenSecretName" . }}
+            {{- if $bridgeTokenSecret }}
+            - name: BEADS_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $bridgeTokenSecret }}
+                  key: jira-bridge
+            {{- else if .Values.beads.tokenSecret }}
+            - name: BEADS_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.tokenSecretName" . }}
+                  key: token
+            {{- end }}
+            # JIRA connection
+            {{- if .Values.jiraBridge.jira.baseURL }}
+            - name: JIRA_BASE_URL
+              value: {{ .Values.jiraBridge.jira.baseURL | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.email }}
+            - name: JIRA_EMAIL
+              value: {{ .Values.jiraBridge.jira.email | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.apiToken }}
+            {{- fail "jiraBridge.jira.apiToken plaintext value is removed for security (AUDIT §J6) — use jiraBridge.jira.secretName pointing at a K8s Secret with key 'api-token'." }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.secretName }}
+            - name: JIRA_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.jiraBridge.jira.secretName }}
+                  key: api-token
+            {{- end }}
+            # JIRA polling config
+            {{- if .Values.jiraBridge.jira.projects }}
+            - name: JIRA_PROJECTS
+              value: {{ .Values.jiraBridge.jira.projects | quote }}
+            {{- end }}
+            {{- /* Extra @gardenio-mention SPAWN-only projects (ka-0000005656):
+                   spawn + reply eligible, NOT outbound-writable. Emitted only
+                   when set so the default render stays byte-for-byte unchanged. */}}
+            {{- if .Values.jiraBridge.jira.spawnProjects }}
+            - name: JIRA_SPAWN_PROJECTS
+              value: {{ .Values.jiraBridge.jira.spawnProjects | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.statuses }}
+            - name: JIRA_STATUSES
+              value: {{ .Values.jiraBridge.jira.statuses | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.issueTypes }}
+            - name: JIRA_ISSUE_TYPES
+              value: {{ .Values.jiraBridge.jira.issueTypes | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.pollInterval }}
+            - name: JIRA_POLL_INTERVAL
+              value: {{ .Values.jiraBridge.jira.pollInterval | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.boatProjects }}
+            - name: BOAT_PROJECTS
+              value: {{ .Values.jiraBridge.jira.boatProjects | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.fixVersions }}
+            - name: JIRA_FIX_VERSIONS
+              value: {{ .Values.jiraBridge.jira.fixVersions | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.requiredLabels }}
+            - name: JIRA_REQUIRED_LABELS
+              value: {{ .Values.jiraBridge.jira.requiredLabels | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.filterProjects }}
+            - name: JIRA_FILTER_PROJECTS
+              value: {{ .Values.jiraBridge.jira.filterProjects | quote }}
+            {{- end }}
+            {{- /* Scope trigger-bead loading to this bridge's own boat
+                   projects so a second bridge sharing the daemon (e.g. a
+                   sandbox misconfigured onto prod) never evaluates — and
+                   cooldown-starves — this environment's trigger:jira beads
+                   (ka-0000006237). Empty = load all (back-compat). */}}
+            {{- if .Values.jiraBridge.jira.triggerProjects }}
+            - name: JIRA_TRIGGER_PROJECTS
+              value: {{ .Values.jiraBridge.jira.triggerProjects | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.disableTransitions }}
+            - name: JIRA_DISABLE_TRANSITIONS
+              value: "true"
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.enableClaimTransition }}
+            - name: JIRA_ENABLE_CLAIM_TRANSITION
+              value: "true"
+            {{- end }}
+            # Coordinated GBFSM outbox write-back toggle (epic ka-0000002067). ONE
+            # env var feeds the single WritePolicy shared by all four outbound
+            # paths (jira_sync, jira_mentions, jira_squawk_forward, jira_poller),
+            # so the outbox cutover is atomic. Default OFF — the outbox stays
+            # inert until the E2E gate (ka-0000000600) validates the Automation
+            # rules end-to-end; flipping this one var on is the cutover
+            # (ka-0000000900), unsetting it is the rollback. FSM is never
+            # writable in any state. Emitted only when true so prod's default
+            # render is byte-for-byte unchanged.
+            {{- if .Values.jiraBridge.jira.outboxEnabled }}
+            - name: JIRA_OUTBOX_ENABLED
+              value: "true"
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.botAccountID }}
+            - name: JIRA_BOT_ACCOUNT_ID
+              value: {{ .Values.jiraBridge.jira.botAccountID | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.botAccountIDs }}
+            # SET of gardenio bot Jira accountId(s) whose comments must never
+            # WAKE the ticket's assignee — the identity-based defence for the
+            # self-wake family (ka-0000003581). A `gb jira reply` posts arbitrary
+            # free-text under the bot account, which content classification
+            # cannot enumerate; the webhook suppresses only the wake and still
+            # mirrors the comment to the bead. Seeded with both gardenio bots.
+            - name: JIRA_BOT_ACCOUNT_IDS
+              value: {{ .Values.jiraBridge.jira.botAccountIDs | quote }}
+            {{- end }}
+            {{- /*
+            GBFSM outbox field-id passthrough for the Phase 6 cutover (epic
+            ka-0000002637, Phase 6 ka-0000000885). These three vars name the prod
+            Jira Analysis issue type + the labels/version custom-field ids the
+            outbox writes into (parsed by cmd/jira-bridge/main.go into
+            AnalysisIssueType / LabelsFieldID / VersionFieldID). Pure config, no
+            code change. This is a template comment (not YAML) on purpose: it is
+            stripped at render so the default render stays byte-for-byte identical
+            to main until the operator wires the prod field ids in at cutover.
+            */}}
+            {{- if .Values.jiraBridge.jira.outboxAnalysisIssueType }}
+            - name: JIRA_OUTBOX_ANALYSIS_ISSUE_TYPE
+              value: {{ .Values.jiraBridge.jira.outboxAnalysisIssueType | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.outboxLabelsField }}
+            - name: JIRA_OUTBOX_LABELS_FIELD
+              value: {{ .Values.jiraBridge.jira.outboxLabelsField | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.jira.outboxVersionField }}
+            - name: JIRA_OUTBOX_VERSION_FIELD
+              value: {{ .Values.jiraBridge.jira.outboxVersionField | quote }}
+            {{- end }}
+            # Per-role field-write allowlist enforcement mode (epic ka-0000004904).
+            # "enforce" drops out-of-policy outbound writes; any other value
+            # (including unset) is parsed as shadow by AllowlistModeFromString —
+            # logs would-be rejects but allows them. Emitted only when set, so the
+            # bridge default stays shadow until the operator-owned prod enforce
+            # cutover (ka-0000004831).
+            {{- if .Values.jiraBridge.jira.fieldAllowlistMode }}
+            - name: JIRA_FIELD_ALLOWLIST_MODE
+              value: {{ .Values.jiraBridge.jira.fieldAllowlistMode | quote }}
+            {{- end }}
+            # Webhook secret
+            {{- if .Values.jiraBridge.webhook.secretName }}
+            - name: JIRA_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.jiraBridge.webhook.secretName }}
+                  key: webhook-secret
+            {{- else if .Values.jiraBridge.webhook.secret }}
+            {{- fail "jiraBridge.webhook.secret plaintext value is removed for security (AUDIT §J6) — use jiraBridge.webhook.secretName pointing at a K8s Secret with key 'webhook-secret'." }}
+            {{- end }}
+            {{- if .Values.jiraBridge.webhook.devMode }}
+            - name: JIRA_WEBHOOK_DEV_MODE
+              value: "true"
+            {{- end }}
+            # @gardenio mention handling (Jira comment → spawn agent)
+            {{- if .Values.jiraBridge.mention.disabled }}
+            - name: JIRA_MENTION_DISABLED
+              value: "true"
+            {{- end }}
+            {{- if .Values.jiraBridge.mention.trigger }}
+            - name: JIRA_MENTION_TRIGGER
+              value: {{ .Values.jiraBridge.mention.trigger | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.mention.botTrigger }}
+            - name: JIRA_MENTION_BOT_TRIGGER
+              value: {{ .Values.jiraBridge.mention.botTrigger | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.mention.botAccountIDs }}
+            # Jira accountId(s) a native @-mention of the bot targets. A native
+            # @-mention (Jira's @-picker) is an ADF mention node carrying the
+            # target's accountId; matching on it detects the mention regardless
+            # of the bot's display name or whether Jira prefixed the display text
+            # with "@" (epic ka-0000007401 — the GBFSM-85 native-mention miss).
+            - name: JIRA_MENTION_BOT_ACCOUNT_IDS
+              value: {{ .Values.jiraBridge.mention.botAccountIDs | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.mention.project }}
+            - name: JIRA_MENTION_PROJECT
+              value: {{ .Values.jiraBridge.mention.project | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.mention.defaultOperator }}
+            - name: JIRA_BRIDGE_DEFAULT_OPERATOR
+              value: {{ .Values.jiraBridge.mention.defaultOperator | quote }}
+            {{- end }}
+            # Shared bearer token for the /api/jira/reply agent endpoint
+            # (F2 ka-0000000065). When unset, the endpoint is unauthenticated
+            # (local dev only — set it in production). The controller injects
+            # the same secret into agent pods as JIRA_BRIDGE_TOKEN.
+            {{- if .Values.jiraBridge.agentTokenSecret }}
+            - name: JIRA_BRIDGE_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.jiraBridge.agentTokenSecret | quote }}
+                  key: token
+            {{- end }}
+            {{- if .Values.jiraBridge.triggerDefaultOperator }}
+            # Designated human operator the shared TriggerEngine (which the
+            # jira-bridge runs to evaluate JQL trigger beads) attributes a fire
+            # to when the trigger bead has no walkable human author. Distinct
+            # from JIRA_BRIDGE_DEFAULT_OPERATOR above, which only covers the
+            # @-mention JiraAgentResolver — NOT the JQL fireAction path that
+            # spawns fsm-triage agents (the gap in ka-0000006023). Human shape
+            # only; non-human values are logged and ignored.
+            - name: TRIGGER_ENGINE_DEFAULT_OPERATOR
+              value: {{ .Values.jiraBridge.triggerDefaultOperator | quote }}
+            {{- end }}
+            {{- if .Values.global.humanOperator.mode }}
+            # Human-operator spawn gate posture (rollout ka-0000004589) for the
+            # jira-bridge's @-mention resolver AND the shared TriggerEngine it
+            # runs. "warn" logs a gap but never refuses; "enforce" fail-closes.
+            # Flip fleet-wide only once M8/M9 residual is clean. Empty ⇒ warn.
+            - name: GARDENIO_REQUIRE_HUMAN_OPERATOR
+              value: {{ .Values.global.humanOperator.mode | quote }}
+            {{- end }}
+            # JQL-count metrics exporter (Phase 2, ka-0000006172). The /metrics
+            # server on METRICS_LISTEN_ADDR (default :9093) always starts; the
+            # collector only runs when JIRA_METRICS_QUERIES is a non-empty JSON
+            # array of {name, jql, help?, project?, interval?}. Without this env
+            # the exporter serves no gardenio_jira_* series.
+            {{- with .Values.jiraBridge.metrics.queries }}
+            - name: JIRA_METRICS_QUERIES
+              value: {{ . | toJson | quote }}
+            {{- end }}
+            # Per-issue AGE collector (task ka-0000000282). Same shape as
+            # JIRA_METRICS_QUERIES; when set (a non-empty JSON array of {name,
+            # jql, help?, project?, interval?, maxIssues?}) the collector pages
+            # each query's open issues and publishes the age snapshot histogram
+            # gardenio_jira_issue_age_seconds + gardenio_jira_issue_oldest_age_seconds.
+            # Without this env the age collector does not run.
+            {{- with .Values.jiraBridge.metrics.ageQueries }}
+            - name: JIRA_AGE_QUERIES
+              value: {{ . | toJson | quote }}
+            {{- end }}
+            - name: JIRA_LISTEN_ADDR
+              value: ":8091"
+            - name: STATE_PATH
+              value: "/data/jira-bridge-state.json"
+            {{- if .Values.jiraBridge.basePath }}
+            - name: BASE_PATH
+              value: {{ .Values.jiraBridge.basePath | quote }}
+            {{- end }}
+            {{- if .Values.jiraBridge.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.jiraBridge.logLevel | quote }}
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: "{{ .Values.global.coverage.mountPath }}/jira-bridge"
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: state
+              mountPath: /data
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.jiraBridge.resources | nindent 12 }}
+      {{- if .Values.global.coverage.enabled }}
+      terminationGracePeriodSeconds: 45
+      {{- end }}
+      volumes:
+        - name: state
+          {{- if .Values.jiraBridge.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.fullname" . }}-jira-bridge-state
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.jiraBridge.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.jiraBridge.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.jiraBridge.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

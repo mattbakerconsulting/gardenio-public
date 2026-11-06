@@ -1,0 +1,395 @@
+{{- if .Values.landing.enabled }}
+{{- /* The /403 force-logout page. The image page is the public front door
+       (clonk.tv), where a link to /403 would sign a visitor out: there it is
+       served only while the errors middleware that needs it is on. */ -}}
+{{- $forceLogout := and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled (or (ne .Values.landing.page "image") .Values.keycloak.forwardAuth.forceLogoutOn403.enabled) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.landing.fullname" . }}-nginx
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.landing.labels" . | nindent 4 }}
+data:
+  default.conf: |
+    {{- if $forceLogout }}
+    # /403 force-logout helpers (ka-0000000378). When the Traefik
+    # gardenio-forwardauth-errors middleware proxies a 403 here, Traefik sets
+    # X-Forwarded-Host + X-Forwarded-Uri to the original request. Default the
+    # host to $host so the page still renders sensibly under direct in-cluster
+    # probes (e.g. liveness checks); default the URI to "/".
+    map $http_x_forwarded_host $forcelogout_host {
+        default      $host;
+        ""           $host;
+        "~^.+$"      $http_x_forwarded_host;
+    }
+    map $http_x_forwarded_uri $forcelogout_uri {
+        default      "/";
+        ""           "/";
+        "~^.+$"      $http_x_forwarded_uri;
+    }
+    {{- end }}
+
+    server {
+        listen 80;
+        server_name _;
+        root /usr/share/nginx/html;
+        index index.html;
+        {{- if eq .Values.landing.page "image" }}
+
+        # The page baked into the image (landing.page=image): the document is
+        # revalidated on every load, and the two files it asks for under
+        # ?v=<hash> are cached for a year. Any other path is 404.
+        location / {
+            try_files $uri $uri/ =404;
+            add_header X-Content-Type-Options "nosniff" always;
+        }
+
+        location = /index.html {
+            add_header Cache-Control "no-cache" always;
+            add_header X-Content-Type-Options "nosniff" always;
+        }
+
+        location = /three.module.min.js {
+            add_header Cache-Control "public, max-age=31536000, immutable" always;
+            add_header X-Content-Type-Options "nosniff" always;
+        }
+
+        location = /still.png {
+            add_header Cache-Control "public, max-age=31536000, immutable" always;
+            add_header X-Content-Type-Options "nosniff" always;
+        }
+        {{- else }}
+
+        location / {
+            try_files $uri /index.html;
+            expires 10m;
+        }
+        {{- end }}
+
+        location /healthz {
+            access_log off;
+            return 200 "ok";
+        }
+
+        {{- if $forceLogout }}
+        # /403 — force-logout landing for the Traefik gardenio-forwardauth-errors
+        # middleware. Returns a meta-refresh HTML page that bounces the browser
+        # through {{ if .Values.keycloak.forwardAuth.forceLogoutOn403.signOutURL -}}{{ .Values.keycloak.forwardAuth.forceLogoutOn403.signOutURL }}{{- else -}}https://{{ .Values.keycloak.forwardAuth.ingress.host }}/oauth2/sign_out{{- end }}?rd=<orig>
+        # so oauth2-proxy clears the stale _gardenio_oauth2 cookie and re-runs
+        # the full Keycloak login flow. The status code is preserved as 403 so
+        # error logs and monitoring still attribute the response to an auth
+        # failure. `Cache-Control: no-store` prevents browsers/proxies from
+        # caching the page (the rd= target is request-specific). Design:
+        # gardenio/docs/research/forwardauth-403-force-logout.md.
+        location = /403 {
+            default_type text/html;
+            add_header Cache-Control "no-store" always;
+            add_header X-Robots-Tag "noindex" always;
+            return 403 '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="0; url={{ if .Values.keycloak.forwardAuth.forceLogoutOn403.signOutURL -}}{{ .Values.keycloak.forwardAuth.forceLogoutOn403.signOutURL }}{{- else -}}https://{{ .Values.keycloak.forwardAuth.ingress.host }}/oauth2/sign_out{{- end }}?rd=https://$forcelogout_host$forcelogout_uri"><title>Refreshing session</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:1rem;text-align:center}main{max-width:32rem}h1{font-size:1.4rem;font-weight:600;margin:0 0 .5rem}p{color:#94a3b8;margin:.4rem 0}a{color:#38bdf8;text-decoration:none}a:hover{color:#7dd3fc}</style></head><body><main><h1>Refreshing your session\u2026</h1><p>Your sign-in is no longer valid. We are re-running the login flow.</p><p><a href="{{ if .Values.keycloak.forwardAuth.forceLogoutOn403.signOutURL -}}{{ .Values.keycloak.forwardAuth.forceLogoutOn403.signOutURL }}{{- else -}}https://{{ .Values.keycloak.forwardAuth.ingress.host }}/oauth2/sign_out{{- end }}?rd=https://$forcelogout_host$forcelogout_uri">Click here if you are not redirected within a few seconds.</a></p></main></body></html>';
+        }
+        {{- end }}
+    }
+  {{- if ne .Values.landing.page "image" }}
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Gardenio</title>
+      <style>
+        :root {
+          --bg: #0f172a;
+          --surface: #1e293b;
+          --border: #334155;
+          --text: #e2e8f0;
+          --muted: #94a3b8;
+          --accent: #38bdf8;
+          --accent-hover: #7dd3fc;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          background: var(--bg);
+          color: var(--text);
+          min-height: 100vh;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          padding: 3rem 1rem;
+        }
+        h1 {
+          font-size: 2.5rem;
+          font-weight: 700;
+          margin-bottom: 0.5rem;
+        }
+        .subtitle {
+          color: var(--muted);
+          font-size: 1.1rem;
+          margin-bottom: 2.5rem;
+        }
+        .grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+          gap: 1rem;
+          max-width: 960px;
+          width: 100%;
+        }
+        .card {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          padding: 1.25rem;
+          transition: border-color 0.15s;
+        }
+        .card:hover { border-color: var(--accent); }
+        .card h2 {
+          font-size: 1.1rem;
+          margin-bottom: 0.4rem;
+        }
+        .card h2 a {
+          color: var(--accent);
+          text-decoration: none;
+        }
+        .card h2 a:hover { color: var(--accent-hover); }
+        .card p {
+          color: var(--muted);
+          font-size: 0.9rem;
+          line-height: 1.4;
+        }
+        .card .internal {
+          color: var(--muted);
+          font-size: 0.8rem;
+          font-style: italic;
+          margin-top: 0.3rem;
+        }
+        .auth-bar {
+          display: flex;
+          gap: 0.75rem;
+          align-items: center;
+          margin-bottom: 2rem;
+        }
+        .auth-bar .btn {
+          display: inline-block;
+          padding: 0.5rem 1.25rem;
+          border-radius: 6px;
+          font-size: 0.95rem;
+          text-decoration: none;
+          font-weight: 500;
+          transition: background 0.15s, border-color 0.15s;
+        }
+        .auth-bar .btn-primary {
+          background: var(--accent);
+          color: var(--bg);
+        }
+        .auth-bar .btn-primary:hover { background: var(--accent-hover); }
+        .auth-bar .btn-secondary {
+          background: transparent;
+          color: var(--accent);
+          border: 1px solid var(--accent);
+        }
+        .auth-bar .btn-secondary:hover {
+          background: rgba(56, 189, 248, 0.1);
+          border-color: var(--accent-hover);
+          color: var(--accent-hover);
+        }
+        .auth-bar .user-info {
+          color: var(--muted);
+          font-size: 0.9rem;
+        }
+        .auth-bar .btn-logout {
+          background: transparent;
+          color: var(--muted);
+          border: 1px solid var(--border);
+          font-size: 0.85rem;
+          padding: 0.4rem 0.8rem;
+        }
+        .auth-bar .btn-logout:hover {
+          border-color: var(--muted);
+          color: var(--text);
+        }
+        .section-title {
+          font-size: 1.3rem;
+          font-weight: 600;
+          margin: 2rem 0 1rem;
+          max-width: 960px;
+          width: 100%;
+        }
+        .quickstart {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          padding: 1.5rem;
+          max-width: 960px;
+          width: 100%;
+          margin-bottom: 1.5rem;
+          line-height: 1.6;
+        }
+        .quickstart h3 { margin-bottom: 0.5rem; color: var(--accent); }
+        .quickstart ol { padding-left: 1.5rem; }
+        .quickstart li { margin-bottom: 0.4rem; }
+        .quickstart code {
+          background: var(--bg);
+          padding: 0.15rem 0.4rem;
+          border-radius: 4px;
+          font-size: 0.85rem;
+        }
+        .health { display: inline-flex; align-items: center; gap: 0.3rem; }
+        .health .dot {
+          width: 8px; height: 8px;
+          border-radius: 50%;
+          background: var(--muted);
+        }
+        .health .dot.ok { background: #4ade80; }
+        .health .dot.err { background: #f87171; }
+        footer {
+          margin-top: 3rem;
+          color: var(--muted);
+          font-size: 0.8rem;
+        }
+      </style>
+    </head>
+    <body>
+      <h1>Gardenio</h1>
+      <p class="subtitle">K8s agent controller &amp; beads automation platform</p>
+
+      {{- $kcIssuerURL := include "gardenio.keycloak.issuerURL" . }}
+      {{- if and .Values.keycloak.enabled $kcIssuerURL }}
+      <div class="auth-bar" id="auth-bar">
+        <a id="login-btn" class="btn btn-primary" href="#">Login</a>
+        <a id="register-btn" class="btn btn-secondary" href="#">Register</a>
+      </div>
+      {{- end }}
+
+      <div class="quickstart">
+        <h3>Getting Started</h3>
+        <p>Welcome to Gardenio — a platform for managing AI agent workflows using <strong>beads</strong> (work items with dependencies, labels, and event history).</p>
+        <ol>
+          <li><strong>Explore beads</strong> — Open <a href="{{ include "gardenio.link.beadsWebURL" . | default "#" }}" style="color:var(--accent)">Beads Viewer</a> to browse all work items and their dependencies.</li>
+          <li><strong>Use the CLI</strong> — Install <code>kd</code> and point it at this environment: <code>export KD_HOST=https://{{ .Values.beads.ingress.host | default "beads.example.com" }}</code></li>
+          <li><strong>Create your first bead</strong> — <code>kd create "My first task" -t task</code></li>
+        </ol>
+      </div>
+
+      <h2 class="section-title">Services</h2>
+      <div class="grid">
+        {{- if .Values.coopmux.enabled }}
+        <div class="card">
+          <h2>{{- if .Values.coopmux.ingress.host }}<a href="https://{{ .Values.coopmux.ingress.host }}/mux">Coopmux</a>{{- else }}Coopmux{{- end }}</h2>
+          <p>Terminal multiplexer and credential manager for agent pods.</p>
+        </div>
+        {{- end }}
+        {{- if .Values.slackBridge.enabled }}
+        <div class="card">
+          <h2>Slack Bridge</h2>
+          <p>Decision and mail notifications bridge to Slack.</p>
+        </div>
+        {{- end }}
+        {{- if .Values.agents.enabled }}
+        <div class="card">
+          <h2>Agent Controller</h2>
+          <p>Manages agent pod lifecycle from bead events.</p>
+        </div>
+        {{- end }}
+        <div class="card">
+          <h2>Beads Daemon</h2>
+          <p>gRPC + HTTP API for bead CRUD, backed by PostgreSQL.</p>
+          {{- if .Values.beads.ingress.host }}
+          <p class="internal">API: {{ .Values.beads.ingress.host }}</p>
+          {{- end }}
+        </div>
+        {{- if .Values.nats.enabled }}
+        <div class="card">
+          <h2>NATS</h2>
+          <p>JetStream event bus for bead lifecycle events.</p>
+        </div>
+        {{- end }}
+        {{- if .Values.postgres.enabled }}
+        <div class="card">
+          <h2>PostgreSQL</h2>
+          <p>Persistent storage for beads data.</p>
+        </div>
+        {{- end }}
+        {{- if .Values.jiraBridge.enabled }}
+        <div class="card">
+          <h2>JIRA Bridge</h2>
+          <p>Bidirectional sync between JIRA tickets and beads.</p>
+        </div>
+        {{- end }}
+      </div>
+
+      {{- if .Values.beads.ingress.host }}
+      <h2 class="section-title">System Health</h2>
+      <div class="grid">
+        <div class="card">
+          <h2>Beads Daemon <span class="health" id="beads-health"><span class="dot"></span></span></h2>
+          <p id="beads-status">Checking...</p>
+        </div>
+      </div>
+      <script>
+        (function() {
+          var url = 'https://{{ .Values.beads.ingress.host }}/healthz';
+          fetch(url, {mode: 'cors', credentials: 'include'})
+            .then(function(r) {
+              document.querySelector('#beads-health .dot').classList.add(r.ok ? 'ok' : 'err');
+              document.getElementById('beads-status').textContent = r.ok ? 'Healthy' : 'Error (' + r.status + ')';
+            })
+            .catch(function() {
+              document.querySelector('#beads-health .dot').classList.add('err');
+              document.getElementById('beads-status').textContent = 'Unreachable';
+            });
+        })();
+      </script>
+      {{- end }}
+
+      {{- if and .Values.keycloak.enabled $kcIssuerURL }}
+      <script>
+      (function() {
+        var issuer = {{ $kcIssuerURL | quote }};
+        var clientId = 'gardenio-landing';
+        var redirectUri = encodeURIComponent(window.location.origin + window.location.pathname);
+
+        // Build Keycloak OIDC endpoints
+        var loginUrl = issuer + '/protocol/openid-connect/auth'
+          + '?client_id=' + clientId
+          + '&redirect_uri=' + redirectUri
+          + '&response_type=code'
+          + '&scope=openid%20email%20profile';
+        var registerUrl = issuer + '/protocol/openid-connect/registrations'
+          + '?client_id=' + clientId
+          + '&redirect_uri=' + redirectUri
+          + '&response_type=code'
+          + '&scope=openid%20email%20profile';
+        var logoutUrl = issuer + '/protocol/openid-connect/logout'
+          + '?client_id=' + clientId
+          + '&post_logout_redirect_uri=' + redirectUri;
+
+        var loginBtn = document.getElementById('login-btn');
+        var registerBtn = document.getElementById('register-btn');
+        if (loginBtn) loginBtn.href = loginUrl;
+        if (registerBtn) registerBtn.href = registerUrl;
+
+        // If we got redirected back with a code, show logged-in state.
+        // The code exchange happens via ForwardAuth/oauth2-proxy on protected
+        // services. The landing page itself just shows the auth buttons.
+        var params = new URLSearchParams(window.location.search);
+        if (params.has('code')) {
+          // Clean up the URL
+          window.history.replaceState({}, '', window.location.pathname);
+          // Show logged-in state
+          var bar = document.getElementById('auth-bar');
+          if (bar) {
+            bar.innerHTML = '<span class="user-info">Logged in</span>'
+              + '<a class="btn btn-logout" href="' + logoutUrl + '">Logout</a>';
+          }
+        }
+      })();
+      </script>
+      {{- end }}
+
+      <footer>Gardenio &mdash; {{ .Release.Namespace }}</footer>
+    </body>
+    </html>
+  {{- end }}
+{{- end }}

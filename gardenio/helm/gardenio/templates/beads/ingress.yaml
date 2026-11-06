@@ -1,0 +1,397 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.beads.ingress.enabled (not .Values.fleet.enabled) }}
+{{- if and .Values.beads.ingress.ipWhitelist.enabled (empty .Values.beads.ingress.ipWhitelist.sourceRange) }}
+{{- fail "beads.ingress.ipWhitelist.enabled is true but beads.ingress.ipWhitelist.sourceRange is empty: set the operator's allow-listed CIDRs (see values.yaml comments) or set beads.ingress.ipWhitelist.enabled=false." }}
+{{- end }}
+{{- $fullname := include "gardenio.beads.fullname" . -}}
+{{- $host := .Values.beads.ingress.host -}}
+{{- $httpPort := .Values.beads.service.httpPort | default 8080 -}}
+{{- $pathPrefix := .Values.beads.ingress.pathPrefix | default "" -}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $host }}`){{ if $pathPrefix }} && PathPrefix(`{{ $pathPrefix }}`){{ end }}
+      kind: Rule
+      services:
+        - name: {{ $fullname }}
+          port: {{ $httpPort }}
+      {{- if or $pathPrefix .Values.beads.ingress.ipWhitelist.enabled .Values.beads.ingress.rateLimit.enabled (and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled (not .Values.beads.ingress.skipForwardAuth)) .Values.global.securityHeaders.enabled }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if $pathPrefix }}
+        - name: {{ $fullname }}-stripprefix
+        {{- end }}
+        {{- if .Values.beads.ingress.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ipwhitelist
+        {{- end }}
+        {{- if and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled (not .Values.beads.ingress.skipForwardAuth) }}
+        - name: {{ include "gardenio.fullname" . }}-forwardauth
+        {{- if .Values.keycloak.forwardAuth.forceLogoutOn403.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-forwardauth-errors
+        {{- end }}
+        {{- end }}
+        {{- if .Values.beads.ingress.rateLimit.enabled }}
+        - name: {{ $fullname }}-ratelimit
+        {{- end }}
+      {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if $pathPrefix }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $pathPrefix }}
+{{- end }}
+{{- if .Values.beads.ingress.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.beads.ingress.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.beads.ingress.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if .Values.beads.ingress.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ .Values.beads.ingress.rateLimit.average }}
+    burst: {{ .Values.beads.ingress.rateLimit.burst }}
+{{- end }}
+{{- if .Values.beads.ingress.ciRoute.enabled }}
+---
+# CI route — separate IngressRoute with its own IP whitelist and rate limit.
+# Bearer-token auth is enforced by the beads daemon itself.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-ci
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $host }}`) && PathPrefix(`/ci`)
+      kind: Rule
+      services:
+        - name: {{ $fullname }}
+          port: {{ $httpPort }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        - name: {{ $fullname }}-ci-stripprefix
+        {{- if .Values.beads.ingress.ciRoute.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ci-ipwhitelist
+        {{- end }}
+        {{- if .Values.beads.ingress.ciRoute.rateLimit.enabled }}
+        - name: {{ $fullname }}-ci-ratelimit
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ci-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  stripPrefix:
+    prefixes:
+      - /ci
+{{- if .Values.beads.ingress.ciRoute.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ci-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.beads.ingress.ciRoute.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.beads.ingress.ciRoute.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if .Values.beads.ingress.ciRoute.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ci-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ .Values.beads.ingress.ciRoute.rateLimit.average }}
+    burst: {{ .Values.beads.ingress.ciRoute.rateLimit.burst }}
+{{- end }}
+{{- end }}
+{{- if .Values.beads.ingress.natsWebsocketRoute.enabled }}
+{{- if and .Values.beads.ingress.natsWebsocketRoute.ipWhitelist.enabled (empty .Values.beads.ingress.natsWebsocketRoute.ipWhitelist.sourceRange) }}
+{{- fail "beads.ingress.natsWebsocketRoute.ipWhitelist.enabled is true but beads.ingress.natsWebsocketRoute.ipWhitelist.sourceRange is empty: set the operator's allow-listed CIDRs or set beads.ingress.natsWebsocketRoute.ipWhitelist.enabled=false." }}
+{{- end }}
+{{- $natsFullname := include "gardenio.nats.fullname" . -}}
+{{- $natsWsPort := .Values.beads.ingress.natsWebsocketRoute.servicePort | default 8443 -}}
+---
+# NATS WebSocket route — exposes the gardenio-nats WS listener under
+# /nats on the same host as the beads daemon, so `gb agent start --local`
+# from a laptop can hit `wss://<host>/nats` without port-forwarding. The
+# beads daemon itself has no /nats handler, so this rule must be evaluated
+# before (i.e. listed before, or more-specific than) the host-only main
+# route — Traefik picks the most-specific match.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-nats-ws
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $host }}`) && PathPrefix(`/nats`)
+      kind: Rule
+      services:
+        - name: {{ $natsFullname }}
+          port: {{ $natsWsPort }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        - name: {{ $fullname }}-nats-ws-stripprefix
+        {{- if .Values.beads.ingress.natsWebsocketRoute.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-nats-ws-ipwhitelist
+        {{- end }}
+        {{- if .Values.beads.ingress.natsWebsocketRoute.rateLimit.enabled }}
+        - name: {{ $fullname }}-nats-ws-ratelimit
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-nats-ws-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  stripPrefix:
+    prefixes:
+      - /nats
+{{- if .Values.beads.ingress.natsWebsocketRoute.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-nats-ws-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.beads.ingress.natsWebsocketRoute.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.beads.ingress.natsWebsocketRoute.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if .Values.beads.ingress.natsWebsocketRoute.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-nats-ws-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ .Values.beads.ingress.natsWebsocketRoute.rateLimit.average }}
+    burst: {{ .Values.beads.ingress.natsWebsocketRoute.rateLimit.burst }}
+{{- end }}
+{{- end }}
+{{- /*
+  Parallel AVA-fronted IngressRoute for the beads daemon. Mirrors
+  beads-viewer/ava-ingressroute.yaml: a *second* host (e.g.
+  beads.example.com) on the one-level *.example.com
+  zone that is gated upstream by an AWS Verified Access endpoint.
+
+  Coexists with the legacy host (.Values.beads.ingress.host) above —
+  the legacy host keeps its ipWhitelist + rateLimit posture, the AVA
+  host has NO ipWhitelist (AVA is the gate) and reuses the same
+  rateLimit settings as the legacy route.
+
+  Keycloak forwardauth is intentionally OMITTED here: the daemon has
+  its own bearer-token / OIDC auth (see .Values.beads.ingress.skipForwardAuth),
+  and AVA authenticates the human user upstream of Traefik. No
+  middleware wiring is needed at the chart level — see epic
+  ka-0000005862 and the sibling beads-viewer template for context.
+
+  When .Values.beads.ingress.natsWebsocketRoute.enabled is true, a
+  parallel /nats route on the AVA host is rendered too, so MR !3135's
+  gb-side NATS bridge can replay the AVA cookie on the upstream WS
+  upgrade against `wss://<ava-host>/nats`.
+*/}}
+{{- if and .Values.beads.ingress.avaIngress .Values.beads.ingress.avaIngress.enabled }}
+{{- $avaHost := .Values.beads.ingress.avaIngress.host -}}
+{{- if not $avaHost }}
+{{- fail "beads.ingress.avaIngress.enabled is true but beads.ingress.avaIngress.host is empty: set the one-level AVA-fronted host (e.g. beads.example.com)." }}
+{{- end }}
+{{- if .Values.beads.ingress.natsWebsocketRoute.enabled }}
+{{- $avaNatsFullname := include "gardenio.nats.fullname" . -}}
+{{- $avaNatsWsPort := .Values.beads.ingress.natsWebsocketRoute.servicePort | default 8443 -}}
+---
+# AVA-host NATS WebSocket route. Listed before the AVA-host main route
+# so Traefik picks the more-specific Host+PathPrefix match for /nats.
+# No ipWhitelist — AVA gates ingress; the same rateLimit posture as the
+# legacy NATS route is reused.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-ava-nats-ws
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+    app.kubernetes.io/gate: ava
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $avaHost }}`) && PathPrefix(`/nats`)
+      kind: Rule
+      services:
+        - name: {{ $avaNatsFullname }}
+          port: {{ $avaNatsWsPort }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        - name: {{ $fullname }}-nats-ws-stripprefix
+        {{- if .Values.beads.ingress.natsWebsocketRoute.rateLimit.enabled }}
+        - name: {{ $fullname }}-nats-ws-ratelimit
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+---
+# AVA-host main beads daemon route. Parallel to the legacy host above
+# but with no IP whitelist — AVA terminates auth upstream. Same
+# rateLimit middleware as the legacy route is reused when enabled.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-ava
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+    app.kubernetes.io/gate: ava
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $avaHost }}`){{ if $pathPrefix }} && PathPrefix(`{{ $pathPrefix }}`){{ end }}
+      kind: Rule
+      services:
+        - name: {{ $fullname }}
+          port: {{ $httpPort }}
+      {{- if or $pathPrefix .Values.beads.ingress.rateLimit.enabled .Values.global.securityHeaders.enabled }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if $pathPrefix }}
+        - name: {{ $fullname }}-stripprefix
+        {{- end }}
+        {{- if .Values.beads.ingress.rateLimit.enabled }}
+        - name: {{ $fullname }}-ratelimit
+        {{- end }}
+      {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,231 @@
+{{- /*
+Read-only infrastructure investigator identity: the internal access boundary
+for agents that diagnose capacity, churn and HA questions (2026-09-21, HA
+under spot churn epic gd-StII9fmzym).
+
+A dedicated ServiceAccount, NOT the default agent SA, bound to a cluster-wide
+read-only ClusterRole. The token is only mounted into pods whose ROLE bead
+sets needs_k8s_api=true and service_account=<this SA> (the `infra` role bead);
+every other agent pod stays token-less. Deliberately absent from the rules:
+secrets, serviceaccounts/token, pods/exec, pods/attach, pods/portforward and
+every write verb. Pod logs are included on purpose: the cluster-autoscaler and
+controller logs are the primary evidence for capacity investigations.
+
+Differs from agents.agentServiceAccount.clusterReadOnly (which binds the
+DEFAULT agent SA and excludes logs) by keeping the grant off the shared
+identity entirely.
+
+Namespaced reads (gd-3Xa9PZgybq, operator decision gd-lUsRL07kKO): get/list
+only, never cluster-wide, never via extraRules. One Role+RoleBinding in the
+release namespace for rolebindings, ingresses and networkpolicies, and one in
+agents.infraReader.keycloakClientsNamespace (default operators; empty skips
+it) for the EDP keycloak-operator's keycloakclients. No watch, no secrets, no
+roles/clusterroles, no wildcards.
+
+ARC runner reads (gd-6FEbhRnAkd, escalation gd-vdwY0sszvu): one more
+Role+RoleBinding in agents.infraReader.arcRunnersNamespace (default empty,
+which skips it) with get/list on the actions.github.com runner sets and
+runners, for CI-stall checks. Bound to this SA only. When it equals the release
+namespace (a render where HELM_NAMESPACE is arc-runners, as on CI) the rule
+joins the release-namespace Role instead.
+*/ -}}
+{{- if and .Values.agents.enabled .Values.agents.infraReader.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.agents.infraReader.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: infra-reader
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.agents.infraReader.name }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: infra-reader
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/status
+      - pods
+      - pods/status
+      - pods/log
+      - events
+      - namespaces
+      - persistentvolumes
+      - persistentvolumeclaims
+      - services
+      - endpoints
+      - configmaps
+      - resourcequotas
+      - limitranges
+      - replicationcontrollers
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csidrivers", "csinodes", "volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  {{- with .Values.agents.infraReader.extraRules }}
+    {{- toYaml . | nindent 2 }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.agents.infraReader.name }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: infra-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.agents.infraReader.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.agents.infraReader.name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.agents.infraReader.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: infra-reader
+rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list"]
+  {{- if eq (.Values.agents.infraReader.arcRunnersNamespace | default "") .Release.Namespace }}
+  - apiGroups: ["actions.github.com"]
+    resources: ["autoscalingrunnersets", "ephemeralrunnersets", "ephemeralrunners"]
+    verbs: ["get", "list"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.agents.infraReader.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.coop.labels" . | nindent 4 }}
+    gardenio.io/access-boundary: infra-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.agents.infraReader.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.agents.infraReader.name }}
+    namespace: {{ .Release.Namespace }}
+{{- with .Values.agents.infraReader.keycloakClientsNamespace }}
+{{- if eq . $.Release.Namespace }}
+{{- fail "agents.infraReader.keycloakClientsNamespace must differ from the release namespace: both Roles are named after the ServiceAccount" }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $.Values.agents.infraReader.name }}
+  namespace: {{ . }}
+  labels:
+    {{- include "gardenio.coop.labels" $ | nindent 4 }}
+    gardenio.io/access-boundary: infra-reader
+rules:
+  - apiGroups: ["v1.edp.epam.com"]
+    resources: ["keycloakclients"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $.Values.agents.infraReader.name }}
+  namespace: {{ . }}
+  labels:
+    {{- include "gardenio.coop.labels" $ | nindent 4 }}
+    gardenio.io/access-boundary: infra-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $.Values.agents.infraReader.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $.Values.agents.infraReader.name }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- with .Values.agents.infraReader.arcRunnersNamespace }}
+{{- if eq . ($.Values.agents.infraReader.keycloakClientsNamespace | default "") }}
+{{- fail "agents.infraReader.arcRunnersNamespace must differ from keycloakClientsNamespace: both Roles are named after the ServiceAccount" }}
+{{- end }}
+{{- if ne . $.Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $.Values.agents.infraReader.name }}
+  namespace: {{ . }}
+  labels:
+    {{- include "gardenio.coop.labels" $ | nindent 4 }}
+    gardenio.io/access-boundary: infra-reader
+rules:
+  - apiGroups: ["actions.github.com"]
+    resources: ["autoscalingrunnersets", "ephemeralrunnersets", "ephemeralrunners"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $.Values.agents.infraReader.name }}
+  namespace: {{ . }}
+  labels:
+    {{- include "gardenio.coop.labels" $ | nindent 4 }}
+    gardenio.io/access-boundary: infra-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $.Values.agents.infraReader.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $.Values.agents.infraReader.name }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- end }}

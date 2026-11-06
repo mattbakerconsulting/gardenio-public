@@ -1,0 +1,133 @@
+{{- /* landgate v0 (Lands boundary gd-uYNbyW4a9Z §6 step 11, gd-ParwLpmgID): one
+       transparent proxy per land between the edge's land door and kbeads. It
+       forwards the caller's own bearer and holds no credential: no Secret, no
+       token env, no ServiceAccount token. The edge reaches a land's landgate
+       only once public-edge.yaml's $land_door_upstream map names it. */ -}}
+{{- if .Values.landgate.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- $issuer := .Values.landgate.oidc.issuerURL | default (include "gardenio.keycloak.issuerURL" .) -}}
+{{- $clientID := .Values.landgate.oidc.clientID | default .Values.keycloak.oidcAudience -}}
+{{- if not $issuer }}
+{{- fail "landgate.enabled needs an OIDC issuer: set landgate.oidc.issuerURL or configure keycloak" }}
+{{- end }}
+{{- if not $clientID }}
+{{- fail "landgate.enabled needs an OIDC audience: set landgate.oidc.clientID or keycloak.oidcAudience" }}
+{{- end }}
+{{- range $land := .Values.landgate.lands }}
+{{- if not (regexMatch "^[a-z][a-z0-9-]{0,62}$" $land) }}
+{{- fail (printf "landgate.lands: %q is not a land name (^[a-z][a-z0-9-]{0,62}$)" $land) }}
+{{- end }}
+{{- $name := printf "%s-landgate-%s" $fullname $land }}
+{{- if gt (len $name) 63 }}
+{{- fail (printf "landgate: %s is longer than 63 characters; shorten the release name or the land" $name) }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: landgate
+    gardenio.io/land: {{ $land | quote }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: landgate
+      gardenio.io/land: {{ $land | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" $ | nindent 8 }}
+        app.kubernetes.io/component: landgate
+        gardenio.io/land: {{ $land | quote }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: landgate
+          image: {{ include "gardenio.imageRef" (dict "image" $.Values.landgate.image "global" $.Values.global "Chart" $.Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" $.Values.landgate.image.pullPolicy "global" $.Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: LANDGATE_LAND
+              value: {{ $land | quote }}
+            - name: LANDGATE_UPSTREAM
+              value: "http://{{ include "gardenio.beads.host" $ }}:{{ include "gardenio.beads.httpPort" $ }}"
+            - name: OIDC_ISSUER_URL
+              value: {{ $issuer | quote }}
+            - name: OIDC_CLIENT_ID
+              value: {{ $clientID | quote }}
+            {{- if and $.Values.keycloak.enabled $.Values.keycloak.oidcAllowedEmailDomains }}
+            - name: OIDC_ALLOWED_EMAIL_DOMAINS
+              value: {{ $.Values.keycloak.oidcAllowedEmailDomains | quote }}
+            {{- end }}
+            {{- if $.Values.landgate.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ $.Values.landgate.logLevel | quote }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- toYaml $.Values.landgate.resources | nindent 12 }}
+      {{- /* Every gardenio-k3s node is tainted, so the global agent toleration
+      must merge in like every other platform pod; local-only left the first
+      roll (2026.295.1) Pending until its progress deadline. */}}
+      {{- include "gardenio.nodeSelector" (dict "local" $.Values.landgate.nodeSelector "global" $.Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" $.Values.landgate.tolerations "global" $.Values.global.tolerations) | nindent 6 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: landgate
+    gardenio.io/land: {{ $land | quote }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "gardenio.selectorLabels" $ | nindent 4 }}
+    app.kubernetes.io/component: landgate
+    gardenio.io/land: {{ $land | quote }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+{{- end }}
+{{- end }}

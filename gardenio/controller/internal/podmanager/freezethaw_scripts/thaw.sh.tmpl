@@ -1,0 +1,1693 @@
+set -uo pipefail
+ROOT=/run/containerd/runsc/k8s.io
+T=/run/containerd/io.containerd.runtime.v2.task/k8s.io
+BNAME='{{.PlaceholderPod}}'
+BPODUID='{{.BPodUID}}'
+ASB='{{.ASandboxCID}}'
+AAG='{{.AAgentCID}}'
+APOD='{{.APodUID}}'
+IMG='{{.ImagePath}}'
+BUNDLE='{{.BundlePath}}'
+CCOUNT={{.ContainerCount}}
+RUNSC_TIMEOUT={{.RunscTimeout}}
+# OVERLAY_FLAG (ka-0000007239, overlay-dir-medium): the --overlay2=<medium> the
+# checkpoint was taken under, replayed to EVERY runsc restore so the restored sentry
+# rebuilds its rootfs-overlay upper from the SAME medium (a root:dir checkpoint can
+# ONLY restore under root:dir). The snapshot self-describes the medium (freeze probe
+# FT_OVERLAY_MEDIUM); the Go side renders the full flag here, or LEAVES IT EMPTY for
+# self/default-medium snapshots — empty ⇒ the restore lines are byte-identical to the
+# pre-fix script, so non-dir nodes carry zero blast radius (substrate revalidation
+# ka-0000007329 proved the upper rides inside checkpoint.img, so there is nothing else
+# for thaw to materialize — only the flag must match).
+OVERLAY_FLAG='{{.RestoreOverlayFlag}}'
+# THAWDIR (fix, bug ka-0000000673 / ka-0000001104): the NEW agent's per-agent
+# thaw-state hostPath on the node (thawStateHostDir(req.AgentName)) — the dir the
+# controller's NodeRehydrationTrigger writes the epoch marker into and polls acks
+# from. The [3] mount-rewrite FORCES the agent bundle's MountThawState mount SOURCE
+# to this dir, overriding the bsrc[d] live-Pod-B source (which on the warm-B path is
+# a pool placeholder minted from a DIFFERENT agent's template, so it resolves the
+# WRONG, stale thaw-state dir -> both-consumer ack fail-close). EMPTY (legacy
+# snapshot / older controller) leaves the rewrite at its pre-fix bsrc[d] behavior.
+THAWDIR='{{.ThawStateDir}}'
+THAWDEST='{{.ThawStateDest}}'
+# EGRESS_* (fix B, ka-0000008207): the in-sentry egress targets the [6c] assertion
+# TCP-dials FROM INSIDE the restored sandbox — the SAME endpoints the two rehydrate
+# consumers reach (coop -> NATS, gb -> beads daemon). Empty (older controller / unset
+# config) makes [6c] skip the end-to-end dial but still assert the sentry's own
+# default route. Rendered by buildThawScript from the manager's NatsURL/BeadsHTTPAddr.
+EGRESS_NATS_HOST='{{.NatsHost}}'
+EGRESS_NATS_PORT='{{.NatsPort}}'
+EGRESS_BEADS_HOST='{{.BeadsHost}}'
+EGRESS_BEADS_PORT='{{.BeadsPort}}'
+# EGRESS_*_ADDR (bug ka-0000002907): the resolved ClusterIP LITERALS the [6c-2] dial
+# CONNECTS to. The bare DNS names above are kept only for the human-readable log line;
+# a LINK-ONLY restored sentry cannot reach kube-dns, so dialing a name gaierrors ->
+# "inconclusive" -> flake-OPEN (the #11 miss). A ClusterIP is a cluster-global VIP the
+# netstack routes at L3 with no DNS, so a link-only sentry no-routes it EHOSTUNREACH ->
+# link-only -> fail-closed. Empty (controller could not resolve / already-an-IP that
+# failed) SKIPS the dial for that target; the [6c-1] default-route check is the floor.
+EGRESS_NATS_ADDR='{{.NatsDialAddr}}'
+EGRESS_BEADS_ADDR='{{.BeadsDialAddr}}'
+RUNSC() { nsenter -t 1 -m -p -n -- timeout "${RUNSC_TIMEOUT}" runsc --root=$ROOT "$@"; }
+HMNT() { nsenter -t 1 -m -- "$@"; }
+# HMNTT: KILL-signal-bounded host-ns helper (mirrors the freeze template's HMNTT).
+# The thaw script defines RUNSC/HMNT but historically NOT HMNTT; the fix-C
+# restore-peak measurement (ka-0000003398) needs a bounded host-ns find over
+# /sys/fs/cgroup so a pathological cgroup tree cannot wedge the read. Same nsenter
+# host mount-ns as HMNT, wrapped in the RUNSC_TIMEOUT + SIGKILL discipline. Used
+# only by the best-effort measurement block at the script tail.
+HMNTT() { nsenter -t 1 -m -- timeout -s KILL -k 5s "${RUNSC_TIMEOUT}" "$@"; }
+log() { echo "    $*" >&2; }
+OVER=/var/tmp/gb-thaw-over
+
+# SUBNAMES is the ordered roster of sub-containers to restore on top of the
+# sandbox root (ka-0000003561): the agent first, then any always-on DinD/Postgres
+# sidecars. The bundle subdir for each is its CRI container-name. A bare agent pod
+# has just "agent"; a Docker/Postgres agent adds "dind"/"postgres". A legacy
+# snapshot with no roster falls back to the agent alone (the proven 2-container
+# shape). DSTNS is sandbox + every sub-container — the per-container loops use it.
+SUBNAMES="$(printf '%s\n' {{range .SubContainers}}'{{.Name}}' {{end}})"
+[ -z "$(printf '%s' "$SUBNAMES" | tr -d '[:space:]')" ] && SUBNAMES="agent"
+DSTNS="$(printf 'sandbox\n%s\n' "$SUBNAMES")"
+
+# [0] RE-MATERIALIZE the OCI bundle spec files from the snapshot (fix B,
+# ka-0000000301). The host bundle dir $BUNDLE may have been GC'd by Pod A's
+# post-freeze teardown (containerd 'runsc delete' reaps the per-container bundle
+# dir) — only the standalone checkpoint image survives, so without this thaw
+# FetchSpec-ENOENTs (rc=128) on config.json. Re-create the dir tree (incl. the
+# rootfs mountpoint the [2] overlay targets, one per sandbox + sub-container) and
+# rewrite the captured config.json/.overlay-opts in the HOST ns (HMNT), so all
+# subsequent $BUNDLE reads — [2] overlay, [3] config rewrite, [5] runsc restore
+# --bundle — see a complete bundle regardless of whether the dir survived teardown.
+for dstn in $DSTNS; do HMNT mkdir -p "$BUNDLE/$dstn/rootfs"; done
+write_spec() { # $1=bundle-relative path, $2=base64 bytes
+  printf '%s' "$2" | base64 -d | HMNT tee "$BUNDLE/$1" >/dev/null \
+    && log "rematerialized $1" \
+    || { log "FATAL: rematerialize $1 failed"; echo "FT_ROOT_RC=126"; exit 1; }
+}
+{{range .SpecFiles}}write_spec '{{.Path}}' '{{.Base64}}'
+{{end}}
+# [0b] PRE-RESTORE checkpoint-IMAGE assertion (ka-0000003702), parallel to the
+# freeze [3d/8] FT_IMAGE_OK guard. The 3.0G image is NOT snapshot-carried (too
+# large), so thaw reads it from $IMG (/var/lib/gardenio/ckpt/<agent>, the
+# controller-owned safe path). If it is absent or empty here, runsc restore would
+# ENOENT on checkpoint.img with an opaque rc=128 ("opening state file … failed").
+# Probe it FIRST, in the HOST NS (HMNT test -s — same mount ns runsc reads), and
+# fail LOUD with an image-DELETION diagnosis so the failure mode is unmistakable
+# (a reaped image at the safe path, not a restore-internal error). Emit FT_IMAGE_OK
+# so the Go post-state check can assert it before driving any restore.
+if HMNT test -s "$IMG/checkpoint.img"; then
+  echo "FT_IMAGE_OK=yes"
+else
+  log "FATAL: checkpoint IMAGE $IMG/checkpoint.img absent or empty at thaw — the 3.0G runsc image was DELETED between freeze and thaw (Pod-A-teardown reap of the checkpoint dir). Relocation to the controller-owned safe path /var/lib/gardenio/ckpt should prevent this; if you see this, the safe path is itself being GC'd or freeze never wrote it. NOT a restore-internal failure."
+  echo "FT_IMAGE_OK=no"
+  echo "FT_ROOT_RC=128"
+  exit 1
+fi
+
+# [1] resolve Pod B's fresh kubelet-owned cids: the sandbox + EVERY sub-container,
+# paired to the snapshot's roster BY container-name (gVisor matches a checkpointed
+# sub-container to a restore call via the container-name annotation, not the cid).
+# bann reads one annotation from a B-container state JSON on stdin.
+bann() { python3 -c 'import sys,json;print(json.load(sys.stdin).get("annotations",{}).get(sys.argv[1],""))' "$1" 2>/dev/null; }
+BALL=$(ctr -n k8s.io containers ls 2>/dev/null | awk 'NR>1{print $1}')
+# B_NAME_CID accumulates "<container-name> <cid>" lines for $BNAME's sub-containers.
+B_NAME_CID=""
+BAG=""
+for c in $BALL; do
+  s=$(RUNSC state "$c" 2>/dev/null) || continue
+  sn=$(printf '%s' "$s" | bann io.kubernetes.cri.sandbox-name)
+  ct=$(printf '%s' "$s" | bann io.kubernetes.cri.container-type)
+  cn=$(printf '%s' "$s" | bann io.kubernetes.cri.container-name)
+  [ "$sn" = "$BNAME" ] && [ "$ct" = "container" ] || continue
+  [ -z "$cn" ] && cn=agent   # legacy image whose CRI container-name is unset
+  B_NAME_CID="$B_NAME_CID$cn $c
+"
+  [ "$cn" = "agent" ] && BAG="$c"
+done
+# fall back: if no container was explicitly named "agent", take the first sub.
+if [ -z "$BAG" ]; then
+  BAG=$(printf '%s' "$B_NAME_CID" | awk 'NR==1{print $2}')
+fi
+[ -z "$BAG" ] && { log "FATAL: no agent sub-container for placeholder $BNAME"; echo "FT_ROOT_RC=127"; exit 1; }
+BAGS=$(RUNSC state "$BAG")
+BSB=$(printf '%s' "$BAGS" | bann io.kubernetes.cri.sandbox-id)
+[ -z "$BPODUID" ] && BPODUID=$(printf '%s' "$BAGS" | bann io.kubernetes.cri.sandbox-uid)
+# bcid_for maps a snapshot roster container-name to Pod B's fresh cid.
+bcid_for() { printf '%s' "$B_NAME_CID" | awk -v n="$1" '$1==n{print $2; exit}'; }
+# assert every roster sub-container has a matching B cid BEFORE driving any restore
+# — a missing sidecar slot on Pod B means buildPlaceholderPodB did not carry the
+# sidecar (or it is not Ready), so the barrier could never satisfy; fail loud.
+for cn in $SUBNAMES; do
+  [ -n "$(bcid_for "$cn")" ] || { log "FATAL: placeholder $BNAME has no sub-container named '$cn' (roster/PodB shape mismatch) — the N-container barrier cannot satisfy. NOT proceeding."; echo "FT_ROOT_RC=127"; exit 1; }
+done
+
+# NETNS REPOINT (fix-a, ka-0000004146). The original thaw rc=128 root failure was
+# 'error opening "/var/run/netns/cni-<A>": no such file or directory' — the restore
+# was still wired to Pod A's CNI netns, which the kubelet/CNI tore down when Pod A
+# was deleted at freeze. The repoint to Pod B's fresh netns must resolve a NON-EMPTY
+# path and FAIL CLOSED if it cannot: the prior code resolved BNETNS best-effort from
+# a single ($T/$BSB/config.json) location and, on an empty result, SILENTLY skipped
+# the repoint in PYSANDBOX (the old "if ... and bnetns" guard), leaving Pod A's dead
+# netns path in the spec -> the exact rc=128. Resolve from BOTH the v2 task dir AND
+# the runsc-state bundle dir, in the HOST ns (HMNT) where runsc reads the spec, bail loud
+# if neither yields a network-namespace path.
+read_netns_path() { # $1 = candidate config.json (host-ns path)
+  HMNT test -f "$1" || return 1
+  HMNT python3 -c 'import json,sys
+ns=json.load(open(sys.argv[1])).get("linux",{}).get("namespaces",[])
+print(next((n.get("path","") for n in ns if n.get("type")=="network" and n.get("path")),""))' "$1" 2>/dev/null
+}
+BSB_BUNDLE=$(RUNSC state "$BSB" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("bundle",""))' 2>/dev/null)
+BNETNS_PATH=""
+for cand in "$T/$BSB/config.json" "$BSB_BUNDLE/config.json"; do
+  BNETNS_PATH=$(read_netns_path "$cand"); [ -n "$BNETNS_PATH" ] && break
+done
+if [ -z "$BNETNS_PATH" ]; then
+  log "FATAL: could not resolve Pod B's network namespace path (tried $T/$BSB/config.json and bundle $BSB_BUNDLE). Restore would re-open Pod A's torn-down CNI netns -> rc=128. NOT proceeding with a dead-netns restore."
+  echo "FT_ROOT_RC=128"
+  exit 1
+fi
+# CNI-ADD COMPLETION GATE (fix C, ka-0000001156 — RESEQUENCE, decision ka-0000002646).
+# Re-sequence the graft so the placeholder Pod B sandbox delete ([4] runsc delete
+# --force, below) and the netns pin (immediately below) never capture a netns whose
+# AWS VPC CNI ADD is still IN FLIGHT. On canary xq3 the pin (Fix B) DID preserve Pod
+# B's eth0 veth across the graft delete — but the pinned netns had NO IPv4 addr and
+# an EMPTY route table: the CNI ADD's LINK step had run (veth created + moved in +
+# UP, host eni* peer wired) while its IPAM/route-install step had NOT yet completed.
+# The force-delete of Pod B's sandbox aborted the in-flight ADD before IPAM assigned
+# an IP + installed the default route, so Fix B pinned a half-configured (link-only)
+# netns and Fix A's restore-time netns-content assertion correctly fail-closed LOUD
+# (non-lo ifaces=1, default-route=no).
+#
+# FIX: before pinning (and long before the [4] force-delete), POLL Pod B's LIVE CNI
+# netns until the ADD is CONFIRMED COMPLETE — i.e. a global-scope IPv4 addr exists on
+# a non-loopback iface (IPAM finished) AND a default route is present in
+# /proc/net/route (the route step ran) — or, equivalently, the CNI result is already
+# committed to /var/lib/cni/results/. Only then pin, so the bind-mount captures a
+# FULLY-configured, routable netns inode, and the subsequent force-delete + kubelet
+# CNI DEL can race all they like — the pinned copy already holds eth0 + IP + route.
+# All checks run in the HOST mount ns (HMNT) so they see the same /var/run/netns,
+# /var/lib/cni, and node iproute2 binary runsc/the kubelet use.
+#
+# Bounded, best-effort: a placeholder that became Ready has normally finished CNI ADD
+# already, so the poll usually returns on the first iteration; the loop only covers
+# the tail of a fresh placeholder still mid-ADD. If the ADD never completes within
+# the deadline we log LOUD and pin anyway (same best-effort posture as the pin
+# itself) — Fix A's netns-content assertion still fails-closed LOUD at restore time
+# if the graft lands a link-only netns, so a missed confirmation degrades to a loud
+# restore failure + clean cold-start fallback, never a silent 60s-later ack timeout.
+cni_add_complete() { # rc 0 == Pod B's CNI ADD has fully completed (IPv4 + default route)
+  # global-scope IPv4 on a non-loopback iface => CNI IPAM assigned an address
+  # (scope global already excludes 127.0.0.1/::1; the awk guard is belt-and-suspenders).
+  HMNT nsenter --net="$BNETNS_PATH" -- ip -4 -o addr show scope global 2>/dev/null \
+    | awk '$2!="lo"{f=1} END{exit !f}' || return 1
+  # default route (00000000 destination, /proc/net/route) => the CNI route step ran.
+  HMNT nsenter --net="$BNETNS_PATH" -- awk 'NR>1 && $2=="00000000"{f=1} END{exit !f}' /proc/net/route 2>/dev/null || return 1
+  return 0
+}
+# read_cni_pod_ip echoes the IPv4 (CIDR form, e.g. 10.30.136.3/32) the AWS VPC CNI
+# assigned Pod B, read from the AUTHORITATIVE committed CNI result file (fix C,
+# ka-0000001099). THIS is the layer that fixes the two-inode split: the prior Fix-C
+# gate confirmed via cni_result_cached keyed on $BSB (the SANDBOX cid) and/or polled
+# $BNETNS_PATH (the SANDBOX netns), but in the runsc placeholder the AWS VPC CNI
+# installs the pod IP into a DIFFERENT inode — the PAUSE container's netns — so the
+# sandbox netns the pin/restore targets carries the eth0 veth but NO IP/route, and the
+# $BSB-keyed result probe matched a file that does not describe the restore-target
+# netns. Instead, glob /var/lib/cni/results and select Pod B's entry by its
+# K8S_POD_UID cniArg (falling back to K8S_POD_NAME) — NOT by a cid — so we get the IP
+# the kubelet/CNI committed regardless of which netns inode holds it. The IP is then
+# self-applied into the restore-target inode post-restore (self_ipam), decoupling the
+# fix from netns-inode resolution entirely (the failure mode that recurred 3x:
+# ka-0000001790 -> ka-0000001156 -> ka-0000001099).
+read_cni_pod_ip() {
+  HMNT python3 - "$BPODUID" "$BNAME" <<'PYCNI' 2>/dev/null
+import json,glob,sys
+uid,name=(sys.argv[1] if len(sys.argv)>1 else ""),(sys.argv[2] if len(sys.argv)>2 else "")
+for fp in sorted(glob.glob("/var/lib/cni/results/*")):
+    try: d=json.load(open(fp))
+    except Exception: continue
+    args=dict((kv[0],kv[1]) for kv in d.get("cniArgs",[]) if isinstance(kv,(list,tuple)) and len(kv)==2)
+    if uid and args.get("K8S_POD_UID")==uid: pass
+    elif name and args.get("K8S_POD_NAME")==name: pass
+    else: continue
+    for ip in d.get("result",{}).get("ips",[]):
+        a=ip.get("address","")
+        if a and ":" not in a:  # IPv4 only
+            print(a); sys.exit(0)
+PYCNI
+}
+# AWS VPC CNI synthesizes a link-scope gateway at 169.254.1.1 for every pod (the pod
+# eth0 has only a /32, no on-link subnet), and installs the default route via it. We
+# reconstruct exactly that in self_ipam below from the committed pod IP.
+CNI_GW=169.254.1.1
+# poll up to ~30s (60 * 0.5s) for the ADD to confirm; matches the seq+sleep idiom
+# used by the [5] post-restore sandbox-state wait below. CONFIRMATION SOURCE OF
+# TRUTH = the committed CNI result IP (read_cni_pod_ip), decoupled from inode; the
+# $BNETNS_PATH netns poll is kept only as a secondary signal for non-split topologies
+# that DO populate the sandbox netns.
+CNI_POD_IP=$(read_cni_pod_ip)
+CNI_CONFIRMED=no
+CNI_VIA=
+for _i in $(seq 1 60); do
+  [ -z "$CNI_POD_IP" ] && CNI_POD_IP=$(read_cni_pod_ip)
+  if [ -n "$CNI_POD_IP" ]; then CNI_CONFIRMED=yes; CNI_VIA=cni-result; break; fi
+  if cni_add_complete; then CNI_CONFIRMED=yes; CNI_VIA=netns; break; fi
+  sleep 0.5
+done
+echo "FT_CNI_CONFIRMED=$CNI_CONFIRMED"
+echo "FT_CNI_POD_IP=$CNI_POD_IP"
+if [ "$CNI_CONFIRMED" = yes ]; then
+  log "Pod B CNI ADD confirmed (via $CNI_VIA): committed CNI result assigns pod IP '$CNI_POD_IP' (matched by K8S_POD_UID=$BPODUID / name=$BNAME) — fix C will self-apply it onto eth0 in the RESTORE-TARGET netns (the restored sentry's OWN netns, /proc/<RPID>/ns/net) post-restore + synthesize link-scope gw $CNI_GW. This decouples from the sandbox-vs-pause netns inode split; the restore-target L3 is then confirmed by Fix A's [6a] content assertion ON THAT SAME inode."
+else
+  log "WARN Pod B CNI ADD NOT confirmed within ~30s (no committed CNI result IP for uid=$BPODUID/name=$BNAME under /var/lib/cni/results, no global IPv4 + default route in $BNETNS_PATH) — the placeholder's CNI ADD likely never finished provisioning. Fix C self-IPAM will no-op; Fix A's netns-content assertion still fails-closed LOUD at restore if the graft lands a link-only netns (clean cold-start fallback)."
+fi
+
+# L3 CAPTURE for post-delete re-assert (fix B, ka-0000001790). The Fix-C gate above
+# proved (necessary) that Pod B's CNI ADD COMPLETED — a global IPv4 + default route
+# exist in $BNETNS_PATH right now — but b4a's on-node forensics (06-12) proved it
+# INSUFFICIENT: the [4] force-delete below fires the AWS VPC CNI DEL, which STRIPS the
+# IPv4 ADDRESS + ROUTE TABLE from the netns even though the inode-pin preserves the
+# eth0 veth LINK. (Leaked failed-restore sandbox PID 9528: /proc/.../net/dev = lo+eth0,
+# /proc/.../net/route EMPTY, fib_trie NO global IPv4.) So the gate sees IP+route, then
+# the force-delete removes them anyway — exactly ka-0000001156's link-only signature.
+#
+# FIX B: snapshot the CONFIRMED L3 state HERE (while the CNI ADD output is still live),
+# then statically RE-ASSERT it onto the (surviving, inode-pinned) eth0 veth AFTER the
+# force-delete — so the restore lands a fully-routable netns regardless of the CNI DEL.
+# A veth pair is one object: the forensics proving the POD-side veth survived the DEL
+# imply the HOST-side peer survived too (you cannot delete half a veth), so L2 host<->pod
+# is intact and only the pod-side L3 needs re-applying. We capture ALL global-scope IPv4
+# addrs (IPAM result) AND the full IPv4 route table (the link-scope CNI gateway route +
+# the default via it), so the replay reconstructs the CNI-configured netns faithfully,
+# not just a single addr. Captured into shell vars (one bash process spans gate->restore),
+# replayable verbatim by 'ip addr add' / 'ip route add'. Empty when CNI was NOT confirmed
+# (nothing trustworthy to replay) — reassert_l3 then no-ops and Fix A still fails closed.
+# All HMNT nsenter so we read/write the SAME host-ns netns runsc/the kubelet operate on.
+CAP_ADDRS=
+CAP_ROUTES=
+if [ "$CNI_CONFIRMED" = yes ]; then
+  CAP_ADDRS=$(HMNT nsenter --net="$BNETNS_PATH" -- ip -4 -o addr show scope global 2>/dev/null \
+    | awk '$2!="lo"{print $4" dev "$2}')
+  CAP_ROUTES=$(HMNT nsenter --net="$BNETNS_PATH" -- ip -4 route show 2>/dev/null)
+  log "captured Pod B L3 for fix-B re-assert: addrs=[$(printf '%s' "$CAP_ADDRS" | tr '\n' ';')] routes=[$(printf '%s' "$CAP_ROUTES" | tr '\n' ';')]"
+fi
+# reassert_l3 statically re-applies the captured CNI L3 (addrs + routes) into a netns
+# (fix B, ka-0000001790). $1 is the netns reference to operate in — the pinned bind-mount
+# path PRE-restore (so runsc restore inherits a routable netns), or the restored sentry's
+# /proc/<pid>/ns/net POST-restore (the SAME inode; last-write-wins against a late async
+# kubelet CNI DEL). No-op when nothing was captured (CNI unconfirmed). Order matters:
+# bring the veth UP, add addrs, then NON-default routes (the link-scope CNI gateway, e.g.
+# 169.254.1.1 dev eth0) BEFORE the default route that resolves via it — else an
+# 'ip route add default via <gw>' fails with "Nexthop has invalid gateway". Every op is best-effort
+# (|| true): an already-present addr/route returns EEXIST (the pre-restore apply may still
+# be in place at the post-restore re-apply), which is success for our purposes. The caller
+# emits FT_NETNS_L3_REASSERTED so the controller can see the fix engaged even when [6a]
+# later still fails (e.g. a DEL that also tore the host-side route — the next-layer cause).
+reassert_l3() { # $1 = netns reference (pinned path or /proc/<pid>/ns/net)
+  local ref="$1"
+  [ -n "$CAP_ADDRS$CAP_ROUTES" ] || return 0
+  HMNT nsenter --net="$ref" -- ip link set eth0 up 2>/dev/null || true
+  printf '%s\n' "$CAP_ADDRS" | while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    HMNT nsenter --net="$ref" -- ip addr add $a 2>/dev/null || true
+  done
+  # non-default (link-scope gateway etc.) first, then default, so the gateway route
+  # exists before any 'default via <gw>' that depends on it.
+  printf '%s\n' "$CAP_ROUTES" | grep -v '^default' | while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    HMNT nsenter --net="$ref" -- ip route add $r 2>/dev/null || true
+  done
+  printf '%s\n' "$CAP_ROUTES" | grep '^default' | while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    HMNT nsenter --net="$ref" -- ip route add $r 2>/dev/null || true
+  done
+}
+# self_ipam statically installs the COMMITTED CNI pod IP into a netns from the
+# authoritative /var/lib/cni/results record — independent of which netns inode the
+# AWS VPC CNI populated (fix C, ka-0000001099). This is the layer that closes the
+# two-inode split: Fix B's reassert_l3 captures L3 FROM a netns ($BNETNS_PATH, the
+# sandbox netns) and re-applies it — but in the runsc placeholder topology the CNI
+# installed the IP into the PAUSE netns, a different inode, so the sandbox-netns
+# capture found nothing (CAP_ADDRS empty, l3-reasserted=no). self_ipam does not
+# capture from any source netns at all: it takes the IP straight from the committed
+# CNI result ($CNI_POD_IP) and writes it into whatever inode $1 names — which the
+# caller sets to the restored sentry's OWN netns (/proc/<RPID>/ns/net), i.e. the
+# exact inode the restore lands in. AWS VPC CNI gives the pod eth0 only a /32 with
+# no on-link subnet and routes everything via a synthetic link-scope gateway
+# (169.254.1.1), so we mirror that: force the addr to /32, add an on-link host route
+# to the gateway (scope link, dev eth0), then the default via it. Order matters — the
+# gateway route must exist before 'default via <gw>' or it fails "Nexthop has invalid
+# gateway". Idempotent + guarded: no-op if $CNI_POD_IP is empty (CNI unconfirmed) or
+# the netns has no eth0; every op is best-effort (|| true) so an already-present addr/
+# route (EEXIST, e.g. a non-split topology that DID populate this netns) is success.
+self_ipam() { # $1 = netns reference (typically /proc/<RPID>/ns/net, the restore target)
+  local ref="$1" ip32
+  [ -n "$CNI_POD_IP" ] || return 0
+  HMNT nsenter --net="$ref" -- test -d /sys/class/net/eth0 2>/dev/null || \
+    HMNT nsenter --net="$ref" -- ip link show eth0 >/dev/null 2>&1 || return 0
+  # normalize to a /32 host address (AWS VPC CNI pod eth0 carries no subnet).
+  ip32="${CNI_POD_IP%/*}/32"
+  HMNT nsenter --net="$ref" -- ip link set eth0 up 2>/dev/null || true
+  HMNT nsenter --net="$ref" -- ip addr add "$ip32" dev eth0 2>/dev/null || true
+  # on-link host route to the synthetic link-scope gateway, then the default via it.
+  HMNT nsenter --net="$ref" -- ip route add "$CNI_GW" dev eth0 scope link 2>/dev/null || true
+  HMNT nsenter --net="$ref" -- ip route add default via "$CNI_GW" dev eth0 2>/dev/null || true
+}
+# netns_routable returns rc 0 iff netns $1 currently carries a routable L3: a
+# global-scope IPv4 on a non-loopback iface AND a default route. Used by fix A
+# (ka-0000008207) to RE-VERIFY the restore-target inode is routable in the few
+# hundred ms after the final pre-restore reassert_l3/self_ipam and BEFORE the
+# backgrounded 'runsc restore' detaches and its setupNetwork() scrapes the netns
+# into the sentry netstack. If a late async kubelet CNI DEL re-stripped the addr/
+# route in that window, this returns non-zero and the caller re-applies once more,
+# closing the race the post-restore [6a] L3 apply cannot (it lands after the
+# scrape). Same probes as cni_add_complete but parameterized on an arbitrary ref
+# (the pinned path), all HMNT so we read the same host-ns netns runsc setns-es into.
+netns_routable() { # $1 = netns reference (pinned path or /proc/<pid>/ns/net)
+  local ref="$1"
+  HMNT nsenter --net="$ref" -- ip -4 -o addr show scope global 2>/dev/null \
+    | awk '$2!="lo"{f=1} END{exit !f}' || return 1
+  HMNT nsenter --net="$ref" -- awk 'NR>1 && $2=="00000000"{f=1} END{exit !f}' /proc/net/route 2>/dev/null || return 1
+  return 0
+}
+# STALE-MOUNT REAP (ka-0000007807, MR !5044 review). A hard-killed prior thaw of
+# this SAME BSB can leave a stale bind-mount at either controller-owned pin path
+# (the fix-B pin below and the [4-pre] hold); mounting over one would STACK a
+# second bind-mount that a single later umount won't fully release. Best-effort
+# umount+rm of both candidates before any pin — BSB is unique per placeholder
+# pod, so only our own prior leftovers can match; no verdict logic changes.
+for _stale in "/var/run/netns/gb-thaw-$BSB" "/var/run/netns/gb-thaw-hold-$BSB"; do
+  HMNT umount "$_stale" 2>/dev/null || true; HMNT rm -f "$_stale" 2>/dev/null || true
+done
+# NETNS PIN (fix B, ka-0000007713). Pod B's CNI netns ($BNETNS_PATH) is owned by
+# the kubelet/CNI, NOT by us. The [4] teardown below force-deletes Pod B's
+# pause/sandbox container (runsc delete --force) to free the cid for the restore —
+# and the kubelet, seeing the pod sandbox die, races a CNI DEL that UNMOUNTS
+# /var/run/netns/cni-<B>. On the credentialed canary fr84 that netns was GONE by
+# restore time, so runsc restore could not setns into it and silently fell back
+# ANONYMOUS netns with ONLY lo (no eth0, empty route table) -> the rehydrate-ack
+# gate fail-closed network-unreachable on BOTH coop AND gb 60s later. PIN the
+# netns by bind-mounting it to a controller-owned, kubelet-invisible path BEFORE
+# any teardown: a bind-mount holds the netns inode alive even if the kubelet
+# unmounts its own cni-<B> reference, so the restore can still setns into the SAME
+# (eth0-carrying) namespace instead of falling back to an anonymous lo-only one.
+# Repoint the restore spec at the PINNED path (the [3]/[3-sandbox] netns repoint
+# below uses $BNETNS_PATH, reassigned here). HMNT (host mount ns) so the mount
+# lands where runsc reads it (ka-0000002536). The shared bind-mount keeps the SAME
+# inode, so the netns PROOF below still matches; the inode is stat-ed AFTER the pin
+# so FT_B_NETNS/FT_B_NETNS_PATH describe the path the restore actually targets.
+# Best-effort: if the pin fails we fall back to the original CNI path (pre-fix
+# behavior) — Fix A's netns-content assertion still fails-closed LOUD if the
+# restore lands network-less, so a missed pin degrades to a loud restore failure,
+# never a silent 60s-later ack timeout.
+PINNED_NETNS="/var/run/netns/gb-thaw-$BSB"
+if HMNT mkdir -p /var/run/netns 2>/dev/null \
+   && HMNT test -e "$BNETNS_PATH" \
+   && HMNT touch "$PINNED_NETNS" 2>/dev/null \
+   && HMNT mount --bind "$BNETNS_PATH" "$PINNED_NETNS" 2>/dev/null; then
+  log "pinned Pod B CNI netns $BNETNS_PATH -> $PINNED_NETNS (survives the placeholder-graft sandbox delete + kubelet CNI DEL)"
+  BNETNS_PATH="$PINNED_NETNS"
+  echo "FT_NETNS_PINNED=$PINNED_NETNS"
+else
+  log "WARN could not pin Pod B CNI netns $BNETNS_PATH (proceeding with the original kubelet-owned path; Fix A's netns-content assertion fails-closed loud if the restore lands lo-only)"
+  echo "FT_NETNS_PINNED="
+fi
+# the restore proof compares INODES (FT_RESTORED_NETNS is the sentry's
+# readlink /proc/<pid>/ns/net = net:[inode]); express B's netns as the same
+# net:[inode] form by stat-ing the (now-pinned) bind-mounted netns file in the
+# host ns.
+BNETNS_INODE=$(HMNT stat -L -c 'net:[%i]' "$BNETNS_PATH" 2>/dev/null)
+echo "FT_B_SANDBOX_CID=$BSB"
+echo "FT_B_AGENT_CID=$BAG"
+echo "FT_B_POD_UID=$BPODUID"
+echo "FT_B_NETNS_PATH=$BNETNS_PATH"
+echo "FT_B_NETNS=$BNETNS_INODE"
+
+# [2] reconstruct each container's rootfs overlay in host-init's ns from the
+# opts captured at freeze. Collapse original {lower+upper} into a fresh RO
+# lowerdir (old upper first so written files win), give a fresh upper/work, and
+# whiteout any leftover .gvisor.filestore.* so runsc's overlay guard is happy.
+#
+# MOUNT-NAMESPACE INVARIANT (ka-0000002536): freeze now writes the OCI bundle in
+# the HOST mount ns (nsenter -t 1 -m), the same ns runsc restore reads it from. So
+# EVERY $BUNDLE/$OVER op on thaw must also run in the host ns — a plain rm/mkdir/
+# cat/python in the probe ns (chroot /host) would prep upper/work dirs and read
+# overlay-opts/config.json on a DIFFERENT filesystem than the one the HMNT overlay
+# mount and runsc restore consume, reintroducing the rc=128 FetchSpec defect.
+HMNT rm -rf "$OVER"
+build_lowers() { local opts="$1" upper lower
+  upper=$(echo "$opts" | tr ',' '\n' | sed -n 's/^upperdir=//p')
+  lower=$(echo "$opts" | tr ',' '\n' | sed -n 's/^lowerdir=//p')
+  if [ -n "$upper" ]; then echo "${upper}:${lower}"; else echo "$lower"; fi
+}
+# remount_rootfs reconstructs one container's rootfs overlay. It returns non-zero
+# (and the caller fails LOUD) when a lowerdir source is missing or the mount
+# itself errors — DO NOT swallow either, or the rootfs is left unmounted and
+# runsc restore surfaces the OPAQUE "reading mounts file: unexpected end of JSON
+# input" sub rc=128 instead of the real cause (ka-0000000655, fix C).
+remount_rootfs() { local dstn="$1" opts="$2" lowers up wk d
+  [ -z "$opts" ] && { log "FATAL: no overlay opts for $dstn — bundle is un-thawable"; return 1; }
+  lowers=$(build_lowers "$opts"); up="$OVER/$dstn/upper"; wk="$OVER/$dstn/work"
+  # PRE-MOUNT lowerdir existence assertion (fix C). build_lowers may concat
+  # upper:lower with ':'-separated lowerdir segments; assert EACH exists in the
+  # HOST ns (HMNT) where the mount runs. A GC'd source is the "special device
+  # overlay does not exist" cause — diagnose it HERE, by name, not 3 steps later
+  # as an empty-mounts JSON error. (Freeze fix B rewrites opts to a preserved,
+  # GC-safe $BUNDLE/$dstn/lower, so post-fix this should always pass; it stays as
+  # the fail-closed guard for any future regression of the source-preservation.)
+  local IFS=':'
+  for d in $lowers; do
+    HMNT test -d "$d" || { log "FATAL: $dstn overlay lowerdir missing at thaw: $d (GC'd with Pod A teardown?). mount -t overlay would ENOENT 'special device overlay does not exist' and leave rootfs unmounted -> runsc restore reads an empty mounts file -> sub rc=128. NOT a restore-internal failure."; return 1; }
+  done
+  unset IFS
+  HMNT mkdir -p "$up" "$wk"
+  HMNT umount "$BUNDLE/$dstn/rootfs" 2>/dev/null || true
+  # capture the mount rc directly (the prior pipe to sed masked it with sed's rc);
+  # surface the error AND fail loud so the un-mountable rootfs never reaches runsc.
+  if ! HMNT mount -t overlay overlay "$BUNDLE/$dstn/rootfs" -o "lowerdir=$lowers,upperdir=$up,workdir=$wk,index=off" 2> "$OVER/$dstn.mnterr"; then
+    HMNT sed "s|^|    $dstn overlay: |" "$OVER/$dstn.mnterr" >&2 2>/dev/null || true
+    log "FATAL: $dstn rootfs overlay mount failed (lowerdir=$lowers) — rootfs left unmounted; runsc restore would surface the opaque empty-mounts JSON error. NOT a restore-internal failure."
+    return 1
+  fi
+  # POST-MOUNT CWD-DENTRY assertion (ka-0000008217) — SELF-MEDIUM ONLY, gated on
+  # the overlay medium (ka-0000000357, the dir-medium thaw rc=128 REGRESSION fix).
+  #
+  # WHAT THIS ASSERTS. The container's checkpointed process.cwd (cwd=/home/agent/
+  # workspace on a real agent — an image WORKDIR served by THIS rootfs gofer, not a
+  # kubelet EmptyDir, so the data-driven [3] gofer-preserve sweep structurally
+  # cannot cover it) is the exact path the restored sentry's vfs.CompleteRestore()
+  # 9p-walks against mount "$dstn:/" the instant it resumes.
+  #
+  # WHY IT MUST BE MEDIUM-GATED. This test inspects the freshly-reconstructed,
+  # LOWER-ONLY rootfs overlay BEFORE any runsc restore. That is only sound under the
+  # SELF/default medium, where on-node inspection (ka-0000006205) PROVED the
+  # preserved freeze lower carries home/agent/workspace — so a missing dentry there
+  # localizes a genuine thaw-side overlay-reconstruction loss.
+  #
+  # Under the DIR medium (--overlay2=root:dir, OVERLAY_FLAG non-empty) the original
+  # pre-restore *fail-close* on this test was a structural FALSE-NEGATIVE (the prod
+  # 2026.174.3 regression, crew pk8 canary ka-0000005316): gVisor stores the rootfs-
+  # overlay UPPER in a filestore that runsc createGoferFilestoreInDir()s then
+  # IMMEDIATELY unlinks (open fd only; the dir is EMPTY on disk — verified on-node
+  # ka-0000007329). The runtime writes under /home/agent/workspace therefore live as
+  # guest MemoryFile pages serialized by 'runsc checkpoint' into the checkpoint page
+  # files (pages.img/pages_meta.img) and rebuilt by 'runsc restore', NOT carried in
+  # the host IMAGE LOWER the freeze [3] 'cp -a' reads — so fail-closing because the
+  # lower lacks that *content* was wrong, and the prior fix (ka-0000000357) correctly
+  # REMOVED the fail-close on dir medium.
+  #
+  # BUT removing the guard was NECESSARY-NOT-SUFFICIENT, and the canary still rc=128'd
+  # (ka-0000004935). Adversarial review of the deployed runsc (release-20260525.0)
+  # source corrected the load-bearing premise: 'runsc restore' does NOT merely rebuild
+  # the upper and ignore the lower. gofer.(*filesystem).CompleteRestore ->
+  # restoreDescendantsRecursive -> (*dentry).restoreFile re-walks EVERY non-synthetic
+  # dentry that was cached at checkpoint against the LIVE gofer LOWER, top-down. The
+  # agent's process.cwd (/home/agent/workspace, an image WORKDIR served by THIS rootfs
+  # gofer — mount "agent:/") is one such cached dentry, so restore re-walks it on the
+  # lower; the relocated lower is MISSING /home entirely (prod forensics: proc/run/usr
+  # present but bin/etc/lib/home/opt ABSENT, markers in pages.img) -> ENOENT ->
+  # 'failed to walk "home/agent/workspace" of type 040000 in mount "agent:/"' ->
+  # sub rc=128. This is the gofer LOWER re-walk of the dentry's existence, distinct
+  # from the upper CONTENT — which is exactly why "the upper rides checkpoint.img"
+  # reasoning could not make it disappear.
+  #
+  # So under dir medium we MATERIALIZE the empty CWD dir into the merged rootfs view
+  # (below) so the re-walk resolves; the content overlays from the rebuilt upper. NB the
+  # mkdir targets the mounted host-overlay mountpoint $BUNDLE/$dstn/rootfs, so the new dir
+  # physically lands in the host-overlay UPPER ($OVER/$dstn/upper), NOT $BUNDLE/$dstn/lower
+  # — but it is visible at the merged mountpoint the restore gofer serves as root.path,
+  # which is the gofer-lower the sentry re-walk resolves against. The gardener-floated
+  # "freeze-sync the dir filestore before the cp" still cannot help (the upper is an
+  # unlinked fd + guest memory, and 'cp -a' reads the gofer image-lower regardless),
+  # and we do NOT touch freeze step-3. Read cwd for diagnostics on either medium (it
+  # is the spec runsc restore itself consumes).
+  local cwd
+  cwd=$(HMNT python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("process",{}).get("cwd",""))
+except Exception: print("")' "$BUNDLE/$dstn/config.json" 2>/dev/null)
+  if [ -n "$OVERLAY_FLAG" ]; then
+    # DIR MEDIUM: re-materialize the EMPTY checkpointed CWD *directory chain* into the
+    # merged rootfs view so 'runsc restore' vfs.CompleteRestore can re-walk it
+    # (ka-0000004935 — the REAL rc=128 fix). The mkdir below targets the mounted overlay
+    # mountpoint $BUNDLE/$dstn/rootfs, so the write lands in the host-overlay UPPER
+    # ($OVER/$dstn/upper), NOT $BUNDLE/$dstn/lower; it surfaces at the merged mountpoint
+    # the restore gofer serves (root.path) — the gofer-lower the sentry walks against —
+    # so the walk resolves regardless of which host-overlay layer physically holds it.
+    # The restore re-walk needs the dentry to
+    # EXIST and stat as a directory; gVisor (release-20260525.0, verified) does NOT
+    # preserve/revalidate inoKey/QID across C/R (restoreFile adopts the fresh inode)
+    # and applies NO size/mtime/type validation to a directory, so a same-name same-
+    # TYPE mkdir is sufficient for the walk. The real content overlays from the rebuilt
+    # upper (checkpoint pages); a plain mkdir carries no opaque xattr / whiteout, so it
+    # cannot mask the upper. mkdir -p creates the FULL ancestor chain (restore walks
+    # top-down and fails at the shallowest missing component, so /home and /home/agent
+    # must exist too). Best-effort chown to the checkpointed CWD owner (default 1000 —
+    # the agent image WORKDIR owner) so the resumed agent can write its workspace;
+    # restore itself does not check uid. Idempotent: only mkdir when the path is
+    # genuinely MISSING (a lower that already carries it is left untouched).
+    #
+    # rc DISCIPLINE: this is the last statement in remount_rootfs and the caller
+    # fail-closes on its rc, so the block MUST end with rc 0 for the sandbox/pause
+    # container (cwd=/) and any empty cwd. The outer cwd-non-empty/non-"/" if guards
+    # those, and the trailing ':' pins rc 0 on every path. We do NOT fail-close here
+    # on a mkdir failure (best-effort): the restore rc + the [6b] post-restore
+    # NON-EMPTY liveness guard are the real backstops.
+    if [ -n "$cwd" ] && [ "$cwd" != "/" ]; then
+      if HMNT test -e "$BUNDLE/$dstn/rootfs/${cwd#/}"; then
+        log "note: $dstn CWD '$cwd' already present in the merged rootfs view (overlay upper) under dir medium ($OVERLAY_FLAG); runsc restore re-walks it cleanly (ka-0000004935)."
+      else
+        cwduid=$(HMNT python3 -c 'import json,sys
+try:
+    u=json.load(open(sys.argv[1])).get("process",{}).get("user",{})
+    print("%d:%d"%(int(u.get("uid",1000)),int(u.get("gid",1000))))
+except Exception: print("1000:1000")' "$BUNDLE/$dstn/config.json" 2>/dev/null)
+        [ -z "$cwduid" ] && cwduid="1000:1000"
+        if HMNT mkdir -p "$BUNDLE/$dstn/rootfs/${cwd#/}" 2>/dev/null; then
+          HMNT chown "$cwduid" "$BUNDLE/$dstn/rootfs/${cwd#/}" 2>/dev/null || true
+          log "MATERIALIZED $dstn CWD dir '$cwd' (owner $cwduid) in the merged rootfs view (overlay upper) under dir medium ($OVERLAY_FLAG): the checkpointed process.cwd is an image WORKDIR served by the rootfs gofer, but the relocated lower lacked it, so 'runsc restore' vfs.CompleteRestore would 9p-walk '$cwd' in mount '$dstn:/' and ENOENT -> sub rc=128. Re-created the EMPTY dir chain so the gofer re-walk resolves; the workspace CONTENT overlays from the rebuilt upper (checkpoint pages). Real round-trip of that content is asserted post-restore by the [6b] non-empty liveness guard (ka-0000004935, ka-0000000357)."
+        else
+          log "WARN $dstn could not mkdir CWD dir '$cwd' in the merged rootfs view (overlay upper) under dir medium ($OVERLAY_FLAG) — runsc restore may 9p-walk ENOENT it (sub rc=128). NOT fail-closing here (best-effort); the restore rc + [6b] liveness guard remain the backstop."
+        fi
+      fi
+    fi
+    :
+  elif [ -n "$cwd" ] && [ "$cwd" != "/" ]; then
+    # SELF/DEFAULT MEDIUM: the preserved lower DOES carry the CWD (ka-0000006205).
+    # The fix-C guard above only asserts the lowerdir DIRECTORY exists; this asserts
+    # the CWD subpath survived the collapse-and-remount, in the HOST ns (HMNT) where
+    # runsc reads the rootfs. Without it a lower that mounts clean but lacks the CWD
+    # dentry rc=128's OPAQUELY as a vfs.CompleteRestore 9p-walk ENOENT. Fail LOUD, by
+    # name, so the next driven-thaw canary bisects overlay-reconstruction vs Pod-B
+    # rootfs-wiring instead of the opaque empty-mounts/9p-walk rc=128.
+    if ! HMNT test -e "$BUNDLE/$dstn/rootfs/${cwd#/}"; then
+      log "FATAL: $dstn reconstructed rootfs overlay is MISSING the container CWD dentry '$cwd' (lowerdir=$lowers) under the SELF/default overlay medium. The restored sentry's vfs.CompleteRestore() will 9p-walk '$cwd' in mount '$dstn:/' and ENOENT -> sub rc=128. Under self medium the preserved freeze lower carries this path (ka-0000006205), so its absence here localizes the loss to thaw-side overlay RECONSTRUCTION (the collapse-to-lower or this remount), NOT freeze-preserve. (Correctly SKIPPED under the dir medium, where the upper rides checkpoint.img and is rebuilt by runsc restore — ka-0000000357.) NOT a restore-internal failure."
+      return 1
+    fi
+  fi
+}
+for dstn in $DSTNS; do
+  # read .overlay-opts in the HOST ns (HMNT cat) — that is where freeze wrote it.
+  if ! remount_rootfs "$dstn" "$(HMNT cat "$BUNDLE/$dstn/.overlay-opts" 2>/dev/null)"; then
+    echo "FT_ROOT_RC=128"
+    exit 1
+  fi
+  HMNT bash -c "rm -f $BUNDLE/$dstn/rootfs/.gvisor.filestore.* 2>/dev/null" || true
+done
+
+# [2c] PRE-CREATE the NEW agent's thaw-state hostPath (fix, bug ka-0000000673 /
+# ka-0000001104). The [3] rewrite below FORCES the agent bundle's MountThawState
+# mount SOURCE to $THAWDIR (the new agent's per-agent dir the controller's
+# NodeRehydrationTrigger writes the marker into + polls acks from). That forced
+# source must EXIST in the host ns before the [3a] dangling-source guard runs (an
+# absent source is exactly what makes the sub gofer's ResolveMounts die -> empty
+# --mounts-fd pipe -> the opaque sub rc=128) AND be agent-UID-writable so the
+# restored coop/gb watchers can write their .done acks beside the controller's
+# marker. The controller's writeMarker (freezethaw_rehydrate.go) also mkdir+chowns
+# this dir, but it runs AFTER the restore — so create it HERE too, idempotently, so
+# the restore-time mount has a real, writable source. HostPath DirectoryOrCreate
+# semantics: a dir the kubelet/controller may have already provisioned is untouched
+# (mkdir -p / chown are no-ops). SKIPPED when $THAWDIR is empty (legacy snapshot /
+# older controller) so the pre-fix path carries zero blast radius.
+if [ -n "$THAWDIR" ]; then
+  HMNT mkdir -p "$THAWDIR" 2>/dev/null || log "WARN could not pre-create thaw-state dir $THAWDIR (the [3a] guard will fail-close if the forced source is absent)"
+  # chown/chmod make the forced source agent-UID-owned + group-writable so the
+  # restored coop/gb watchers (running as UID/GID 1000) can write their .done acks
+  # beside the controller's marker. A SILENT failure here (read-only fs, an
+  # immutable bit, or a kubelet-pre-provisioned root-owned DirectoryOrCreate dir)
+  # used to be swallowed with '|| true' — leaving the dir root-owned/non-group-
+  # writable so the agent's ack EACCESes through the mount and re-trips the very
+  # both-consumer rehydrate fail-close ka-0000000673/ka-0000001104 targets. WARN
+  # loudly on each failure instead, and PROVE writability in [2c-assert] below.
+  HMNT chown 1000:1000 "$THAWDIR" 2>/dev/null || log "WARN chown 1000:1000 $THAWDIR failed — thaw-state dir may stay root-owned; the [2c-assert] agent-writability guard below fail-closes if so"
+  HMNT chmod 0775 "$THAWDIR" 2>/dev/null || log "WARN chmod 0775 $THAWDIR failed — thaw-state dir may not be group-writable; the [2c-assert] agent-writability guard below fail-closes if so"
+  # [2c-assert] FAIL-CLOSED agent-writability assertion (ka-0000004248). The
+  # restored coop/gb watchers run as UID/GID 1000 and MUST create their .done ack
+  # in $THAWDIR (the forced MountThawState source). Stat it in the HOST ns and
+  # prove the agent can write: owner-writable+searchable as UID 1000, OR group-
+  # writable+searchable as GID 1000, OR world-writable+searchable. If none hold,
+  # the chown/chmod above silently did not take — driving the restore anyway would
+  # EACCES the ack and fail-close the both-consumer rehydrate gate ~60s later as
+  # an OPAQUE timeout. Diagnose it HERE, by owner/group/mode, with FT_ROOT_RC=128
+  # — the same fail-loud contract the [3a] dangling-source guard uses — instead of
+  # swallowing it. Runs before [3a] so a non-writable forced source fails by name,
+  # not as a downstream gate timeout.
+  twperm=$(HMNT python3 - "$THAWDIR" <<'PYTWPERM'
+import os,stat,sys
+d=sys.argv[1]
+try:
+    st=os.stat(d)
+except OSError as e:
+    print("MISSING %s"%e); sys.exit(0)
+m=st.st_mode
+# UID/GID 1000 can create a file in d iff it has BOTH write and execute (search)
+# on d via whichever class applies: owner (uid==1000), group (gid==1000), or other.
+owner_ok=st.st_uid==1000 and (m&stat.S_IWUSR) and (m&stat.S_IXUSR)
+group_ok=st.st_gid==1000 and (m&stat.S_IWGRP) and (m&stat.S_IXGRP)
+other_ok=(m&stat.S_IWOTH) and (m&stat.S_IXOTH)
+print("OK" if (owner_ok or group_ok or other_ok)
+      else "DENY uid=%d gid=%d mode=%04o"%(st.st_uid,st.st_gid,stat.S_IMODE(m)))
+PYTWPERM
+)
+  case "$twperm" in
+    OK*) log "fix ka-0000000673: pre-created + verified agent-writable thaw-state dir $THAWDIR for the MountThawState source re-point" ;;
+    *)   log "FATAL: thaw-state dir $THAWDIR is NOT writable by the restored agent (UID/GID 1000) after the [2c] pre-create ($twperm). The chown 1000:1000 / chmod 0775 silently failed (read-only fs, an immutable bit, or a kubelet-pre-provisioned root-owned dir), so the restored coop/gb watchers cannot write their .done ack into the forced MountThawState source -> the ack EACCESes through the mount -> the both-consumer rehydrate gate fail-closes ~60s later as an OPAQUE timeout (ka-0000000673/ka-0000001104 regression). Diagnosed HERE by owner/group/mode, NOT as that downstream timeout. NOT a restore-internal failure."
+         echo "FT_ROOT_RC=128"; exit 1 ;;
+  esac
+fi
+
+# [3] normalize EACH sub-container bundle's mount DESTINATIONS /var/run/* -> /run/*
+# so RestoreValidateSpec's destination set matches the symlink-resolved checkpoint,
+# and repoint the GC'able sources to the preserved node-local copies + B ids.
+# HMNT python3: the config.json read+rewrite must happen in the HOST ns bundle.
+#
+# SANDBOX-ID ANNOTATION REPOINT (fix-b, ka-0000004146). The original thaw rc=128
+# SUB failure was 'cannot load sandbox: open
+# /run/containerd/runsc/k8s.io/<A-sandboxCID>_sandbox:<A-sandboxCID>.state: no such
+# file or directory' — the sub-container's spec still carried Pod A's
+# io.kubernetes.cri.sandbox-id annotation, so runsc restore of the sub tried to
+# JOIN sandbox A and load A's sandbox .state file. That .state was destroyed when
+# Pod A was torn down at freeze (containerd GC'd the runsc sandbox dir). The sub
+# must join Pod B's sandbox (BSB) — whose .state the [5] root restore freshly wrote
+# under the controller-owned $ROOT — so rewrite EVERY annotation value that names
+# the A sandbox-cid / A pod-uid over to B. (Mirrors the source rewrite below.)
+# The same annotation rewrite is correct for the agent AND every sidecar (each
+# carries the same A sandbox-id / A pod-uid). Mount SOURCES are repointed by
+# DESTINATION to Pod B's live source (see the ka-0000004815 block below), which
+# subsumes the old A->B uid substring repoint for kubelet bind sources (incl. the
+# sidecars' fresh dind-storage/postgres-data emptyDirs); /work alone rides the
+# preserved warm copy.
+# BIND-SOURCE REPOINT BY DESTINATION (fix, ka-0000004815). The empty-mounts sub
+# rc=128 ("reading mounts file: unexpected end of JSON input") is runsc's INTERNAL
+# --mounts-fd os.Pipe closing EMPTY: the sub-container's gofer dies during
+# ResolveMounts — walking the bind-mount SOURCES — BEFORE WriteMounts, so runsc
+# ReadMounts() the empty pipe. The pause sandbox has no bind sources to walk (root
+# restores fine, ROOT_RC=0); the agent sub does (sub=128) — exactly the asymmetry.
+# At the real lifecycle Pod A is kubectl-deleted at freeze, so the kubelet GC's the
+# whole /var/lib/kubelet/pods/<A-uid>/ tree; Pod B has a fresh uid. Repointing those
+# GC'd sources A-uid->B-uid by SUBSTRING (the prior code) silently fails for any
+# source path with a PER-POD-RANDOM component beyond the uid — /dev/termination-log
+# (.../containers/<name>/<hex>) and the projected SA token (kube-api-access-<rand>) —
+# leaving a dangling A-side source on Pod B -> the gofer dies -> empty mounts pipe.
+# Pod B is the SOURCE OF TRUTH for the fresh kubelet bindings (it is still live here;
+# [4] deletes it AFTER this rewrite) and was minted from the SAME pod template
+# (shapePlaceholderSpec), so its mount DESTINATION set matches A's while its SOURCES
+# are the correct fresh kubelet paths. So repoint each sub mount SOURCE to Pod B's
+# live source for the SAME destination; keep /work -> the preserved warm copy
+# ($BUNDLE/.work, which carries A's warm data B's fresh emptyDir lacks); fall back to
+# the A->B substring rewrite for any destination Pod B lacks. The [3a] guard then
+# fails loud on any source that still does not resolve.
+for dstn in $SUBNAMES; do
+# resolve Pod B's LIVE bundle config.json for this sub (runsc-state bundle field,
+# then the v2 task dir) so we can read its fresh per-destination sources.
+bc=$(bcid_for "$dstn")
+BDIR=$(RUNSC state "$bc" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("bundle",""))' 2>/dev/null)
+BCFG=""
+for cand in "$BDIR/config.json" "$T/$bc/config.json"; do
+  HMNT test -f "$cand" && { BCFG="$cand"; break; }
+done
+[ -z "$BCFG" ] && log "WARN no live Pod B bundle config for sub '$dstn' (cid=$bc) — falling back to A->B substring source repoint; [3a] guard will catch any dangling source"
+HMNT python3 - "$BUNDLE/$dstn/config.json" "$ASB" "$BSB" "$APOD" "$BPODUID" "$BUNDLE" "$BCFG" "$THAWDIR" "$THAWDEST" <<'PYAGENT'
+import json,sys
+p,asb,bsb,apod,bpod,bundle,bcfg,thawdir,thawdest=sys.argv[1:10]
+c=json.load(open(p))
+# build a destination->source map from Pod B's LIVE bundle. Normalize B's mount
+# destinations the same way (/var/run -> /run) so the keys line up with the
+# checkpoint-resolved destinations we rewrite the A bundle to.
+bsrc={}
+if bcfg:
+    try:
+        b=json.load(open(bcfg))
+        for m in b.get("mounts",[]):
+            d=m.get("destination","")
+            if d.startswith("/var/run/"): d="/run/"+d[len("/var/run/"):]
+            if d: bsrc[d]=m.get("source","")
+    except Exception:
+        bsrc={}
+# load the data-driven gofer-preserve manifest (ka-0000006427): destination ->
+# $BUNDLE/.gofer/<n> for every runtime-populated 9p gofer EmptyDir/subPath mount
+# the freeze warm-copied. These MUST win over the bsrc[d] live-source branch
+# below: Pod B's live source for such a destination is the FRESH EMPTY kubelet
+# dir, whose 9p walk for a runtime subtree (e.g. ~/.claude/projects) would ENOENT
+# -> agent sub rc=128. Repointing to the warm copy carries that subtree across C/R.
+import os as _os
+def _atomic_overlay(path,data):
+    # ATOMIC byte-overlay (ka-0000005326 nit 1): write data over the backing file
+    # path resolves to, all-or-nothing. Follow the atomic-writer symlink chain to
+    # the REAL backing file first (so the rename lands on it, not on a link), write a
+    # temp file in the SAME dir (same fs -> rename is atomic), fsync it durable, then
+    # os.rename over the target. A write interrupted mid-flush (ENOSPC/EIO) leaves the
+    # temp file, never a truncated backing token — the restored coop reads either the
+    # old or the full new token, never a half JWT (which it would reject as Malformed).
+    import tempfile
+    rp=_os.path.realpath(path)
+    d=_os.path.dirname(rp)
+    fd,tmp=tempfile.mkstemp(dir=d,prefix=".tok.")
+    try:
+        _os.write(fd,data)
+        _os.fsync(fd)
+    finally:
+        _os.close(fd)
+    _os.rename(tmp,rp)
+gofer={}
+try:
+    _raw=json.load(open(_os.path.join(bundle,".gofer","manifest.json")))
+    # NORMALIZE the manifest keys the same /var/run -> /run way the mount
+    # destinations are normalized below, and KEY BOTH FORMS, so the 'd in gofer'
+    # lookup hits regardless of which form the freeze-side manifest recorded
+    # (ka-0000007745). THE GAP this closes: the freeze sweep (PYGOFER) keys the
+    # warm-copy manifest by the RAW OCI destination — e.g. the EKS projected SA
+    # token at /var/run/secrets/eks.amazonaws.com/serviceaccount — but the loop
+    # below normalizes 'd' to /run/secrets/... BEFORE the 'd in gofer' test, so a
+    # raw /var/run key NEVER matched. The warm copy was silently skipped and the
+    # loop fell through to bsrc[d] (Pod B's FRESH EMPTY projected-token dir). The
+    # restored sentry's vfs.CompleteRestore 9p walk for the runtime subtree under
+    # that mount then ENOENTs -> the agent sub gofer dies in ResolveMounts BEFORE
+    # WriteMounts -> runsc's internal --mounts-fd os.Pipe closes EMPTY -> the
+    # opaque "reading mounts file: unexpected end of JSON input" agent sub rc=128
+    # (root restores clean / ROOT_RC=0 — the pause sandbox has no such 9p tree).
+    # [3a]'s os.path.exists guard could not catch it: Pod B's fresh dir EXISTS, so
+    # the source root resolves; only the DEEP 9p walk of the checkpoint subtree
+    # fails. Keying both forms HERE (not only at freeze) also lets a snapshot
+    # frozen by an older controller thaw correctly.
+    for _k,_v in _raw.items():
+        gofer[_k]=_v
+        if _k.startswith("/var/run/"): gofer["/run/"+_k[len("/var/run/"):]]=_v
+        elif _k.startswith("/run/"):   gofer["/var/run/"+_k[len("/run/"):]]=_v
+except Exception:
+    gofer={}
+# repoint the CRI annotations that name the sandbox the sub joins, so the restored
+# sub loads Pod B's sandbox .state (BSB) and not Pod A's GC'd one.
+ann=c.get("annotations",{})
+for k,v in list(ann.items()):
+    if asb and asb in v: ann[k]=v.replace(asb,bsb).replace(apod,bpod) if apod else v.replace(asb,bsb)
+    elif apod and apod in v: ann[k]=v.replace(apod,bpod)
+# SA/IRSA TOKEN MOUNT ALLOWLIST (ka-0000004956 overlay + ka-0000008074 forced source).
+# The TWO projected serviceaccount token mount destinations (normalized /run/... form,
+# since 'd' is normalized below before the lookups). These get their OWN forced-source
+# branch below (highest precedence after the thaw-state force): they bind ONLY to the
+# stable controller-owned warm copy, never the ephemeral live-Pod-B source — and their
+# warm copy is byte-overlaid with Pod B's live token. The set is also the overlay
+# allowlist: a blanket overlay would clobber the /home/agent/.claude etc. warm trees
+# and reintroduce ka-0000006427.
+_SA_TOKEN_DIRS={"/run/secrets/eks.amazonaws.com/serviceaccount","/run/secrets/kubernetes.io/serviceaccount"}
+for m in c.get("mounts",[]):
+    d=m.get("destination","")
+    if d.startswith("/var/run/"):
+        m["destination"]="/run/"+d[len("/var/run/"):]
+        d=m["destination"]
+    s=m.get("source","")
+    if thawdir and d==thawdest:
+        # THAW-STATE SOURCE RE-POINT (fix, bug ka-0000000673 / ka-0000001104). HIGHEST
+        # precedence — overrides the bsrc[d] live-Pod-B branch below. The thaw-state
+        # hostPath (MountThawState=/run/gardenio-thaw) is the C5 rehydrate rendezvous:
+        # the controller's NodeRehydrationTrigger writes the epoch marker into + polls
+        # the consumer .done acks from thawStateHostDir(<NEW agent>) on the node, and
+        # the restored coop/gb watchers read the marker + write their acks through this
+        # mount. On the warm-B graft path Pod B is a pool placeholder minted from a
+        # DIFFERENT agent's snapshot template (shapePlaceholderSpec), so bsrc[d] (Pod
+        # B's LIVE source) is thawStateHostDir(<placeholder-template-agent>) — and the
+        # checkpointed agent bundle carries thawStateHostDir(<frozen agent>). BOTH are
+        # the WRONG dir: the restored watchers ack into a stale thaw-state the
+        # controller never polls -> guaranteed both-consumer fail-close every cycle
+        # (instrumented canary #7, prod 2026.180.27). Only the controller knows the new
+        # agent's identity, so it threads thawStateHostDir(req.AgentName) in as $THAWDIR
+        # and we FORCE the source here, overriding every live/warm/substring branch.
+        # The node pre-created + chowned $THAWDIR at [2c], so the forced source resolves
+        # (the [3a] guard passes) and is agent-writable for the ack. Unlike the
+        # ka-0000006427 EmptyDir mounts, the thaw-state dir holds only poll-loop marker/
+        # ack/armed files (no deep runtime subtree the checkpoint cached a dentry for),
+        # and canary #7 restored rc=0 with this mount pointed at the placeholder's
+        # different-content dir — proving vfs.CompleteRestore re-walks only the
+        # mountpoint, not the contents — so re-pointing to the new agent's fresh dir is
+        # restore-safe. EMPTY $thawdir (legacy snapshot / older controller) SKIPS this
+        # branch and the rewrite falls through to the pre-fix bsrc[d] behavior.
+        m["source"]=thawdir
+    elif d in _SA_TOKEN_DIRS:
+        # SA/IRSA TOKEN FORCED SOURCE (fix, bug ka-0000008074; SAME CLASS as the
+        # a61f450fb/ka-0000000673 thaw-state force). HIGHEST precedence after the
+        # thaw-state force — overrides the d-in-gofer AND the bsrc[d] branches below.
+        # The two projected serviceaccount token mounts MUST bind to the controller-
+        # owned warm copy ($BUNDLE/.gofer/<n>, relocated under /var/lib/gardenio and so
+        # surviving the [4] placeholder force-delete), NEVER to bsrc[d] (Pod B's LIVE
+        # projected dir under /var/lib/kubelet/pods/<podB>/...). bsrc[d] RESOLVES at the
+        # [3a] guard (Pod B is alive until [4]) but [4] force-deletes Pod B BEFORE the
+        # [5] restore, so the kubelet reclaims Pod B's projected volumes and the source
+        # dir VANISHES — the restored sandbox then sees the serviceaccount DIRECTORY
+        # itself ENOENT and coop fails closed with FreshnessError::Missing ("token file
+        # not found"), NOT PodAIdentity (instrumented canary #7, prod 2026.180.27).
+        # The pre-fix d-in-gofer branch already pinned KEYED token dirs to the warm copy,
+        # but it was NOT robust: any path where the token dir is ABSENT from the gofer
+        # manifest (a best-effort copytree skip at freeze, or a snapshot frozen by an
+        # older controller before the ka-0000008074 sweep) fell THROUGH to bsrc[d] -> the
+        # ephemeral [4]-teardown trap. Forcing it here, and refusing to fall through,
+        # closes that gap EXACTLY as a61f450fb forced the thaw-state source instead of
+        # trusting bsrc[d]. vfs.CompleteRestore re-walks only the mountpoint (proven by
+        # canary #7 restoring rc=0 against a re-pointed thaw-state mount), so binding the
+        # token mount to the warm copy is restore-safe.
+        if d in gofer:
+            _warm=bundle+"/.gofer/"+gofer[d]
+            m["source"]=_warm
+            # CRED-OVERLAY (ka-0000004956): the warm copy carries the FROZEN Pod-A token
+            # whose kubernetes.io.pod.uid is Pod A's; coop's freshness_gate HARD-rejects a
+            # mismatched pod_uid with FreshnessError::PodAIdentity at Sequence stage A.
+            # KEEP the warm DIR as the source (so the restore 9p walk finds the runtime
+            # subtree -> no rc=128) but OVERLAY Pod B's LIVE token bytes onto the file coop
+            # re-reads, so the gate takes the honest pod_uid==want_uid arm. Pod B is alive
+            # until [4], so bsrc[d]/token is a FRESH Pod-B token; realpath resolves it
+            # through the kubelet atomic-writer ..data/token layout, and we overlay BOTH
+            # token AND ..data/token (same backing file via the preserved symlink).
+            # Best-effort/idempotent: a copy miss must NOT fail thaw (the warm dir still
+            # resolves; [3a] asserts it). NOT a gate-loosen: we serve the ACTUAL fresh
+            # Pod-B token, so a genuine foreign/stale token still fails closed.
+            #
+            # RESTORE-SAFETY ASSUMPTION PIN (ka-0000005326 nit 3). Overwriting a
+            # regular-file token in the warm copy is invisible to 'runsc restore' ONLY
+            # because the deployed runsc release-20260525.0 constructs an EMPTY
+            # &vfs.CompleteRestoreOptions{} -> ValidateFileSizes / ValidateFileModifi-
+            # cationTimestamps default false -> the gofer restore re-walk validates a
+            # dentry's EXISTENCE + TYPE, never re-stats size/mtime against the checkpoint.
+            # Pod-A and Pod-B JWTs differ in length, so a size-validating restore WOULD
+            # rc=128 on this overlay. If a future runsc bump flips ValidateFileSizes on,
+            # RE-REVIEW this byte-overlay (the [3a-tok]/rehydrate gates would surface it as
+            # a fresh rc=128 / coop fail-close, but pin the assumption here so the bump
+            # triggers the review rather than a canary burn).
+            if d in bsrc and bsrc[d]:
+                try:
+                    _live=_os.path.realpath(_os.path.join(bsrc[d],"token"))
+                    if _os.path.isfile(_live):
+                        _tok=open(_live,"rb").read()
+                        # EMPTY-TOKEN GUARD (ka-0000005326 nit 2). _tok is whatever
+                        # realpath(bsrc[d]/token) yields at read time; if the kubelet
+                        # atomic-writer is mid ..data-swap and the resolved file is
+                        # momentarily zero-length, an unconditional write would TRUNCATE
+                        # a previously-valid warm token to b"" (coop then rejects the
+                        # empty token as FreshnessError::Malformed -> a wasted operator-
+                        # gated canary cycle). Skip the overlay on an empty read and let
+                        # the warm copy stand; the [3a-tok] read-probe still guards it.
+                        if _tok:
+                            # ATOMIC TOKEN WRITE (ka-0000005326 nit 1). Write to a temp
+                            # file on the SAME dir (fs) then os.rename over the target, so
+                            # a write interrupted mid-flush (ENOSPC/EIO) never leaves a
+                            # TRUNCATED JWT the restored coop would reject as Malformed —
+                            # the overlay is all-or-nothing. _atomic_overlay follows the
+                            # realpath first so the rename lands on the actual backing file
+                            # (through the atomic-writer token -> ..data/token symlink
+                            # chain), matching the chown/chmod below.
+                            _atomic_overlay(_os.path.join(_warm,"token"),_tok)
+                        _dd=_os.path.join(_warm,"..data","token")
+                        if _tok and _os.path.isfile(_dd): _atomic_overlay(_dd,_tok)
+                        # TOKEN-OWNERSHIP RESTORE (fix, bug ka-0000000189). The freeze
+                        # warm-copy (shutil.copytree as ROOT; copy2/copystat preserve MODE
+                        # but NEVER uid/gid) RESET the projected token's GROUP from agent
+                        # (GID 1000) to root, and the cred-overlay open().write() above keeps
+                        # that root:root ownership (it rewrites BYTES, not owner). The
+                        # restored UID/GID-1000 coop then EACCESes the bound token read (mode
+                        # 0640: agent is neither owner=root nor group=root, falls to OTHER=---)
+                        # -> FreshnessError::Malformed -> NodeRehydrationTrigger.waitForAcks
+                        # fail-closes 'failed consumers: coop' (node-confirmed prod 181.5; the
+                        # NEW coop-only signature first reachable once the forced-source +
+                        # overlay makes coop's token READ actually execute). The maintainers'
+                        # own [2c] block already chowns the ack dir the agent WRITES through
+                        # the gofer 1000:1000 for exactly this FSGroup-1000 hazard; this is the
+                        # missing READ-side mirror. chown the REAL backing file: os.path.realpath
+                        # follows the atomic-writer chain token -> ..data/token -> ..<ts>/token,
+                        # so the ..<ts>/token the empirical evidence shows root:root is the one
+                        # re-owned (chown over the realpath FOLLOWS the symlink, so the backing
+                        # file gains the new group, not the link itself). 1000:1000 is the kubelet
+                        # root:agent grant's simplest sufficient superset (agent then reads as
+                        # OWNER). Defensively re-assert the 0640 read bits (the copy already
+                        # preserved them, but a belt-and-suspenders OR-in guarantees owner+group
+                        # read survive any mode drift). SCOPE: ONLY the two _SA_TOKEN_DIRS warm
+                        # copies reach here; the ka-0000006427 ~/.claude warm trees take the
+                        # generic gofer warm-copy branch further below and stay agent-owned-as-
+                        # copied, untouched. Relative ..data/..<ts> symlinks keep realpath INSIDE
+                        # _warm, so the chown never escapes the token warm copy. Best-effort/
+                        # idempotent: a chown miss must NOT fail thaw -- the [3a-tok] UID-1000
+                        # read-probe below is the durable fail-loud guard.
+                        for _wt in (_os.path.join(_warm,"token"), _dd):
+                            try:
+                                _rp=_os.path.realpath(_wt)
+                                if _os.path.isfile(_rp):
+                                    _os.chown(_rp,1000,1000)
+                                    _os.chmod(_rp,_os.stat(_rp).st_mode|0o640)
+                            except OSError:
+                                pass
+                except Exception:
+                    pass
+        # NO else-bind: when the token dir is NOT in the gofer manifest there is NO stable
+        # controller-owned source to point at. Leave m["source"] as the frozen Pod-A value
+        # (GC'd at freeze) so the [3a] dangling-source guard fails LOUD by name (rc=128)
+        # rather than silently binding to bsrc[d] (the ephemeral Pod-B dir [4] removes ->
+        # the opaque restored-sandbox ENOENT) or the A->B substring rewrite (dangling).
+    elif d=="/work":
+        # the warm /work copy — B's fresh emptyDir would wake the agent into empty data.
+        m["source"]=bundle+"/.work"
+    elif d=="/tmp":
+        # the preserved /tmp gofer tree (ka-0000001085). B's fresh /tmp EmptyDir is
+        # empty, so the restored sentry's vfs.CompleteRestore 9p walk for the
+        # runtime-created /tmp/claude-1000 would ENOENT -> sub rc=128. Repoint to
+        # the freeze-time copy that carries claude-1000, mirroring /work.
+        m["source"]=bundle+"/.tmp"
+    elif d in gofer:
+        # the data-driven warm copy (ka-0000006427): a runtime-populated 9p gofer
+        # EmptyDir/subPath (e.g. /home/agent/.claude). B's fresh empty dir would
+        # ENOENT the vfs.CompleteRestore 9p walk for the runtime subtree -> sub
+        # rc=128. Repoint to the freeze-time copy, generalizing the /work + /tmp
+        # cases above to the whole mount class. (The two SA/IRSA token dirs are
+        # handled by the dedicated _SA_TOKEN_DIRS forced branch ABOVE — including
+        # their warm-copy bind + cred-overlay — so they never reach here.)
+        _warm=bundle+"/.gofer/"+gofer[d]
+        m["source"]=_warm
+    elif d in bsrc and bsrc[d]:
+        # PRIMARY: Pod B's live source for this destination — robust to uid AND the
+        # per-pod-random path components the substring rewrite cannot fix.
+        m["source"]=bsrc[d]
+    elif asb and asb in s: m["source"]=s.replace(asb,bsb).replace(apod,bpod)
+    elif apod and apod in s: m["source"]=s.replace(apod,bpod)
+json.dump(c,open(p,"w"))
+PYAGENT
+done
+
+# [3a] FAIL-CLOSED bind-source existence assertion (ka-0000004815). Every sub
+# mount SOURCE must resolve in the HOST ns BEFORE any runsc restore — a dangling
+# source is precisely what makes the sub gofer's ResolveMounts die before
+# WriteMounts, closing runsc's internal --mounts-fd pipe EMPTY and surfacing the
+# opaque "reading mounts file: unexpected end of JSON input" sub rc=128. Diagnose
+# it HERE, by destination<-source, instead of letting it manifest as the opaque
+# empty-mounts error one step later. Only absolute-path sources are bind mounts;
+# pseudo-fs sources (proc/tmpfs/sysfs/mqueue/devpts/cgroup) are bare names, skipped.
+# Run in the HOST ns (HMNT) where runsc reads the spec and the gofer walks.
+for dstn in $SUBNAMES; do
+  miss=$(HMNT python3 - "$BUNDLE/$dstn/config.json" <<'PYCHK'
+import json,os,sys
+c=json.load(open(sys.argv[1]))
+for m in c.get("mounts",[]):
+    s=m.get("source","")
+    if s.startswith("/") and not os.path.exists(s):
+        print(m.get("destination","?")+" <- "+s)
+PYCHK
+)
+  if [ -n "$miss" ]; then
+    log "FATAL: sub '$dstn' has dangling bind-mount source(s) after the A->B repoint (Pod B live source not found and the uid+random substring repoint could not resolve them). The sub gofer's ResolveMounts would die on these -> runsc's internal --mounts-fd pipe closes EMPTY -> the opaque 'reading mounts file: unexpected end of JSON input' sub rc=128. NOT a restore-internal failure. Dangling destination<-source:"
+    printf '%s\n' "$miss" | while IFS= read -r ln; do log "  $ln"; done
+    echo "FT_ROOT_RC=128"
+    exit 1
+  fi
+done
+
+# [3a-tok] FAIL-CLOSED SA/IRSA token READABILITY assertion (fix, bug ka-0000000189).
+# The READ-side mirror of the [2c-assert] guard that proves the agent can WRITE its
+# .done ack dir. The freeze warm-copy (shutil.copytree as ROOT; copy2/copystat preserve
+# MODE but NEVER uid/gid) RESET the projected token's GROUP from agent (GID 1000) to
+# root, and the cred-overlay open().write() rewrites BYTES not owner — so without the
+# overlay chown above the backing token stays root:root 0640. The restored UID/GID-1000
+# coop then EACCESes the bound token read (agent is neither owner=root nor group=root ->
+# falls to OTHER=--- ) -> FreshnessError::Malformed -> NodeRehydrationTrigger.waitForAcks
+# fail-closes 'failed consumers: coop' ~60s later as an OPAQUE timeout (the prod-181.5
+# canary-#8 signature; budget is DefaultRehydrateDeadline=60s, NOT 180s, ka-0000005354).
+# The overlay chown restores the agent's read grant; THIS probe is the durable guard that
+# the chown actually took. Stat each _SA_TOKEN_DIRS mount's REAL backing token in the
+# HOST ns (realpath follows the atomic-writer token -> ..data/token -> ..<ts>/token chain
+# to the file coop actually reads) and prove UID/GID-1000 can read it: owner-read as uid
+# 1000, OR group-read as gid 1000, OR other-read. If none hold (the chown silently did not
+# take: cross-fs, an immutable bit, a realpath that escaped the warm copy), emit
+# FT_ROOT_RC=128 + a named line and FAIL LOUD HERE, by owner/group/mode -- exactly the
+# fail-loud contract [3a] and [2c-assert] use -- instead of letting it manifest as the
+# downstream coop-only rehydrate timeout, closing the read/write asymmetry. SCOPE: fires
+# ONLY on the two _SA_TOKEN_DIRS destinations (the only mounts the kubelet projects
+# root:agent and the copytree's group-drop breaks); every other mount -- incl. the
+# ka-0000006427 ~/.claude warm trees -- is skipped. Runs AFTER [3a] (so the token mount
+# source dir already resolves) and BEFORE the restore (so the agent never reads an
+# unreadable token).
+#
+# It ALSO asserts DIRECTORY TRAVERSAL (fix, bug ka-0000000537). Reading the backing token
+# requires SEARCH (x) permission on every intermediate directory the restored UID/GID-1000
+# agent walks: the mount-source dir itself AND the kubelet atomic-writer ..<ts>/ dir the
+# realpath chain passes through. PART 1 chowns only the backing FILE, not these dirs; and
+# this probe runs as ROOT in the host ns, where root traverses ANY dir regardless of x-bit
+# -- so a file-mode-only verdict would see the token as readable while the restored uid-1000
+# agent EACCESes the dir walk. coop's gate_token (rehydrate.rs) maps a directory-traversal
+# PermissionDenied to FreshnessError::Malformed IDENTICALLY to a file-read EACCES, so a dir-x
+# gap would be INVISIBLE here and present as the SAME opaque coop-only 60s timeout. Today the
+# warm ..<ts>/ dir is 0755 (kubelet newTimestampDir + copytree copystat preserve it), so the
+# other-x bit keeps uid-1000 traversal alive; this probe makes that invariant an explicit,
+# diagnosed fail-close rather than a silent dependency on a kubelet/copytree detail.
+for dstn in $SUBNAMES; do
+  tokbad=$(HMNT python3 - "$BUNDLE/$dstn/config.json" <<'PYTOKRD'
+import json,os,stat,sys
+_SA={"/run/secrets/eks.amazonaws.com/serviceaccount","/run/secrets/kubernetes.io/serviceaccount"}
+# xtrav1000: can UID/GID 1000 SEARCH (traverse) dir st, by the FIRST matching POSIX class?
+# Owner is checked iff uid==1000; else group iff gid==1000; else other. The classes are
+# first-match, NOT a union: an owner-without-x dir denies traversal even when other-x is set
+# (POSIX-verified) -- so this must short-circuit on the owning class, unlike the file-read
+# verdict's owner-OR-group-OR-other form below.
+def xtrav1000(st):
+    md=st.st_mode
+    if st.st_uid==1000: return bool(md&stat.S_IXUSR)
+    if st.st_gid==1000: return bool(md&stat.S_IXGRP)
+    return bool(md&stat.S_IXOTH)
+c=json.load(open(sys.argv[1]))
+for m in c.get("mounts",[]):
+    d=m.get("destination","")
+    if d not in _SA: continue
+    src=m.get("source","")
+    if not src.startswith("/"): continue
+    # realpath follows the kubelet atomic-writer symlink chain to the backing file
+    # the restored coop actually reads -- the file the empirical evidence shows root:root.
+    tok=os.path.realpath(os.path.join(src,"token"))
+    try:
+        st=os.stat(tok)
+    except OSError as e:
+        print("%s token MISSING (%s)"%(d,e)); continue
+    md=st.st_mode
+    # UID/GID 1000 can READ tok iff it has the read bit via whichever class applies:
+    # owner (uid==1000), group (gid==1000), or other. Mirrors [2c-assert]'s classifier.
+    owner_ok=st.st_uid==1000 and (md&stat.S_IRUSR)
+    group_ok=st.st_gid==1000 and (md&stat.S_IRGRP)
+    other_ok=md&stat.S_IROTH
+    if not (owner_ok or group_ok or other_ok):
+        print("%s token UNREADABLE by uid/gid 1000 uid=%d gid=%d mode=%04o (%s)"%(
+            d,st.st_uid,st.st_gid,stat.S_IMODE(md),tok))
+        continue
+    # DIR TRAVERSAL (bug ka-0000000537): reading tok also needs SEARCH (x) on every dir
+    # between the resolved mount-source root and the backing file -- chiefly the kubelet
+    # atomic-writer ..<ts>/ dir the realpath chain passes through, which PART 1 does NOT
+    # chown. We run as ROOT (traverses any dir), so a file-only verdict would MISS a dir-x
+    # gap that EACCESes the restored uid-1000 agent's walk -> the SAME coop Malformed timeout.
+    # Walk realpath(src) (already symlink-free) down to tok's parent, asserting x by class.
+    srcroot=os.path.realpath(src)
+    rel=os.path.relpath(os.path.dirname(tok),srcroot)
+    chain=[srcroot]
+    if rel not in (".",""):
+        acc=srcroot
+        for part in rel.split(os.sep):
+            if part=="..":  # realpath kept us inside the warm copy; a .. is unexpected -> stop
+                break
+            acc=os.path.join(acc,part); chain.append(acc)
+    for dpth in chain:
+        try:
+            dst=os.stat(dpth)
+        except OSError as e:
+            print("%s token-dir MISSING (%s)"%(d,e)); break
+        if not stat.S_ISDIR(dst.st_mode): continue
+        if not xtrav1000(dst):
+            print("%s token-dir UN-TRAVERSABLE by uid/gid 1000 uid=%d gid=%d mode=%04o (%s) -> the restored agent EACCESes the dir walk to the backing token (coop FreshnessError::Malformed, same opaque timeout as an unreadable file)"%(
+                d,dst.st_uid,dst.st_gid,stat.S_IMODE(dst.st_mode),dpth))
+            break
+PYTOKRD
+)
+  if [ -n "$tokbad" ]; then
+    log "FATAL: sub '$dstn' SA/IRSA token NOT readable/traversable by the restored agent (UID/GID 1000) after the cred-overlay chown (bug ka-0000000189 / ka-0000000537). The freeze copytree reset the projected token GROUP agent->root and the overlay chown to 1000:1000 silently did not take, OR an intermediate ..<ts>/ token dir lacks the search (x) bit for uid/gid 1000, so coop EACCESes the bound token read or its dir walk -> FreshnessError::Malformed -> the rehydrate gate fail-closes 'failed consumers: coop' ~60s later as an OPAQUE timeout. Diagnosed HERE, by owner/group/mode, NOT as that downstream coop-only timeout. NOT a restore-internal failure. Unreadable/un-traversable/missing token path(s):"
+    printf '%s\n' "$tokbad" | while IFS= read -r ln; do log "  $ln"; done
+    echo "FT_ROOT_RC=128"
+    exit 1
+  fi
+done
+
+# repoint the sandbox bundle: A-sandbox-cid->B / A-pod-uid->B in every mount
+# source + CRI annotation, and the network namespace path -> Pod B's fresh CNI
+# netns ($BNETNS_PATH, fail-closed-resolved at [1]). HMNT python3 again so the
+# rewrite lands on the host-ns bundle runsc restore reads. The netns repoint is
+# now UNCONDITIONAL on a resolved path (the script already bailed at [1] if it was
+# empty) and ASSERTS a network namespace entry exists to repoint — a sandbox spec
+# with no netns to point at B is a torn-down-netns restore waiting to rc=128, so
+# fail loud rather than silently restoring against Pod A's dead path.
+HMNT python3 - "$BUNDLE/sandbox/config.json" "$ASB" "$BSB" "$APOD" "$BPODUID" "$BNETNS_PATH" <<'PYSANDBOX'
+import json,sys
+p,asb,bsb,apod,bpod,bnetns=sys.argv[1:7]
+c=json.load(open(p))
+repointed=False
+for n in c.get("linux",{}).get("namespaces",[]):
+    if n.get("type")=="network":
+        n["path"]=bnetns; repointed=True
+if not repointed:
+    sys.stderr.write("FATAL: sandbox spec has no network namespace to repoint to Pod B\n")
+    sys.exit(3)
+ann=c.get("annotations",{})
+for k,v in list(ann.items()):
+    if asb and asb in v: ann[k]=v.replace(asb,bsb).replace(apod,bpod) if apod else v.replace(asb,bsb)
+    elif apod and apod in v: ann[k]=v.replace(apod,bpod)
+for m in c.get("mounts",[]):
+    s=m.get("source","")
+    if asb and asb in s: m["source"]=s.replace(asb,bsb).replace(apod,bpod)
+    elif apod and apod in s: m["source"]=s.replace(apod,bpod)
+json.dump(c,open(p,"w"))
+PYSANDBOX
+if [ "$?" -ne 0 ]; then
+  log "FATAL: sandbox config.json netns repoint failed (no network namespace in spec) — refusing a dead-netns restore"
+  echo "FT_ROOT_RC=128"
+  exit 1
+fi
+
+# [4-pre] EXTRA netns bind-mount ref (bug ka-0000002907). Hold a SECOND, independent
+# bind-mount of the restore-target netns inode on a distinct controller-owned path
+# BEFORE the [4] force-delete below fires the kubelet's induced CNI DEL. On canary
+# fr84 the kubelet's 'ip netns delete cni-<B>' (umount + unlink of ITS OWN path)
+# raced the graft and the netns was GONE by restore time, so runsc restore could
+# not setns into it and fell back to an ANONYMOUS lo-only netns. PINNED_NETNS ([1])
+# already holds one ref; a SECOND ref makes it strictly harder for any single umount
+# to release the inode, so the restore still setns-es into the SAME eth0-carrying
+# namespace. This is INODE-SURVIVAL hardening only — a bind-mount keeps the namespace
+# alive but does NOT freeze its L3 config, so it does not by itself stop a CNI DEL
+# from re-stripping addr/route; the LOAD-BEARING pre-restore routability verdict at
+# [4b] is what fails-closed if L3 is missing at scrape time. Best-effort (|| true):
+# a failed extra pin leaves PINNED_NETNS as the sole ref (pre-fix behavior).
+# HELD_NETNS is set to the pin path ONLY on a successful bind-mount, so the cleanup
+# guard ([ -n "$HELD_NETNS" ]) is exact — a failed pin leaves it empty and reaps any
+# stray touched file here so nothing leaks.
+HELD_NETNS=""
+_held_cand="/var/run/netns/gb-thaw-hold-$BSB"
+if HMNT test -e "$BNETNS_PATH" \
+   && HMNT touch "$_held_cand" 2>/dev/null \
+   && HMNT mount --bind "$BNETNS_PATH" "$_held_cand" 2>/dev/null; then
+  HELD_NETNS="$_held_cand"
+  log "held EXTRA netns ref $BNETNS_PATH -> $HELD_NETNS (survives the kubelet's induced CNI DEL of its own cni-<B> path)"
+  echo "FT_NETNS_HELD=$HELD_NETNS"
+else
+  HMNT rm -f "$_held_cand" 2>/dev/null || true
+  log "WARN could not hold extra netns ref $_held_cand (proceeding with PINNED_NETNS as sole ref; the [4b] load-bearing routability verdict still fails-closed if the restore lands link-only)"
+  echo "FT_NETNS_HELD="
+fi
+
+# [4] tear down B's live original containers so the cids+sentry are free for the
+# restore (we restore into B's bundle ids in place). Delete every sub-container
+# first, then the sandbox root. This is what triggers the kubelet's async CNI DEL;
+# the [4-pre] extra ref keeps the netns inode alive and the [4b] verdict below is
+# load-bearing against any L3 re-strip the DEL lands before the restore scrape.
+for cn in $SUBNAMES; do RUNSC delete --force "$(bcid_for "$cn")" >/dev/null 2>&1 || true; done
+RUNSC delete --force "$BSB" >/dev/null 2>&1 || true
+sleep 1
+
+# L3 RE-ASSERT, pre-restore (fix B, ka-0000001790). The force-deletes above fired the
+# AWS VPC CNI DEL, which strips the IPv4 addr + routes from the (inode-pinned, eth0-
+# carrying) netns — proven by b4a on-node forensics. Re-apply the L3 we captured at the
+# Fix-C gate so 'runsc restore' below inherits a FULLY-routable netns instead of the
+# link-only one Fix A would otherwise reject. The CNI DEL is the kubelet's reaction to
+# the sandbox death and may still be in flight asynchronously, so we re-assert AGAIN
+# post-restore in [6a]; this pre-restore apply is what the restored sentry sees at boot.
+reassert_l3 "$BNETNS_PATH"
+log "fix-B pre-restore L3 re-assert into pinned netns $BNETNS_PATH complete"
+
+# SELF-IPAM, pre-restore (fix D, ka-0000004088). The MISSING half of fix C. gVisor's
+# 'runsc restore' does NOT reload the sentry netstack from the checkpoint image: per
+# runsc/sandbox/sandbox.go the restore path runs setupNetwork() — which SCRAPES the
+# LIVE netns (addrs + routes) into a FRESH netstack and strips them off the NIC,
+# exactly like StartRoot — BEFORE the ContMgrRestore RPC, and runsc/boot/restore.go's
+# createNetworkStackForRestore() then KEEPS that freshly-scraped live stack and
+# discards the checkpoint's ("slap [it] on top of the one that was restored"). So the
+# netns MUST already carry eth0 + IP + default route AT RESTORE TIME, or the sentry
+# netstack comes up link-only and every in-sandbox egress is network-unreachable.
+#
+# Fix C's self_ipam runs only POST-restore ([6a], /proc/<RPID>/ns/net) — it repopulates
+# the HOST-KERNEL netns view (why the [6a] content assertion goes green) but lands AFTER
+# gVisor already scraped the link-only netns into the sentry, so it never reaches the
+# already-built sentry netstack. That is the hny rehydrate-ack frontier: host L3 proven
+# perfect on-node, yet BOTH coop (NATS) and gb (DNS) fail "network is unreachable" inside
+# the restored sentry for the full 60s deadline. The pre-restore reassert_l3 above does
+# NOT close it either: it replays only CAP_ADDRS/CAP_ROUTES captured from $BNETNS_PATH
+# (the sandbox netns), which is EMPTY under the two-inode split (the AWS VPC CNI put the
+# IP in the PAUSE netns). self_ipam is the inode-decoupled populator (committed CNI result
+# IP, no source netns) — so drive it HERE, into the SAME pinned restore-target netns the
+# spec's network-namespace path points at and gVisor setns-es into, so gVisor's own
+# setupNetwork scrapes a fully-routable netns into the sentry netstack. Idempotent + best-
+# effort (EEXIST swallowed) so the post-restore self_ipam at [6a] remains a harmless
+# last-write-wins re-apply against any late async CNI DEL. No-op when CNI was unconfirmed.
+self_ipam "$BNETNS_PATH"
+log "fix-D pre-restore self-IPAM into pinned netns $BNETNS_PATH complete (pod IP '$CNI_POD_IP' via gw $CNI_GW) — gVisor setupNetwork will scrape this into the restored sentry netstack"
+
+# [4b] FINAL pre-restore routability RE-VERIFY + RE-APPLY (fix A, ka-0000008207).
+# The reassert_l3 + self_ipam above run RIGHT AFTER the [4] force-delete, but the
+# kubelet's CNI DEL (its async reaction to the sandbox death) can still be IN FLIGHT
+# and land a SECOND strip in the window between those applies and the moment the
+# backgrounded 'runsc restore' below detaches and its setupNetwork() SCRAPES the
+# netns into the sentry netstack (the two-inode pause-vs-sandbox split, lines ~1690-
+# 1700 below: the AWS VPC CNI/DEL operates the PAUSE inode, our pin targets the
+# SANDBOX inode). On prod .13 (bug ka-0000000514) the restore "verified" rc=0 but the
+# sentry came up LINK-ONLY and BOTH rehydrate consumers failed network-unreachable
+# for the full 60s — because nothing re-asserted routability in this last-few-hundred-
+# ms window, and the post-restore [6a] apply lands AFTER the scrape (too late to reach
+# the already-built sentry netstack). So: probe the SAME pinned restore-target inode
+# the spec's network-namespace path points at, the instant before launching restore,
+# and if it is NOT routable (a late DEL re-stripped it) re-apply L3 + self_ipam ONE
+# more time, then probe again. Best-effort + idempotent (EEXIST swallowed): a netns
+# already routable is a single cheap probe + no-op. FT_NETNS_PRERESTORE_ROUTABLE
+# records the outcome (yes => the sentry will scrape a routable netns; no => a deeper
+# strip the [6a]/[6c] guards will fail-close on). This does NOT replace [6a]/[6c] —
+# it makes the routable-at-scrape-time outcome the COMMON case instead of a race.
+PRERESTORE_ROUTABLE=no
+if netns_routable "$BNETNS_PATH"; then
+  PRERESTORE_ROUTABLE=yes
+else
+  log "fix-A: restore-target netns $BNETNS_PATH NOT routable just before restore (a late kubelet CNI DEL re-stripped the addr/route after the pre-restore apply) — re-applying L3 + self-IPAM once more into the SAME pinned inode gVisor setupNetwork will scrape"
+  reassert_l3 "$BNETNS_PATH"
+  self_ipam "$BNETNS_PATH"
+  netns_routable "$BNETNS_PATH" && PRERESTORE_ROUTABLE=yes
+fi
+echo "FT_NETNS_PRERESTORE_ROUTABLE=$PRERESTORE_ROUTABLE"
+if [ "$PRERESTORE_ROUTABLE" = yes ]; then
+  log "fix-A: restore-target netns $BNETNS_PATH is ROUTABLE at restore time (global IPv4 + default route) — gVisor setupNetwork will scrape a routable netns into the sentry netstack"
+else
+  # LOAD-BEARING verdict (bug ka-0000002907). This branch used to WARN-and-PROCEED,
+  # letting runsc restore scrape a link-only netns into the sentry and rely on the
+  # downstream [6c] guards — which flaked OPEN on canary #11, so a routeless sentry
+  # was mis-declared "restore verified" and died 60s later on the rehydrate ack gate.
+  # A netns that is NOT routable at scrape time can ONLY yield a link-only sentry (the
+  # post-restore self_ipam repairs only the host-kernel view, never the already-built
+  # sentry netstack). So FAIL-CLOSED HERE, before the scrape: a clean cold-start is
+  # strictly better than resurrecting a sentry that cannot egress for its whole life.
+  # Do NOT add another L3 re-apply here — the re-apply-vs-DEL race lost 4x running
+  # (fr84 -> hmsMrE3zR6 -> #10 -> #11); the fix is to REFUSE the link-only scrape.
+  log "FATAL fix-A: restore-target netns $BNETNS_PATH is NOT routable after the final re-apply (a late kubelet CNI DEL re-stripped the addr/route in the window before the restore scrape) — gVisor setupNetwork would scrape a LINK-ONLY netns into the sentry and every off-link egress would fail network-unreachable for the full 60s ack deadline. Refusing to scrape a link-only netns; failing the restore LOUD here for a clean cold-start instead of a verified-but-network-less resume. NOT declaring restore verified."
+  # Release the [4-pre] extra netns ref before the fail-close cold-start (no restore
+  # will run, so nothing needs the inode held any longer) — avoid a per-fail mount leak.
+  if [ -n "${HELD_NETNS:-}" ]; then HMNT umount "$HELD_NETNS" 2>/dev/null && HMNT rm -f "$HELD_NETNS" 2>/dev/null || true; fi
+  echo "FT_ROOT_RC=128"
+  exit 1
+fi
+
+# [5] COUNT-GATED BARRIER restore (N-container, ka-0000003561). Background the ROOT
+# sandbox restore: with --detach it does NOT return until ALL N containers join (it
+# parks at restoringUnstarted reading ContainerCount=$CCOUNT). Then fire one SUB
+# restore PER sub-container (agent + each sidecar) to satisfy the count and unblock
+# the whole pod. Mirrors the shim's concurrent ContMgrRestore +
+# ContMgrRestoreSubcontainer RPCs — the proven gvisor-poc spike sequence, now
+# scaled from the fixed pause+agent pair to sandbox + every captured sub-container.
+# Each sub restore pairs the captured bundle subdir ($BUNDLE/<name>) to Pod B's
+# fresh cid for that name (bcid_for); gVisor matches the checkpointed sub-container
+# by its container-name annotation, so name-keyed pairing is what makes a sidecar's
+# checkpointed state land on the right B slot.
+( RUNSC $OVERLAY_FLAG restore --image-path="$IMG" --bundle "$BUNDLE/sandbox" --detach "$BSB" >/var/tmp/gb-thaw-root.out 2>&1; echo "ROOT_RC=$?" >>/var/tmp/gb-thaw-root.out ) &
+ROOT_BG=$!
+for i in $(seq 1 20); do RUNSC state "$BSB" >/dev/null 2>&1 && break; sleep 0.5; done
+# Fire every sub-container restore. Collect the worst (max) rc as FT_SUB_RC so the
+# Go post-state check still sees a single sub rc, and name each failure in the log.
+SUBRC=0
+for cn in $SUBNAMES; do
+  bc=$(bcid_for "$cn")
+  RUNSC $OVERLAY_FLAG restore --image-path="$IMG" --bundle "$BUNDLE/$cn" --detach "$bc" >"/var/tmp/gb-thaw-sub-$cn.out" 2>&1; r=$?
+  log "sub restore '$cn' (cid=$bc) rc=$r"
+  if [ "$r" -ne 0 ]; then
+    [ "$r" -gt "$SUBRC" ] && SUBRC=$r
+    log "sub '$cn': $(tail -3 "/var/tmp/gb-thaw-sub-$cn.out" 2>/dev/null)"
+    # On failure, dump the sub gofer/boot log.json tail (mirrors the PoC). An empty
+    # --mounts-fd pipe ("reading mounts file: unexpected end of JSON input") means the
+    # gofer died in ResolveMounts before WriteMounts — these lines name the dying
+    # mount walk; "not being restored" means ordering; "already restored"/"CID already
+    # belongs" means a cid/name collision. Without this the empty-mounts cause is
+    # opaque (ka-0000004815); with it a single redrive reveals the real failure.
+    for lf in "$BUNDLE/$cn/log.json" "$T/$bc/log.json"; do
+      HMNT test -f "$lf" || continue
+      HMNT python3 -c 'import sys,json
+sub=sys.argv[2]
+for l in open(sys.argv[1]):
+  l=l.strip()
+  if not l: continue
+  try: m=json.loads(l).get("msg","")
+  except Exception: m=l[:200]
+  if m: print("      ["+sub+" gofer/boot] "+m[:200])' "$lf" "$cn" 2>/dev/null | tail -15 >&2
+    done
+  fi
+done
+echo "FT_SUB_RC=$SUBRC"
+wait "$ROOT_BG" 2>/dev/null
+ROOTRC=$(sed -n 's/^ROOT_RC=//p' /var/tmp/gb-thaw-root.out | tail -1); [ -z "$ROOTRC" ] && ROOTRC=1
+echo "FT_ROOT_RC=$ROOTRC"
+# Release the [4-pre] EXTRA netns ref (bug ka-0000002907). Its ONLY job was to keep the
+# inode alive across the kubelet's induced CNI DEL until 'runsc restore' scraped the
+# netns into the sentry netstack — which is complete once the barrier restore has
+# returned (setupNetwork() runs during the restore RPC). The restored sentry uses
+# PINNED_NETNS, not HELD_NETNS, so tearing this extra bind-mount down now is safe and
+# prevents a per-thaw mount leak. Best-effort; runs on both the success and the
+# restore-failed early-exit paths below.
+if [ -n "${HELD_NETNS:-}" ]; then HMNT umount "$HELD_NETNS" 2>/dev/null && HMNT rm -f "$HELD_NETNS" 2>/dev/null || true; fi
+if [ "$SUBRC" -ne 0 ] || [ "$ROOTRC" -ne 0 ]; then
+  log "restore failed: root=$ROOTRC sub=$SUBRC"; log "root: $(tail -3 /var/tmp/gb-thaw-root.out 2>/dev/null)"
+  exit 0
+fi
+
+# [6] PROOF: all containers re-scheduled; restored sentry shares B's netns inode.
+sleep 3
+RPID=$(RUNSC state "$BSB" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["pid"])' 2>/dev/null)
+echo "FT_RESTORED_PID=$RPID"
+echo "FT_RESTORED_NETNS=$(readlink /proc/$RPID/ns/net 2>/dev/null)"
+
+# [6a] NETNS-CONTENT ASSERTION (fix A, ka-0000007713). The inode proof below
+# (FT_RESTORED_NETNS == FT_B_NETNS) only proves the restored sentry landed in the
+# netns we REPOINTED to — it does NOT prove that netns actually carries a network.
+# On canary fr84 the restore "verified" (inode matched) but the netns held ONLY lo
+# (no eth0, empty route table): the CNI veth had been torn down with Pod B's
+# sandbox delete (the defect Fix B's pin closes). BOTH coop and gb then failed
+# 'network is unreachable', and the rehydrate-ack gate fail-closed 60s LATER on
+# the consumer acks — long after this node script returned a "verified" restore.
+# Assert HERE, in the restored sentry's OWN netns (entered via the host-ns PID
+# /proc/$RPID/ns/net — the sentry runs as a host process, so its netns is visible
+# from the host mount/pid ns), that the restored network is real:
+#   (1) >= 1 non-loopback interface in /proc/net/dev (eth0), AND
+#   (2) a default route in /proc/net/route (a 00000000 destination).
+# Read both via 'nsenter --net=/proc/$RPID/ns/net' so we inspect EXACTLY the netns
+# the restored sentry uses. On failure emit a distinct FT_ROOT_RC=128 with a loud
+# lo-only diagnosis so the controller fails-closed to cold-start AT RESTORE TIME,
+# not 60s later on a network-unreachable ack timeout. Emit FT_NETNS_IFACES /
+# FT_NETNS_DEFROUTE either way so the Go side (and a redrive) can see the contents.
+# L3 RE-ASSERT, post-restore (fix B, ka-0000001790). The CNI DEL the [4] force-delete
+# triggered is the kubelet's async reaction to the sandbox death and may have landed
+# AFTER our pre-restore re-assert (or after runsc restore re-created the netns view), so
+# re-apply the captured L3 ONE more time into the restored sentry's OWN netns — the same
+# inode the pre-restore apply targeted via the pinned bind-mount, reached here via the
+# host-ns PID. Last-write-wins: whichever of {CNI DEL, our re-assert} ran last decides,
+# and we make ours last, immediately before the content assertion reads the table. EEXIST
+# on an addr/route the pre-restore apply still holds is success (reassert_l3 swallows it).
+# Then FT_NETNS_L3_REASSERTED records whether the fix engaged, so a thaw that STILL lands
+# lo-only (e.g. the host-side veth peer was also torn down — a deeper failure than L3
+# strip) is distinguishable controller-side from one where the fix never ran.
+if [ -n "$RPID" ] && [ -r "/proc/$RPID/ns/net" ]; then
+  reassert_l3 "/proc/$RPID/ns/net"
+fi
+if [ -n "$CAP_ADDRS$CAP_ROUTES" ]; then echo "FT_NETNS_L3_REASSERTED=yes"; else echo "FT_NETNS_L3_REASSERTED=no"; fi
+# SELF-IPAM, post-restore (fix C, ka-0000001099; now the SECONDARY apply — fix D
+# ka-0000004088 moved the load-bearing self_ipam PRE-restore, above [5]). reassert_l3
+# above only re-applies what it CAPTURED from $BNETNS_PATH (the sandbox netns) — which
+# is empty under the two-inode split because the AWS VPC CNI populated the PAUSE netns
+# instead, a different inode. So drive self_ipam INTO the restored sentry's OWN netns —
+# the exact inode the restore landed in, reached via the host-ns PID /proc/<RPID>/ns/net
+# — using the committed CNI result IP read at the gate (decoupled from any source-netns
+# inode). NOTE this post-restore apply ALONE does NOT make the sentry netstack routable:
+# gVisor scraped the netns into the sentry DURING the [5] restore RPC (setupNetwork runs
+# before ContMgrRestore — runsc/sandbox/sandbox.go), so an L3 apply that lands AFTER the
+# restore only fixes the HOST-KERNEL netns view, not the already-built sentry netstack —
+# the exact gap fix D closes by applying self_ipam pre-restore. This call is kept as a
+# last-write-wins re-apply that (a) repels any late async kubelet CNI DEL racing the
+# sandbox death, and (b) keeps the [6a] content assertion below confirming eth0 + default
+# route on the restore-target inode. Idempotent vs. the pre-restore apply + reassert_l3
+# (EEXIST swallowed), so a netns already populated pre-restore is a no-op here.
+if [ -n "$RPID" ] && [ -r "/proc/$RPID/ns/net" ]; then
+  self_ipam "/proc/$RPID/ns/net"
+  log "fix-C self-IPAM into restored sentry OWN netns /proc/$RPID/ns/net complete (pod IP '$CNI_POD_IP' via gw $CNI_GW; secondary to fix-D pre-restore apply)"
+fi
+if [ -n "$CNI_POD_IP" ]; then echo "FT_NETNS_SELF_IPAM=yes"; else echo "FT_NETNS_SELF_IPAM=no"; fi
+
+NETNS_IFACES=0
+NETNS_DEFROUTE=no
+if [ -n "$RPID" ] && [ -r "/proc/$RPID/ns/net" ]; then
+  # non-loopback interface count: /proc/net/dev lines past the 2 header rows,
+  # excluding the "lo:" entry. nsenter into the restored sentry's netns.
+  NETNS_IFACES=$(nsenter --net="/proc/$RPID/ns/net" -- cat /proc/net/dev 2>/dev/null \
+    | awk 'NR>2{n=$1; sub(/:.*/,"",n); gsub(/[[:space:]]/,"",n); if(n!="" && n!="lo") c++} END{print c+0}')
+  # default route: /proc/net/route has a row whose Destination (col 2) is 00000000.
+  if nsenter --net="/proc/$RPID/ns/net" -- awk 'NR>1 && $2=="00000000"{found=1} END{exit !found}' /proc/net/route 2>/dev/null; then
+    NETNS_DEFROUTE=yes
+  fi
+fi
+echo "FT_NETNS_IFACES=$NETNS_IFACES"
+echo "FT_NETNS_DEFROUTE=$NETNS_DEFROUTE"
+if [ "${NETNS_IFACES:-0}" -lt 1 ] || [ "$NETNS_DEFROUTE" != "yes" ]; then
+  log "FATAL: restored sandbox netns has no non-loopback interface / default route (non-lo ifaces=$NETNS_IFACES, default-route=$NETNS_DEFROUTE) — this is a lo-only netns: the CNI eth0 is NOT present in the restore target (Pod B's CNI netns was torn down with the placeholder-graft sandbox delete, or the netns pin failed). The rehydrate-ack gate WOULD fail-closed network-unreachable 60s later on both coop and gb; failing the restore LOUD here instead. NOT declaring restore verified."
+  echo "FT_ROOT_RC=128"
+  exit 1
+fi
+
+# [6c] SENTRY-SIDE EGRESS assertion (fix B, ka-0000008207 / bug ka-0000000514). THE
+# no-regret floor. The [6a] check above reads the HOST-KERNEL netns (nsenter --net=
+# /proc/$RPID/ns/net inspects the host's view of that inode), so it goes GREEN even
+# when the restored gVisor SENTRY netstack is LINK-ONLY: runsc restore's setupNetwork()
+# SCRAPES the netns into a FRESH sentry netstack DURING the [5] restore RPC and discards
+# the checkpoint's, so if the netns was link-only at scrape-time the SENTRY comes up with
+# no default route REGARDLESS of what the host netns carries afterward. That is exactly the
+# prod .13 fail (rehydrate "not released; failed consumers: coop, gb" — both consumers got
+# "network is unreachable" for the full 60s on a restore that [6a] called verified). So
+# assert egress from INSIDE the sentry, where the consumers actually run, via 'runsc exec':
+#   [6c-1] (always) read the SENTRY's OWN /proc/net/{route,dev} — the gVisor netstack's own
+#          view, NOT the host kernel's — and require a default route + a non-lo iface. This
+#          is the DIRECT link-only detector, DNS- and service-independent: it catches the
+#          exact gap [6a] is blind to. A definitive "no default route in the sentry netstack"
+#          is the bug signature -> fail-closed FT_ROOT_RC=128 (clean cold-start fallback).
+#   [6c-2] (when egress targets are configured) TCP-dial NATS + the beads daemon — the SAME
+#          endpoints coop + gb reach — from inside the sentry and fail-closed ONLY on the
+#          unambiguous network-unreachable / no-route errno (ENETUNREACH/EHOSTUNREACH/
+#          ENETDOWN), the precise "network is unreachable" the consumers reported. A
+#          connection-refused / timeout / DNS-resolution failure is NOT fail-closed (the
+#          netstack routed the SYN; a service-down or DNS blip must never cold-start an
+#          otherwise-good resume) — so this never false-positives, it only catches a
+#          provably link-only sentry that [6c-1] somehow passed (e.g. a default route present
+#          but the host-side veth peer severed). Both emit sentinels either way so the Go side
+#          + a redrive can see the contents; an exec that FLAKES (sentry not joinable / no
+#          output) is INCONCLUSIVE (unknown) and never fail-closes — the [6a] host-view +
+#          the 60s ack gate remain the backstops, mirroring [6b]'s LIVE=unknown posture.
+ABC=$(bcid_for agent)
+SENTRY_DEFROUTE=unknown
+SENTRY_NONLO=-1
+if [ -n "$ABC" ]; then
+  # BOUNDED READINESS+RETRY (bug ka-0000002907). The pre-fix code did a SINGLE runsc
+  # exec at t+3s with no retry — so a sentry not yet joinable (its gofer/exec path
+  # still coming up ~3s post-restore) yielded FT_SENTRY_DEFROUTE=unknown, which the Go
+  # acceptance then flaked OPEN on (the canary #11 miss). Retry the in-sentry read
+  # until it returns a DEFINITIVE verdict (defroute in yes|no AND a non-negative iface
+  # count) or the budget (~10 * 1s) is exhausted. With the retry in place, an "unknown"
+  # reaching the Go side means the sentry was genuinely un-joinable across the WHOLE
+  # window — a real fault the positive-proof rule fail-closes on — not a t+3s timing
+  # flake. The classifier condition below is UNCHANGED (still tolerant of unknown/-1);
+  # the positive-proof enforcement lives Go-side. Best-effort: keeps the last read.
+  for _sretry in $(seq 1 10); do
+    # Read the restored sentry's OWN netstack view via runsc exec. python3 (in the
+    # agent image) parses /proc/net/route (a 00000000 destination row == a default
+    # route) and /proc/net/dev (non-lo iface count). Emits one sentinel line; a flaked
+    # exec (sentry not yet joinable) emits nothing and leaves the defaults (unknown/-1).
+    SENTRY_NET=$(RUNSC exec "$ABC" python3 -c '
+import sys
+defroute="no"; nonlo=0
+try:
+    for i,l in enumerate(open("/proc/net/route")):
+        if i==0: continue
+        f=l.split()
+        if len(f)>1 and f[1]=="00000000": defroute="yes"
+except Exception:
+    defroute="unknown"
+try:
+    for i,l in enumerate(open("/proc/net/dev")):
+        if i<2: continue
+        n=l.split(":")[0].strip()
+        if n and n!="lo": nonlo+=1
+except Exception:
+    nonlo=-1
+print("SENTRY_DEFROUTE=%s SENTRY_NONLO=%d" % (defroute,nonlo))
+' 2>/dev/null)
+    _dr=$(printf '%s' "$SENTRY_NET" | sed -n 's/.*SENTRY_DEFROUTE=\([a-z]*\).*/\1/p')
+    _nl=$(printf '%s' "$SENTRY_NET" | sed -n 's/.*SENTRY_NONLO=\(-\{0,1\}[0-9]*\).*/\1/p')
+    [ -n "$_dr" ] && SENTRY_DEFROUTE="$_dr"
+    [ -n "$_nl" ] && SENTRY_NONLO="$_nl"
+    # DEFINITIVE read (real yes|no route verdict + non-negative iface count) -> stop
+    # retrying; otherwise the sentry is not yet joinable, wait and re-read.
+    case "$SENTRY_DEFROUTE" in
+      yes|no) if [ "${SENTRY_NONLO:--1}" -ge 0 ] 2>/dev/null; then break; fi ;;
+    esac
+    sleep 1
+  done
+fi
+echo "FT_SENTRY_DEFROUTE=$SENTRY_DEFROUTE"
+echo "FT_SENTRY_NONLO=$SENTRY_NONLO"
+if [ "$SENTRY_DEFROUTE" = no ] || [ "${SENTRY_NONLO:-0}" = 0 ]; then
+  log "FATAL: restored SENTRY netstack is LINK-ONLY (sentry default-route=$SENTRY_DEFROUTE, sentry non-lo ifaces=$SENTRY_NONLO) — read from INSIDE the restored sandbox via runsc exec, i.e. the gVisor netstack's OWN view, not the host kernel's. runsc restore's setupNetwork() scraped a link-only netns into the sentry; the host-side [6a] check passed but the SENTRY cannot egress. Both rehydrate consumers (coop NATS, gb beads) WOULD fail 'network is unreachable' for the full 60s ack deadline; failing the restore LOUD here instead (clean cold-start fallback). NOT declaring restore verified."
+  echo "FT_ROOT_RC=128"
+  exit 1
+fi
+
+# [6c-2] in-sentry end-to-end TCP egress dial to the rehydrate consumers' endpoints.
+# Fail-closed ONLY on the network-unreachable signature; refused/timeout/DNS-fail is a
+# routable netstack (do NOT cold-start a good resume over a service blip). Skipped when
+# no targets are configured (older controller) — [6c-1] above is the load-bearing floor.
+SENTRY_EGRESS=skipped
+sentry_dial() { # $1=host $2=port $3=label -> echoes ok|link-only|other|skip
+  [ -z "$1" ] && { echo skip; return 0; }
+  RUNSC exec "$ABC" python3 -c '
+import socket,sys,errno
+host,port,label=sys.argv[1],int(sys.argv[2]),sys.argv[3]
+try:
+    s=socket.create_connection((host,port),timeout=4); s.close()
+    print("ok"); sys.exit(0)
+except OSError as e:
+    en=getattr(e,"errno",None)
+    if en in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN):
+        sys.stderr.write("%s network-unreachable errno=%s\n"%(label,en)); print("link-only"); sys.exit(0)
+    sys.stderr.write("%s reachable-or-ambiguous errno=%s msg=%s\n"%(label,en,e)); print("other"); sys.exit(0)
+' "$1" "$2" "$3" 2>>/var/tmp/gb-thaw-egress.err
+}
+# Dial the ClusterIP LITERALS (bug ka-0000002907), NOT the bare DNS names: a link-only
+# sentry cannot reach kube-dns, so a name-dial gaierrors -> "inconclusive" -> flake-open
+# (the #11 miss), whereas a ClusterIP is routed purely at L3 so it no-routes EHOSTUNREACH
+# -> link-only -> fail-closed. Guarded on the resolved LITERALS (EGRESS_*_ADDR): if the
+# controller could not resolve a ClusterIP the dial SKIPS and [6c-1] is the floor.
+if [ -n "$EGRESS_NATS_ADDR$EGRESS_BEADS_ADDR" ]; then
+  : >/var/tmp/gb-thaw-egress.err 2>/dev/null || true
+  EG_NATS=$(sentry_dial "$EGRESS_NATS_ADDR" "$EGRESS_NATS_PORT" nats)
+  EG_BEADS=$(sentry_dial "$EGRESS_BEADS_ADDR" "$EGRESS_BEADS_PORT" beads)
+  log "fix-B in-sentry egress dial (ClusterIP literals): nats($EGRESS_NATS_HOST->$EGRESS_NATS_ADDR:$EGRESS_NATS_PORT)=$EG_NATS beads($EGRESS_BEADS_HOST->$EGRESS_BEADS_ADDR:$EGRESS_BEADS_PORT)=$EG_BEADS"
+  [ -s /var/tmp/gb-thaw-egress.err ] && HMNT sed 's/^/    in-sentry egress: /' /var/tmp/gb-thaw-egress.err >&2 2>/dev/null || true
+  if [ "$EG_NATS" = link-only ] || [ "$EG_BEADS" = link-only ]; then
+    SENTRY_EGRESS=link-only
+  elif [ "$EG_NATS" = ok ] || [ "$EG_BEADS" = ok ]; then
+    SENTRY_EGRESS=ok
+  else
+    SENTRY_EGRESS=inconclusive
+  fi
+fi
+echo "FT_SENTRY_EGRESS=$SENTRY_EGRESS"
+if [ "$SENTRY_EGRESS" = link-only ]; then
+  log "FATAL: restored SENTRY cannot egress to the rehydrate consumers' endpoints — an in-sentry TCP dial to NATS/beads returned 'network is unreachable' (the exact errno coop+gb hit for 60s on prod .13). The sentry netstack passed the [6c-1] route check but a dial still no-routes (host-side veth peer severed, or a default route to an unreachable gateway). Failing the restore LOUD here (clean cold-start fallback) instead of 60s later on the ack gate. NOT declaring restore verified."
+  echo "FT_ROOT_RC=128"
+  exit 1
+fi
+
+# [6b] DIR-MEDIUM WORKSPACE-LIVENESS assertion (ka-0000000357, gardener steer yd0g
+# req-2; HARDENED to NON-EMPTINESS by ka-0000004935). The pre-restore CWD-dentry
+# fail-close ([2]/remount_rootfs) is SKIPPED under the dir medium; [2] now also
+# MATERIALIZES an empty CWD dir on the lower so 'runsc restore' can re-walk it. That
+# makes the workspace path ALWAYS EXIST post-restore (the lower carries the empty dir
+# even if the upper content was lost), so a mere existence test ('test -e') here would
+# be DEFEATED by the [2] fix and silently mask genuine data loss — resuming an agent
+# into an empty /home/agent/workspace. So this guard asserts the CWD is present AND
+# NON-EMPTY inside the restored sentry: the directory existence is provided by the
+# lower (the [2] mkdir), but its CONTENT can ONLY come from the rebuilt upper
+# (checkpoint pages). A populated CWD => the upper round-tripped; an EMPTY CWD => real
+# loss, fail-closed FT_ROOT_RC=128 by name (last-wins over the FT_ROOT_RC=0 above) so
+# the controller cold-starts rather than resume a workspace-less agent. (Mirrors the
+# zero-canary discriminating-restore-check.sh entries>0 verdict.) SELF medium already
+# proved the path pre-restore on the host lower, so this runs ONLY under dir medium
+# (OVERLAY_FLAG non-empty); empty OVERLAY_FLAG leaves this section a no-op (zero blast
+# radius on self nodes). Best-effort cwd read: a missing/'/'/unreadable cwd has
+# nothing to prove (skip).
+if [ -n "$OVERLAY_FLAG" ]; then
+  ACWD=$(HMNT python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("process",{}).get("cwd",""))
+except Exception: print("")' "$BUNDLE/agent/config.json" 2>/dev/null)
+  ABC=$(bcid_for agent)
+  if [ -n "$ACWD" ] && [ "$ACWD" != "/" ] && [ -n "$ABC" ]; then
+    # Count the entries under the checkpointed CWD INSIDE the restored sentry. We use
+    # an entry COUNT (not 'test -e') because the [2] dir-medium fix guarantees the dir
+    # EXISTS on the lower regardless of upper content — only non-emptiness proves the
+    # upper round-tripped. The exec emits an integer on success and nothing on an
+    # infra failure, which we disambiguate from a real empty-dir:
+    #   integer >0  => populated workspace: the upper round-tripped (LIVE=yes).
+    #   integer ==0 => present but EMPTY: real workspace loss (LIVE=no, fail-closed).
+    #   non-integer/empty => exec INFRASTRUCTURE failed (sentry not joinable, 'sh'/'ls'
+    #     missing, runsc timeout) — a flaky exec that must NOT nuke an otherwise-good
+    #     restore (LIVE=unknown, let it stand; the rehydrate-ack gate remains the
+    #     backstop). So a transient exec hiccup never converts a good thaw into a
+    #     cold-start, while a genuinely empty workspace DOES fail closed.
+    ACNT=$(RUNSC exec "$ABC" sh -c 'ls -A1 "$1" 2>/dev/null | wc -l' ls-cwd "$ACWD" 2>/dev/null | tr -dc '0-9')
+    if [ -z "$ACNT" ]; then
+      echo "FT_DIRMEDIUM_CWD_LIVE=unknown"
+      log "WARN dir-medium workspace-liveness exec INCONCLUSIVE for CWD '$ACWD' (RUNSC exec produced no count: sentry not joinable / 'sh'/'ls' missing / timeout). Letting the restore stand rather than fail-close on a flaky exec; the rehydrate-ack gate remains the backstop."
+    elif [ "$ACNT" -gt 0 ]; then
+      echo "FT_DIRMEDIUM_CWD_LIVE=yes"
+      log "dir-medium workspace-liveness OK: restored agent CWD '$ACWD' is present and NON-EMPTY ($ACNT entries) inside the restored sentry — the rootfs-overlay upper round-tripped through the checkpoint pages."
+    else
+      echo "FT_DIRMEDIUM_CWD_LIVE=no"
+      log "FATAL: dir-medium restored agent CWD '$ACWD' is present but EMPTY (0 entries) inside the restored sentry — the rootfs-overlay upper did NOT round-trip under $OVERLAY_FLAG. This is REAL workspace data loss: the [2] lower-side mkdir provides the empty dir so restore can re-walk it (ka-0000004935), but the CONTENT must come from the rebuilt upper (checkpoint pages) and did not. The agent would resume into an empty /home/agent/workspace. Failing the restore LOUD here so the controller cold-starts. NOT declaring restore verified. NOT a restore-internal failure."
+      echo "FT_ROOT_RC=128"
+      exit 1
+    fi
+  fi
+fi
+
+# [6d] THAW-STATE SOURCE-PROVENANCE assertion (ka-0000001208). DEFENSE-IN-DEPTH
+# only — the [3a] PRE-restore dangling-source guard + the rehydrate ack remain the
+# functional gate. Confirms POST-restore that the /run/gardenio-thaw ($THAWDEST) mount
+# the restored sentry actually carries resolves to the LIVE per-agent host source
+# $THAWDIR (thawStateHostDir(req.AgentName)) — NOT a checkpointed 9p gofer /
+# placeholder dir the restore might have re-walked to a stale/wrong source.
+#
+# WHY A CONTENT-MARKER PROBE, NOT A mountinfo SCRAPE (the bead's literal ask). gVisor
+# serves every host-backed bind mount through the gofer, so neither the guest
+# mountinfo nor /proc/$RPID/mountinfo (RPID = host-side sentry pid, runsc-internal
+# mounts) carries the host bind SOURCE path — there is nothing there to compare
+# against $THAWDIR (root-cause ka-0000000673). The discriminator canary #7 ACTUALLY
+# used was mount CONTENTS, so assert on contents: write a fresh unique marker into
+# $THAWDIR on the HOST, then read it back from INSIDE the restored sentry at
+# $THAWDEST via runsc exec. If the sentry's mount is bound to the live $THAWDIR the
+# marker is visible (PRESENT -> ok); if it resolves to a different (stale/placeholder/
+# checkpointed) dir the host-written marker is absent (ABSENT -> mismatch), which is
+# exactly canary #7's "rc=0 against a different-content dir" — now a fail-closed gate
+# (FT_ROOT_RC=128) instead of an empirical claim, caught one step before the ack gate.
+#
+# POSTURE mirrors [6c]/FT_DIRMEDIUM_CWD_LIVE: a DEFINITIVE ABSENT (the in-sentry read
+# ran and reported the marker missing) fail-closes; an exec that FLAKES (sentry not
+# joinable, no output) is INCONCLUSIVE (unknown) and never fail-closes — the [3a]
+# guard + ack gate remain the backstops. SKIPPED (unknown) when $THAWDIR/$THAWDEST is
+# empty (legacy snapshot) or the agent sub-container is unresolvable. The marker uses
+# a unique name never looked up before, so a correctly-bound gofer mount has no cached
+# negative dentry for it and WILL see it — a false-positive cold-start is not a fresh
+# concern; a single retry absorbs any propagation delay before declaring mismatch.
+FT_THAW_SRC_PROVENANCE=unknown
+if [ -n "$THAWDIR" ] && [ -n "$THAWDEST" ]; then
+  APBC=$(bcid_for agent)
+  if [ -n "$APBC" ]; then
+    # Unique marker name (host-generated uuid; falls back to pid so a uuid-less node
+    # still gets a name). Written into $THAWDIR on the HOST, removed on every path.
+    PMARK=".ft-srcprov-$(HMNT cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -dc 'a-f0-9' | cut -c1-32)"
+    [ "$PMARK" = ".ft-srcprov-" ] && PMARK=".ft-srcprov-$$"
+    if HMNT touch "$THAWDIR/$PMARK" 2>/dev/null; then
+      PVERD=""
+      for _pretry in 1 2; do
+        # Read from INSIDE the restored sentry: emit PRESENT/ABSENT on a definitive
+        # read, nothing on a flaked exec (sentry not joinable). $THAWDEST is the guest
+        # mount point (/run/gardenio-thaw); test -e resolves it through the gofer.
+        PREAD=$(RUNSC exec "$APBC" sh -c 'if [ -e "$1" ]; then echo PRESENT; else echo ABSENT; fi' _ "$THAWDEST/$PMARK" 2>/dev/null | tr -dc 'A-Z')
+        case "$PREAD" in
+          PRESENT) PVERD=ok; break ;;
+          ABSENT)  PVERD=mismatch ;;   # keep reading: a second PRESENT wins (propagation)
+        esac
+        [ "$_pretry" = 2 ] && break
+        sleep 1
+      done
+      [ -n "$PVERD" ] && FT_THAW_SRC_PROVENANCE="$PVERD"
+    else
+      log "WARN [6d] could not write thaw-state provenance marker into host source $THAWDIR — source-provenance assertion INCONCLUSIVE (unknown); the [3a] guard + rehydrate ack remain the gate."
+    fi
+    HMNT rm -f "$THAWDIR/$PMARK" 2>/dev/null || true
+  fi
+fi
+echo "FT_THAW_SRC_PROVENANCE=$FT_THAW_SRC_PROVENANCE"
+if [ "$FT_THAW_SRC_PROVENANCE" = mismatch ]; then
+  log "FATAL: [6d] restored /run/gardenio-thaw ($THAWDEST) mount does NOT resolve to the live per-agent host source $THAWDIR (thawStateHostDir(req.AgentName)) — a fresh marker written into $THAWDIR on the host was NOT visible inside the restored sentry, so the restore re-walked the thaw-state mount to a DIFFERENT (stale/placeholder/checkpointed 9p-gofer) source. The rehydrate consumers would write their .done ack into a dir the controller never reads -> the both-consumer ack gate fail-closes ~60s later as an OPAQUE timeout (canary #7 signature). Failing the restore LOUD here instead. NOT declaring restore verified."
+  echo "FT_ROOT_RC=128"
+  exit 1
+fi
+
+SBUP=$(RUNSC state "$BSB" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status",""))' 2>/dev/null)
+# every sub-container must report running; collect the first non-running one.
+ALLUP=yes; BADC=""
+for cn in $SUBNAMES; do
+  st=$(RUNSC state "$(bcid_for "$cn")" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status",""))' 2>/dev/null)
+  [ "$st" = "running" ] || { ALLUP=no; BADC="$cn=$st"; break; }
+done
+if [ "$SBUP" = "running" ] && [ "$ALLUP" = "yes" ]; then echo "FT_CONTAINERS_RUNNING=yes"; else echo "FT_CONTAINERS_RUNNING=no(sandbox=$SBUP,$BADC)"; fi
+log "thaw complete: restored sentry pid=$RPID netns=$(readlink /proc/$RPID/ns/net 2>/dev/null) subcontainers=[$SUBNAMES]"
+
+# [7] RESTORE-PEAK MEASUREMENT (ka-0000003398 fix C — best-effort, POST-verify,
+# NEVER gates). The runsc restore ran inside Pod B's per-container scope cgroup
+# (cgroup-v2 memory.max); memory.peak is the high-water RSS that cgroup reached
+# reconstructing the eager pages.img — the EXACT quantity canary #15's OOM fired
+# against (bug ka-0000000413). Emitting it lets the controller calibrate the
+# restore-peak multiplier (modeledRestorePeakLimit) against real peaks per medium
+# and sandbox role, instead of the single-data-point 3.0x we ship. This runs
+# AFTER the restore is already verified above, so it cannot perturb it, and
+# tolerates every failure (cgroup-v1 node, unresolvable scope, missing file): the
+# sentinel is then FT_RESTORE_PEAK_BYTES=0 and the Go side leaves RestorePeakBytes
+# unset. Resolve each restored container's host cgroup scope by cid and emit the
+# MAX peak across the sandbox root + every sub (the root sandbox is the one that
+# OOMed in #15). HMNTT bounds the find so a pathological cgroup tree cannot wedge.
+# TODO(ka-0000003398 fix C): aggregate FT_RESTORE_PEAK_BYTES across canaries and
+# replace the flat 3.0x multiplier with a per-medium / per-role calibrated term.
+PEAK=0
+peak_for_cid() {
+  _cid="$1"; [ -n "$_cid" ] || return 0
+  for mp in $(HMNTT find /sys/fs/cgroup -type f -name memory.peak -path "*$_cid*.scope/memory.peak" 2>/dev/null); do
+    v=$(HMNT cat "$mp" 2>/dev/null | tr -dc '0-9'); [ -n "$v" ] || continue
+    [ "$v" -gt "$PEAK" ] && PEAK="$v"
+  done
+}
+peak_for_cid "$BSB"
+for cn in $SUBNAMES; do peak_for_cid "$(bcid_for "$cn")"; done
+echo "FT_RESTORE_PEAK_BYTES=$PEAK"
+[ "$PEAK" -gt 0 ] && log "restore-peak measurement: cgroup memory.peak=$PEAK bytes across restored scopes (fix C — for multiplier calibration)"

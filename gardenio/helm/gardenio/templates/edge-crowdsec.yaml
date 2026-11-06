@@ -1,0 +1,244 @@
+{{- /*
+  CrowdSec WAF-lite (P3.3, ka-0000001941; ingress doc §5, ka-0000002581).
+
+  Ships the CrowdSec AGENT (Local API + log acquisition) as an in-cluster
+  Deployment + Service, a chart-managed bouncer-key Secret, a PVC for the
+  agent's state, and the Traefik BOUNCER Middleware. The bouncer is a Traefik
+  yaegi plugin that calls the agent's LAPI in STREAMING mode and FAILS OPEN, so
+  a CrowdSec hiccup never takes the site down.
+
+  Why CrowdSec and not Coraza/CRS: on a single small box the full OWASP CRS
+  consumes many CPUs / tens of GB RAM; CrowdSec's streaming bouncer is ~100 MB.
+  Signature SQLi/XSS, if needed, is CrowdSec's own AppSec component
+  (edge.crowdsec.appsec.enabled) — one fewer moving part than a Coraza plugin.
+
+  OPERATOR PREREQUISITE: the bouncer plugin must be registered in Traefik's
+  STATIC config (experimental.plugins.crowdsec) — the chart does not own the
+  Traefik install. On k3s add it via a HelmChartConfig for the bundled Traefik.
+  The Middleware below references the plugin under the name `crowdsec`; the
+  static plugin registration MUST use the same moduleName/version. Pin the
+  version — yaegi plugins run in-process.
+
+  Default OFF; the Gardenio-in-a-Box overlay (deploy-values/gardenio-inbox.yaml)
+  flips edge.crowdsec.enabled on.
+*/ -}}
+{{- if and .Values.edge .Values.edge.crowdsec .Values.edge.crowdsec.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- $cs := .Values.edge.crowdsec -}}
+{{- $name := printf "%s-edge-crowdsec" $fullname -}}
+{{- $lapiPort := 8080 -}}
+{{- $appsecPort := 7422 -}}
+# ── Bouncer API key Secret ───────────────────────────────────────────────────
+# Chart-managed unless edge.crowdsec.bouncerKeySecret points at an existing one.
+# Generated once (randAlphaNum 48) and preserved across upgrades via the lookup
+# in gardenio.crowdsec.bouncerKey + resource-policy:keep.
+{{- if not $cs.bouncerKeySecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: edge-crowdsec
+  annotations:
+    "helm.sh/resource-policy": keep
+type: Opaque
+data:
+  bouncer-key: {{ include "gardenio.crowdsec.bouncerKey" . | b64enc | quote }}
+---
+{{- end }}
+# ── CrowdSec agent (LAPI + acquisition) Service ──────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: edge-crowdsec
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "gardenio.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: edge-crowdsec
+  ports:
+    - name: lapi
+      port: {{ $lapiPort }}
+      targetPort: lapi
+    {{- if $cs.appsec.enabled }}
+    - name: appsec
+      port: {{ $appsecPort }}
+      targetPort: appsec
+    {{- end }}
+{{- if $cs.persistence.enabled }}
+---
+# ── CrowdSec state PVC ───────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: edge-crowdsec
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ $cs.persistence.size | default "1Gi" }}
+  {{- $sc := $cs.persistence.storageClass | default .Values.global.storageClass }}
+  {{- if $sc }}
+  storageClassName: {{ $sc | quote }}
+  {{- end }}
+{{- end }}
+---
+# ── CrowdSec agent Deployment ────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: edge-crowdsec
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: edge-crowdsec
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: edge-crowdsec
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: false   # crowdsec entrypoint writes /etc/crowdsec + /var/lib/crowdsec
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: crowdsec
+          image: {{ include "gardenio.mirroredImage" (dict "image" $cs.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ $cs.image.pullPolicy | default "IfNotPresent" }}
+          ports:
+            - name: lapi
+              containerPort: {{ $lapiPort }}
+            {{- if $cs.appsec.enabled }}
+            - name: appsec
+              containerPort: {{ $appsecPort }}
+            {{- end }}
+          env:
+            # Air-gapped startup. The Gardenio-in-a-Box overlay (the ONLY place
+            # crowdsec is enabled) runs under default-deny egress
+            # (networkPolicies.defaultDenyEgress), so the agent cannot reach the
+            # CrowdSec Central API or the Hub. The container entrypoint runs
+            # under `set -e`; its unconditional `cscli capi register` (the image
+            # ships online_client present-but-unconfigured, so registration
+            # fires on every fresh boot) dials api.crowdsec.net, fails on the
+            # blocked egress, and aborts startup -> CrashLoopBackOff
+            # (ka-0000000072). DISABLE_ONLINE_API skips CAPI registration +
+            # signal push; NO_HUB_UPGRADE skips the from-volume `cscli hub
+            # upgrade` network fetch. The LAPI, local agent, and streaming
+            # bouncer are fully in-cluster and need no internet — only the
+            # community blocklist is forgone, which the fail-open bouncer never
+            # relied on. Local scenario decisions and the baked parser installs
+            # still work offline from the image's `--with-content` hub index.
+            - name: DISABLE_ONLINE_API
+              value: "true"
+            - name: NO_HUB_UPGRADE
+              value: "true"
+            # Register the Traefik bouncer with our shared key at startup so the
+            # plugin can authenticate without a manual `cscli bouncers add`.
+            - name: BOUNCER_KEY_traefik
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $cs.bouncerKeySecret | default $name }}
+                  key: bouncer-key
+            {{- if $cs.disabledScenarios }}
+            - name: DISABLE_SCENARIOS
+              value: {{ join " " $cs.disabledScenarios | quote }}
+            {{- end }}
+            {{- if $cs.appsec.enabled }}
+            - name: COLLECTIONS
+              value: "crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules"
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml $cs.resources | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/crowdsec/data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: lapi
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: lapi
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: state
+          {{- if $cs.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $name }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true" }}
+---
+# ── Traefik bouncer Middleware ───────────────────────────────────────────────
+# References the crowdsec yaegi plugin (operator-registered in Traefik static
+# config). Streaming mode + fail-open (crowdsecMode=stream, the plugin admits
+# traffic when the LAPI is unreachable). The plugin reads the LAPI at the
+# in-cluster Service with the shared bouncer key.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: edge-crowdsec
+spec:
+  plugin:
+    crowdsec:
+      enabled: "true"
+      crowdsecMode: {{ $cs.mode | default "stream" | quote }}
+      # Fail-open: when the LAPI is unreachable the plugin ADMITS traffic so a
+      # CrowdSec outage never blackholes the box (ingress §5).
+      crowdsecLapiScheme: "http"
+      crowdsecLapiHost: {{ printf "%s:%d" $name (int $lapiPort) | quote }}
+      crowdsecLapiKey: {{ include "gardenio.crowdsec.bouncerKey" . | quote }}
+      {{- if $cs.appsec.enabled }}
+      crowdsecAppsecEnabled: "true"
+      crowdsecAppsecHost: {{ printf "%s:%d" $name (int $appsecPort) | quote }}
+      {{- end }}
+      # failureBlock=false => fail OPEN. defaultDecisionSeconds keeps cached
+      # decisions briefly so a transient LAPI blip doesn't re-query per request.
+      # Direct reference (NOT `| default true`): Helm's `default` treats a
+      # boolean false as empty and would clobber an operator's `failOpen: false`
+      # back to true, silently discarding their fail-CLOSED intent. The key
+      # always ships in values.yaml (default true), so reference it directly.
+      failureBlock: {{ not $cs.failOpen }}
+      defaultDecisionSeconds: "15"
+{{- end }}
+{{- end }}

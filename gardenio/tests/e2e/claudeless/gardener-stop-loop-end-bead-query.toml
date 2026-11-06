@@ -1,0 +1,148 @@
+# gardener-stop-loop-end-bead-query.toml
+#
+# Live-flow scenario for ka-0000002765 §9: stop.loop_end bead_query
+# satisfied → gardener auto-closes.
+#
+# Engine code covered:
+#   - gardenio/controller/internal/scheduler/stop.go:273-305 (bead_query
+#     evaluator forwards to conditions.EvaluateCondition).
+#   - gardenio/controller/internal/scheduler/stop.go:413-450
+#     (enforceStopSpec: closes schedule when a stop entry matches;
+#     comments the bead with terminated: <slot>:<kind>).
+#
+# Gardener §5.1 uses the bead_query "no open children" as the canonical
+# loop-end gate. We exercise the inverse: start with one open child →
+# expect schedule open; close the child → bead_query (op="==" value="0")
+# matches → schedule auto-closes within the next reconcile tick.
+#
+# Why live-flow: shape tests for the stop block already exist in
+# gardener-stop-no-progress.toml. They prove the spec persists. They do
+# NOT prove that the bead_query evaluator dispatches the daemon query
+# correctly OR that enforceStopSpec actually closes the bead. A regression
+# in either path leaves wedged gardeners running forever.
+
+[claude]
+session_id = "e2e00000-000c-4000-a000-000000000009"
+username = "e2e-gardener-stop-bead-query"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 240000
+
+[[responses]]
+on = "*"
+say = "Running gardener-stop-loop-end-bead-query: close child → schedule auto-closes."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if [ -z "${BEADS_HTTP_URL:-}" ] || [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL/BEADS_TOKEN unset"; exit 0
+fi
+
+TAG="e2e-cslbq-$$-$(date +%s)"
+
+EPIC_ID=$(kd create "gardener-stop-bq-epic-$TAG" --type=epic -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then fail "create epic"; exit 1; fi
+CHILD_ID=$(kd create "stop-bq-child-$TAG" --type=task -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$CHILD_ID" ]; then fail "create child"; exit 1; fi
+kd dep add "$CHILD_ID" "$EPIC_ID" --type parent-child >/dev/null 2>&1 || true
+
+# Never-firing cron so we don't accidentally fire-and-close on max_runs.
+TRIGGERS='[{"kind":"cron","cron":"0 0 1 1 *","timezone":"UTC"}]'
+
+# loop_end.any: when zero open children of EPIC_ID remain, close.
+STOP=$(cat <<JSON
+{
+  "loop_end": {"any":[
+    {"kind":"bead_query","op":"==","value":"0",
+     "types":["task","bug","epic"],
+     "parent":"$EPIC_ID",
+     "statuses":["open","in_progress","blocked"]}
+  ]},
+  "run_end": {"any":[{"kind":"no_actionable_state"}]},
+  "hard_stop": {"any":[{"kind":"manual_force","field":"force_close","value":"true"}]}
+}
+JSON
+)
+
+SCHED_ID=$(kd create "gardener-sched-$TAG" --type=schedule \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "role:gardener" -l "project:gardenio" \
+  -f "enabled=true" -f "role=gardener" -f "assign_bead=$EPIC_ID" -f "project=gardenio" \
+  -f "prompt=gardener test prompt" -f "max_runs=10" \
+  -f "cron=0 0 1 1 *" -f "timezone=UTC" \
+  -f "triggers=$TRIGGERS" -f "stop=$STOP" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$SCHED_ID" ]; then fail "create schedule"; exit 1; fi
+echo "schedule: $SCHED_ID  epic: $EPIC_ID  child: $CHILD_ID"
+
+cleanup() {
+  kd update "$SCHED_ID" -f "enabled=false" -f "force_close=true" >/dev/null 2>&1 || true
+  kd close "$SCHED_ID" >/dev/null 2>&1 || true
+  kd close "$CHILD_ID" >/dev/null 2>&1 || true
+  kd close "$EPIC_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# Sanity check first: schedule must still be open while child is open.
+sleep 10
+STATUS_BEFORE=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.status // empty')
+if [ "$STATUS_BEFORE" = "open" ] || [ "$STATUS_BEFORE" = "in_progress" ]; then
+  pass "schedule still open while child open (status=$STATUS_BEFORE)"
+else
+  fail "schedule unexpectedly $STATUS_BEFORE before child closed"
+  exit 1
+fi
+
+# ── Mutate: close the child — bead_query should match → auto-close
+kd close "$CHILD_ID" >/dev/null 2>&1 || { fail "kd close child"; exit 1; }
+echo "closed child $CHILD_ID at $(date -u +%FT%TZ)"
+
+# Wait up to 150s for schedule to auto-close (two reconcile ticks worth).
+DEADLINE=$(( $(date +%s) + 150 ))
+CLOSED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  STATUS=$(kd show "$SCHED_ID" --json 2>/dev/null | jq -r '.status // empty')
+  if [ "$STATUS" = "closed" ]; then
+    CLOSED=1
+    pass "schedule auto-closed (status=closed)"
+    break
+  fi
+  sleep 5
+done
+
+if [ "$CLOSED" = "0" ]; then
+  fail "schedule did not auto-close within 150s of child closure"
+  kd show "$SCHED_ID" 2>/dev/null | head -40 || true
+  exit 1
+fi
+
+# Verify the close-reason comment names loop_end:bead_query.
+COMMENTS=$(kd show "$SCHED_ID" 2>/dev/null | grep -i "terminated\\|loop_end\\|bead_query" | head -3 || true)
+if echo "$COMMENTS" | grep -q "loop_end" && echo "$COMMENTS" | grep -q "bead_query"; then
+  pass "close-reason comment names loop_end:bead_query"
+else
+  echo "  (note) no close-reason comment found — non-fatal"
+fi
+
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "gardener-stop-loop-end-bead-query OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-stop-loop-end-bead-query scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

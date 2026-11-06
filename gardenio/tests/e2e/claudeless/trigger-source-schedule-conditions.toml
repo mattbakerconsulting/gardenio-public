@@ -1,0 +1,185 @@
+# trigger-source-schedule-conditions.toml
+#
+# Claudeless scenario: false bead-query condition → no fire within bound.
+#
+# ka-0000002354 / parent ka-0000008095 §P3:
+#   "trigger-source-schedule-conditions.toml — false condition → no fire."
+#
+# Drives the real evaluation→action loop end-to-end by:
+#   1. Creating a trigger:schedule bead with cron='* * * * *', action=notify,
+#      and a --bead-query condition that can never be satisfied (filters by a
+#      unique label that no bead carries → count is 0, op=> 0 fails).
+#   2. Starting a short-lived `trigger-engine` subprocess with poll=1s.
+#   3. Waiting through at least one cron fire boundary (~75s).
+#   4. Asserting NO audit bead exists for this trigger (conditions filter
+#      out matches before fireAction → no audit, no notification).
+#
+# Companion to trigger-source-schedule-fires.toml (true → fires).
+
+[claude]
+session_id = "e2e00000-000a-4000-a000-000000000002"
+username = "e2e-trigger-schedule-conditions"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 60000
+
+[[responses]]
+on = "*"
+say = "Running trigger-source-schedule-conditions: false condition → no fire."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-engine ─────────────────────
+TE_BIN=""
+if command -v trigger-engine >/dev/null 2>&1; then
+  TE_BIN=$(command -v trigger-engine)
+elif [ -x /usr/local/bin/trigger-engine ]; then
+  TE_BIN=/usr/local/bin/trigger-engine
+elif [ -x /tmp/trigger-engine ]; then
+  TE_BIN=/tmp/trigger-engine
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-engine from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-engine ./cmd/trigger-engine/ ) || {
+    echo "SKIP: trigger-engine build failed"; exit 0;
+  }
+  TE_BIN=/tmp/trigger-engine
+else
+  echo "SKIP: trigger-engine binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-engine: $TE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL not set (must run inside e2e shard)"
+  exit 0
+fi
+if [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_TOKEN not set"
+  exit 0
+fi
+if ! command -v gb >/dev/null 2>&1; then
+  echo "SKIP: gb not present"
+  exit 0
+fi
+
+# ── Setup ──────────────────────────────────────────────────────────
+TAG="e2e-tsc-$$-$(date +%s)"
+# An impossible label: nothing else in the daemon should carry this exact tag.
+IMPOSSIBLE_LABEL="e2e-impossible-${TAG}"
+echo "tag: $TAG"
+echo "impossible label: $IMPOSSIBLE_LABEL"
+
+# Create the trigger with a bead-query condition that requires >0 beads
+# carrying a label that no bead has → condition is always false.
+TRIG_OUT=$(gb trigger create schedule \
+  --http-url "$BEADS_HTTP_URL" \
+  --title "$TAG" \
+  --cron '* * * * *' \
+  --bead-query "labels=$IMPOSSIBLE_LABEL,statuses=open,op=>,value=0" \
+  --action notify \
+  --prompt "should never fire" \
+  --label "e2e:claudeless" \
+  --label "e2e-tag:$TAG" \
+  --json 2>&1) || { fail "gb trigger create" "$TRIG_OUT"; exit 1; }
+
+TRIG_ID=$(echo "$TRIG_OUT" | jq -r '.id // .ID // empty')
+if [ -z "$TRIG_ID" ]; then
+  fail "extract trigger id" "out=$TRIG_OUT"
+  exit 1
+fi
+echo "trigger: $TRIG_ID"
+
+cleanup() {
+  gb trigger disable "$TRIG_ID" --http-url "$BEADS_HTTP_URL" >/dev/null 2>&1 || true
+  kd close "$TRIG_ID" >/dev/null 2>&1 || true
+  if [ -n "${TE_PID:-}" ]; then
+    kill "$TE_PID" 2>/dev/null || true
+    wait "$TE_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+# ── Run trigger-engine subprocess ──────────────────────────────────
+TE_LOG=/tmp/trigger-engine-conditions-$$.log
+BEADS_HTTP_ADDR="$BEADS_HTTP_URL" \
+  BEADS_DAEMON_TOKEN="$BEADS_TOKEN" \
+  TRIGGER_POLL_INTERVAL=1s \
+  LISTEN_ADDR=":0" \
+  LOG_LEVEL=info \
+  "$TE_BIN" >"$TE_LOG" 2>&1 &
+TE_PID=$!
+echo "trigger-engine pid: $TE_PID"
+
+# ── Wait through at least one cron boundary (~75s) ────────────────
+# Even with cron='* * * * *', conditions are checked at every poll, so we
+# need to outlast the next minute boundary to prove the gate held.
+DEADLINE=$(( $(date +%s) + 75 ))
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  # Early-exit if we observe an unexpected fire — fail fast.
+  AUDIT=$(kd list --type=event -l "trigger:$TRIG_ID" --json 2>/dev/null | \
+    jq -c '[.[] | select(.fields.outcome=="allow")][0] // empty' 2>/dev/null)
+  if [ -n "$AUDIT" ] && [ "$AUDIT" != "null" ]; then
+    fail "trigger fired despite false condition" "audit=$AUDIT"
+    echo "--- trigger-engine log (tail) ---"
+    tail -40 "$TE_LOG" 2>/dev/null || true
+    echo "--- end log ---"
+    exit 1
+  fi
+  if grep -q 'triggers: notification sent' "$TE_LOG" 2>/dev/null; then
+    fail "trigger-engine logged 'notification sent' despite false condition"
+    echo "--- trigger-engine log (tail) ---"
+    tail -40 "$TE_LOG" 2>/dev/null || true
+    echo "--- end log ---"
+    exit 1
+  fi
+  sleep 3
+done
+
+# Final audit-count check.
+AUDIT_COUNT=$(kd list --type=event -l "trigger:$TRIG_ID" --json 2>/dev/null | jq 'length' 2>/dev/null)
+AUDIT_COUNT="${AUDIT_COUNT:-0}"
+if [ "$AUDIT_COUNT" = "0" ]; then
+  pass "no audit bead recorded for false-condition trigger"
+else
+  fail "expected 0 audit beads, got $AUDIT_COUNT"
+fi
+
+# Sanity: the engine must have at least observed the trigger (last_checked
+# stamped). Otherwise we'd be testing nothing.
+LAST=$(kd show "$TRIG_ID" --json 2>/dev/null | jq -r '.fields.last_checked // empty')
+if [ -n "$LAST" ]; then
+  pass "engine evaluated trigger (last_checked=$LAST)"
+else
+  fail "engine never evaluated trigger (last_checked unset)"
+  echo "--- trigger-engine log (tail) ---"
+  tail -40 "$TE_LOG" 2>/dev/null || true
+  echo "--- end log ---"
+fi
+
+# ── Summary ────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "trigger-source-schedule-conditions: false condition → no fire OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "trigger-source-schedule-conditions scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

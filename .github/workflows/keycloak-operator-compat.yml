@@ -1,0 +1,123 @@
+# EPAM keycloak-operator vs Keycloak server compatibility (gd-s47ivaszhW; plan
+# gd-QXq1fjYuRD, phase 2).
+#
+# The operator publishes no Keycloak compatibility matrix; its own PR CI runs its
+# integration suite against Keycloak 26.4 and 26.5 only (pr.yaml, v1.32.0). The
+# cluster runs operator 1.32.0 (gocloak REST client). This workflow runs the
+# operator's OWN integration suite (`go test ./...` as the Makefile `test` recipe does, envtest + a real Keycloak at
+# TEST_KEYCLOAK_URL) from a chosen operator tag against chosen Keycloak tags, so
+# "is operator X fine against Keycloak Y" is a measured answer instead of a guess.
+# Compare each cell against the 26.5.7 control: a failure that also fails there is
+# the suite's own flake or an unrelated test, not a Keycloak regression.
+#
+# Dispatch-only plus push to agent/kc-preflight/** (same reason as
+# keycloak-upgrade-preflight.yml). Never a required check.
+name: keycloak-operator-compat
+
+on:
+  push:
+    branches: ['agent/kc-preflight/**']
+  workflow_dispatch:
+    inputs:
+      operators:
+        description: 'JSON array of EPAM operator tags'
+        required: false
+        default: '["v1.32.0","v1.35.0"]'
+      keycloaks:
+        description: 'JSON array of Keycloak tags (first is the control)'
+        required: false
+        default: '["26.5.7","26.7.5","26.8.1"]'
+
+permissions:
+  contents: read
+
+env:
+  OPERATORS: ${{ inputs.operators || '["v1.32.0","v1.35.0"]' }}
+  KEYCLOAKS: ${{ inputs.keycloaks || '["26.5.7","26.7.5","26.8.1"]' }}
+
+jobs:
+  matrix:
+    runs-on: gardenio-k3s-light
+    timeout-minutes: 5
+    outputs:
+      operators: ${{ steps.m.outputs.operators }}
+      keycloaks: ${{ steps.m.outputs.keycloaks }}
+    steps:
+      - id: m
+        run: |
+          set -euo pipefail
+          # Plain version strings only: both reach `git checkout` / `docker run`.
+          echo "$OPERATORS" | jq -e 'type=="array" and length>0 and all(.[]; type=="string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' >/dev/null
+          echo "$KEYCLOAKS" | jq -e 'type=="array" and length>0 and all(.[]; type=="string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' >/dev/null
+          echo "operators=$(echo "$OPERATORS" | jq -c .)" >>"$GITHUB_OUTPUT"
+          echo "keycloaks=$(echo "$KEYCLOAKS" | jq -c .)" >>"$GITHUB_OUTPUT"
+
+  compat:
+    name: operator ${{ matrix.operator }} / keycloak ${{ matrix.keycloak }}
+    needs: matrix
+    runs-on: gardenio-k3s # dind sidecar: the job drives `docker run`
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        operator: ${{ fromJSON(needs.matrix.outputs.operators) }}
+        keycloak: ${{ fromJSON(needs.matrix.outputs.keycloaks) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: epam/edp-keycloak-operator
+          ref: ${{ matrix.operator }}
+          path: operator
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: operator/go.mod
+          cache: false
+      - name: start Keycloak ${{ matrix.keycloak }} (the operator CI's own recipe)
+        run: |
+          set -euo pipefail
+          docker run -d --name keycloak --network host \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            -e KC_FEATURES=admin-fine-grained-authz:v1 \
+            -e KC_HTTP_PORT=8081 \
+            "quay.io/keycloak/keycloak:${{ matrix.keycloak }}" start-dev >/dev/null
+          for i in $(seq 1 90); do
+            curl -sf http://localhost:8081/realms/master >/dev/null && { echo "keycloak ready after ~$((i*2))s"; exit 0; }
+            sleep 2
+          done
+          docker logs keycloak | tail -50
+          exit 1
+      - name: operator integration suite
+        id: suite
+        working-directory: operator
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          # The runner image has no `make`; this is the operator Makefile's `test` recipe.
+          ENVTEST_VERSION=$(go list -m -f '{{ .Version }}' sigs.k8s.io/controller-runtime | awk -F'[v.]' '{printf "release-%d.%d", $2, $3}')
+          K8S_VERSION=$(go list -m -f '{{ .Version }}' k8s.io/api | awk -F'[v.]' '{printf "1.%d", $3}')
+          go install "sigs.k8s.io/controller-runtime/tools/setup-envtest@${ENVTEST_VERSION}"
+          KUBEBUILDER_ASSETS="$("$(go env GOPATH)/bin/setup-envtest" use "${K8S_VERSION}" -p path)"
+          export KUBEBUILDER_ASSETS
+          TEST_KEYCLOAK_URL="http://localhost:8081" go test ./... 2>&1 | tee ../suite.log
+      - name: summarise
+        if: always()
+        run: |
+          {
+            echo "### operator ${{ matrix.operator }} vs keycloak ${{ matrix.keycloak }}: suite ${{ steps.suite.outcome }}"
+            echo
+            echo "packages: ok=$(grep -c '^ok ' suite.log || true) FAIL=$(grep -c '^FAIL\s' suite.log || true)"
+            echo
+            echo '```'
+            grep -E '^(--- FAIL|FAIL\s|panic:)' suite.log | sort | uniq | head -60 || true
+            echo '```'
+          } | tee suite-summary.md >>"$GITHUB_STEP_SUMMARY"
+          docker logs keycloak 2>&1 | grep -E " (ERROR|WARN) " | sed -E 's/^[0-9: ,.-]+//' | sort | uniq -c | sort -rn | head -30 >keycloak-warn.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compat-${{ matrix.operator }}-${{ matrix.keycloak }}
+          path: |
+            suite.log
+            suite-summary.md
+            keycloak-warn.txt
+          if-no-files-found: warn

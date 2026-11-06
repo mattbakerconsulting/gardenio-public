@@ -1,0 +1,67 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-cover-images
+  annotations:
+    policies.kyverno.io/title: Disallow coverage-instrumented images outside E2E namespaces
+    policies.kyverno.io/category: gardenio
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Coverage-instrumented image variants (registry.../gardenio/<name>-cover:<tag>)
+      exist for runtime coverage collection during E2E runs (W2,
+      ka-0000005395). The pre-Actions CI built them; no workflow builds them
+      today, and the coverage ratchet work (gd-d29n0m678l) may bring them back.
+      These binaries carry instrumentation overhead and write counters to a
+      host volume — they MUST NEVER run in production. They also carry the OCI
+      label org.gardenio.cover=1. This ClusterPolicy is the admission-time
+      defense: it denies any Pod whose container image repository ends with
+      `-cover` outside the allowlisted E2E namespaces. The allowlist matches
+      BOTH the singleton namespace gardenio-e2e AND every gardenio-e2e-<id>
+      namespace (including the live lane's gardenio-e2e-0/1 pool), where an
+      E2E coverage shard may legitimately run -cover pods.
+      The Helm chart's `global.coverage.enabled` gate is the first line of
+      defense; this policy is the second, blocking accidental misuse at admission
+      time even if the chart is misconfigured or an operator runs `kubectl apply`
+      with a hand-edited manifest.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: block-cover-images-outside-e2e
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      exclude:
+        any:
+          # Kyverno namespace selectors accept `*`/`?` globs. Allowlist both the
+          # singleton namespace AND the per-instance ones (gardenio-e2e-<id>)
+          # where an E2E coverage shard runs -cover pods. Without
+          # the `-*` globs this policy would wrongly DENY the very pods it is
+          # designed to permit (ka-0000001728).
+          - resources:
+              namespaces:
+                - gardenio-e2e
+                - gardenio-e2e-*
+      validate:
+        message: >-
+          Coverage-instrumented images (*-cover) are forbidden outside the
+          gardenio-e2e E2E namespaces (gardenio-e2e and gardenio-e2e-*). See
+          policy/kyverno/disallow-cover-images.yaml.
+        foreach:
+          - list: request.object.spec.containers
+            deny:
+              conditions:
+                any:
+                  - key: "{{ regex_match('^.*/[^/]+-cover(:[^/@]+)?(@sha256:[a-f0-9]+)?$', '{{ element.image }}') }}"
+                    operator: Equals
+                    value: true
+          - list: request.object.spec.initContainers || []
+            deny:
+              conditions:
+                any:
+                  - key: "{{ regex_match('^.*/[^/]+-cover(:[^/@]+)?(@sha256:[a-f0-9]+)?$', '{{ element.image }}') }}"
+                    operator: Equals
+                    value: true

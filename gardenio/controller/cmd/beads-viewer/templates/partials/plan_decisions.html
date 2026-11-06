@@ -1,0 +1,143 @@
+{{define "plan_decisions"}}
+{{/* The plan's CLARIFYING-QUESTION decisions, answerable IN PLACE (task
+     ka-0000003157, risk R5). Previously each question out-linked to /{id},
+     breaking the Cursor-style one-at-a-time loop; now an operator resolves or
+     dismisses a question right here and the gardener's NEXT question appears
+     inline live (the plan SSE stream re-renders this whole section under the
+     `plan-decisions-updated` frame). No new resolution logic: the inline
+     resolve/dismiss chips POST to plan-scoped routes that delegate to the same
+     daemon.ResolveDecision / CancelDecision the /{id} card uses.
+
+     Wrapped in #plan-decisions so add/close/resolve re-render it via
+     hx-swap=outerHTML AND the SSE stream can swap the whole section's outerHTML
+     the moment a decision is asked, answered, or dismissed. The section root
+     carries data-open-decisions so plan_events.js can update the header "N to
+     answer" chip client-side on swap (never section-live / header-static).
+     Operator-only chips are gated on $.IsOperator (matched by the operatorOnly
+     POST routes); read-only viewers keep the click-out link. Called with a data
+     bag: PlanID, Decisions, OpenDecisions, IsOperator, Error, BasePath. */}}
+<section id="plan-decisions" class="plan-decisions" data-open-decisions="{{.OpenDecisions}}" aria-live="polite">
+  <h3 aria-level="2">Clarifying questions
+    {{if .OpenDecisions}}<span class="chip chip-attention">{{.OpenDecisions}} open</span>{{end}}
+  </h3>
+
+  {{if .Error}}
+  <p class="bead-actions-error" role="alert">{{.Error}}</p>
+  {{end}}
+
+  {{if .Decisions}}
+  <ul class="plan-decision-list">
+    {{range .Decisions}}
+    {{$dec := .}}
+    <li class="plan-decision{{if $dec.Resolved}} plan-decision-resolved{{end}}" data-bead-id="{{$dec.ID}}">
+      {{/* The question: markdown-rendered prompt when present, else the title.
+           Read-only viewers (and any non-operator) get the click-out link to the
+           canonical decision card; operators read it in place. */}}
+      {{if $.IsOperator}}
+        <div class="plan-decision-q">{{if $dec.PromptHTML}}{{$dec.PromptHTML}}{{else if $dec.Prompt}}{{$dec.Prompt}}{{else}}{{$dec.Title}}{{end}}</div>
+      {{else}}
+        <a class="plan-decision-title" href="{{$.BasePath}}/{{$dec.ID}}">{{if $dec.Prompt}}{{$dec.Prompt}}{{else}}{{$dec.Title}}{{end}}</a>
+      {{end}}
+
+      <div class="plan-decision-meta">
+        <span class="chip chip-status chip-status-{{$dec.Status}}">{{if $dec.Resolved}}resolved{{else}}open{{end}}</span>
+        {{if $dec.Ago}}<span class="meta">{{$dec.Ago}}</span>{{end}}
+        <a class="meta plan-decision-open" href="{{$.BasePath}}/{{$dec.ID}}" title="Open the decision bead">{{$dec.ID}} &rarr;</a>
+      </div>
+
+      {{/* The agent's context, above the options (gd-hmwSI9lwKe). */}}
+      {{$dec.Context.Block}}
+      {{$dec.Evidence}}
+
+      {{/* Resolved/dismissed attribution banner — mirrors the type_decision card. */}}
+      {{if $dec.Resolved}}
+        <div class="plan-decision-outcome">
+          {{if $dec.Resolution.Canceled}}
+            <strong>Dismissed</strong>
+            {{if $dec.Resolution.ResolvedBy}} by {{$dec.Resolution.ResolvedBy}}{{end}}
+            {{if $dec.Resolution.CancelReason}}<div class="plan-decision-response">{{$dec.Resolution.CancelReason}}</div>{{end}}
+          {{else}}
+            <strong>Answered</strong>
+            {{if $dec.Resolution.OptionID}} &mdash; chose <code>{{$dec.Resolution.OptionID}}</code>{{end}}
+            {{if $dec.Resolution.ResolvedBy}} by {{$dec.Resolution.ResolvedBy}}{{end}}
+            {{if $dec.Resolution.ResponseText}}<div class="plan-decision-response">{{$dec.Resolution.ResponseText}}</div>{{end}}
+          {{end}}
+        </div>
+      {{end}}
+
+      {{/* Options: always listed so the reader sees the choice set. When the
+           viewer can resolve (operator + open) each option is a one-click POST
+           form carrying its id in a hidden field — HTML attribute escaping
+           safely handles any option id, no client JSON needed. Otherwise the
+           options render read-only (a chosen option is badged on a resolved
+           decision). Plain htmx throughout, mirroring the Done/Reopen step
+           buttons. */}}
+      {{if $dec.Options}}
+      <ul class="plan-decision-options" aria-label="Answer options">
+        {{range $dec.Options}}
+        <li class="plan-decision-opt{{if and $dec.Resolved (eq $dec.Resolution.OptionID .ID)}} plan-decision-opt-chosen{{end}}">
+          {{if $dec.CanResolve}}
+          <form class="plan-decision-opt-form"
+                hx-post="{{$.BasePath}}/plans/{{$.PlanID}}/decisions/{{$dec.ID}}/resolve"
+                hx-target="#plan-decisions" hx-swap="outerHTML"
+                hx-confirm="Answer with {{if .Short}}{{.Short}}{{else}}{{.ID}}{{end}}?"
+                hx-disabled-elt="find button">
+            <input type="hidden" name="option_id" value="{{.ID}}">
+            <button type="submit" class="bead-action plan-decision-chip" title="Answer with option {{.ID}}">
+              <code class="plan-decision-opt-id">{{.ID}}</code>
+              {{if .Short}}<span class="plan-decision-opt-short">{{.Short}}</span>{{end}}
+              {{if .Label}}<span class="plan-decision-opt-label">{{.Label}}</span>{{end}}
+              {{if .Description}}<span class="opt-desc">{{.Description}}</span>{{end}}
+            </button>
+          </form>
+          {{else}}
+          <code class="plan-decision-opt-id">{{.ID}}</code>
+          {{if .Short}}<span class="plan-decision-opt-short">{{.Short}}</span>{{end}}
+          {{if .Label}}<span class="plan-decision-opt-label">{{.Label}}</span>{{end}}
+          {{if .Description}}<span class="opt-desc">{{.Description}}</span>{{end}}
+          {{if and $dec.Resolved (eq $dec.Resolution.OptionID .ID)}}<span class="plan-decision-opt-badge">chosen</span>{{end}}
+          {{end}}
+        </li>
+        {{end}}
+      </ul>
+      {{end}}
+
+      {{/* Other answer / dismiss — operator-only, open-only. A collapsible
+           <details> holds the free-text answer (resolve with no option) and the
+           dismiss action, so the common one-click path stays uncluttered. On
+           success each POST re-renders this whole section: the answered question
+           flips to its resolved skin and the gardener's NEXT question (a fresh
+           decision bead) appears in place. */}}
+      {{if $dec.CanResolve}}
+      <details class="plan-decision-more">
+        <summary>Other answer or dismiss&hellip;</summary>
+        <form class="plan-decision-other"
+              hx-post="{{$.BasePath}}/plans/{{$.PlanID}}/decisions/{{$dec.ID}}/resolve"
+              hx-target="#plan-decisions" hx-swap="outerHTML"
+              hx-on::after-request="if(event.detail.successful) this.reset()"
+              hx-disabled-elt="find textarea, find button">
+          <label for="plan-dec-resp-{{$dec.ID}}">Answer with a free-text response</label>
+          <textarea id="plan-dec-resp-{{$dec.ID}}" name="response_text" rows="3" maxlength="10000" required
+                    placeholder="Your answer&hellip; doesn't have to match a listed option."></textarea>
+          <button type="submit" class="bead-action">Submit response</button>
+        </form>
+        <form class="plan-decision-dismiss"
+              hx-post="{{$.BasePath}}/plans/{{$.PlanID}}/decisions/{{$dec.ID}}/dismiss"
+              hx-target="#plan-decisions" hx-swap="outerHTML"
+              hx-confirm="Dismiss this question without answering?"
+              hx-disabled-elt="find textarea, find button">
+          <label for="plan-dec-reason-{{$dec.ID}}">Dismiss without answering (optional reason)</label>
+          <textarea id="plan-dec-reason-{{$dec.ID}}" name="reason" rows="2" maxlength="10000"
+                    placeholder="Optional reason&hellip;"></textarea>
+          <button type="submit" class="bead-action plan-decision-dismiss-btn">Dismiss</button>
+        </form>
+      </details>
+      {{end}}
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p class="empty empty-yet">No clarifying questions yet. The planner gardener asks these one at a time as it researches.</p>
+  {{end}}
+</section>
+{{end}}

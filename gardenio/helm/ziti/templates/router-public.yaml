@@ -1,0 +1,203 @@
+{{- if and .Values.ziti.enabled .Values.ziti.routerPublic.enabled }}
+# router-public-1 -- OpenZiti public edge router, replacing router-instance-1
+# on Vultr (gd-dCvIWuT6t6).
+#
+# Why: the controller and the current public router (router-instance-1,
+# #public) live on Vultr. This router moves the public edge into k3s so
+# Vultr can eventually be decommissioned (gd-cknbyfXxKt), while keeping the
+# in-VPC-only router-aws-1 unchanged.
+#
+# Public, unlike router-aws-1: role attribute `public` (admitted by the
+# existing all-endpoints-public-routers edge-router-policy, no new policy
+# needed), a link listener (default bootstrap -- no --private arg), and SG
+# ingress on 3022 from 0.0.0.0/0 on the edge node's OWN SG only
+# (terraform/modules/k3s aws_security_group.ziti_edge, operator ruling
+# gd-II5iO7Nbbf separate-sg; the shared nodes SG stays VPC-only on 3022). Tunneler mode `host`
+# (default), matching router-instance-1 -- unlike router-aws-1, which is
+# ZITI_ROUTER_MODE=none.
+#
+# nodeSelector gardenio.io/ziti-public-router: "true" is deliberately NOT
+# gardenio.io/lifecycle: on-demand (router-aws-1's selector) -- both routers
+# hostNetwork on 3022, so they cannot share a node. Labeling the node with
+# this selector is done by the edge node's k3s registration flags
+# (--node-label gardenio.io/ziti-public-router=true, terraform
+# aws_instance.ziti_edge). Until that node exists, this Deployment stays
+# Pending -- expected, not a bug.
+#
+# ZITI_ROUTER_ADVERTISED_ADDRESS is the DNS name ziti.clonk.tv, not a node
+# IP, so (unlike router-aws-1) there is no ZITI_ROUTER_IP_OVERRIDE here --
+# per docs/ziti-routers.md's own gotcha, the override is only needed when
+# the advertised address is an IP. The DNS record itself is owned by part
+# (b) (static EIP), not this manifest.
+#
+# The identity lives on a local-path PVC so a restart re-uses the enrolment.
+# Enrolment token (one-shot, ~3 h TTL) comes from Secret `router-public-1-jwt`
+# (key router.jwt), created by hand from the edge router's enrollmentJwt on
+# the IN-CLUSTER controller, never committed -- see docs/ziti-routers.md.
+# First enrolled 2026-09-23 (edge router id JK-4CbiIYO). Once enrolled the
+# identity on the PVC is what matters; the Secret is optional and stale.
+#
+# The `public` role attribute is admitted by all-endpoints-public-routers on
+# the VULTR controller. The in-cluster controller is a fresh network with no
+# such policy yet; its policies arrive with the Phase 2 cutover
+# (gd-GMCZt0OzB7), not with this router.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: router-public-1-identity
+  namespace: ziti
+  labels:
+    app: router-public-1
+    app.kubernetes.io/part-of: gas-city
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: router-public-1
+  namespace: ziti
+  labels:
+    app: router-public-1
+    app.kubernetes.io/part-of: gas-city
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # RWO identity volume + a fixed host port
+  selector:
+    matchLabels:
+      app: router-public-1
+  template:
+    metadata:
+      labels:
+        app: router-public-1
+    spec:
+      # hostNetwork so the edge listener is reachable at the node's public IP.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        gardenio.io/ziti-public-router: "true"
+      # See router-aws-1.yaml's header comment for why both tolerations are
+      # required: every Ready node here is NoSchedule-tainted by design, and
+      # a local-path PVC pins this pod to whichever exact node its PV was
+      # provisioned on, so it needs a toleration for whatever taint that node
+      # carries. The static-EIP node (part b) is the dedicated edge node
+      # (terraform modules/k3s aws_instance.ziti_edge), tainted
+      # gardenio.io/ziti-edge=true:NoSchedule so nothing else lands there;
+      # the other two are kept from the earlier design and are harmless.
+      tolerations:
+        - key: gardenio.io/ziti-edge
+          operator: Exists
+          effect: NoSchedule
+        - key: gardenio.agent
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsUser: 2171 # ziggy, the image's user
+        runAsGroup: 2171
+        fsGroup: 2171
+      containers:
+        - name: router
+          image: openziti/ziti-router:2.0.4 # must match the controller's major.minor (ziti v2.0.4 on Vultr)
+          args: ["run", "/ziti-router/config.yml"]
+          env:
+            - name: ZITI_HOME
+              value: /ziti-router
+            - name: ZITI_BOOTSTRAP
+              value: "true"
+            - name: ZITI_BOOTSTRAP_CONFIG
+              value: "true"
+            - name: ZITI_BOOTSTRAP_ENROLLMENT
+              value: "true"
+            - name: ZITI_AUTO_RENEW_CERTS
+              value: "true"
+            - name: ZITI_ROUTER_NAME
+              value: router-public-1
+            - name: ZITI_ROUTER_TYPE
+              value: edge
+            - name: ZITI_ROUTER_PORT
+              value: "3022"
+            - name: ZITI_ROUTER_BIND_ADDRESS
+              value: 0.0.0.0
+            # A DNS name, not an IP -- tracks whichever node currently holds
+            # the static EIP (part b). No ZITI_ROUTER_IP_OVERRIDE: that is
+            # only needed when the advertised address is an IP.
+            - name: ZITI_ROUTER_ADVERTISED_ADDRESS
+              value: "ziti.clonk.tv"
+            # The in-cluster controller (gd-Vn8uWTbQ9S), NOT the Vultr box. Its
+            # server cert's only DNS SAN is this name; inside the cluster
+            # CoreDNS rewrites it to the controller Service
+            # (templates/coredns-split-horizon.yaml), which this hostNetwork pod sees
+            # through dnsPolicy ClusterFirstWithHostNet. 8440 is never public.
+            - name: ZITI_CTRL_ADVERTISED_ADDRESS
+              value: ziti-ctrl.clonk.tv
+            - name: ZITI_CTRL_ADVERTISED_PORT
+              value: "8440"
+            - name: ZITI_ENROLL_TOKEN
+              value: /jwt/router.jwt
+          ports:
+            - name: edge
+              containerPort: 3022
+              protocol: TCP
+          volumeMounts:
+            - name: identity
+              mountPath: /ziti-router
+            - name: jwt
+              mountPath: /jwt
+              readOnly: true
+          # Not tcpSocket: a bare TCP open against the edge listener is not a
+          # TLS handshake, so the router logs "handshake failed: EOF" on every
+          # poll. Not pgrep either -- the image has no procps. The router
+          # exposes no health endpoint, so check that the listener is up. (If
+          # the router itself dies, PID 1 exits and the container restarts.)
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "ss -ltn | grep -q ':3022'"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "ss -ltn | grep -q ':3022'"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: "1", memory: 512Mi }
+      volumes:
+        - name: identity
+          persistentVolumeClaim:
+            claimName: router-public-1-identity
+        - name: jwt
+          secret:
+            secretName: router-public-1-jwt
+            optional: true
+---
+# PDB only (gd-27vcHmrurh) -- no topologySpreadConstraints/podAntiAffinity:
+# the identity PVC above is local-path (node-bound, see the header comment),
+# so this pod is pinned to one exact node and runs strategy:Recreate; a
+# spread/anti-affinity block would be dead YAML -- there is no "spread" to
+# have with a PV-node-pinned singleton. maxUnavailable, NOT minAvailable
+# (ka-0000001453): on a 1-replica Deployment minAvailable:1 ==
+# maxUnavailable:0, which makes the eviction API refuse the pod forever.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: router-public-1
+  namespace: ziti
+  labels:
+    app: router-public-1
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: router-public-1
+{{- end }}

@@ -1,0 +1,134 @@
+{{- if .Values.mcpGrafanaWrite.enabled }}
+{{- /*
+  SECOND, WRITE-CAPABLE grafana/mcp-grafana instance (ka-0000000293, epic
+  ka-0000002011). DISTINCT from the read-only `mcpGrafana` sidecar
+  (mcp-grafana/deployment.yaml): different component label, NO --disable-write, a
+  curated --enabled-tools family allow-list, and per-request header auth (no env
+  SA token).
+
+  The gardenio-assistant-app plugin BACKEND reverse-proxies the chat box's MCP
+  traffic here instead of grafana-llm-app's EMBEDDED server (which dials Grafana's
+  external edge-auth'd app_url and 403s). The backend stamps X-Grafana-URL (the
+  in-cluster Grafana) + X-Grafana-API-Key (the plugin's OWN Grafana-minted managed
+  SA, scoped by plugin.json iam to dashboards+folders+datasource-reads) on every
+  request; mcp-grafana reads those headers (ExtractGrafanaInfoFromHeaders) in
+  preference to its own env. So this pod needs no env token and the write identity
+  never leaves the cluster.
+*/ -}}
+{{- $grafanaURL := include "gardenio.mcpGrafana.grafanaURL" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.mcpGrafanaWrite.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.mcpGrafanaWrite.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.mcpGrafanaWrite.replicaCount | default 1 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "gardenio.mcpGrafanaWrite.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.mcpGrafanaWrite.selectorLabels" . | nindent 8 }}
+    spec:
+      # Talks to the Grafana API over a Bearer token only; no Kubernetes API.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: mcp-grafana
+          image: "{{ .Values.mcpGrafanaWrite.image.repository }}:{{ .Values.mcpGrafanaWrite.image.tag }}"
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.mcpGrafanaWrite.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          # Override the baked ENTRYPOINT so our args fully REPLACE it (same
+          # reason as the read sidecar: the image hardcodes `--transport sse
+          # --address 0.0.0.0:8000`).
+          command: ["/app/mcp-grafana"]
+          args:
+            - "-t"
+            - "streamable-http"
+            - "--address"
+            - "0.0.0.0:{{ .Values.mcpGrafanaWrite.listenPort }}"
+            - "--endpoint-path"
+            - {{ .Values.mcpGrafanaWrite.endpointPath | quote }}
+            {{- /* Curated FAMILY allow-list — the server-layer half of the
+                   envelope. Read families for grounding + dashboard/folder for
+                   create. NO admin/alerting/etc. */}}
+            {{- if .Values.mcpGrafanaWrite.enabledTools }}
+            - "--enabled-tools"
+            - {{ .Values.mcpGrafanaWrite.enabledTools | quote }}
+            {{- end }}
+            {{- /* WRITE-CAPABLE: --disable-write is OFF here (unlike the read
+                   sidecar). Rendered only if an overlay explicitly flips it on. */}}
+            {{- if .Values.mcpGrafanaWrite.disableWrite }}
+            - "--disable-write"
+            {{- end }}
+          env:
+            {{- /* Fallback only — the plugin backend's X-Grafana-URL header wins
+                   per request. Keeps the pod usable for an in-cluster smoke probe
+                   even before the plugin connects. */}}
+            {{- if $grafanaURL }}
+            - name: GRAFANA_URL
+              value: {{ $grafanaURL | quote }}
+            {{- end }}
+            {{- /* Normally EMPTY: identity is supplied per-request via
+                   X-Grafana-API-Key by the plugin backend. An env token is only
+                   set for a deployment that opts into a static SA token. */}}
+            {{- if .Values.mcpGrafanaWrite.token.secretName }}
+            - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.mcpGrafanaWrite.token.secretName }}
+                  key: token
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mcpGrafanaWrite.listenPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.mcpGrafanaWrite.resources | nindent 12 }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.mcpGrafanaWrite.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.mcpGrafanaWrite.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.mcpGrafanaWrite.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

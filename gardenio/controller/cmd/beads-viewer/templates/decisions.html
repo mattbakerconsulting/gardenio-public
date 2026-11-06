@@ -1,0 +1,312 @@
+{{template "layout" .}}
+{{define "title"}}Decisions · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+{{with .GardenHref}}{{template "garden_banner" .}}{{end}}
+<h1>Decisions{{if .ProjectFilter}} · {{.ProjectFilter}}{{end}}
+  {{if and .CanScope (not .ShowAll)}}<span class="meta">· yours</span>{{end}}
+  {{if .Decisions}}<span class="meta">({{len .Decisions}})</span>{{end}}
+</h1>
+
+{{if .Error}}
+<div class="banner banner-error">{{.Error}}</div>
+{{end}}
+
+{{if .CanScope}}
+<p class="decisions-scope-toggle">
+  {{if .ShowAll}}
+  <span class="meta">Showing all open decisions.</span>
+  <a class="chip chip-type" href="{{.BasePath}}/decisions{{if .ProjectFilter}}?project={{.ProjectFilter}}{{end}}">Show mine</a>
+  {{else}}
+  <span class="meta">Showing only decisions assigned to you.</span>
+  <a class="chip chip-type" href="{{.BasePath}}/decisions?all=1{{if .ProjectFilter}}&amp;project={{.ProjectFilter}}{{end}}">Show all</a>
+  {{end}}
+</p>
+{{end}}
+
+{{/* Project selector (ka-0000004140). Rendered whenever there is more than
+     one project to choose between, or a filter is already pinned — a
+     single-project fleet gets no dead chip row. Chips come from the projects
+     that actually have an open decision, so every one is clickable and carries
+     its queue depth as a count badge. */}}
+{{if or .ProjectFilter (gt (len .ProjectFacets) 2)}}
+<div class="filter-rows" aria-label="Decision filters">
+  {{template "filter_row" (dict "Name" "Project" "Items" .ProjectFacets)}}
+</div>
+{{end}}
+
+{{if .Truncated}}
+<div class="banner banner-warn">Showing first {{.Limit}} open decisions.</div>
+{{end}}
+
+{{if .Decisions}}
+<ul class="bead-list" id="decisions-list">
+  {{range .Decisions}}
+  {{$decisionID := .ID}}
+  <li class="bead-row" id="decision-row-{{.ID}}" data-bead-id="{{.ID}}" data-last-activity-ts="{{.UpdatedAtRFC}}" data-decision-id="{{.ID}}" data-decision-title="{{.Title}}">
+    <div class="bead-row-top">
+      <div class="bead-row-text">
+        <a class="bead-row-title" href="{{$.BasePath}}/{{.ID}}"
+           hx-get="{{$.BasePath}}/{{.ID}}"
+           hx-trigger="mouseover once"
+           hx-target="none"
+           hx-swap="none">{{.Title}}</a>
+        {{if .Prompt}}
+        <div class="bead-row-desc">{{.Prompt}}</div>
+        {{end}}
+        {{/* Open by default: the context is what makes the options below
+             answerable (gd-PNtilz1bgs). With none, the context block says so
+             outside the disclosure. */}}
+        {{if .HasDetails}}
+        <details class="bead-row-details" open>
+          <summary>details</summary>
+          {{if .PromptHTML}}<div class="bead-row-details-section"><h4>Prompt</h4><div class="bead-row-details-body">{{.PromptHTML}}</div></div>{{end}}
+          {{if .Context.Present}}{{.Context.Block}}{{end}}
+        </details>
+        {{end}}
+        {{if not .Context.Present}}{{.Context.Block}}{{end}}
+        {{/* Screenshots from the beads the decision is about, under the
+             context (gd-Pi7C83262N). */}}
+        {{.Evidence}}
+        {{if .Options}}
+        <div class="chip-strip" aria-label="Decision options">
+          {{range .Options}}
+          <button type="button"
+                  class="chip chip-type decision-resolve-chip"
+                  data-bead-id="{{$decisionID}}"
+                  data-option-id="{{.ID}}"
+                  data-option-label="{{if .Short}}{{.Short}}{{else}}{{.ID}}{{end}}"
+                  title="Resolve with option {{.ID}}{{if .Label}} — {{.Label}}{{end}}{{if .Description}}: {{.Description}}{{end}}">{{if .Short}}{{.Short}}{{else}}{{.ID}}{{end}}</button>
+          {{end}}
+          <button type="button"
+                  class="chip chip-type decision-dismiss-chip"
+                  data-bead-id="{{$decisionID}}"
+                  title="Dismiss this decision without choosing an option">Dismiss</button>
+        </div>
+        {{end}}
+        <div class="bead-row-meta">
+          <span class="bead-row-id">{{.ID}}</span>
+          {{if .Project}}<span class="chip-type">{{.Project}}</span>{{end}}
+          {{if .OperatorCompact}}<span class="bead-row-operator">{{.OperatorCompact}}</span>{{else if .Operator}}<span class="bead-row-operator">operator {{.Operator}}</span>{{end}}
+          {{if .Origin.Agent}}<span class="bead-row-assignee">requested by <a href="{{$.BasePath}}/{{.Origin.Agent.ID}}" class="agent-link" data-agent="{{.Origin.Agent.Label}}" title="requesting agent {{.Origin.Agent.ID}}">{{.Origin.Agent.Label}}</a></span>
+          {{else if .RequestedBy}}<span class="bead-row-assignee">requested by {{.RequestedBy}}</span>{{end}}
+          {{if or .Origin.Task .Origin.Plan}}{{template "request_origin" (dict "Origin" .Origin.WithoutAgent "BasePath" $.BasePath "Compact" true)}}{{end}}
+          <span class="bead-row-spacer"></span>
+          {{if .Ago}}<span class="bead-row-ago">{{.Ago}}</span>{{end}}
+          <a class="meta" href="{{$.BasePath}}/decisions/{{.ID}}">open&nbsp;&rsaquo;</a>
+        </div>
+      </div>
+    </div>
+  </li>
+  {{end}}
+</ul>
+
+<dialog id="decision-resolve-dialog" class="decision-resolve-dialog">
+  <form id="decision-resolve-form" method="dialog">
+    <h3 id="decision-resolve-title">Resolve decision</h3>
+    <p class="decision-resolve-summary">
+      <span id="decision-resolve-verb">Choosing</span> <code id="decision-resolve-option"></code>
+      <span id="decision-resolve-bead" class="meta"></span>
+    </p>
+    <label for="decision-resolve-reason">Reason (optional)</label>
+    <textarea id="decision-resolve-reason" name="response_text" rows="4"
+              maxlength="10000"
+              placeholder="Optional reason or response&hellip; included with the resolution."></textarea>
+    <p id="decision-resolve-error" class="decision-error" role="alert" hidden></p>
+    <menu class="decision-resolve-actions">
+      <button type="button" id="decision-resolve-cancel" value="cancel">Cancel</button>
+      <button type="submit" id="decision-resolve-submit" value="confirm">Resolve</button>
+    </menu>
+  </form>
+</dialog>
+
+<style>
+  .decision-resolve-chip { cursor: pointer; font: inherit; }
+  .decision-resolve-chip:hover { background: rgba(128,128,128,0.30); }
+  .decision-resolve-chip:focus-visible { outline: 2px solid #4a9eff; outline-offset: 1px; }
+  .decision-dismiss-chip { cursor: pointer; font: inherit; background: rgba(198,40,40,0.12); border-color: rgba(198,40,40,0.4); }
+  .decision-dismiss-chip:hover { background: rgba(198,40,40,0.22); }
+  .decision-dismiss-chip:focus-visible { outline: 2px solid #c62828; outline-offset: 1px; }
+  .decision-dismiss-form { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0 0; }
+  .decision-dismiss-btn { font: inherit; padding: 0.35rem 0.9rem; border-radius: 4px; border: 1px solid rgba(198,40,40,0.5); background: rgba(198,40,40,0.18); color: inherit; cursor: pointer; }
+  .decision-dismiss-btn:hover { background: rgba(198,40,40,0.28); }
+  .decision-dismiss-btn:disabled { opacity: 0.5; cursor: default; }
+  .decision-dismiss-hint { font-size: 0.85em; opacity: 0.7; }
+  .decision-resolve-dialog { border: 1px solid rgba(128,128,128,0.4); border-radius: 6px; padding: 1rem 1.25rem; max-width: 36rem; width: 90vw; color: inherit; background: Canvas; }
+  .decision-resolve-dialog::backdrop { background: rgba(0,0,0,0.45); }
+  .decision-resolve-dialog h3 { margin: 0 0 0.5rem; }
+  .decision-resolve-dialog .decision-resolve-summary { margin: 0 0 0.75rem; font-size: 0.95em; }
+  .decision-resolve-dialog label { display: block; font-size: 0.85em; opacity: 0.8; margin-bottom: 0.25rem; }
+  .decision-resolve-dialog textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 0.4rem 0.5rem; border-radius: 4px; border: 1px solid rgba(128,128,128,0.35); background: Canvas; color: inherit; resize: vertical; }
+  .decision-resolve-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin: 0.75rem 0 0; padding: 0; }
+  .decision-resolve-actions button { font: inherit; padding: 0.35rem 0.9rem; border-radius: 4px; border: 1px solid rgba(128,128,128,0.35); background: rgba(128,128,128,0.1); color: inherit; cursor: pointer; }
+  .decision-resolve-actions button[type=submit] { background: rgba(76,175,80,0.18); border-color: rgba(76,175,80,0.5); }
+  .decision-resolve-actions button:disabled { opacity: 0.5; cursor: default; }
+  .decision-error { color: #c62828; margin: 0.5rem 0 0; font-size: 0.9em; }
+  .bead-row-resolved .bead-row-title { color: #595959; }
+  /* Inline details disclosure (full prompt + agent context) and the
+     agent / task / plan origin strip (Slack thread gd-AREKDbHx70). */
+  .bead-row-details { margin: 0.25rem 0 0.35rem; font-size: 0.9em; }
+  .bead-row-details > summary { cursor: pointer; opacity: 0.72; font-size: 0.9em; }
+  .bead-row-details-section h4 { margin: 0.5rem 0 0.2rem; font-size: 0.8em; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.7; }
+  .bead-row-details-body { opacity: 0.95; }
+  .bead-row-details-body p:first-child { margin-top: 0; }
+  .bead-row-details-body p:last-child { margin-bottom: 0; }
+  .request-origin { display: inline-flex; flex-wrap: wrap; gap: 0 0.6rem; min-width: 0; }
+  .request-origin > span { min-width: 0; overflow-wrap: anywhere; }
+  .request-origin .bead-row-id { margin-left: 0.3rem; }
+  .bead-row-resolved { transition: background 0.25s; }
+  /* ka-0000007139: prevent horizontal overflow at narrow (375px mobile)
+     viewports. The operator chip carries a long unbreakable email token
+     (`<long.address@example.com>`) and decision option chips can hold full
+     `short` labels — both shrink-to-fit inside flex rows, so without a real
+     width reference they push the row (and the page) past the viewport.
+     Constrain the operator-chip's flex parent so its existing single-line
+     ellipsis clamp has something to clamp against, and let the option chips
+     wrap their text instead of forcing a fixed intrinsic width. */
+  #decisions-list .bead-row-operator { min-width: 0; max-width: 100%; }
+  #decisions-list .chip-strip > .chip-type {
+    min-width: 0;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: left;
+  }
+</style>
+
+<script>
+(function() {
+  var basePath = window.BEADS_VIEWER_BASE_PATH || "";
+  var dialog = document.getElementById("decision-resolve-dialog");
+  if (!dialog || typeof dialog.showModal !== "function") return;
+
+  var form = document.getElementById("decision-resolve-form");
+  var cancelBtn = document.getElementById("decision-resolve-cancel");
+  var submitBtn = document.getElementById("decision-resolve-submit");
+  var optionEl = document.getElementById("decision-resolve-option");
+  var beadEl = document.getElementById("decision-resolve-bead");
+  var titleEl = document.getElementById("decision-resolve-title");
+  var reasonEl = document.getElementById("decision-resolve-reason");
+  var errEl = document.getElementById("decision-resolve-error");
+  var verbEl = document.getElementById("decision-resolve-verb");
+
+  var pending = null; // { mode, beadId, optionId, optionLabel, rowEl }
+
+  function openResolveDialog(beadId, optionId, optionLabel, rowEl) {
+    pending = { mode: "resolve", beadId: beadId, optionId: optionId, optionLabel: optionLabel, rowEl: rowEl };
+    var beadTitle = rowEl ? rowEl.getAttribute("data-decision-title") || "" : "";
+    titleEl.textContent = beadTitle ? "Resolve: " + beadTitle : "Resolve decision";
+    optionEl.textContent = optionId;
+    beadEl.textContent = beadId ? "(" + beadId + ")" : "";
+    reasonEl.value = "";
+    errEl.hidden = true;
+    errEl.textContent = "";
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Resolve";
+    if (verbEl) verbEl.textContent = "Choosing";
+    dialog.showModal();
+    setTimeout(function() { reasonEl.focus(); }, 0);
+  }
+
+  function openDismissDialog(beadId, rowEl) {
+    pending = { mode: "dismiss", beadId: beadId, rowEl: rowEl };
+    var beadTitle = rowEl ? rowEl.getAttribute("data-decision-title") || "" : "";
+    titleEl.textContent = beadTitle ? "Dismiss: " + beadTitle : "Dismiss decision";
+    if (verbEl) verbEl.textContent = "Dismissing";
+    optionEl.textContent = "dismissed";
+    beadEl.textContent = beadId ? "(" + beadId + ")" : "";
+    reasonEl.value = "";
+    errEl.hidden = true;
+    errEl.textContent = "";
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Dismiss";
+    dialog.showModal();
+    setTimeout(function() { reasonEl.focus(); }, 0);
+  }
+
+  function closeDialog() {
+    if (dialog.open) dialog.close();
+    pending = null;
+  }
+
+  document.addEventListener("click", function(ev) {
+    var dismissBtn = ev.target.closest(".decision-dismiss-chip");
+    if (dismissBtn) {
+      ev.preventDefault();
+      var dBeadId = dismissBtn.getAttribute("data-bead-id");
+      var dRowEl = document.getElementById("decision-row-" + dBeadId);
+      openDismissDialog(dBeadId, dRowEl);
+      return;
+    }
+    var btn = ev.target.closest(".decision-resolve-chip");
+    if (!btn) return;
+    ev.preventDefault();
+    var beadId = btn.getAttribute("data-bead-id");
+    var optionId = btn.getAttribute("data-option-id");
+    var optionLabel = btn.getAttribute("data-option-label") || optionId;
+    var rowEl = document.getElementById("decision-row-" + beadId);
+    openResolveDialog(beadId, optionId, optionLabel, rowEl);
+  });
+
+  cancelBtn.addEventListener("click", function() { closeDialog(); });
+
+  form.addEventListener("submit", function(ev) {
+    ev.preventDefault();
+    if (!pending) { closeDialog(); return; }
+    var p = pending;
+    submitBtn.disabled = true;
+    errEl.hidden = true;
+    errEl.textContent = "";
+
+    var url, body;
+    if (p.mode === "dismiss") {
+      url = basePath + "/b/" + encodeURIComponent(p.beadId) + "/decision/dismiss";
+      body = new URLSearchParams();
+      body.set("reason", reasonEl.value);
+    } else {
+      url = basePath + "/b/" + encodeURIComponent(p.beadId) + "/decision/resolve";
+      body = new URLSearchParams();
+      body.set("option_id", p.optionId);
+      body.set("response_text", reasonEl.value);
+    }
+    var failVerb = p.mode === "dismiss" ? "Dismiss" : "Resolve";
+
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      credentials: "same-origin",
+    }).then(function(resp) {
+      if (resp.ok) return null;
+      return resp.text().then(function(txt) {
+        throw new Error(txt && txt.length < 500 ? txt : (failVerb + " failed (" + resp.status + ")"));
+      });
+    }).then(function() {
+      if (p.rowEl) {
+        p.rowEl.classList.add("bead-row-resolved");
+        setTimeout(function() {
+          if (p.rowEl && p.rowEl.parentNode) p.rowEl.parentNode.removeChild(p.rowEl);
+        }, 250);
+      }
+      closeDialog();
+    }).catch(function(err) {
+      errEl.textContent = (err && err.message) ? err.message : (failVerb + " failed.");
+      errEl.hidden = false;
+      submitBtn.disabled = false;
+    });
+  });
+
+  dialog.addEventListener("cancel", function() { pending = null; });
+})();
+</script>
+{{else if not .Error}}
+{{if and .CanScope (not .ShowAll)}}
+<p class="empty">No open decisions assigned to you{{if .ProjectFilter}} in {{.ProjectFilter}}{{end}}.
+  <a href="{{.BasePath}}/decisions?all=1{{if .ProjectFilter}}&amp;project={{.ProjectFilter}}{{end}}">Show all</a>{{if .ProjectFilter}},
+  or <a href="{{.BasePath}}/decisions">all projects</a>{{end}}.</p>
+{{else}}
+<p class="empty">No open decisions{{if .ProjectFilter}} in {{.ProjectFilter}} &mdash;
+  <a href="{{.BasePath}}/decisions{{if .ShowAll}}?all=1{{end}}">all projects</a>{{end}}.</p>
+{{end}}
+{{end}}
+{{end}}

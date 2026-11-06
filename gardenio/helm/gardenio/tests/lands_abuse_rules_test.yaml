@@ -1,0 +1,160 @@
+# rule_files is rewritten at runtime by TestLandsAbuseAlerts_Fire
+# (lands_abuse_alerts_test.go): the placeholder is replaced with the path to the
+# helm-rendered PrometheusRule spec. By hand:
+#   helm template test gardenio/helm/gardenio --show-only templates/lands-abuse-alerts.yaml \
+#     --set agents.metrics.prometheusRule.landsAbuse.enabled=true | yq eval '.spec' - > /tmp/lands_rules.yaml
+#   sed 's#__RULES_FILE__#/tmp/lands_rules.yaml#' this-file > /tmp/lands_test.yaml
+#   promtool test rules /tmp/lands_test.yaml
+#
+# Lands abuse controls (Track B §5.4, step 10.4): each alert fires on its
+# signal for one land and stays quiet for an ordinary land beside it.
+rule_files:
+  - __RULES_FILE__
+
+evaluation_interval: 1m
+
+tests:
+  # Spend velocity: tomato-patch spends $0.12/h for a week, then $12/h. A
+  # steady $3/h land (bean-row) is over the floor but at 1x its mean: quiet.
+  - name: spend_velocity
+    interval: 5m
+    input_series:
+      - series: 'gardenio_account_cost_usd{account="lands-tomato-patch", env="prod"}'
+        values: '0+0.01x2016 20.16+1x24'
+      - series: 'gardenio_account_cost_usd{account="lands-bean-row", env="prod"}'
+        values: '0+0.25x2040'
+      - series: 'gardenio_account_cost_usd{account="fleet", env="prod"}'
+        values: '0+0.01x2016 20.16+5x24'
+    alert_rule_test:
+      - eval_time: 168h
+        alertname: LandSpendVelocityHigh
+        exp_alerts: []
+      - eval_time: 169h
+        alertname: LandSpendVelocityHigh
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              component: gardenio
+              subsystem: lands
+              land: tomato-patch
+            exp_annotations:
+              summary: "Land tomato-patch is spending more than 5x its 7-day hourly mean"
+              description: |
+                Land tomato-patch spent $11.00 of LLM
+                spend in the last hour (account lands-tomato-patch), more than
+                5 times its 7-day hourly mean and above
+                $2/h. Look at the land's running agents
+                (gb lands purse tomato-patch); if it looks like abuse, freeze first
+                (gb lands freeze tomato-patch --reason ...), then ask the owner.
+
+  # Purse wall: the first refusal at the wall (a counter born at 1) fires.
+  - name: purse_wall_first_hit
+    interval: 1m
+    input_series:
+      - series: 'gardenio_lands_spawn_refusals_total{land="tomato-patch", code="purse_wall"}'
+        values: '_x10 1x30'
+      - series: 'gardenio_lands_spawn_refusals_total{land="bean-row", code="tenant_spawns_off"}'
+        values: '1+1x40'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: LandPurseWallHit
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LandPurseWallHit
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              component: gardenio
+              subsystem: lands
+              land: tomato-patch
+            exp_annotations:
+              summary: "Land tomato-patch hit its purse wall"
+              description: |
+                A spawn into land tomato-patch was refused because its purse is at
+                the wall (code purse_wall). The land's agents are being parked; the steward
+                asks the owner. Grant credits with gb lands credit add tomato-patch
+                if that is the plan.
+
+  # Egress: 100 MB a minute out of land-tomato-patch (6 GB/h) fires; 10 MB a
+  # minute out of land-bean-row and any traffic outside a land namespace do not.
+  - name: egress
+    interval: 1m
+    input_series:
+      - series: 'container_network_transmit_bytes_total{namespace="land-tomato-patch", pod="crew-1"}'
+        values: '0+100000000x80'
+      - series: 'container_network_transmit_bytes_total{namespace="land-bean-row", pod="crew-1"}'
+        values: '0+10000000x80'
+      - series: 'container_network_transmit_bytes_total{namespace="gardenio", pod="bridge"}'
+        values: '0+500000000x80'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: LandEgressHigh
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              component: gardenio
+              subsystem: lands
+              land: tomato-patch
+            exp_annotations:
+              summary: "Land tomato-patch sent 5.588GiB out in an hour"
+              description: |
+                The pods in namespace land-tomato-patch sent
+                5.588GiB in the last hour, over the
+                5000000000-byte limit. Package installs are
+                normal; a sustained stream is not. Freeze first if it looks like abuse.
+
+  # Spawn refusals: one a minute into tomato-patch fires; five an hour into
+  # bean-row does not.
+  - name: spawn_refusals
+    interval: 1m
+    input_series:
+      - series: 'gardenio_lands_spawn_refusals_total{land="tomato-patch", code="spawn_rate"}'
+        values: '0+1x70'
+      - series: 'gardenio_lands_spawn_refusals_total{land="bean-row", code="purse_unknown"}'
+        values: '0x10 1x10 2x10 3x10 4x10 5x20'
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: LandSpawnRefusalsHigh
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              component: gardenio
+              subsystem: lands
+              land: tomato-patch
+            exp_annotations:
+              summary: "Land tomato-patch had 60 spawns refused in an hour"
+              description: |
+                The Lands spawn wall refused more than 10 spawns
+                into land tomato-patch in the last hour. Break it down with
+                sum by (code) (increase(gardenio_lands_spawn_refusals_total{land="tomato-patch"}[1h]));
+                spawn_rate means it is starting agents faster than LANDS_SPAWNS_PER_HOUR.
+
+  # Untrusted-input unusable: the first refused write for a land (a counter
+  # born at 1) fires, naming the reason; a land with no refusals stays quiet.
+  - name: untrusted_input_unusable_first_hit
+    interval: 1m
+    input_series:
+      - series: 'gardenio_lands_untrusted_input_unusable_total{land="tomato-patch", reason="unregistered"}'
+        values: '_x10 1x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: LandUntrustedInputUnusable
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LandUntrustedInputUnusable
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              component: gardenio
+              subsystem: lands
+              land: tomato-patch
+              reason: unregistered
+            exp_annotations:
+              summary: "Land tomato-patch is refusing writes: the untrusted-input taint is unusable (unregistered)"
+              description: |
+                The beads daemon refused a write in tenant land tomato-patch
+                (unregistered): it will not create a tenant bead without the
+                untrusted-input taint, nor provision a tenant land while that taint is
+                unusable. Check kd taint show untrusted-input; it must be registered with
+                the restrict effect only (kd taint create untrusted-input --owner <team>
+                --effect restrict).

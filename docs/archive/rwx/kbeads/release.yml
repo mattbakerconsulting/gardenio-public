@@ -1,0 +1,321 @@
+# Release workflow — parallel builds on separate compute, then publish.
+# Replaces sequential GitHub Actions release with RWX-native DAG parallelism.
+#
+# ── The clone roots at the MONOREPO root, not at kbeads/ (ka-0000001846) ─────
+# `code` clones the whole gardenio monorepo, so the RWX workspace root holds
+# `coop/`, `kbeads/`, `gardenio/`, `.rwx/` — there is NO `go.mod` at the
+# workspace root (the Go module is `kbeads/go.mod`; the root has only
+# `go.work`). So every `go` invocation below must `cd kbeads` first, and every
+# path that names a file IN the component (filter globs, lock files, artifact
+# output paths, LICENSE/README) is workspace-root-relative and needs its
+# `kbeads/` prefix. Paths that are pure scratch ($DIST, /tmp) and the
+# `${{ tasks.*.artifacts.* }}` expansions stay root-relative — see `release`.
+# Without the `cd`, `go mod download` dies with `go: no modules specified (see
+# 'go help mod download')` — MEASURED on 66ca4414, run
+# 09d5c89ceb784c3886a0fc15738392fc against the sibling kbeads/.rwx/ci.yml.
+#
+# `GOWORK=off` is required alongside the `cd`: from inside `kbeads/`, Go walks
+# up and finds the monorepo `go.work`, entering workspace mode over sibling
+# modules (gardenio/controller, the script modules) that this workflow neither
+# stages nor needs. Same convention as the root `.rwx/ci.yml` kbeads tasks.
+#
+# `kbeads/go.mod` also has `replace gardenio/clicreds =>
+# ../gardenio/clicreds`, so every Go task's filter must additionally stage that
+# local module or the command FATALs on the missing path (ka-0000003839).
+# ── The darwin builds are CGO_ENABLED=0 (ka-0000001846) ─────────────────────
+# kbeads has NO `import "C"` anywhere and no cgo-requiring dependency, so cgo
+# buys the darwin binaries nothing — but it does drag in
+# prometheus/client_golang's `process_collector_mem_cgo_darwin.c`, which needs
+# a macOS SDK header zig's bundled libc does not ship:
+#   process_collector_mem_cgo_darwin.c:18:10: fatal error:
+#     'mach/mach_vm.h' file not found
+# MEASURED in run 7438d8dce21b43a192e84cdf2458192b, the first run ever to get
+# past `go-deps` on this workflow. client_golang gates that file on
+# `//go:build darwin && cgo` with a pure-Go sibling behind `darwin && !cgo`,
+# so CGO_ENABLED=0 is the only lever — and it is a strict improvement: the
+# darwin archives currently ship NOTHING because the build never completes.
+# `linux/amd64` keeps CGO_ENABLED=1, unchanged.
+on:
+  gitlab:
+    tag-push:
+      if: ${{ starts-with(event.git.ref, 'refs/tags/20') }}
+      init:
+        commit-sha: ${{ event.git.sha }}
+        ref-name: ${{ event.git.ref }}
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      ref-name: dev
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.0
+
+tasks:
+  # ── System deps (cached until lock changes) ─────────────────────────
+  - key: system-deps
+    filter:
+      - kbeads/.rwx/release-deps.lock
+    run: |
+      echo "Installing release dependencies..."
+      sudo apt-get update
+      sudo apt-get install -y libicu-dev gcc g++
+
+  # ── Full clone with history (needed for changelog) ─────────────────
+  - key: code
+    # ── Clone credential MUST be in the URL (ka-0000006904) ────────────────
+    # With a bare `https://gitlab.com/...` URL, `git/clone` falls back to the
+    # RWX vault-resolved GitLab credential, which is DENIED on the CLI/manual
+    # `rwx run` path: every run aborted in the first task,
+    # `code.get-latest-sha-for-ref`, with `remote: HTTP Basic: Access denied`
+    # / `fatal: Authentication failed` (exit 128) — killing the self-verify
+    # command this repo's CLAUDE.md documents. `secrets.GITLAB_CLONE_TOKEN` is
+    # the credential source the root `.rwx/ci.yml` and `.rwx/e2e.yml` already
+    # use, and it resolves on every trigger (cli, push, tag-push, MR, dispatch).
+    call: git/clone 2.0.3
+    with:
+      repository: https://oauth2:${{ secrets.GITLAB_CLONE_TOKEN }}@gitlab.com/Acme/Platform/gardenio.git
+      ref: ${{ init.commit-sha }}
+      fetch-full-depth: true
+      preserve-git-dir: true
+
+  # ── Go toolchain ───────────────────────────────────────────────────
+  - key: go
+    call: golang/install 1.2.0
+    with:
+      go-version: "1.25"
+    filter:
+      # There is no `.go-version` in this repo (at the workspace root OR under
+      # kbeads/) — that glob matched nothing. Key off the real module file,
+      # as kbeads/.rwx/ci.yml does (ka-0000001846).
+      - kbeads/go.mod
+
+  # ── Go deps (cached by lockfiles) ──────────────────────────────────
+  - key: go-deps
+    use: [code, go, system-deps]
+    filter:
+      - kbeads/go.mod
+      - kbeads/go.sum
+      # `replace gardenio/clicreds => ../gardenio/clicreds`
+      # (ka-0000003839).
+      - gardenio/clicreds/go.mod
+      - gardenio/clicreds/go.sum
+    run: cd kbeads && GOWORK=off go mod download
+
+  # ── Build: linux/amd64 (native gcc) ───────────────────────────────
+  - key: build-linux-amd64
+    use: [code, go-deps]
+    filter:
+      - kbeads/.rwx/release.yml
+      - "kbeads/**/*.go"
+      - "kbeads/**/*.sql"
+      - kbeads/go.mod
+      - kbeads/go.sum
+      - "!kbeads/**/*_test.go"
+      # clicreds source needed to build kbeads (ka-0000003839).
+      - "gardenio/clicreds/**"
+    run: |
+      TAG="${REF_NAME#refs/tags/}"
+      TAG="${TAG#refs/heads/}"
+      COMMIT="${COMMIT_SHA}"
+      SHORT="${COMMIT_SHA:0:7}"
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      cd kbeads
+      GOWORK=off CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+        go build -ldflags "-s -w \
+          -X main.Version=${TAG} \
+          -X main.Build=${SHORT} \
+          -X main.Commit=${COMMIT} \
+          -X gardenio/kbeads/internal/buildinfo.Branch=${TAG} \
+          -X gardenio/kbeads/internal/buildinfo.Date=${BUILD_DATE}" \
+        -o kd ./cmd/kd
+    env:
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+    outputs:
+      artifacts:
+        - key: binary
+          path: kbeads/kd
+
+  # ── Build: darwin/amd64 (pure Go, no cgo — see header) ─────────────
+  - key: build-darwin-amd64
+    use: [code, go-deps]
+    filter:
+      - kbeads/.rwx/release.yml
+      - "kbeads/**/*.go"
+      - "kbeads/**/*.sql"
+      - kbeads/go.mod
+      - kbeads/go.sum
+      - "!kbeads/**/*_test.go"
+      # clicreds source needed to build kbeads (ka-0000003839).
+      - "gardenio/clicreds/**"
+    run: |
+      TAG="${REF_NAME#refs/tags/}"
+      TAG="${TAG#refs/heads/}"
+      COMMIT="${COMMIT_SHA}"
+      SHORT="${COMMIT_SHA:0:7}"
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      cd kbeads
+      GOWORK=off CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 \
+        go build -tags "gms_pure_go,netgo" \
+        -ldflags "-s -w \
+          -X main.Version=${TAG} \
+          -X main.Build=${SHORT} \
+          -X main.Commit=${COMMIT} \
+          -X gardenio/kbeads/internal/buildinfo.Branch=${TAG} \
+          -X gardenio/kbeads/internal/buildinfo.Date=${BUILD_DATE}" \
+        -o kd ./cmd/kd
+    env:
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+    outputs:
+      artifacts:
+        - key: binary
+          path: kbeads/kd
+
+  # ── Build: darwin/arm64 (pure Go, no cgo — see header) ─────────────
+  - key: build-darwin-arm64
+    use: [code, go-deps]
+    filter:
+      - kbeads/.rwx/release.yml
+      - "kbeads/**/*.go"
+      - "kbeads/**/*.sql"
+      - kbeads/go.mod
+      - kbeads/go.sum
+      - "!kbeads/**/*_test.go"
+      # clicreds source needed to build kbeads (ka-0000003839).
+      - "gardenio/clicreds/**"
+    run: |
+      TAG="${REF_NAME#refs/tags/}"
+      TAG="${TAG#refs/heads/}"
+      COMMIT="${COMMIT_SHA}"
+      SHORT="${COMMIT_SHA:0:7}"
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      cd kbeads
+      GOWORK=off CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
+        go build -tags "gms_pure_go,netgo" \
+        -ldflags "-s -w \
+          -X main.Version=${TAG} \
+          -X main.Build=${SHORT} \
+          -X main.Commit=${COMMIT} \
+          -X gardenio/kbeads/internal/buildinfo.Branch=${TAG} \
+          -X gardenio/kbeads/internal/buildinfo.Date=${BUILD_DATE}" \
+        -o kd ./cmd/kd
+    env:
+      REF_NAME: ${{ init.ref-name }}
+      COMMIT_SHA: ${{ init.commit-sha }}
+    outputs:
+      artifacts:
+        - key: binary
+          path: kbeads/kd
+
+  # ── GitLab CLI (cached, for creating releases) ─────────────────────
+  - key: glab-cli
+    filter:
+      - kbeads/.rwx/release-deps.lock
+    run: |
+      curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v1.52.0/downloads/glab_1.52.0_linux_amd64.tar.gz" \
+        | tar xz -C /tmp
+      sudo cp /tmp/bin/glab /usr/local/bin/
+
+  # ── Release: archive, checksum, publish ────────────────────────────
+  - key: release
+    use: [code, build-linux-amd64, build-darwin-amd64, build-darwin-arm64, glab-cli]
+    cache: false
+    run: |
+      set -e
+      # This task deliberately stays at the WORKSPACE ROOT: the artifact
+      # expansions below and $DIST are root-relative, and `git describe` /
+      # `git log` / `git tag` read the root .git dir. Only the two
+      # component-owned files packaged into each archive need the `kbeads/`
+      # prefix — see the `cp` below (ka-0000001846).
+      TAG="${REF_NAME#refs/tags/}"
+      TAG="${TAG#refs/heads/}"
+      IS_SNAPSHOT=false
+      if [[ "$TAG" == "dev" ]]; then
+        TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo '0.0.0')-next"
+        IS_SNAPSHOT=true
+      fi
+
+      PROJECT="kd"
+      DIST="dist"
+      mkdir -p "$DIST"
+
+      # Package each target into a tar.gz archive
+      for target in linux_amd64 darwin_amd64 darwin_arm64; do
+        case "$target" in
+          linux_amd64)  BINARY="${{ tasks.build-linux-amd64.artifacts.binary }}" ;;
+          darwin_amd64) BINARY="${{ tasks.build-darwin-amd64.artifacts.binary }}" ;;
+          darwin_arm64) BINARY="${{ tasks.build-darwin-arm64.artifacts.binary }}" ;;
+        esac
+
+        ARCHIVE="${PROJECT}_${TAG}_${target}.tar.gz"
+        STAGING=$(mktemp -d)
+        cp "$BINARY" "$STAGING/kd"
+        chmod +x "$STAGING/kd"
+        # kbeads/-prefixed: the monorepo root has its own LICENSE + README.md,
+        # so the bare form silently packaged the WRONG pair into every kd
+        # archive (ka-0000001846).
+        cp kbeads/LICENSE kbeads/README.md "$STAGING/" 2>/dev/null || true
+
+        tar -czf "$DIST/$ARCHIVE" -C "$STAGING" .
+        rm -rf "$STAGING"
+        echo "Created: $DIST/$ARCHIVE"
+      done
+
+      # Generate checksums
+      cd "$DIST"
+      sha256sum *.tar.gz > checksums.txt
+      cat checksums.txt
+      cd ..
+
+      if $IS_SNAPSHOT; then
+        echo "Snapshot build — skipping release"
+        ls -la "$DIST/"
+        exit 0
+      fi
+
+      # Generate changelog from previous tag
+      PREV_TAG=$(git tag --sort=-v:refname | grep -E '^20' | head -2 | tail -1 || true)
+      if [[ -n "$PREV_TAG" ]]; then
+        CHANGELOG=$(git log --oneline "${PREV_TAG}..HEAD" \
+          --no-merges \
+          --grep='^docs:' --grep='^test:' --grep='^chore:' --grep='Merge pull request' --grep='Merge branch' \
+          --invert-grep \
+          --format='* %H %s')
+      else
+        CHANGELOG=$(git log --oneline HEAD~20..HEAD \
+          --no-merges \
+          --format='* %H %s')
+      fi
+
+      # Create GitLab release
+      BODY="## Changelog"$'\n'"${CHANGELOG}"
+      glab release create "$TAG" \
+        --repo Acme/Platform/gardenio \
+        --name "$TAG" \
+        --notes "$BODY" \
+        $DIST/*.tar.gz $DIST/checksums.txt 2>&1
+    env:
+      GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+      REF_NAME: ${{ init.ref-name }}
+
+  # ── Dispatch to gardenio (only for real releases) ─────────────────
+  - key: dispatch-gardenio
+    use: release
+    if: ${{ init.ref-name != 'dev' }}
+    run: |
+      TAG="${REF_NAME#refs/tags/}"
+      TAG="${TAG#refs/heads/}"
+
+      echo "Dispatching to gardenio for agent rebuild (kd: $TAG)..."
+      curl -fsSL -X POST https://cloud.rwx.com/mint/api/runs/dispatches \
+        -H "Authorization: Bearer $RWX_ACCESS_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"key\": \"gardenio-agent-rebuild\", \"params\": {\"trigger-source\": \"kbeads-release-$TAG\", \"kd-version\": \"$TAG\"}, \"ref\": \"main\", \"title\": \"Agent rebuild (kd $TAG)\"}"
+    env:
+      RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+      REF_NAME: ${{ init.ref-name }}

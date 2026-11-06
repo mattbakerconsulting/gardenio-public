@@ -1,0 +1,9 @@
+output "instance_id" { value = aws_instance.hq.id }
+output "public_ip" { value = aws_instance.hq.public_ip }
+output "private_ip" { value = aws_instance.hq.private_ip }
+output "security_group_id" { value = aws_security_group.hq.id }
+output "instance_profile_name" { value = aws_iam_instance_profile.hq.name }
+output "iam_role_name" { value = aws_iam_role.hq.name }
+output "dlm_policy_id" { value = aws_dlm_lifecycle_policy.daily.id }
+output "backup_bucket" { value = aws_s3_bucket.backups.bucket }
+output "backup_bucket_arn" { value = aws_s3_bucket.backups.arn }

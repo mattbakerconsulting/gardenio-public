@@ -1,0 +1,169 @@
+{{- if and .Values.backup.nats.enabled .Values.nats.enabled }}
+# Optional Gardenio-in-a-Box NATS JetStream backup (ka-0000008198).
+#
+# Runs `nats account backup` from the nats-box image into a timestamped
+# directory on a dedicated PVC, pruning directories older than
+# `backup.nats.retentionDays`. This is a nice-to-have for zero JetStream
+# event-loss across a restore; postgres (the MUST-backup) is covered by the
+# pg_dumpall job. We deliberately use `nats account backup` rather than a
+# `cp -r` of the live JetStream dir — copying a live store corrupts mid-write.
+#
+# Restore caveat: `nats account restore` (or `nats stream restore`) FAILS over
+# an existing same-named stream — the runbook covers "delete stream, then
+# restore". See gardenio/docs/gardenio-in-a-box-restore.md.
+#
+# Mirrors the token-rotator CronJob pattern.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "gardenio.nats.fullname" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.nats.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats-backup
+spec:
+  accessModes:
+    {{- toYaml .Values.backup.nats.storage.accessModes | nindent 4 }}
+  {{- if .Values.backup.nats.storage.storageClass }}
+  storageClassName: {{ .Values.backup.nats.storage.storageClass }}
+  {{- else if .Values.global.storageClass }}
+  storageClassName: {{ .Values.global.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.nats.storage.size }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "gardenio.nats.fullname" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.nats.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats-backup
+spec:
+  schedule: {{ .Values.backup.nats.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      activeDeadlineSeconds: {{ .Values.backup.nats.activeDeadlineSeconds }}
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "gardenio.nats.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: nats-backup
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: OnFailure
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            fsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          {{- if $.Values.global.systemPriorityClass.create }}
+          priorityClassName: {{ $.Values.global.systemPriorityClass.name }}
+          {{- end }}
+          containers:
+            - name: backup
+              image: {{ include "gardenio.mirroredImage" (dict "image" .Values.natsBoxImage "global" .Values.global) | quote }}
+              imagePullPolicy: {{ .Values.natsBoxImage.pullPolicy | default "IfNotPresent" }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              env:
+                - name: NATS_URL
+                  {{- if .Values.backup.nats.serverURL }}
+                  value: {{ .Values.backup.nats.serverURL | quote }}
+                  {{- else }}
+                  value: {{ include "gardenio.natsURL" . | quote }}
+                  {{- end }}
+                - name: BACKUP_DIR
+                  value: /backups
+                - name: RETENTION_DAYS
+                  value: {{ .Values.backup.nats.retentionDays | quote }}
+                {{- if .Values.nats.auth.subjectIsolation.enabled }}
+                {{- /* JetStream account backup needs full access → infra
+                       creds, sourced from the Secret rather than values
+                       (ka-0000006513). NATS_USER makes the secret the infra
+                       user's PASSWORD — multi-user server entries only
+                       support user/password (ka-0000000002). */}}
+                - name: NATS_USER
+                  value: infra
+                - name: NATS_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "gardenio.fullname" . }}-nats-infra-creds
+                      key: token
+                {{- else if and .Values.nats.auth.enabled .Values.nats.auth.token }}
+                - name: NATS_TOKEN
+                  value: {{ .Values.nats.auth.token | quote }}
+                {{- end }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+                  OUT="${BACKUP_DIR}/nats-${STAMP}"
+                  TMP="${OUT}.partial"
+                  NATS_ARGS="-s ${NATS_URL}"
+                  # With NATS_USER the secret is that user's password (multi-user
+                  # auth); bare NATS_TOKEN stays legacy token auth.
+                  if [ -n "${NATS_USER:-}" ] && [ -n "${NATS_TOKEN:-}" ]; then
+                    NATS_ARGS="${NATS_ARGS} --user ${NATS_USER} --password ${NATS_TOKEN}"
+                  elif [ -n "${NATS_TOKEN:-}" ]; then
+                    NATS_ARGS="${NATS_ARGS} --token ${NATS_TOKEN}"
+                  fi
+
+                  echo "=== nats account backup start: ${NATS_URL} -> ${OUT} (retentionDays=${RETENTION_DAYS}) ==="
+                  # Wait for NATS to accept connections (up to 60s).
+                  i=1
+                  while [ "$i" -le 30 ]; do
+                    if nats server check connection $NATS_ARGS >/dev/null 2>&1; then break; fi
+                    echo "[backup]   not ready yet (${i}/30)"; sleep 2; i=$((i+1))
+                  done
+
+                  # `nats account backup` snapshots every JetStream stream.
+                  # Write to .partial then atomic-rename so a killed run never
+                  # leaves a half-written backup dir that a restore would trust.
+                  rm -rf "${TMP}"
+                  nats account backup $NATS_ARGS "${TMP}"
+                  mv "${TMP}" "${OUT}"
+                  echo "[backup] wrote ${OUT}"
+
+                  # Retention: delete backup dirs older than RETENTION_DAYS, and
+                  # sweep any stale .partial dirs from killed runs.
+                  rm -rf "${BACKUP_DIR}"/*.partial 2>/dev/null || true
+                  find "${BACKUP_DIR}" -maxdepth 1 -type d -name 'nats-*' \
+                    -mtime +"${RETENTION_DAYS}" -print -exec rm -rf {} + || true
+                  echo "=== nats account backup complete ==="
+              resources:
+                {{- toYaml .Values.backup.nats.resources | nindent 16 }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+          {{- include "gardenio.nodeSelector" (dict "local" .Values.nats.nodeSelector "global" .Values.global.nodeSelector) | nindent 10 }}
+          {{- include "gardenio.tolerations" (dict "local" .Values.nats.tolerations "global" .Values.global.tolerations) | nindent 10 }}
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ include "gardenio.nats.fullname" . }}-backup
+            - name: tmp
+              emptyDir: {}
+{{- end }}

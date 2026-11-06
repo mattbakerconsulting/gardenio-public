@@ -1,0 +1,140 @@
+# Runner scale set "gascity-packs-hq-k3s" for the PRIVATE mirror
+# mattbakerconsulting/gascity-packs-hq (mirror of gastownhall/gascity-packs).
+# Chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+# Namespace: arc-runners (same controller as gardenio-k3s). Release name = runs-on label.
+#
+# Runs upstream's ci.yml "Check" job contract through hq-gates.yml on hq/**
+# branches: validate_registry.py --require-git, the pytest suites, `gc lint`
+# over the maintained packs + the live-gc pytest suites, the gastown shell
+# tests, and the Go module tests (root embed, slack-*, runtime-cloudflare).
+# All five inherited upstream workflows on the mirror are disabled by API.
+#
+# Auth: the same PAT secret as gardenio-k3s (admin on gascity-packs-hq;
+# verified 2026-09-17 via GET /repos/.../permissions). Debt: GitHub App.
+githubConfigUrl: https://github.com/mattbakerconsulting/gascity-packs-hq
+githubConfigSecret: gardenio-github
+
+minRunners: 0
+maxRunners: 2
+
+containerMode:
+  type: dind
+
+template:
+  spec:
+    nodeSelector:
+      gardenio.io/role: ci
+    tolerations:
+      - key: ci
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    containers:
+      - name: runner
+        image: ghcr.io/actions/actions-runner:latest
+        # Stock image (Ubuntu 24.04 "noble") has git/jq/curl but no make and
+        # no Python. Upstream's Check job uses setup-python 3.12 and
+        # `pip install PyYAML pytest jsonschema`; noble's python3 IS 3.12 and
+        # PEP 668 blocks bare pip, so the same deps come from apt instead.
+        # Go comes from actions/setup-go in the workflow (go-version-file:
+        # slack-full/adapter/go.mod, 1.25.9), as upstream does.
+        #
+        # gc: upstream runs `go install github.com/gastownhall/gascity/cmd/gc@latest`,
+        # which resolves to the latest tagged release (v1.4.1 on 2026-09-17,
+        # and the ci.yml comments about oversight-rig assume exactly that
+        # version). We download that release's linux_amd64 binary instead of
+        # compiling gascity (Go 1.26.6) on every run; the sha256 is from
+        # gascity_1.4.1_checksums.txt. Bump GC_VERSION/GC_SHA256 together when
+        # upstream's @latest moves.
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -e
+            GC_VERSION=1.4.1
+            GC_SHA256=8d8c8b511db3fc44931445aab5cb9f212509c0867105c880d6c3d0e6e5d33e42
+            sudo apt-get update -q >/dev/null
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+              make python3 python3-yaml python3-pytest python3-jsonschema >/dev/null
+            tmp=$(mktemp -d)
+            curl -fsSL -o "$tmp/gc.tgz" "https://github.com/gastownhall/gascity/releases/download/v${GC_VERSION}/gascity_${GC_VERSION}_linux_amd64.tar.gz"
+            echo "${GC_SHA256}  $tmp/gc.tgz" | sha256sum -c - >/dev/null
+            tar -xzf "$tmp/gc.tgz" -C "$tmp" gc
+            sudo install -m 0755 "$tmp/gc" /usr/local/bin/gc
+            rm -rf "$tmp"
+            exec /home/runner/run.sh
+        resources:
+          # One runner per 4-vCPU / 16 GiB node (same pool as the other sets).
+          requests: { cpu: "3", memory: 12Gi }
+          limits: { memory: 14Gi }
+
+# ── LISTENER PLACEMENT ──────────────────────────────────────────────────────
+# The listener is the pod that acquires jobs from GitHub; if it cannot schedule,
+# NOTHING runs and the queue just grows silently. It is NOT a runner: it
+# requests 50m CPU / 128Mi and does no build work.
+#
+# Every Ready node in this cluster carries a NoSchedule taint by design —
+# control-plane on the three servers, gardenio.agent on the platform nodes
+# (terraform modules/k3s), ci on the CI pool. The RUNNER side already tolerates
+# ci=true and selects gardenio.io/role=ci, but the listener had only the default
+# not-ready/unreachable tolerations, so it was homeless the moment it had to be
+# re-placed.
+#
+# That is exactly what happened 2026-09-20: a control-plane node hung, its
+# listener was evicted, and CI was dead for ~20 minutes with 12 runs queued
+# before anyone noticed — the runners sat "Listening for Jobs" the whole time,
+# which looks healthy. The other three scale sets only kept working because
+# their listeners had been scheduled earlier and were never forced to move.
+#
+# Tolerating control-plane is deliberate and is NOT a reversal of the taint
+# added the same day: that taint exists to keep 2Gi-limit AGENT pods off
+# 1.95Gi etcd nodes, and a 50m/128Mi listener is a different thing entirely.
+# The platform nodes were at 100% CPU when this was chosen; the servers are the
+# calmer home for a latency-sensitive poller.
+listenerTemplate:
+  spec:
+    containers:
+      - name: listener   # required by the ARS CRD even when only tolerations change
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      # Home off the servers (gd-ybTutceJpn). The 2 GiB servers ran out of memory
+      # one after another on 2026-10-14 because a server drain piled the ARC
+      # listeners onto the survivors. Tolerate the platform pool's taint and
+      # PREFER those nodes; the control-plane toleration above stays as the
+      # fallback, so a listener is never stranded Pending.
+      - key: gardenio.agent
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: gardenio.io/role
+                  operator: In
+                  values: ["platform"]
+
+    # Keep the listeners off one another's node. All six tolerate only the
+    # control-plane taint above, so they all compete for the same three k3s
+    # servers; left alone they pile up (3/2/1 on 2026-09-22, with every
+    # gardenio tier on one node), which turns a single node loss into a
+    # TIER-BLIND dispatch outage.
+    #
+    # ScheduleAnyway is deliberate and must stay: six listeners over three
+    # nodes means a hard constraint can strand one Pending, the failure this
+    # file already has a scar from. This all-six selector is shared by the three
+    # MIRROR values files in this directory (beads-hq, gascity-hq,
+    # gascity-packs-hq) -- change one, change those three. The gardenio tiers
+    # deliberately select on repository instead; arc-runners-values.yaml says
+    # why, and carries the full rationale.
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/part-of: gha-runner-scale-set
+            app.kubernetes.io/component: runner-scale-set-listener

@@ -1,0 +1,74 @@
+{{/*
+ValidatingAdmissionPolicy that prevents any out-of-band patch from
+re-introducing the legacy `kd-beads-token` secret reference into the
+BEADS_DAEMON_TOKEN env on bridge deployments.
+
+Context: ka-0000007278 — at 2026-05-25T17:46:58Z a `kubectl patch`
+(manager=kubectl-patch) silently rewrote
+`spec.template.spec.containers[0].env[BEADS_DAEMON_TOKEN].valueFrom.secretKeyRef`
+on `gardenio-{gitlab,jira,slack}-bridge` from `bridge-tokens/<bridge>`
+back to `kd-beads-token/token`. The source of the patch could not be
+identified post-hoc (EKS API-server audit logs not retained in Mezmo at
+the bug-filing time). This policy enforces the invariant at admission
+time so a regression cannot land regardless of which client/SA issues
+the patch.
+
+Off by default; flip to true via
+`agents.bridgeTokenAdmissionPolicy.enabled` once the bridges have migrated
+to `beads.bridgeTokenSecret` (resolves to "bridge-tokens" by default; the
+legacy `beads.bridgeFleetTokenSecret` alias still works during the
+fleet→bridge rename window, ka-0000005788). When a bridge token secret is
+set, the chart renders the bridge deployments referencing it — so this
+policy is fully compatible with normal `helm upgrade`s. It only blocks
+mutations that try to put the legacy reference BACK into the live
+deployment spec.
+
+Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA).
+*/}}
+{{- if and .Values.agents.enabled (((.Values.agents.bridgeTokenAdmissionPolicy).enabled)) }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-bridge-token-guard
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+  matchConditions:
+    - name: only-gardenio-bridge-deployments
+      expression: >-
+        object.metadata.namespace == '{{ .Release.Namespace }}' &&
+        object.metadata.name in [
+          '{{ include "gardenio.fullname" . }}-gitlab-bridge',
+          '{{ include "gardenio.fullname" . }}-jira-bridge',
+          '{{ include "gardenio.fullname" . }}-slack-bridge'
+        ]
+  validations:
+    - expression: >-
+        !object.spec.template.spec.containers.exists(c,
+          c.?env.orValue([]).exists(e,
+            e.name == 'BEADS_DAEMON_TOKEN' &&
+            e.?valueFrom.?secretKeyRef.?name.orValue('') == 'kd-beads-token'
+          )
+        )
+      message: >-
+        Bridge deployment may not reference legacy secret `kd-beads-token`
+        for BEADS_DAEMON_TOKEN. Use the bridge token secret
+        (`beads.bridgeTokenSecret` in the chart). See ka-0000007278.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-bridge-token-guard
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "gardenio.agents.fullname" . }}-bridge-token-guard
+  validationActions: ["Deny"]
+{{- end }}

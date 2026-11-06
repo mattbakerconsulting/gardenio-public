@@ -1,0 +1,67 @@
+{{define "gardener_iteration_card"}}
+{{- /* One run in a gardener's life-thread. Mirrors the /agents card markup so
+       it "captures everything an agent card shows" (design doc §4.3), then
+       prepends the run-number ribbon + live badge from the gardenerIterationView
+       overlay. Dot context: { Iter gardenerIterationView, BasePath string } —
+       wrapped in a dict because a sub-template rebinds `$`, so the card cannot
+       reach the page-level BasePath directly. */ -}}
+{{- $base := .BasePath -}}
+{{- with .Iter -}}
+<li class="bead-row gardener-iter{{if .IsLive}} gardener-iter-live{{else}} bead-row-terminated{{end}}{{if .DidNotRun}} gardener-iter-didnotrun{{end}}"
+    data-bead-id="{{.ID}}" data-last-activity-ts="{{.UpdatedAtRFC}}">
+  <div class="bead-row-top">
+    <div class="bead-row-text">
+      <div class="gardener-iter-ribbon">
+        <span class="gardener-run-label{{if .IsLive}} gardener-run-live{{end}}{{if .ByTime}} gardener-run-bytime{{end}}{{if .ByFireOrder}} gardener-run-byfireorder{{end}}"
+              {{if .ByTime}}title="Ordering is heuristic (by created_at) — the gardener's run chain was incomplete."{{else if .ByFireOrder}}title="Ordered by the schedule fire-slot (schedule_key) — a genuine run order, just inferred from the fire schedule rather than the run chain."{{end}}>{{.RunLabel}}</span>
+        {{- /* Per-run cost + token/turn usage (bug ka-0000001009 / C2): the
+               single run's reconciled total_cost_usd (plus live estimate while
+               in flight) and context/turns, so an operator can attribute a
+               spend spike to a specific run instead of seeing only the gardener's
+               cumulative roll-up. Reuses the shared /agents usage-chip strip off
+               the iteration's embedded agentRowView.Usage — no extra fetch. */ -}}
+        {{if .Usage.HasAny}}<span class="gardener-iter-usage" title="This run's own cost, context, and turns">{{template "agent_usage_chips" .Usage}}</span>{{end}}
+      </div>
+      {{- /* Outcome-first: the run's wrap-up tldr (or a derived outcome line)
+             is the PRIMARY, linked text of the card; the bare agent name is
+             demoted to metadata below (ka-0000001187). When a run left no
+             outcome at all we fall back to the task title, then the bead's own
+             title, so the headline link is never empty. */ -}}
+      <a class="bead-row-title{{if not (or .WrapUpSummary .DerivedOutcome)}} gardener-iter-noutcome{{end}}" href="{{$base}}/{{.ID}}"
+         hx-get="{{$base}}/{{.ID}}"
+         hx-trigger="mouseover once"
+         hx-target="none"
+         hx-swap="none">{{if .WrapUpSummary}}{{.WrapUpSummary}}{{else if .DerivedOutcome}}{{.DerivedOutcome}}{{else if .TaskTitle}}{{.TaskTitle}}{{else}}{{.Name}}{{end}}</a>
+      {{if .WrapUpMRs}}<div class="agent-wrapup-mrs" aria-label="Merge requests produced by this run">{{range .WrapUpMRs}}{{template "mr_pill" .}}{{end}}</div>{{end}}
+      <div class="chip-strip" aria-label="Run state">
+        {{- /* A never-ran spawn shell: the reconciler expired it in the coop
+               queue before it claimed a pod. Show one explicit "did not run"
+               chip and SUPPRESS the outcome/closed chips, which would otherwise
+               read as a real (empty) run. It is not counted in Iterations
+               (bug ka-0000006805). */ -}}
+        {{if .DidNotRun}}<span class="chip chip-type gardener-iter-didnotrun-chip" title="This spawn expired in the coop queue before it ever claimed a pod (agent_state=expired). It never ran, so it is not counted as an iteration.">did not run</span>{{else}}
+        {{if .WrapUpBeadsClosed}}<span class="chip chip-type gardener-iter-outcome-chip" title="beads closed by this run">{{.WrapUpBeadsClosed}} closed</span>{{end}}
+        {{if and (not .IsLive) .RunOutcome}}<span class="chip chip-type gardener-iter-exit-{{.RunOutcome}}" title="exit reason (from wrap-up)">{{if eq .RunOutcome "ok"}}clean exit{{else if eq .RunOutcome "fail"}}blocked exit{{else}}no wrap-up{{end}}</span>{{end}}
+        {{end}}
+        {{if .Role}}<span class="chip chip-type">{{.Role}}</span>{{end}}
+        {{if .AgentState}}<span class="chip chip-type agent-state-{{.AgentState}}">{{.AgentState}}</span>{{end}}
+        {{if .PodPhase}}<span class="chip chip-type">pod: {{.PodPhase}}</span>{{end}}
+        {{if .Uptime}}<span class="chip chip-type agent-uptime{{if .LongRunning}} agent-uptime-warn{{end}}" title="started {{.CreatedAtRFC}}">up {{.Uptime}}</span>{{end}}
+        {{if .TerminalURL}}<a class="chip chip-type agent-terminal-link" href="{{.TerminalURL}}" title="Open live terminal in coopmux" rel="noopener">terminal</a>{{end}}
+        {{if .SlackURL}}<a class="chip chip-type agent-slack-link" href="{{.SlackURL}}" title="Open Slack thread" rel="noopener">slack thread</a>{{end}}
+      </div>
+      <div class="bead-row-meta">
+        {{if .Name}}<span class="meta agent-name-meta" title="agent identity">{{.Name}}</span>{{end}}
+        <span class="bead-row-id">{{.ID}}</span>
+        {{if .Project}}<span class="chip-type">{{.Project}}</span>{{end}}
+        {{if .TaskID}}<a class="meta" href="{{$base}}/{{.TaskID}}">{{.TaskID}}</a>{{end}}
+        {{if .SpawnedBy}}<span class="meta agent-spawned-by" title="spawned_by">by {{.SpawnedBy}}</span>{{end}}
+        {{if .OperatedByDisplay}}{{ownerInitials .OperatedByDisplay .OperatedBySlug}}<span class="meta agent-operated-by" title="operated_by">op {{userLink .OperatedByDisplay .OperatedBySlug}}</span>{{end}}
+        <span class="bead-row-spacer"></span>
+        {{if .Ago}}<span class="bead-row-ago" title="last activity">active {{.Ago}}</span>{{end}}
+      </div>
+    </div>
+  </div>
+</li>
+{{- end -}}
+{{end}}

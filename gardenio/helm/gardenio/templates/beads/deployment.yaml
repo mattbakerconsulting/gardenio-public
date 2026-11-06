@@ -1,0 +1,638 @@
+{{- if not .Values.fleet.enabled }}
+{{- /* The daemon fetches OIDC discovery (and, through it, the JWKS) over the
+     keycloak-runtime https port and trusts its CA (gd-lYPZlslOM7): only when
+     BEADS_OIDC_DISCOVERY_URL below renders, i.e. no beads.oidc override, the
+     Keycloak issuer is on and the discovery URL is the in-cluster https one. */}}
+{{- $kcCA := and (not (.Values.beads.oidc | default dict).issuerUrl) .Values.keycloak.enabled (include "gardenio.keycloak.issuerURL" .) (include "gardenio.keycloak.inClusterCA" .) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.beads.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.beads.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "gardenio.beads.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.beads.selectorLabels" . | nindent 8 }}
+      annotations:
+        {{- include "gardenio.doNotDisrupt" . | nindent 8 }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.beads.service.metricsPort | default 9091 }}"
+        prometheus.io/path: "/metrics"
+    spec:
+      {{- if .Values.beads.rbacProbe.enabled }}
+      {{- /* Spawn permission snapshot probe (gd-g9zzRfy1WL): the daemon reads
+             RBAC from the in-cluster API with its own read-only ServiceAccount
+             (templates/beads/rbac.yaml), via the standard token + CA mount. */}}
+      serviceAccountName: {{ include "gardenio.beads.fullname" . }}
+      automountServiceAccountToken: true
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
+      {{- /* Drain guard (gd-27vcHmrurh): gives in-flight kd/HTTP/gRPC requests
+             a window to finish before SIGTERM. Must exceed
+             preStop.sleepSeconds below with headroom for the daemon's own
+             graceful-shutdown work (in-flight DB writes). */}}
+      terminationGracePeriodSeconds: {{ .Values.beads.terminationGracePeriodSeconds | default 30 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: beads
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.beads.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.beads.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          command: {{ .Values.beads.command | default (list "kd" "serve") | toJson }}
+          ports:
+            - name: grpc
+              containerPort: 9090
+              protocol: TCP
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          env:
+            {{- include "gardenio.otelTracingEnv" . | nindent 12 }}
+            {{- if .Values.beads.databasePasswordFile.enabled }}
+            {{- /* Rotation-tolerant password-FILE mode (ka-0000004150 / P0
+                   ka-0000006811). The daemon reads the DB password from the
+                   mounted Secret volume below (a K8s Secret volume live-updates
+                   on the kubelet sync loop, unlike a secretKeyRef env var frozen
+                   at container start) and injects it into the connection string
+                   per connection. So an RDS master-password rotation reconnects
+                   in-process with NO CrashLoop. No BEADS_DATABASE_PASSWORD env
+                   var and a password-less BEADS_DATABASE_URL. */}}
+            - name: BEADS_DATABASE_PASSWORD_FILE
+              value: {{ printf "%s/%s" (.Values.beads.databasePasswordFile.mountPath | default "/var/run/db-secret") (include "gardenio.beads.rawPasswordSecretKey" .) | quote }}
+            - name: BEADS_DATABASE_URL
+              value: {{ include "gardenio.beads.databaseURLNoPassword" . }}
+            {{- else }}
+            {{- if .Values.beads.externalRDS.enabled }}
+            - name: BEADS_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.externalRDS.passwordSecretName" . }}
+                  key: password
+            {{- else if .Values.postgresExternal.enabled }}
+            # BEADS_DATABASE_PASSWORD is substituted into BEADS_DATABASE_URL
+            # (postgres://user:$(BEADS_DATABASE_PASSWORD)@host/db), so it needs
+            # the URL-encoded copy (urlKey, falling back to key). ka-0000005248.
+            - name: BEADS_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.beads.postgresExternal.passwordSecretName" . }}
+                  key: {{ include "gardenio.beads.postgresExternal.passwordSecretURLKey" . }}
+            {{- else if .Values.postgres.enabled }}
+            - name: BEADS_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.passwordSecret | default (include "gardenio.postgres.passwordSecretName" .) }}
+                  key: {{ if .Values.externalSecrets.enabled }}password_url{{ else }}password{{ end }}
+            {{- end }}
+            - name: BEADS_DATABASE_URL
+              value: {{ include "gardenio.beads.databaseURL" . }}
+            {{- end }}
+            # application_name (gd-rXqkv4rSmG): libpq and lib/pq read PGAPPNAME, so
+            # pg_stat_activity and the postgres exporter attribute this client's load.
+            - name: PGAPPNAME
+              value: "kbeads-server"
+            - name: BEADS_GRPC_ADDR
+              value: ":9090"
+            - name: BEADS_HTTP_ADDR
+              value: ":8080"
+            {{- if .Values.beads.rbacProbe.enabled }}
+            # The namespace spawned agents' ServiceAccounts live in (the
+            # permission snapshot probe falls back to "gardenio" without it).
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- end }}
+            - name: BEADS_METRICS_ADDR
+              value: ":9091"
+            {{- if .Values.beads.extractCommentReferences }}
+            - name: BEADS_REFERENCES_EXTRACT_COMMENTS
+              value: "1"
+            {{- end }}
+            {{- if .Values.beads.ownerDefaultEnabled }}
+            - name: BEADS_OWNER_DEFAULT_ENABLED
+              value: "1"
+            {{- end }}
+            {{- if .Values.beads.spawnPolicyEnabled }}
+            - name: BEADS_SPAWN_POLICY_ENABLED
+              value: "true"
+            {{- end }}
+            {{- if .Values.beads.migrateAutoRecover }}
+            - name: BEADS_MIGRATE_AUTO_RECOVER
+              value: {{ .Values.beads.migrateAutoRecover | quote }}
+            {{- end }}
+            {{- if .Values.global.humanOperator.authoringGate }}
+            # Authoring-time human-operator gate (rollout ka-0000004589). "warn"
+            # is behavior-identical to off EXCEPT it records M9
+            # (kbeads_authoring_human_gate_total{action="allowed_warn"}) — the
+            # residual an "enforce" flip would start refusing. Flip to "enforce"
+            # (collapses the resolver ladder + fail-closes autonomous non-human
+            # authoring) only once that residual is zero. Empty ⇒ code default
+            # (off).
+            - name: BEADS_AUTHORING_HUMAN_GATE
+              value: {{ .Values.global.humanOperator.authoringGate | quote }}
+            {{- end }}
+            {{- if .Values.beads.shortTitleGate }}
+            # Create-time short_title gate (gd-V5nGseRS5f). Unset ⇒ daemon
+            # default "warn"; "enforce" refuses agent creates with no
+            # short_title; "off" is the kill switch.
+            - name: BEADS_SHORT_TITLE_GATE
+              value: {{ .Values.beads.shortTitleGate | quote }}
+            {{- end }}
+            {{- if .Values.beads.operationTypeGate }}
+            # Escalation operation_type registry gate (gd-OXdyPW15fC). Unset ⇒
+            # daemon default "warn"; "enforce" refuses unregistered types;
+            # "off" is the kill switch.
+            - name: BEADS_OPERATION_TYPE_GATE
+              value: {{ .Values.beads.operationTypeGate | quote }}
+            {{- end }}
+            # History-retention window in days (gd-1F8R0SQtiQ); 0 disables.
+            - name: BEADS_HISTORY_RETENTION_DAYS
+              value: {{ .Values.beads.historyRetentionDays | quote }}
+            {{- with .Values.beads.heraldryGate }}
+            {{- if .home }}
+            # Create-time heraldry gate on epics (gd-fn7uPujOqj): the home
+            # garden's mode. Unset ⇒ daemon default "warn".
+            - name: BEADS_HERALDRY_GATE
+              value: {{ .home | quote }}
+            {{- end }}
+            {{- if .tenantLands }}
+            # The heraldry gate's mode for tenant lands. Unset ⇒ daemon
+            # default "off".
+            - name: BEADS_HERALDRY_GATE_TENANT_LANDS
+              value: {{ .tenantLands | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /* Land-door decision evidence (gd-U0WmpYaenI, route from #1736):
+                   GET /v1/lands/{land}/decisions/{decision}/evidence/{image}
+                   reads the bucket the viewer's /image/ proxy reads
+                   (landmap.PicturesFromEnv). Rendered only with agents.s3.bucket;
+                   without it the door answers 503 and shows no evidence. The read
+                   credentials come from the AWS default chain: an IRSA annotation
+                   on this ServiceAccount (AWS S3), or in endpoint mode the
+                   read-only in-box MinIO user below (gd-k3GmLJKW8R). */}}
+            {{- with .Values.agents.s3 }}
+            {{- if .bucket }}
+            - name: COOP_S3_BUCKET
+              value: {{ .bucket | quote }}
+            {{- with include "gardenio.objectStore.imagesBucket" $ }}
+            # Session images bucket (gd-CmjVAU3vgd): read first, then COOP_S3_BUCKET.
+            - name: COOP_S3_IMAGES_BUCKET
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .prefix }}
+            - name: COOP_S3_PREFIX
+              value: {{ .prefix | quote }}
+            {{- end }}
+            {{- if .region }}
+            - name: COOP_S3_REGION
+              value: {{ .region | quote }}
+            {{- end }}
+            {{- if .endpoint }}
+            - name: COOP_S3_ENDPOINT
+              value: {{ .endpoint | quote }}
+            {{- if include "gardenio.minio.beadsCredentialsEnabled" $ }}
+            # Read-only in-box MinIO user (objectStore.beadsCredentials):
+            # s3:GetObject under <prefix>/images/ only, never the root or
+            # agent keys. Via the default AWS credential chain.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.beadsSecretName" $ }}
+                  key: accesskey
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.beadsSecretName" $ }}
+                  key: secretkey
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- /* No BEADS_AUTH_TOKEN / BEADS_PREVIOUS_TOKEN: the daemon no longer
+                   accepts a shared static bearer (gd-ke6PC7bRto). Callers authenticate
+                   with a fleet token (BEADS_FLEET_MAP below / minted), an OIDC JWT or a
+                   machine principal (beads.machineClients). */ -}}
+            {{- /* Per-bridge tokens (ka-0000005187 / decision ka-0000001054).
+                   Registers gitlab-bridge / jira-bridge / slack-bridge identities
+                   so kbeads audit.go auto-attributes their writes as fleet:<name>.
+                   Secret name resolves via the fleet→bridge rename helper
+                   (ka-0000005788): bridgeTokenSecret, else legacy
+                   bridgeFleetTokenSecret, else "bridge-tokens". */}}
+            {{- $bridgeTokenSecret := include "gardenio.beads.bridgeTokenSecretName" . }}
+            {{- if $bridgeTokenSecret }}
+            - name: BEADS_FLEET_MAP
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $bridgeTokenSecret }}
+                  key: fleet-map
+                  {{- /* Optional so a deploy without a pre-provisioned bridge-token
+                         Secret (e.g. gardenio-next, which runs no bridges) does not
+                         wedge the beads pod in CreateContainerConfigError. Prod pins
+                         the existing Secret via beads.bridgeFleetTokenSecret, so the
+                         fleet map still loads there. ka-0000002852. */}}
+                  optional: true
+            {{- /* Bridge fleets get cross-fleet-read so they can observe activity
+                   in agent/decision/escalation beads from every fleet for Slack relay
+                   while their writes still attribute to fleet:<bridge>. See
+                   ka-0000008234 follow-up. Defaults to the three known bridge fleets;
+                   override via beads.crossFleetReadFleets if your deployment has more. */}}
+            - name: BEADS_CROSS_FLEET_READ_FLEETS
+              value: {{ .Values.beads.crossFleetReadFleets | default "slack-bridge,jira-bridge,gitlab-bridge" | quote }}
+            {{- /* Privileged service fleets (ka-0000001946): tokens of these
+                   fleets bypass per-bead ownership for system-managed graph
+                   writes (produces/triggered-by deps + mr_url back-fill). Applied
+                   to EVERY token of a listed fleet regardless of load path, so the
+                   live gitlab-bridge token loaded via this same fleet-map Secret
+                   (which has no per-token privileged field) gets the bypass instead
+                   of 403-ing. Keep aligned with agents.bridgeTokenRotation
+                   .privilegedFleets. Default to gitlab-bridge since that is the
+                   sole privileged bridge today. */}}
+            - name: BEADS_PRIVILEGED_FLEETS
+              value: {{ .Values.beads.privilegedFleets | default "gitlab-bridge" | quote }}
+            {{- /* Writer-fleet allowlist for the trigger/schedule
+                   service-managed-fields ownership bypass (ka-0000006237).
+                   A NON-listed, non-privileged fleet token can no longer stamp
+                   last_checked/last_run on trigger beads it does not own —
+                   this is what stops a foreign-environment bridge (e.g. the
+                   gardenio-jira-sandbox fleet, misconfigured onto this daemon)
+                   from cooldown-starving this environment's triggers (the
+                   2026-07-01 jira-bridge outage, epic ka-0000005107).
+                   Defaults to this deployment's own bridge fleets. */}}
+            - name: BEADS_SERVICE_FIELD_FLEETS
+              value: {{ .Values.beads.serviceFieldFleets | default "slack-bridge,jira-bridge,gitlab-bridge" | quote }}
+            {{- end }}
+            {{- /* Fleet subjects whose X-Operated-By relay counts for access
+                   control (team, taint grant, decision responder); every other
+                   caller's relay is attribution only (P7 Task 3). */}}
+            {{- with .Values.beads.bridgeSubjects }}
+            - name: BEADS_BRIDGE_SUBJECTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- /* The operator's own GitHub accounts (gd-72m3STiqya): the daemon
+                   refuses a project write that would bind a land minting with
+                   the Lands App to a repo one of them owns. Same list the
+                   controller checks at mint time. */}}
+            {{- with .Values.agents.lands.operatorGithubOrgs }}
+            - name: BEADS_LANDS_OPERATOR_GITHUB_ORGS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if .Values.tokenRotation.enabled }}
+            - name: BEADS_REVOKED_TOKENS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "gardenio.fullname" . }}-revoked-tokens
+                  key: revoked-hashes
+                  optional: true
+            {{- end }}
+            {{- /* Stage 3 / W-B-11 (ka-0000001678): daemon-side HMAC verify of the
+                   gardenio-edge-auth envelope. Wire the same shared secret used
+                   by the edge-auth Deployment so envelopes signed at the edge
+                   verify here. DAEMON_HMAC_VERIFY_ENFORCE defaults off in
+                   values.yaml — flip per-env only after a clean ≥7d burn-in
+                   per runbook ka-0000000026. */}}
+            {{- if .Values.edgeAuth.enabled }}
+            - name: DAEMON_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.edgeAuth.hmacSecretName" . }}
+                  key: {{ .Values.edgeAuth.hmacKey.secretKey | default "hmac-key" }}
+                  {{- /* dryRun: secret may not exist yet — mark optional so
+                         the pod can start even before the operator provisions
+                         gardenio-<env>-edge-auth-hmac. (ka-0000000726) */}}
+                  optional: {{ .Values.edgeAuth.dryRun | default false }}
+            {{- /* Split v2 envelope key (gd-h2tQrOwjGJ): verifies the
+                   role-bearing v2 envelope; unset falls back to
+                   DAEMON_HMAC_KEY. Wired with every other v2 signer/verifier
+                   from edgeAuth.hmacKey.secretKeyV2 in one upgrade. */}}
+            {{- if .Values.edgeAuth.hmacKey.secretKeyV2 }}
+            - name: DAEMON_HMAC_KEY_V2
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.edgeAuth.hmacSecretName" . }}
+                  key: {{ .Values.edgeAuth.hmacKey.secretKeyV2 }}
+                  optional: {{ .Values.edgeAuth.dryRun | default false }}
+            {{- end }}
+            {{- if .Values.daemonHmacVerify.enforce }}
+            - name: DAEMON_HMAC_VERIFY_ENFORCE
+              value: "true"
+            {{- end }}
+            {{- end }}
+            {{- $natsURL := .Values.beads.natsURL | default (include "gardenio.natsURL" .) }}
+            {{- if $natsURL }}
+            - name: BEADS_NATS_URL
+              value: {{ $natsURL }}
+            {{- if .Values.nats.auth.subjectIsolation.enabled }}
+            {{- /* Daemon publishes events + owns the JetStream streams — full
+                   pub/sub access, so it authenticates as the infra user. The
+                   username makes the shared secret a user PASSWORD: multi-user
+                   server entries only support user/password, so a bare token
+                   can never match one (ka-0000000002). */}}
+            - name: BEADS_NATS_USER
+              value: infra
+            - name: BEADS_NATS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.fullname" . }}-nats-infra-creds
+                  key: token
+            {{- end }}
+            {{- end }}
+            {{- /* OIDC issuer + audience for the beads daemon's JWT verifier
+                   (internal/server/oidc.go — generic go-oidc JWKS discovery, no
+                   provider-specific code). An explicit beads.oidc.issuerUrl
+                   override (GitLab-direct front door, T3 ka-0000002268, epic
+                   ka-0000004118) WINS over the Keycloak derivation for BOTH env
+                   vars; when it is empty the historical Keycloak path renders
+                   byte-identically (in-box + ephemeral CI). Setting the override
+                   REPLACES the Keycloak issuer/audience, so a Keycloak-issued JWT
+                   (wrong issuer/aud) is now REJECTED — proving we switched, not
+                   added. In-cluster agents keep authenticating via
+                   BEADS_DAEMON_TOKEN, an independent path this does not touch. */}}
+            {{- $beadsOidc := .Values.beads.oidc | default dict }}
+            {{- if $beadsOidc.issuerUrl }}
+            - name: BEADS_OIDC_ISSUER_URL
+              value: {{ $beadsOidc.issuerUrl | quote }}
+            {{- if $beadsOidc.audience }}
+            - name: BEADS_OIDC_AUDIENCE
+              value: {{ $beadsOidc.audience | quote }}
+            {{- end }}
+            {{- else }}
+            {{- $kcIssuerURL := include "gardenio.keycloak.issuerURL" . }}
+            {{- if and .Values.keycloak.enabled $kcIssuerURL }}
+            - name: BEADS_OIDC_ISSUER_URL
+              value: {{ $kcIssuerURL | quote }}
+            {{- $kcDiscoveryURL := include "gardenio.keycloak.discoveryURL" . }}
+            {{- if $kcDiscoveryURL }}
+            # Issuer is the public hostnameUrl one; discovery goes over the
+            # Service (gd-l1Jh9aFEXY).
+            - name: BEADS_OIDC_DISCOVERY_URL
+              value: {{ $kcDiscoveryURL | quote }}
+            {{- if $kcCA }}
+            - name: BEADS_OIDC_CA_FILE
+              value: {{ include "gardenio.keycloakRuntime.caFile" . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if and .Values.keycloak.enabled .Values.keycloak.oidcAudience }}
+            - name: BEADS_OIDC_AUDIENCE
+              value: {{ .Values.keycloak.oidcAudience | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.beads.oidcIssuerURLs }}
+            - name: BEADS_OIDC_ISSUER_URLS
+              value: {{ .Values.beads.oidcIssuerURLs | quote }}
+            {{- end }}
+            {{- if .Values.beads.escalationCoordinatorClients }}
+            - name: BEADS_ESCALATION_COORDINATOR_CLIENTS
+              value: {{ .Values.beads.escalationCoordinatorClients | quote }}
+            {{- end }}
+            {{- if .Values.beads.escalationResultMachines }}
+            - name: BEADS_ESCALATION_RESULT_MACHINES
+              value: {{ .Values.beads.escalationResultMachines | quote }}
+            {{- end }}
+            - name: BEADS_ESCALATION_RESULT_REQUIRES_APPROVAL
+              value: {{ .Values.beads.escalationResultRequiresApproval | quote }}
+            {{- if .Values.beads.clientRoleCeiling }}
+            - name: BEADS_CLIENT_ROLE_CEILING
+              value: {{ .Values.beads.clientRoleCeiling | quote }}
+            {{- end }}
+            {{- /* Machine-principal registry (gd-gQ4iLIpWCm / gd-s7aPIf0Bgp): the
+                 Keycloak confidential clients whose service-account tokens the
+                 daemon classifies as machine principals. Rollout order: a client
+                 is listed here NO LATER than it gets the kbeads audience mapper,
+                 otherwise its tokens take the human OIDC path. */}}
+            {{- with .Values.beads.machineClients }}
+            - name: BEADS_MACHINE_CLIENTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if and .Values.keycloak.enabled .Values.keycloak.oidcAllowedEmailDomains }}
+            - name: BEADS_OIDC_ALLOWED_EMAIL_DOMAINS
+              value: {{ .Values.keycloak.oidcAllowedEmailDomains | quote }}
+            {{- end }}
+            {{- if and .Values.keycloak.enabled .Values.keycloak.admin.enabled }}
+            - name: BEADS_KEYCLOAK_ADMIN_URL
+              value: {{ .Values.keycloak.admin.url | quote }}
+            - name: BEADS_KEYCLOAK_ADMIN_REALM
+              value: {{ .Values.keycloak.admin.realm | default .Values.keycloak.realm.name | quote }}
+            - name: BEADS_KEYCLOAK_ADMIN_CLIENT_ID
+              value: {{ .Values.keycloak.admin.clientId | quote }}
+            {{- if .Values.keycloak.admin.clientSecretRef }}
+            - name: BEADS_KEYCLOAK_ADMIN_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.keycloak.admin.clientSecretRef.name }}
+                  key: {{ .Values.keycloak.admin.clientSecretRef.key | default "client-secret" }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: "{{ .Values.global.coverage.mountPath }}/kbeads"
+            {{- end }}
+            {{- if .Values.beads.embedding.enabled }}
+            - name: BEADS_EMBED_BACKEND
+              value: "openai"
+            - name: BEADS_EMBED_URL
+              value: {{ .Values.beads.embedding.url | quote }}
+            - name: BEADS_EMBED_MODEL
+              value: {{ .Values.beads.embedding.model | quote }}
+            {{- if .Values.beads.embedding.apiKeySecret.name }}
+            - name: BEADS_EMBED_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.beads.embedding.apiKeySecret.name | quote }}
+                  key: {{ .Values.beads.embedding.apiKeySecret.key | default "api-key" | quote }}
+                  {{- /* Optional so a deploy whose embedding API-key Secret has not
+                         synced yet (e.g. gardenio-next missing litellm-gardenio-key)
+                         does not wedge the beads pod in CreateContainerConfigError;
+                         embedding degrades instead. ka-0000002852. */}}
+                  optional: true
+            {{- end }}
+            {{- if .Values.beads.embedding.allowedTypes }}
+            # Default type allowlist for `kd embed sync` runs that
+            # exec into this pod (operator + gardener cron). The CLI
+            # filters bead types client-side; without this env every
+            # event/session/agent bead would be embedded for ~zero
+            # value. See ka-0000003072 §3.
+            - name: BEADS_EMBED_TYPES
+              value: {{ join "," .Values.beads.embedding.allowedTypes | quote }}
+            {{- end }}
+            {{- if .Values.beads.embedding.excludeTypes }}
+            - name: BEADS_EMBED_EXCLUDE_TYPES
+              value: {{ join "," .Values.beads.embedding.excludeTypes | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if and .Values.beads.charts.enabled .Values.beads.charts.vmselectURL }}
+            # In-house chart backend (ka-0000006905): enables
+            # GET /v1/charts/uniqueness (DAU/WAU/MAU query-time panels).
+            - name: BEADS_VMSELECT_URL
+              value: {{ .Values.beads.charts.vmselectURL | quote }}
+            {{- if .Values.beads.charts.tokenSecret.name }}
+            - name: BEADS_VMSELECT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.beads.charts.tokenSecret.name | quote }}
+                  key: {{ .Values.beads.charts.tokenSecret.key | default "token" | quote }}
+            {{- end }}
+            {{- end }}
+          # Probe strategy for the SINGLE-replica beads daemon (ka-0000001764,
+          # family B of E2E deflake epic ka-0000007460):
+          #
+          #   startupProbe  → GET /v1/health      (DB ping — the cold-start gate)
+          #   livenessProbe → GET /v1/health/live (cheap, no DB)
+          #   readinessProbe→ GET /v1/health/live (cheap, no DB)
+          #
+          # WHY split them: /v1/health pings the DB (kbeads handleHealth, 5s
+          # timeout). Gating READINESS on a DB ping for a single-replica Service
+          # is an anti-pattern — a slow cold-POC ping trips the probe, K8s pulls
+          # the pod's ONLY address out of the Service EndpointSlice, and an
+          # in-flight kd call mid-request gets HTTP 000 (the family-B flake).
+          # With no second replica to route around, evicting the sole endpoint
+          # only converts a slow response into a hard failure. Gating LIVENESS on
+          # the DB ping is worse: a transient DB blip restarts a healthy daemon.
+          #
+          # The DB-connectivity gate is preserved where it is actually useful —
+          # the startupProbe: K8s holds the pod OUT of the EndpointSlice until
+          # /v1/health first succeeds, so a genuinely-unreachable-DB daemon never
+          # joins the Service (this is what backs e2e-setup's "waiting for
+          # endpoints on <ns>-beads" gate, ka-0000005545). After startup,
+          # readiness/liveness track only process health — the thing a single
+          # replica can actually act on. MR !4331's failureThreshold 3→6 only
+          # widened the DB-ping tolerance window; this removes the coupling.
+          startupProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /v1/health/live
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /v1/health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          {{- /* Drain in-flight requests before SIGTERM (gd-27vcHmrurh). The
+                 pod is pulled from Service Endpoints as soon as SIGTERM is
+                 sent, but that propagation is not instantaneous across the
+                 cluster, so a client can still dial this pod for a moment
+                 after termination starts. Sleeping here delays SIGTERM to the
+                 daemon itself, giving those already-in-flight requests a
+                 window to complete instead of getting reset. */}}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ .Values.beads.preStop.sleepSeconds | default 5 }}"]
+          {{- if or .Values.global.coverage.enabled .Values.beads.databasePasswordFile.enabled $kcCA }}
+          volumeMounts:
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+            {{- if .Values.beads.databasePasswordFile.enabled }}
+            # Rotation-tolerant DB password (ka-0000004150): a Secret volume
+            # live-updates on the kubelet sync loop, so the daemon re-reads a
+            # rotated password from this file per connection without a restart.
+            - name: db-secret
+              mountPath: {{ .Values.beads.databasePasswordFile.mountPath | default "/var/run/db-secret" }}
+              readOnly: true
+            {{- end }}
+            {{- if $kcCA }}
+            {{- include "gardenio.keycloakRuntime.caVolumeMount" . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.beads.resources | nindent 12 }}
+      {{- if or .Values.global.coverage.enabled .Values.beads.databasePasswordFile.enabled $kcCA }}
+      volumes:
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+        {{- if .Values.beads.databasePasswordFile.enabled }}
+        # Optional so the pod still schedules before ESO has synced the Secret;
+        # the daemon's pingWithRetry re-reads the file until the rotated password
+        # authenticates (ka-0000004150), and a startup miss self-heals on the
+        # next kubelet sync rather than CrashLooping.
+        - name: db-secret
+          secret:
+            secretName: {{ include "gardenio.beads.rawPasswordSecretName" . }}
+            optional: true
+        {{- end }}
+        {{- if $kcCA }}
+        {{- include "gardenio.keycloakRuntime.caVolume" . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.beads.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- /* HA spread (gd-27vcHmrurh). Only rendered at replicaCount > 1 — see
+             templates/litellm/deployment.yaml for the rationale this mirrors. */}}
+      {{- if gt (int (.Values.beads.replicaCount | default 1)) 1 }}
+      {{- with .Values.beads.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew | default 1 }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable | default "ScheduleAnyway" }}
+          labelSelector:
+            matchLabels:
+              {{- include "gardenio.beads.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- if .Values.beads.affinity }}
+      affinity:
+        {{- toYaml .Values.beads.affinity | nindent 8 }}
+      {{- else if and (gt (int (.Values.beads.replicaCount | default 1)) 1) .Values.beads.podAntiAffinity.enabled }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: {{ .Values.beads.podAntiAffinity.weight | default 100 }}
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "gardenio.beads.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.beads.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- if .Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ .Values.global.systemPriorityClass.name }}
+      {{- end }}
+{{- end }}

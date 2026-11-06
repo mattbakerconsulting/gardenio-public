@@ -1,0 +1,85 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.jiraBridge.enabled .Values.jiraBridge.webhook.enabled }}
+{{- if and .Values.jiraBridge.webhook.ipWhitelist.enabled (empty .Values.jiraBridge.webhook.ipWhitelist.sourceRange) }}
+{{- fail "jiraBridge.webhook.ipWhitelist.enabled is true but jiraBridge.webhook.ipWhitelist.sourceRange is empty: set Atlassian webhook source CIDRs (see values.yaml comments) or set jiraBridge.webhook.ipWhitelist.enabled=false." }}
+{{- end }}
+{{- $fullname := printf "%s-jira-bridge" (include "gardenio.fullname" .) -}}
+{{- $host := .Values.jiraBridge.webhook.host -}}
+{{- $port := .Values.jiraBridge.service.port | default 8091 -}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jira-bridge
+spec:
+  # Default web/websecure preserves the legacy shape (dedicated-host webhook
+  # ingress on the shared edge). Environments whose shared edge cannot accept
+  # unauthenticated SaaS deliveries (e.g. AVA-fronted prod) point this at a
+  # dedicated public entrypoint instead (e.g. `webhooks`). Mirrors
+  # gitlabBridge.ingress.entryPoints (MR !5229).
+  entryPoints:
+    {{- range .Values.jiraBridge.webhook.entryPoints | default (list "web" "websecure") }}
+    - {{ . }}
+    {{- end }}
+  routes:
+    - match: Host(`{{ $host }}`) && Path(`/webhook`)
+      kind: Rule
+      priority: 100
+      services:
+        - name: {{ $fullname }}
+          port: {{ $port }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if .Values.jiraBridge.webhook.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ipwhitelist
+        {{- end }}
+        {{- if .Values.jiraBridge.webhook.rateLimit.enabled }}
+        - name: {{ $fullname }}-ratelimit
+        {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if .Values.jiraBridge.webhook.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jira-bridge
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.jiraBridge.webhook.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.jiraBridge.webhook.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if .Values.jiraBridge.webhook.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jira-bridge
+spec:
+  rateLimit:
+    average: {{ .Values.jiraBridge.webhook.rateLimit.average }}
+    burst: {{ .Values.jiraBridge.webhook.rateLimit.burst }}
+{{- end }}
+{{- end }}

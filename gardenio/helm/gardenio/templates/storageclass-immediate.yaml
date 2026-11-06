@@ -1,0 +1,63 @@
+{{- if .Values.storageClassImmediate.create }}
+# ---------------------------------------------------------------------------
+# gardenio-gp3-immediate — EBS gp3 StorageClass with volumeBindingMode: Immediate
+# ---------------------------------------------------------------------------
+# Deadlock-safe sibling of the cluster-scoped `gardenio-gp3` class
+# (templates/storageclass.yaml), which uses volumeBindingMode:
+# WaitForFirstConsumer (WFC). A WFC PVC does NOT bind until a consumer pod is
+# scheduled — but the prod deploy runs the chart through an ATOMIC helm_release
+# with --wait, which waits for every PVC to bind *before* it schedules the
+# consumer Deployments. On the FIRST upgrade that creates a WFC PVC that has no
+# already-scheduled consumer, the PVC stays Pending, --wait errors after ~60s,
+# and the atomic rollback DELETES the fresh PVC — so every retry starts over
+# (ka-0000002370: prod stranded on 2026.209.6 ~11h; MR !6257 disabled
+# slack-bridge persistence to unblock it).
+#
+# Immediate binding provisions AND binds the EBS volume at PVC-creation time
+# (no consumer needed), so the PVC is Bound well before --wait inspects the
+# Deployment — breaking the deadlock. Steady-state behavior is identical to
+# WFC: once bound, the volume pins to its AZ and the single-replica consumer
+# (strategy: Recreate) must schedule in that AZ on every subsequent upgrade —
+# exactly what WFC also does after its first bind. The ONLY difference is the
+# first bind, which is the deadlock. This is why grafana's 32-day-old WFC PVC
+# never deadlocks (it bound before any --wait) while a brand-new one does.
+#
+# Scope: this class is intended for small, single-replica bridge state PVCs
+# (slack-bridge/gitlab-bridge/jira-bridge). It is deliberately SEPARATE from
+# `gardenio-gp3` so the shared WFC class used by the multi-AZ StatefulSets
+# (postgres/nats/keycloak) is untouched — those want WFC so their per-replica
+# volumes co-locate with the pod the scheduler picks.
+#
+# Ownership mirrors `gardenio-gp3`: cluster-scoped, so exactly ONE Helm release
+# per cluster may own it (create:true only on the prod/persistent release);
+# every other release references it with create:false. `resource-policy: keep`
+# orphans (rather than deletes) it if a release stops templating it, so other
+# releases' bound PVCs keep their backing class.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClassImmediate.name }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: storage-immediate
+  annotations:
+    "helm.sh/resource-policy": keep
+provisioner: {{ .Values.storageClassImmediate.provisioner | default "ebs.csi.aws.com" }}
+parameters:
+  type: {{ .Values.storageClassImmediate.type | default "gp3" }}
+  {{- range $i, $tag := .Values.storageClassImmediate.tags }}
+  tagSpecification_{{ add $i 1 }}: "{{ $tag.key }}={{ $tag.value }}"
+  {{- end }}
+volumeBindingMode: Immediate
+reclaimPolicy: {{ .Values.storageClassImmediate.reclaimPolicy | default "Delete" }}
+allowVolumeExpansion: {{ .Values.storageClassImmediate.allowVolumeExpansion | default true }}
+{{- with .Values.storageClassImmediate.allowedTopologies }}
+# Optional AZ pin. Empty (default) lets the EBS CSI driver provision in any AZ
+# that has schedulable nodes. Set this to the AZ(s) that carry an untainted
+# consumer-schedulable node if Immediate ever provisions a volume into an AZ
+# where the single-replica consumer cannot schedule (a capacity edge, not a
+# structural deadlock).
+allowedTopologies:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

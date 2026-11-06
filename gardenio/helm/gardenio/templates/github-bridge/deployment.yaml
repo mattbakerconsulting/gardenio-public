@@ -1,0 +1,262 @@
+{{- if .Values.githubBridge.enabled }}
+{{- if not .Values.githubBridge.webhookSecret.secretName }}
+{{- fail "githubBridge.enabled is true but githubBridge.webhookSecret.secretName is empty: the bridge fails closed without a webhook secret. Point it at a K8s Secret (githubBridge.webhookSecret.externalSecret.enabled syncs one from SSM)." }}
+{{- end }}
+{{- if .Values.githubBridge.githubApp.appId }}
+{{- if not .Values.githubBridge.githubApp.privateKeySecret }}
+{{- fail "githubBridge.githubApp.appId is set but githubBridge.githubApp.privateKeySecret is empty: the bridge needs the App private key to mint installation tokens." }}
+{{- end }}
+{{- end }}
+{{- $ghApp := .Values.githubBridge.githubApp }}
+{{- $scan := .Values.githubBridge.conflictScanner }}
+{{- if and $scan.repo (not $ghApp.appId) }}
+{{- fail "githubBridge.conflictScanner.repo is set but githubBridge.githubApp.appId is empty: the conflict scanner fetches with an installation token and stays off without one." }}
+{{- end }}
+{{- $secretKey := .Values.githubBridge.webhookSecret.secretKey | default "webhook-secret" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.fullname" . }}-github-bridge
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: github-bridge
+spec:
+  replicas: {{ .Values.githubBridge.replicaCount | default 1 }}
+  # Recreate, not RollingUpdate: the delivery-replay cache is in memory, so two
+  # pods would each accept a replay the other already saw.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: github-bridge
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: github-bridge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9101"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: github-bridge
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.githubBridge.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.githubBridge.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8101
+              protocol: TCP
+            - name: metrics
+              containerPort: 9101
+              protocol: TCP
+          env:
+            {{- include "gardenio.otelTracingEnv" . | nindent 12 }}
+            # Beads daemon: webhook deliveries, the CI-wait resolver, the agent
+            # resolver, the squawk stream and the conflict scanner all write
+            # through one daemon client.
+            - name: BEADS_HTTP_ADDR
+              value: "http://{{ include "gardenio.beads.host" . }}:{{ include "gardenio.beads.httpPort" . }}"
+            {{- /* The static token is injected only while the machine principal
+                 is off (rollback path): with it on, every daemon call AND the
+                 SSE stream authenticate as the Keycloak service account
+                 (gd-tCMXlS9fXW). */}}
+            {{- if not .Values.githubBridge.machinePrincipal.enabled }}
+            - name: BEADS_DAEMON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  {{- if .Values.githubBridge.beads.tokenSecret }}
+                  name: {{ .Values.githubBridge.beads.tokenSecret }}
+                  key: {{ .Values.githubBridge.beads.tokenKey | default "github-bridge" }}
+                  {{- else }}
+                  name: {{ .Values.beads.tokenSecret | default "kd-beads-token" }}
+                  key: token
+                  {{- end }}
+            {{- end }}
+            {{- /* Machine principal: every daemon call authenticates as the
+                 Keycloak service account of githubBridge.machinePrincipal.clientId
+                 (roles gardenio-machine-release-recorder for the release writes,
+                 gardenio-machine-github-bridge for the rest; gd-305kriuXdT,
+                 gd-tCMXlS9fXW). The secret is a file, never an env var; its
+                 Secret is operator-created and optional, so a missing Secret
+                 still starts the pod and the writes fail closed
+                 (auth_unavailable). Same contract as templates/grafana-bridge. */}}
+            {{- if .Values.githubBridge.machinePrincipal.enabled }}
+            - name: BEADS_OIDC_TOKEN_URL
+              value: {{ include "gardenio.keycloak.tokenURL" . | quote }}
+            - name: BEADS_OIDC_CLIENT_ID
+              value: {{ .Values.githubBridge.machinePrincipal.clientId | quote }}
+            - name: BEADS_OIDC_CLIENT_SECRET_FILE
+              value: /var/run/secrets/gardenio-machine/clientSecret
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            # The token URL is the keycloak-runtime https port: trust its CA
+            # (gd-lYPZlslOM7).
+            - name: BEADS_OIDC_CA_FILE
+              value: {{ include "gardenio.keycloakRuntime.caFile" . | quote }}
+            {{- end }}
+            {{- end }}
+            - name: LISTEN_ADDR
+              value: ":8101"
+            - name: METRICS_ADDR
+              value: ":9101"
+            # Webhook secret and App key are read as FILES, never env vars:
+            # env leaks via /proc/<pid>/environ and `kubectl describe pod`.
+            - name: GITHUB_WEBHOOK_SECRET_FILE
+              value: "/etc/gardenio/github-webhook/{{ $secretKey }}"
+            {{- if $ghApp.appId }}
+            - name: GITHUB_APP_ID
+              value: {{ $ghApp.appId | quote }}
+            - name: GITHUB_APP_PRIVATE_KEY_FILE
+              value: "{{ $ghApp.mountPath | default "/etc/gardenio/github-app" }}/private-key"
+            {{- if $ghApp.installationId }}
+            - name: GITHUB_APP_INSTALLATION_ID
+              value: {{ $ghApp.installationId | quote }}
+            {{- end }}
+            {{- if $ghApp.apiUrl }}
+            - name: GITHUB_API_URL
+              value: {{ $ghApp.apiUrl | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.githubBridge.replay.ttl }}
+            - name: REPLAY_TTL
+              value: {{ .Values.githubBridge.replay.ttl | quote }}
+            {{- end }}
+            {{- if .Values.githubBridge.replay.maxEntries }}
+            - name: REPLAY_MAX_ENTRIES
+              value: {{ .Values.githubBridge.replay.maxEntries | quote }}
+            {{- end }}
+            {{- if .Values.githubBridge.draftAgentPRs }}
+            # Convert a ready PR opened from an agent/ branch onto main back to a
+            # draft, so it runs the light CI tier until `gb pr ready`.
+            - name: GITHUB_BRIDGE_DRAFT_AGENT_PRS
+              value: "true"
+            {{- end }}
+            {{- if $scan.repo }}
+            # PR conflict scanner (docs/pr-conflicts.md). The mirror lives one
+            # level below the emptyDir mount: git refuses a repo whose top
+            # directory another uid owns, and the mount point is root's.
+            - name: CONFLICT_SCAN_REPO
+              value: {{ $scan.repo | quote }}
+            - name: CONFLICT_SCAN_DIR
+              value: /var/lib/github-bridge/mirror
+            {{- if $scan.interval }}
+            - name: CONFLICT_SCAN_INTERVAL
+              value: {{ $scan.interval | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.githubBridge.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.githubBridge.logLevel | quote }}
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: "{{ .Values.global.coverage.mountPath }}/github-bridge"
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: webhook-secret
+              mountPath: /etc/gardenio/github-webhook
+              readOnly: true
+            {{- if $ghApp.appId }}
+            - name: app-private-key
+              mountPath: {{ $ghApp.mountPath | default "/etc/gardenio/github-app" }}
+              readOnly: true
+            {{- end }}
+            {{- if $scan.repo }}
+            - name: conflict-mirror
+              mountPath: /var/lib/github-bridge
+            {{- end }}
+            {{- if .Values.global.coverage.enabled }}
+            - name: coverage-data
+              mountPath: {{ .Values.global.coverage.mountPath }}
+            {{- end }}
+            {{- if .Values.githubBridge.machinePrincipal.enabled }}
+            - name: machine-client-secret
+              mountPath: /var/run/secrets/gardenio-machine
+              readOnly: true
+            {{- if include "gardenio.keycloak.inClusterCA" . }}
+            {{- include "gardenio.keycloakRuntime.caVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.githubBridge.resources | nindent 12 }}
+      {{- if .Values.global.coverage.enabled }}
+      terminationGracePeriodSeconds: 45
+      {{- end }}
+      volumes:
+        - name: webhook-secret
+          secret:
+            secretName: {{ .Values.githubBridge.webhookSecret.secretName }}
+            defaultMode: 0440
+        {{- if $ghApp.appId }}
+        - name: app-private-key
+          secret:
+            secretName: {{ $ghApp.privateKeySecret }}
+            defaultMode: 0440
+        {{- end }}
+        {{- if $scan.repo }}
+        - name: conflict-mirror
+          emptyDir:
+            sizeLimit: {{ $scan.mirrorSizeLimit | default "2Gi" }}
+        {{- end }}
+        {{- if .Values.global.coverage.enabled }}
+        - name: coverage-data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.agents.fullname" . }}-coverage
+        {{- end }}
+        {{- if .Values.githubBridge.machinePrincipal.enabled }}
+        # Release recorder client secret (gd-305kriuXdT). optional: the operator
+        # creates the Secret by hand; without it the pod still starts and the
+        # release writes fail closed with auth_unavailable in the log.
+        - name: machine-client-secret
+          secret:
+            secretName: {{ .Values.githubBridge.machinePrincipal.secretName | quote }}
+            optional: true
+        {{- if include "gardenio.keycloak.inClusterCA" . }}
+        {{- include "gardenio.keycloakRuntime.caVolume" . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.githubBridge.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.githubBridge.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with .Values.githubBridge.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

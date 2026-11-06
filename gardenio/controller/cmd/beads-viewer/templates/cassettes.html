@@ -1,0 +1,158 @@
+{{template "layout" .}}
+{{define "title"}}Cassettes · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+
+<style>
+  /* Claudemore cassette wire-audit surface (Phase-7 S6, ka-0000006302).
+     Scoped under .cassettes-page so it never leaks into other pages. */
+  .cassettes-page h1 .meta { color: var(--text-subtle, #888); font-weight: 400; font-size: 0.9rem; }
+  .cassettes-intro { color: var(--text-subtle, #888); font-size: 0.9rem; max-width: 60rem; margin: 0.25rem 0 1rem; }
+  .cassettes-intro code { font-size: 0.85em; }
+
+  .cassette-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  .cassette-table th, .cassette-table td {
+    text-align: left; padding: 0.4rem 0.6rem; vertical-align: top;
+    border-bottom: 1px solid rgba(128,128,128,0.2); font-size: 0.85rem;
+  }
+  .cassette-table th { color: var(--text-subtle, #888); font-weight: 600; white-space: nowrap; }
+  .cassette-table tr:hover td { background: rgba(128,128,128,0.05); }
+
+  .cassette-identity { font-weight: 600; }
+  .cassette-identity.is-anon { color: var(--text-subtle, #999); font-weight: 400; font-style: italic; }
+  .cassette-hash { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; color: var(--text-subtle, #888); }
+  .cassette-model { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; }
+
+  .cassette-chips { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+  .cassette-chip {
+    display: inline-block; padding: 0.05rem 0.4rem; border-radius: 999px;
+    background: hsl(210, 60%, 94%); color: hsl(210, 65%, 30%);
+    font-size: 0.75rem; white-space: nowrap;
+  }
+  html[data-skin="dark-terminal"] .cassette-chip { background: hsl(210, 35%, 18%); color: hsl(210, 60%, 78%); }
+  .cassette-chip.is-empty { background: transparent; color: var(--text-subtle, #999); font-style: italic; }
+
+  .cassette-stop { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; color: var(--text-subtle, #888); }
+  .cassette-stream-badge {
+    display: inline-block; padding: 0.03rem 0.35rem; border-radius: 3px;
+    font-size: 0.7rem; background: rgba(128,128,128,0.15); color: var(--text-subtle, #888);
+  }
+
+  .cassette-thinking { max-width: 32rem; color: var(--text, #333); white-space: pre-wrap; }
+  .cassette-thinking .clip { color: var(--text-subtle, #888); }
+  .cassette-thinking .none { color: var(--text-subtle, #999); font-style: italic; }
+  .cassette-metric { color: var(--text-subtle, #888); font-size: 0.75rem; }
+
+  .cassette-usage { white-space: nowrap; }
+  .cassette-usage .u-in { color: hsl(210, 55%, 45%); }
+  .cassette-usage .u-out { color: hsl(150, 55%, 38%); }
+  .cassette-usage .u-cache { color: var(--text-subtle, #999); }
+
+  .cassettes-empty { color: var(--text-subtle, #888); padding: 1.5rem; border: 1px dashed rgba(128,128,128,0.3); border-radius: 6px; }
+</style>
+
+<div class="cassettes-page">
+<h1>Cassettes
+  {{if .StoreEnabled}}<span class="meta">({{.Shown}}{{if .Truncated}} of {{.Total}}{{end}})</span>{{end}}
+</h1>
+
+<p class="cassettes-intro">
+  Wire-audit of recorded claudemore cassettes — one row per Messages-API
+  round-trip the proxy captured on the LLM wire. Each row is keyed to the
+  <strong>native Claude-Code session identity</strong> (request
+  <code>metadata.user_id</code>) rather than scraped from log headers, and shows
+  the model's tool-choice, reasoning length, stop reason, and reported token
+  usage. Token counts are &ldquo;what the model said it used&rdquo; for
+  observability only — litellm remains the source of truth for cost. Read-only;
+  cassettes are redaction-safe artifacts.
+</p>
+
+{{if .Error}}
+<div class="banner banner-error">{{.Error}}</div>
+{{end}}
+
+{{if not .StoreEnabled}}
+<div class="cassettes-empty">
+  No cassette store is wired for this viewer. The surface enables when a
+  claudemore cassette store is configured (<code>COOP_S3_BUCKET</code>, or a
+  local <code>CLAUDEMORE_CASSETTE_DIR</code>). In a claudeless namespace nothing
+  is recorded, so there is nothing to audit — this is expected.
+</div>
+{{else if not .Rows}}
+<div class="cassettes-empty">
+  No cassettes recorded yet. Cassettes appear here once claudemore runs in
+  LIVE/RECORD mode and captures Messages-API traffic.
+</div>
+{{else}}
+
+{{if .Truncated}}
+<div class="banner banner-warn">
+  Showing the first {{.Limit}} of {{.Total}} cassettes (sorted by model + hash).
+</div>
+{{end}}
+{{if gt .FetchFailures 0}}
+<div class="banner banner-warn">
+  {{.FetchFailures}} cassette(s) could not be fetched from the store and are
+  omitted from the rows below.
+</div>
+{{end}}
+
+<table class="cassette-table">
+  <thead>
+    <tr>
+      <th>Session identity</th>
+      <th>Model</th>
+      <th>Tools called</th>
+      <th>Reasoning</th>
+      <th>Stop</th>
+      <th>Tokens (in / out)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range .Rows}}
+    <tr>
+      <td>
+        {{if .SessionUserID}}
+        <div class="cassette-identity">{{.SessionUserID}}</div>
+        {{else}}
+        <div class="cassette-identity is-anon">(no metadata.user_id)</div>
+        {{end}}
+        <div class="cassette-hash" title="request hash">{{.RequestHash}}</div>
+      </td>
+      <td>
+        <div class="cassette-model">{{if .Model}}{{.Model}}{{else}}—{{end}}</div>
+        {{if .Streaming}}<span class="cassette-stream-badge" title="served as a streaming SSE response">stream</span>{{end}}
+      </td>
+      <td>
+        {{if .ToolNames}}
+        <div class="cassette-chips">
+          {{range .ToolNames}}<span class="cassette-chip">{{.}}</span>{{end}}
+        </div>
+        {{else}}
+        <span class="cassette-chip is-empty">none</span>
+        {{end}}
+      </td>
+      <td>
+        <div class="cassette-thinking">
+          {{if .ThinkingPreview}}{{.ThinkingPreview}}{{if .ThinkingClipped}}<span class="clip">…</span>{{end}}{{else}}<span class="none">no reasoning</span>{{end}}
+        </div>
+        {{if gt .ThinkingChars 0}}<div class="cassette-metric">{{.ThinkingChars}} chars reasoning · {{.TextChars}} chars text</div>{{else if gt .TextChars 0}}<div class="cassette-metric">{{.TextChars}} chars text</div>{{end}}
+      </td>
+      <td><span class="cassette-stop">{{if .StopReason}}{{.StopReason}}{{else}}—{{end}}</span></td>
+      <td class="cassette-usage">
+        <span class="u-in" title="input tokens">{{.Usage.InputTokens}}</span>
+        /
+        <span class="u-out" title="output tokens">{{.Usage.OutputTokens}}</span>
+        {{if or (gt .Usage.CacheReadInputTokens 0) (gt .Usage.CacheCreationInputTokens 0)}}
+        <div class="cassette-metric u-cache" title="cache read / creation input tokens">
+          cache {{.Usage.CacheReadInputTokens}}r / {{.Usage.CacheCreationInputTokens}}w
+        </div>
+        {{end}}
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{end}}
+</div>
+{{end}}

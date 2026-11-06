@@ -1,0 +1,245 @@
+{{- if and .Values.objectStore.enabled .Values.objectStore.bootstrap.enabled }}
+{{- /*
+In-box object store (MinIO) bucket bootstrap — ka-0000004955.
+
+coop calls `head_bucket` on connect (warns-but-continues) but `put_object`
+into a missing bucket errors — so the session bucket MUST pre-exist. This Job
+creates it idempotently (`mc mb --ignore-existing`) and installs an ILM expiry
+rule so the single-disk session archive self-prunes (replacing the AWS lifecycle
+rule the terraform s3-sessions module used to provide). Without ILM, capacity
+creep on the shared host disk is a slow-motion outage for postgres.
+
+Runs as a post-install/post-upgrade Helm hook so it fires after the MinIO
+Deployment+Service exist; the entrypoint polls `mc ready` until the server is
+up before acting. Idempotent — safe to re-run on every upgrade.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gardenio.minio.fullname" . }}-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.minio.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  activeDeadlineSeconds: {{ .Values.objectStore.bootstrap.activeDeadlineSeconds | default 300 }}
+  backoffLimit: {{ .Values.objectStore.bootstrap.backoffLimit | default 6 }}
+  ttlSecondsAfterFinished: {{ .Values.objectStore.bootstrap.ttlSecondsAfterFinished | default 600 }}
+  template:
+    metadata:
+      labels:
+        # NOT gardenio.minio.selectorLabels: those match the gardenio-minio
+        # Service, which would route S3 traffic to this pod while it runs.
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: minio-bootstrap
+        gardenio.io/component: minio-bootstrap
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: mc
+          image: {{ include "gardenio.mirroredImage" (dict "image" .Values.objectStore.mcImage "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.objectStore.mcImage.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.secretName" . }}
+                  key: accesskey
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.secretName" . }}
+                  key: secretkey
+            # Least-privilege agent user (gd-urSiLLwPIz). optional: a missing
+            # Secret reaches the script as empty values and fails it with a
+            # clear message, instead of a CreateContainerConfigError that only
+            # times out at activeDeadlineSeconds.
+            - name: AGENT_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.agentSecretName" . }}
+                  key: accesskey
+                  optional: true
+            - name: AGENT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.agentSecretName" . }}
+                  key: secretkey
+                  optional: true
+            {{- if include "gardenio.minio.beadsCredentialsEnabled" . }}
+            # Read-only beads daemon user (gd-k3GmLJKW8R); optional for the
+            # same reason as the agent pair above.
+            - name: BEADS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.beadsSecretName" . }}
+                  key: accesskey
+                  optional: true
+            - name: BEADS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gardenio.minio.beadsSecretName" . }}
+                  key: secretkey
+                  optional: true
+            {{- end }}
+            # Must come AFTER ACCESS_KEY/SECRET_KEY: Kubernetes expands $(VAR)
+            # only from variables defined earlier in the list; otherwise mc gets
+            # the literal "$(ACCESS_KEY)" and every call is rejected.
+            - name: MC_HOST_local
+              value: "http://$(ACCESS_KEY):$(SECRET_KEY)@{{ include "gardenio.minio.fullname" . }}:9000"
+            # mc writes its config under $HOME; readOnlyRootFilesystem forces an
+            # explicit writable HOME (the mounted emptyDir below).
+            - name: HOME
+              value: /tmp
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              echo "waiting for MinIO to become ready..."
+              mc ready local
+              echo "creating bucket {{ .Values.objectStore.bucket }} (idempotent)..."
+              mc mb --ignore-existing "local/{{ .Values.objectStore.bucket }}"
+              {{- if gt (int .Values.objectStore.ilmExpiryDays) 0 }}
+              echo "applying ILM expiry rule ({{ .Values.objectStore.ilmExpiryDays }}d)..."
+              # Remove any prior expiry rule, then (re)add — keeps the rule set
+              # to exactly one expiry policy across repeated upgrades.
+              mc ilm rule remove --all --force "local/{{ .Values.objectStore.bucket }}" 2>/dev/null || true
+              mc ilm rule add --expire-days "{{ .Values.objectStore.ilmExpiryDays }}" "local/{{ .Values.objectStore.bucket }}"
+              {{- else }}
+              echo "ILM expiry disabled (objectStore.ilmExpiryDays<=0) — skipping"
+              {{- end }}
+              {{- with .Values.objectStore.bucketQuota }}
+              # local-path does not enforce the PVC size, so this quota is the
+              # only hard byte cap on the node disk postgres shares.
+              echo "setting bucket quota ({{ . }})..."
+              mc quota set "local/{{ $.Values.objectStore.bucket }}" --size "{{ . }}"
+              {{- else }}
+              mc quota clear "local/{{ .Values.objectStore.bucket }}" 2>/dev/null || true
+              {{- end }}
+              {{- with .Values.objectStore.commonsFiles.bucket }}
+              # Commons attachments (gd-3Vgzf25MZY): own bucket, never expired.
+              echo "creating attachments bucket {{ . }} (idempotent, no ILM)..."
+              mc mb --ignore-existing "local/{{ . }}"
+              mc ilm rule remove --all --force "local/{{ . }}" 2>/dev/null || true
+              {{- if $.Values.objectStore.commonsFiles.quota }}
+              echo "setting attachments quota ({{ $.Values.objectStore.commonsFiles.quota }})..."
+              mc quota set "local/{{ . }}" --size "{{ $.Values.objectStore.commonsFiles.quota }}"
+              {{- else }}
+              mc quota clear "local/{{ . }}" 2>/dev/null || true
+              {{- end }}
+              {{- end }}
+              {{- with include "gardenio.objectStore.imagesBucket" . }}
+              {{- $imagesDays := int ($.Values.objectStore.images.ilmExpiryDays | default 0) }}
+              # Session images (gd-CmjVAU3vgd): own bucket and quota, its own
+              # expiry, never the archive's ilmExpiryDays.
+              echo "creating images bucket {{ . }} (idempotent)..."
+              mc mb --ignore-existing "local/{{ . }}"
+              mc ilm rule remove --all --force "local/{{ . }}" 2>/dev/null || true
+              {{- if gt $imagesDays 0 }}
+              echo "applying images ILM expiry rule ({{ $imagesDays }}d)..."
+              mc ilm rule add --expire-days "{{ $imagesDays }}" "local/{{ . }}"
+              {{- end }}
+              {{- if $.Values.objectStore.images.quota }}
+              echo "setting images quota ({{ $.Values.objectStore.images.quota }})..."
+              mc quota set "local/{{ . }}" --size "{{ $.Values.objectStore.images.quota }}"
+              {{- else }}
+              mc quota clear "local/{{ . }}" 2>/dev/null || true
+              {{- end }}
+              {{- end }}
+              {{- $agentSecret := include "gardenio.minio.agentSecretName" . }}
+              {{- $agentPolicy := (.Values.objectStore.agentCredentials | default dict).policyName | default "gardenio-coop-agent" }}
+              # Least-privilege agent user (gd-urSiLLwPIz): agent pods get this
+              # user, never the root keys. Policy create, user add and attach
+              # are all idempotent; user add also applies a rotated secret key.
+              echo "configuring agent user from Secret {{ $agentSecret }} (policy {{ $agentPolicy }})..."
+              if [ -z "${AGENT_ACCESS_KEY:-}" ] || [ -z "${AGENT_SECRET_KEY:-}" ]; then
+                echo "ERROR: Secret {{ $agentSecret }} (keys accesskey/secretkey) is missing or empty." >&2
+                echo "Seed it before installing/upgrading (scripts/deploy-byo.sh creates it create-if-missing)." >&2
+                exit 1
+              fi
+              if [ "$AGENT_ACCESS_KEY" = "$ACCESS_KEY" ]; then
+                echo "ERROR: Secret {{ $agentSecret }} carries the MinIO root user; give the agent its own access key." >&2
+                exit 1
+              fi
+              cat > /tmp/agent-policy.json <<'POLICY'
+              {{ include "gardenio.minio.agentPolicy" . }}
+              POLICY
+              mc admin policy create local "{{ $agentPolicy }}" /tmp/agent-policy.json
+              # The secret key goes in on stdin (mc reads it when it is not a
+              # tty; printf is a builtin), never in mc's argv.
+              printf '%s\n' "$AGENT_SECRET_KEY" | mc admin user add local "$AGENT_ACCESS_KEY"
+              # Older servers reject re-attaching an attached policy; accept
+              # that case only when the policy really is attached. Plain shell
+              # matching: the mc image has no grep.
+              if ! mc admin policy attach local "{{ $agentPolicy }}" --user "$AGENT_ACCESS_KEY"; then
+                info=$(mc admin user info local "$AGENT_ACCESS_KEY" --json)
+                case "$info" in
+                  *'"policyName":"{{ $agentPolicy }}"'*|*'"policyName":"{{ $agentPolicy }},'*|*',{{ $agentPolicy }}"'*|*',{{ $agentPolicy }},'*) ;;
+                  *) echo "ERROR: could not attach policy {{ $agentPolicy }} to the agent user: $info" >&2; exit 1 ;;
+                esac
+              fi
+              {{- if include "gardenio.minio.beadsCredentialsEnabled" . }}
+              {{- $beadsSecret := include "gardenio.minio.beadsSecretName" . }}
+              {{- $beadsPolicy := (.Values.objectStore.beadsCredentials | default dict).policyName | default "gardenio-beads-evidence" }}
+              # Read-only beads daemon user (gd-k3GmLJKW8R): the land door's
+              # evidence route reads <prefix>/images/ with it, never the root
+              # or agent keys. Same idempotent create/add/attach as above.
+              echo "configuring beads user from Secret {{ $beadsSecret }} (policy {{ $beadsPolicy }})..."
+              if [ -z "${BEADS_ACCESS_KEY:-}" ] || [ -z "${BEADS_SECRET_KEY:-}" ]; then
+                echo "ERROR: Secret {{ $beadsSecret }} (keys accesskey/secretkey) is missing or empty." >&2
+                echo "Seed it before enabling objectStore.beadsCredentials (docs/inbox-object-store-runbook.md)." >&2
+                exit 1
+              fi
+              if [ "$BEADS_ACCESS_KEY" = "$ACCESS_KEY" ] || [ "$BEADS_ACCESS_KEY" = "${AGENT_ACCESS_KEY:-}" ]; then
+                echo "ERROR: Secret {{ $beadsSecret }} carries the MinIO root or agent user; give the beads daemon its own access key." >&2
+                exit 1
+              fi
+              cat > /tmp/beads-policy.json <<'BEADSPOLICY'
+              {{ include "gardenio.minio.beadsPolicy" . }}
+              BEADSPOLICY
+              mc admin policy create local "{{ $beadsPolicy }}" /tmp/beads-policy.json
+              printf '%s\n' "$BEADS_SECRET_KEY" | mc admin user add local "$BEADS_ACCESS_KEY"
+              if ! mc admin policy attach local "{{ $beadsPolicy }}" --user "$BEADS_ACCESS_KEY"; then
+                info=$(mc admin user info local "$BEADS_ACCESS_KEY" --json)
+                case "$info" in
+                  *'"policyName":"{{ $beadsPolicy }}"'*|*'"policyName":"{{ $beadsPolicy }},'*|*',{{ $beadsPolicy }}"'*|*',{{ $beadsPolicy }},'*) ;;
+                  *) echo "ERROR: could not attach policy {{ $beadsPolicy }} to the beads user: $info" >&2; exit 1 ;;
+                esac
+              fi
+              {{- end }}
+              echo "bootstrap complete"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.objectStore.bootstrap.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.objectStore.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.objectStore.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

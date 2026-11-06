@@ -1,0 +1,976 @@
+{{- if .Values.grafana.enabled }}
+{{- /*
+  Effective public root URL for Grafana. Explicit grafana.rootURL wins; else,
+  when serveFromSubPath is on AND the unified host fans out a /grafana path,
+  derive https://<unifiedHost.host><paths.grafana> so assets and generated
+  links resolve under the AVA-gated subpath (ka-0000001842 / epic ka-0000007895).
+*/ -}}
+{{- $grafanaUnifiedPath := (.Values.unifiedHost.paths | default dict).grafana | default "" -}}
+{{- $grafanaRootURL := .Values.grafana.rootURL | default "" -}}
+{{- if and (eq $grafanaRootURL "") .Values.grafana.serveFromSubPath .Values.unifiedHost .Values.unifiedHost.enabled .Values.unifiedHost.host -}}
+{{- if ne $grafanaUnifiedPath "" -}}
+{{- $grafanaRootURL = printf "https://%s%s" .Values.unifiedHost.host $grafanaUnifiedPath -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+  Probe path prefix. With serve_from_sub_path=true Grafana serves /api/health
+  under the subpath, so the in-pod probes must hit <subpath>/api/health. The
+  subpath is the path component of rootURL (falls back to the unified /grafana
+  path). When serveFromSubPath is off, probes stay at root (no behavior change).
+*/ -}}
+{{- $grafanaProbePrefix := "" -}}
+{{- if .Values.grafana.serveFromSubPath -}}
+{{- if ne $grafanaRootURL "" -}}
+{{- $grafanaProbePrefix = regexReplaceAll "^https?://[^/]+" $grafanaRootURL "" -}}
+{{- else if ne $grafanaUnifiedPath "" -}}
+{{- $grafanaProbePrefix = $grafanaUnifiedPath -}}
+{{- end -}}
+{{- end -}}
+{{- $grafanaProbePrefix = $grafanaProbePrefix | trimSuffix "/" -}}
+{{- /*
+  Custom gardenio-assistant-app plugin (C4 ka-0000007568, epic ka-0000002011).
+  Fixed plugin id (matches gardenio-assistant-app/src/plugin.json) — used both
+  for the unsigned-allow env scope and the on-disk plugins subdir. Hard-coded,
+  not value-driven: the unsigned-allow MUST name the exact id Grafana loads, so
+  the two can never drift.
+*/ -}}
+{{- $assistantPluginID := "gardenio-assistant-app" -}}
+{{- $assistantPluginDir := printf "/var/lib/grafana/plugins/%s" $assistantPluginID -}}
+{{- /* VictoriaLogs datasource plugin (Phase-2 forensics ka-0000007948). Fixed
+       upstream plugin id — the on-disk plugins subdir Grafana discovers it under,
+       and the seed initContainer's copy target. Defined per-file since Helm vars
+       do not cross templates. */}}
+{{- $vlDatasourcePluginID := "victoriametrics-logs-datasource" -}}
+{{- $vlDatasourcePluginDir := printf "/var/lib/grafana/plugins/%s" $vlDatasourcePluginID -}}
+{{- /*
+  Pre-baked grafana-llm-app foundation plugin (C6/prod prereq ka-0000007541,
+  epic ka-0000002011). When grafana.llm.prebake.enabled, a copy-only
+  initContainer seeds a PINNED, CHECKSUMMED grafana-llm-app dist into a writable
+  emptyDir mounted at this on-disk subdir — instead of catalog-installing it from
+  grafana.com at boot — so the env can run with grafana.plugins.allowCatalogEgress
+  FALSE and keep "zero off-cluster egress" as a NETWORK guarantee. Fixed plugin id
+  (matches the upstream plugin.json id + the on-disk subdir Grafana discovers).
+*/ -}}
+{{- $llmPluginID := "grafana-llm-app" -}}
+{{- $llmPluginDir := printf "/var/lib/grafana/plugins/%s" $llmPluginID -}}
+{{- /* prebake only makes sense as the plugin-delivery mechanism for the LLM chat
+       box: it changes HOW grafana-llm-app reaches disk, but the plugin's
+       provisioning, key injection, managed SA and mcp toolsets all still gate on
+       grafana.llm.enabled. Seeding an unprovisioned/unconfigured plugin is a
+       foot-gun, so require llm.enabled — symmetric with the assistant→llm guard
+       above (ka-0000007541). */ -}}
+{{- if and .Values.grafana.llm.prebake.enabled (not .Values.grafana.llm.enabled) -}}
+{{- fail "grafana.llm.prebake.enabled requires grafana.llm.enabled (prebake is how grafana-llm-app reaches disk for the chat box; without llm.enabled the plugin is seeded but never provisioned/configured)" -}}
+{{- end -}}
+{{- /* Conflict guard: prebake SEEDS grafana-llm-app from the pinned image, so it
+       must NOT also be catalog-installed via GF_INSTALL_PLUGINS — a catalog
+       install would re-introduce the grafana.com egress this feature removes (and
+       race the seeded copy). Fail the render loudly if an overlay sets both. */ -}}
+{{- if .Values.grafana.llm.prebake.enabled -}}
+{{- range .Values.grafana.plugins.install -}}
+{{- /* Extract the plugin id from an install entry and match it EXACTLY (not as
+       a string prefix, so a sibling like "grafana-llm-app-extra" is not a false
+       positive). GF_INSTALL_PLUGINS accepts two id-bearing forms and we must
+       catch grafana-llm-app in BOTH, or the guard is bypassable and the prebake
+       zero-egress guarantee is only a convention (ka-0000007541 QC):
+         - SPACE form:  "<id> [<version>] [<zip-url>]"  -> id is the first token.
+         - URL  form:   "<plugin-zip-url>;<id>"          -> Grafana reads the id
+           from the trailing ";<id>", so peel that off the first token too.
+       Order: (1) first whitespace token (drops a trailing " <version>"),
+       (2) last ";"-segment (drops a leading "<url>;"), (3) strip an "@version"
+       suffix, (4) lower-case — Grafana plugin ids are case-insensitive, so
+       "Grafana-LLM-App" must match too. toString tolerates a non-string list
+       entry; trim tolerates accidental surrounding space.
+
+       Not statically matchable: a BARE plugin-zip URL with no trailing ";<id>"
+       (Grafana derives the id from the downloaded zip). That form is defense-in-
+       depth-covered, not a hole: a remote zip fetch needs allowCatalogEgress=true,
+       which the coupling gate below ALREADY refuses under prebake.enabled — so the
+       network never lets such a fetch out regardless of this id match. */ -}}
+{{- $pluginID := . | toString | trim | splitList " " | first | splitList ";" | last | splitList "@" | first | lower -}}
+{{- if eq $pluginID "grafana-llm-app" -}}
+{{- fail "grafana.llm.prebake.enabled seeds grafana-llm-app from a pinned, checksummed image; remove the \"grafana-llm-app ...\" entry from grafana.plugins.install so it is not ALSO catalog-installed (which would force allowCatalogEgress and defeat the zero-off-cluster-egress network guarantee, ka-0000007541). This match is id-exact and covers the bare id, the \"<id> <version>\" form, the \"<url>;<id>\" URL form, and case variants." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /* Coupling render-gate: prebake EXISTS only to make "zero off-cluster egress"
+       a NETWORK guarantee rather than a config-only convention (C6/prod prereq
+       ka-0000007541, epic ka-0000002011). The seed mechanism alone does not close
+       the hole — an overlay could enable prebake AND still leave the network open,
+       and the in-pod grafana-llm-app could then POST completions off-cluster
+       unimpeded. So when prebake is on, REFUSE to render unless the network
+       actually enforces the guarantee: (a) the grafana-egress catalog hole must be
+       shut (allowCatalogEgress=false), and (b) default-deny-egress must be in force
+       (networkPolicies.enabled && defaultDenyEgress) so grafana-egress is the only
+       thing letting Grafana out. This is what turns "zero egress" from a promise
+       into an invariant a future overlay edit cannot silently break.
+
+       GATED ON prebake.enabled, NOT grafana.llm.enabled — DELIBERATELY. A staging
+       env (the RWX-era staging overlay did) runs grafana.llm.enabled=true with
+       allowCatalogEgress=true + defaultDenyEgress=true on PURPOSE: it delivers the
+       plugin via the boot-time catalog install and needs the grafana.com hole open
+       for that one fetch. Gating this on llm.enabled would red staging. Gating on
+       prebake.enabled scopes the assertion to the prod zero-egress posture: opting
+       INTO the network-guarantee delivery is exactly the moment to demand the
+       network actually guarantee it. C6 (ka-0000001659) sets prebake.enabled +
+       allowCatalogEgress=false + networkPolicies.enabled + defaultDenyEgress
+       together, and this gate makes that bundle un-bypassable. Two separate
+       messages so the operator knows which knob is wrong. */ -}}
+{{- if .Values.grafana.llm.prebake.enabled -}}
+{{- if .Values.grafana.plugins.allowCatalogEgress -}}
+{{- fail "grafana.llm.prebake.enabled is the zero-off-cluster-egress NETWORK guarantee, but grafana.plugins.allowCatalogEgress=true opens a 0.0.0.0/0:443+:80 hole on the grafana-egress NetworkPolicy through which the in-pod grafana-llm-app could POST completions off-cluster — defeating the guarantee. Set grafana.plugins.allowCatalogEgress=false when prebaking (the pinned seed needs no catalog fetch), ka-0000007541." -}}
+{{- end -}}
+{{- if not (and .Values.networkPolicies.enabled .Values.networkPolicies.defaultDenyEgress) -}}
+{{- fail "grafana.llm.prebake.enabled is the zero-off-cluster-egress NETWORK guarantee, but it is only enforced under default-deny-egress: set networkPolicies.enabled=true AND networkPolicies.defaultDenyEgress=true so the grafana-egress policy is the sole egress allow for Grafana. Without the namespace-wide deny, nothing at the network layer stops the in-pod grafana-llm-app from reaching off-cluster, ka-0000007541." -}}
+{{- end -}}
+{{- end -}}
+{{- /* The custom chat plugin HARD-DEPENDS on grafana-llm-app (plugin.json
+       dependencies.plugins) for the in-cluster LiteLLM/Bedrock transport, and
+       Grafana refuses to load a plugin whose declared dependency is absent. So
+       grafana.assistant.enabled is meaningless without grafana.llm.enabled +
+       the grafana-llm-app install — fail the render loudly rather than ship a
+       plugin that silently never loads (review finding, C4 ka-0000007568). */ -}}
+{{- if and .Values.grafana.assistant.enabled (not .Values.grafana.llm.enabled) -}}
+{{- fail "grafana.assistant.enabled requires grafana.llm.enabled (the gardenio-assistant-app plugin depends on grafana-llm-app for the in-cluster LiteLLM transport)" -}}
+{{- end -}}
+{{- /* OIDC render gates (spec G3). values.schema.json validates none of the
+       grafana block, so a half-configured OIDC block would otherwise boot a
+       Grafana that silently falls back to local login. Fail the render. */ -}}
+{{- if .Values.grafana.auth.oidc.enabled -}}
+{{- if or (not .Values.grafana.auth.oidc.clientId) (not .Values.grafana.auth.oidc.clientSecretSecret) -}}
+{{- fail "grafana.auth.oidc.enabled requires both clientId and clientSecretSecret" -}}
+{{- end -}}
+{{- range $k := list "authURL" "tokenURL" "apiURL" -}}
+{{- if not (get $.Values.grafana.auth.oidc $k) -}}
+{{- fail (printf "grafana.auth.oidc.enabled requires grafana.auth.oidc.%s (an empty URL boots a Grafana whose login redirect or back-channel is broken)" $k) -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.grafana.auth.proxy.enabled -}}
+{{- fail "grafana.auth.oidc and grafana.auth.proxy are mutually exclusive" -}}
+{{- end -}}
+{{- end -}}
+{{- /* Agent path render gates (gd-RUhOpXWwmz). The header-stripping port only
+       protects anything if the trusted port is fenced to the edge and the
+       platform callers, so refuse a config where agents could still reach it. */ -}}
+{{- $agentPath := .Values.grafana.auth.proxy.agentPath -}}
+{{- if $agentPath.enabled -}}
+{{- if not .Values.grafana.auth.proxy.enabled -}}
+{{- fail "grafana.auth.proxy.agentPath.enabled requires grafana.auth.proxy.enabled" -}}
+{{- end -}}
+{{- if not .Values.edgeBackends.enabled -}}
+{{- fail "grafana.auth.proxy.agentPath.enabled requires edgeBackends.enabled: the edge-grafana NetworkPolicy is what keeps agents off the trusted port" -}}
+{{- end -}}
+{{- range .Values.edgeBackends.grafanaCallers -}}
+{{- if contains "gardenio.io/agent" (toYaml .) -}}
+{{- fail "grafana.auth.proxy.agentPath.enabled: edgeBackends.grafanaCallers still admits agent pods (gardenio.io/agent) to the trusted port; override grafanaCallers without them (they reach Grafana through edgeBackends.grafanaAgentCallers)" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardenio.grafana.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.grafana.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  {{- if .Values.grafana.persistence.enabled }}
+  # Recreate: with a ReadWriteOnce data PVC, a RollingUpdate brings the new pod
+  # up before the old releases the RWO volume → FailedAttachVolume Multi-Attach
+  # deadlock that trips verify-prod (ka-0000003526). Terminate first, then attach.
+  # (Only needed when persistence is on; emptyDir tolerates RollingUpdate.)
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gardenio.grafana.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.grafana.selectorLabels" . | nindent 8 }}
+      {{- if $agentPath.enabled }}
+      annotations:
+        checksum/agent-proxy: {{ include "gardenio.contentChecksum" (include (print $.Template.BasePath "/grafana/agent-proxy-configmap.yaml") .) }}
+      {{- end }}
+    spec:
+      {{- if .Values.grafana.sidecar.enabled }}
+      serviceAccountName: {{ include "gardenio.grafana.fullname" . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if or .Values.grafana.assistant.enabled .Values.grafana.llm.prebake.enabled .Values.grafana.victoriaLogsDatasource.enabled }}
+      initContainers:
+      {{- if .Values.grafana.llm.prebake.enabled }}
+        # Seed the PINNED, CHECKSUMMED grafana-llm-app foundation plugin dist into
+        # a writable emptyDir the main Grafana container mounts at the plugin's
+        # subdir (C6/prod prereq ka-0000007541, epic ka-0000002011). The dist is
+        # DOWNLOADED + checksum-verified at image build
+        # (gardenio/images/grafana-llm-app-plugin, pinned in its pin.env; no
+        # workflow builds it today) and shipped at /plugin in
+        # a tiny artifact image — so this step is a pure `cp` with ZERO network
+        # access. That is what lets the env run with
+        # grafana.plugins.allowCatalogEgress FALSE under default-deny-egress: the
+        # boot-time catalog install (GF_INSTALL_PLUGINS) would otherwise fetch the
+        # plugin from grafana.com at :443, forcing a 0.0.0.0/0:443 egress allow.
+        # Pre-baking makes "zero off-cluster egress" a NETWORK guarantee, not a
+        # config-only promise. EXACTLY mirrors the seed-assistant-plugin pattern
+        # (C4): `cp -r` (not `-a`) drops source ownership so the copy inherits this
+        # process's 65534 uid, making the overlay writable by the main container
+        # without a root chown. grafana-llm-app is Grafana-ROOT-SIGNED, so the
+        # seeded copy loads as signed with no unsigned-allow.
+        - name: seed-llm-plugin
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.grafana.llm.prebake.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.grafana.llm.prebake.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              # Fail loudly if the artifact image is missing the built dist —
+              # plugin.json is what Grafana keys discovery on and MANIFEST.txt is
+              # the signature that lets it load without an unsigned-allow, so their
+              # absence means a broken/empty image, not a skippable state. Exit
+              # non-zero so kubelet restarts the init and the main container never
+              # boots with a half-populated plugins dir.
+              test -f /plugin/plugin.json
+              test -f /plugin/MANIFEST.txt
+              cp -r /plugin/. /mnt/plugin/
+          volumeMounts:
+            - name: llm-plugin
+              mountPath: /mnt/plugin
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      {{- end }}
+      {{- if .Values.grafana.assistant.enabled }}
+        # Seed the custom gardenio-assistant-app plugin dist into a writable
+        # emptyDir the main Grafana container mounts at its plugins subdir
+        # (C4 ka-0000007568, epic ka-0000002011). The dist is PRE-BUILT in CI
+        # (npm ci && npm run build) and shipped at /plugin in a tiny artifact
+        # image — so this step is a pure `cp` with ZERO network access, keeping
+        # Grafana at zero off-cluster egress (a runtime `npm` install would
+        # violate the default-deny-egress NetworkPolicy and the no-new-egress
+        # security envelope). The chart deploys STOCK upstream grafana/grafana,
+        # so we cannot bake the plugin into the Grafana image; and the data PVC
+        # mounts /var/lib/grafana, which would shadow a baked plugins dir anyway
+        # — an initContainer-seeded emptyDir overlaying just the plugin subdir
+        # is the only mechanism that works under both. Mirrors the litellm
+        # seed-app pattern: `cp -r` (not `-a`) drops source ownership so the
+        # copy inherits this process's 65534 uid, making the overlay writable by
+        # the main container without a root chown.
+        - name: seed-assistant-plugin
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.grafana.assistant.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.grafana.assistant.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              # Fail loudly if the artifact image is missing the built dist —
+              # plugin.json is what Grafana keys plugin discovery on, so its
+              # absence means a broken/empty image, not a silently-skippable
+              # state. The plugin now ships a BACKEND binary (ka-0000000293): the
+              # arch-suffixed gpx_gardenio_assistant_app_linux_amd64 is what Grafana
+              # spawns as the plugin backend (the MCP reverse-proxy), so assert it
+              # too — its absence means the Go build lane did not run and the chat
+              # box would silently fall back to the broken embedded MCP path. Exit
+              # non-zero so kubelet restarts the init and the main container never
+              # boots with a half-populated plugins dir.
+              test -f /plugin/plugin.json
+              test -f /plugin/gpx_gardenio_assistant_app_linux_amd64
+              cp -r /plugin/. /mnt/plugin/
+          volumeMounts:
+            - name: assistant-plugin
+              mountPath: /mnt/plugin
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      {{- end }}
+      {{- if .Values.grafana.victoriaLogsDatasource.enabled }}
+        # Seed the PINNED, COMMERCIAL-SIGNED victoriametrics-logs-datasource plugin
+        # dist into a writable emptyDir the main Grafana container mounts at the
+        # plugin's subdir (Phase-2 forensics ka-0000007948). The dist is DOWNLOADED
+        # + checksum-verified at image build (gardenio/images/grafana-vl-datasource-
+        # plugin, pinned in its pin.env; no workflow builds it today) and
+        # shipped at /plugin in a tiny artifact image — so this step is a pure `cp`
+        # with ZERO network access. That is what lets the env run with
+        # grafana.plugins.allowCatalogEgress FALSE under default-deny-egress: a
+        # boot-time catalog install (GF_INSTALL_PLUGINS) would otherwise fetch the
+        # plugin from grafana.com at :443, forcing a 0.0.0.0/0:443 egress allow
+        # (ka-0000007541). EXACTLY mirrors the seed-llm-plugin pattern: `cp -r`
+        # (not `-a`) drops source ownership so the copy inherits this process's
+        # 65534 uid, making the overlay writable by the main container without a
+        # root chown. The plugin is commercial-signed with no rootUrls restriction,
+        # so the seeded copy loads as SIGNED with no unsigned-allow.
+        - name: seed-vl-datasource-plugin
+          image: {{ include "gardenio.imageRef" (dict "image" .Values.grafana.victoriaLogsDatasource.image "global" .Values.global "Chart" .Chart) | quote }}
+          imagePullPolicy: {{ include "gardenio.imagePullPolicy" (dict "pullPolicy" .Values.grafana.victoriaLogsDatasource.image.pullPolicy "global" .Values.global) }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              # Fail loudly if the artifact image is missing the built dist —
+              # plugin.json is what Grafana keys discovery on, MANIFEST.txt is the
+              # signature that lets it load without an unsigned-allow, and the amd64
+              # backend binary is what Grafana spawns for this BACKEND datasource on
+              # our amd64 nodes. Their absence means a broken/empty image, not a
+              # skippable state. Exit non-zero so kubelet restarts the init and the
+              # main container never boots with a half-populated plugins dir.
+              test -f /plugin/plugin.json
+              test -f /plugin/MANIFEST.txt
+              test -f /plugin/victoriametrics_logs_backend_plugin_linux_amd64
+              cp -r /plugin/. /mnt/plugin/
+          volumeMounts:
+            - name: vl-datasource-plugin
+              mountPath: /mnt/plugin
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      {{- end }}
+      {{- end }}
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      containers:
+        - name: grafana
+          image: "{{ .Values.grafana.image.repository }}:{{ .Values.grafana.image.tag }}"
+          imagePullPolicy: {{ .Values.grafana.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: {{ .Values.grafana.adminUser | quote }}
+            {{- if .Values.grafana.adminPasswordSecret }}
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.grafana.adminPasswordSecret }}
+                  key: admin-password
+            {{- else if .Values.grafana.adminPassword }}
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: {{ .Values.grafana.adminPassword | quote }}
+            {{- end }}
+            {{- if .Values.grafana.logFilters }}
+            - name: GF_LOG_FILTERS
+              value: {{ .Values.grafana.logFilters | quote }}
+            {{- end }}
+            {{- /* iframe embedding (ka-0000003842). Grafana defaults to
+                   X-Frame-Options: deny, which refuses ALL framing — including
+                   the same-origin beads-viewer dashboard-bead iframe. Setting
+                   allow_embedding=true drops X-Frame-Options + uses a
+                   permissive frame-ancestors CSP so the same-origin embed
+                   loads. SameSite is left at default: the embed is same-origin
+                   and auth rides the auth-proxy header, not a session cookie. */}}
+            {{- if .Values.grafana.allowEmbedding }}
+            - name: GF_SECURITY_ALLOW_EMBEDDING
+              value: "true"
+            {{- end }}
+            {{- /* Subpath serving — set ROOT_URL + SERVE_FROM_SUB_PATH so
+                   Grafana behind the unified host /grafana prefix resolves
+                   its static assets and generated links correctly. */}}
+            {{- if ne $grafanaRootURL "" }}
+            - name: GF_SERVER_ROOT_URL
+              value: {{ $grafanaRootURL | quote }}
+            {{- end }}
+            {{- if .Values.grafana.serveFromSubPath }}
+            - name: GF_SERVER_SERVE_FROM_SUB_PATH
+              value: "true"
+            {{- end }}
+            {{- /* AVA header auth-proxy — the edge-auth forwardAuth stamps
+                   X-Auth-Request-Email (and -Groups) on every unified-host
+                   request, so Grafana trusts that header as the logged-in
+                   user and shows no second login screen. Traefik strips any
+                   client-supplied copy, so only edge-auth can set identity.
+                   See epic ka-0000007895 / task ka-0000001842. */}}
+            {{- if .Values.grafana.auth.proxy.enabled }}
+            - name: GF_AUTH_PROXY_ENABLED
+              value: "true"
+            - name: GF_AUTH_PROXY_HEADER_NAME
+              value: {{ .Values.grafana.auth.proxy.headerName | quote }}
+            - name: GF_AUTH_PROXY_HEADER_PROPERTY
+              value: {{ .Values.grafana.auth.proxy.headerProperty | quote }}
+            - name: GF_AUTH_PROXY_AUTO_SIGN_UP
+              value: {{ .Values.grafana.auth.proxy.autoSignUp | quote }}
+            {{- if .Values.grafana.auth.proxy.headers }}
+            - name: GF_AUTH_PROXY_HEADERS
+              value: {{ .Values.grafana.auth.proxy.headers | quote }}
+            {{- end }}
+            {{- if .Values.grafana.auth.proxy.syncTTL }}
+            - name: GF_AUTH_PROXY_SYNC_TTL
+              value: {{ .Values.grafana.auth.proxy.syncTTL | quote }}
+            {{- end }}
+            {{- /* Whitelist the in-cluster source(s) Grafana accepts the
+                   auth-proxy header from. Defaults to all-private so Traefik
+                   (whatever pod IP) is trusted; tighten per-env if desired. */}}
+            - name: GF_AUTH_PROXY_WHITELIST
+              value: {{ .Values.grafana.auth.proxy.whitelist | quote }}
+            {{- /* Everyone authenticated by AVA lands as this org role
+                   (blanket Viewer, decision ka-0000002146). */}}
+            - name: GF_USERS_AUTO_ASSIGN_ORG_ROLE
+              value: {{ .Values.grafana.auth.defaultOrgRole | quote }}
+            {{- if $agentPath.enabled }}
+            {{- /* Agent path (gd-RUhOpXWwmz): the sidecar strips the identity
+                   header, so an agent request arrives header-less and lands
+                   as an anonymous viewer. Only NetworkPolicy-admitted pods can
+                   send a header-less request at all. */}}
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: {{ $agentPath.anonymousRole | quote }}
+            {{- else }}
+            {{- /* Lock the front door: no anonymous access. */}}
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "false"
+            {{- end }}
+            {{- end }}
+            {{- /* The basic login form is the local-admin break-glass (spec
+                   G2). Rendered for every auth mode, not just auth-proxy, so
+                   OIDC can also hide it deliberately; it stays visible unless
+                   grafana.auth.disableLoginForm=true. */}}
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: {{ .Values.grafana.auth.disableLoginForm | quote }}
+            {{- /* Keycloak/OIDC login (spec G2/G3). auth_url is browser-facing;
+                   token_url/api_url are Grafana's in-cluster back-channel.
+                   The client secret is secretKeyRef only. */}}
+            {{- if .Values.grafana.auth.oidc.enabled }}
+            - name: GF_AUTH_GENERIC_OAUTH_ENABLED
+              value: "true"
+            - name: GF_AUTH_GENERIC_OAUTH_NAME
+              value: {{ .Values.grafana.auth.oidc.name | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_CLIENT_ID
+              value: {{ .Values.grafana.auth.oidc.clientId | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.grafana.auth.oidc.clientSecretSecret }}
+                  key: {{ .Values.grafana.auth.oidc.clientSecretKey | default "client-secret" }}
+            - name: GF_AUTH_GENERIC_OAUTH_SCOPES
+              value: {{ .Values.grafana.auth.oidc.scopes | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_AUTH_URL
+              value: {{ .Values.grafana.auth.oidc.authURL | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_TOKEN_URL
+              value: {{ .Values.grafana.auth.oidc.tokenURL | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_API_URL
+              value: {{ .Values.grafana.auth.oidc.apiURL | quote }}
+            {{- if .Values.grafana.auth.oidc.roleAttributePath }}
+            - name: GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH
+              value: {{ .Values.grafana.auth.oidc.roleAttributePath | quote }}
+            {{- end }}
+            - name: GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_STRICT
+              value: {{ .Values.grafana.auth.oidc.roleAttributeStrict | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_ALLOW_ASSIGN_GRAFANA_ADMIN
+              value: {{ .Values.grafana.auth.oidc.allowAssignGrafanaAdmin | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_USE_PKCE
+              value: {{ .Values.grafana.auth.oidc.usePKCE | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_ALLOW_SIGN_UP
+              value: {{ .Values.grafana.auth.oidc.allowSignUp | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_AUTO_LOGIN
+              value: {{ .Values.grafana.auth.oidc.autoLogin | quote }}
+            {{- end }}
+            {{- /* Image renderer (bead ka-0000001982). Point Grafana at the
+                   grafana-image-renderer sidecar so /render produces a real PNG
+                   instead of the "No image renderer available" placeholder card.
+                   GF_RENDERING_CALLBACK_URL is the in-cluster Grafana base the
+                   renderer's headless browser uses to fetch the dashboard back.
+                   It talks straight to the pod (no Traefik strip, no auth-proxy
+                   hop), so the base MUST match what the pod actually serves:
+                   with serveFromSubPath=true the pod owns /grafana end-to-end,
+                   so the callback carries the subpath; with it off the pod
+                   serves at root. Mismatch here is bug ka-0000001440 — the SPA's
+                   <base href>=/grafana/ then 404s all /grafana/public/build/*.js
+                   ("failed to load application files"). gardenio.grafana.inClusterBaseURL
+                   derives the right base; an explicit imageRenderer.callbackURL
+                   still wins for non-derivable layouts. */}}
+            {{- if .Values.grafana.imageRenderer.enabled }}
+            {{- $rendererCallback := .Values.grafana.imageRenderer.callbackURL | default (printf "%s/" (include "gardenio.grafana.inClusterBaseURL" .)) }}
+            - name: GF_RENDERING_SERVER_URL
+              value: {{ printf "http://127.0.0.1:%d/render" (int .Values.grafana.imageRenderer.port) | quote }}
+            - name: GF_RENDERING_CALLBACK_URL
+              value: {{ $rendererCallback | quote }}
+            {{- end }}
+            {{- /* Plugin install (ka-0000004453, epic ka-0000002011 Phase A).
+                   GF_INSTALL_PLUGINS makes Grafana install each listed plugin at
+                   boot before the server starts. Rendered only when the install
+                   list is non-empty, so an env that does not opt in is byte-
+                   identical. Each entry is fed verbatim, so a PINNED install uses
+                   the SPACE form "<plugin-id> <version>" (NOT "@version") per
+                   Grafana's GF_INSTALL_PLUGINS syntax — overlays pin
+                   "grafana-llm-app 1.0.8" so the embedded MCP toolset family enum
+                   the allow-list denies against stays fixed (ka-0000007430). */}}
+            {{- if .Values.grafana.plugins.install }}
+            - name: GF_INSTALL_PLUGINS
+              value: {{ join "," .Values.grafana.plugins.install | quote }}
+            {{- end }}
+            {{- /* Custom gardenio-assistant-app plugin (C4 ka-0000007568, epic
+                   ka-0000002011). The plugin ships in OUR chart (no signing, no
+                   catalog — we control the whole stack), so Grafana must be told
+                   to load it despite having no Grafana signature. Scope the
+                   allow to EXACTLY this one plugin id — NEVER the "*" allow-all,
+                   which would let any unsigned plugin load. Rendered only when
+                   grafana.assistant.enabled; an env that does not opt in is
+                   byte-identical. */}}
+            {{- if .Values.grafana.assistant.enabled }}
+            - name: GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS
+              value: {{ $assistantPluginID | quote }}
+            {{- end }}
+            {{- /* grafana-llm-app key (ka-0000004453). The provisioned plugin
+                   config references secureJsonData.openAIKey: $LITELLM_API_KEY;
+                   Grafana provisioning interpolates $VAR from the process env, so
+                   inject the LiteLLM virtual key from its K8s Secret here. The
+                   secret defaults to the litellm master-key Secret; set
+                   grafana.llm.keySecret to a dedicated scoped key (C0). */}}
+            {{- if .Values.grafana.llm.enabled }}
+            - name: LITELLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.grafana.llm.keySecret | default (include "gardenio.litellm.masterKeySecretName" .) }}
+                  key: {{ .Values.grafana.llm.keySecretKey | default "token" | quote }}
+            {{- /* Managed (external) service account for grafana-llm-app (C7,
+                   ka-0000001262; epic ka-0000002011). The plugin's EMBEDDED
+                   mcp-grafana server — served at
+                   /api/plugins/grafana-llm-app/resources/mcp/grafana, the URL
+                   @grafana/llm's streamableHTTPURL() returns, and what the chat
+                   box (C3) connects to (DISTINCT from the standalone Track-A
+                   mcpGrafana pod, which stays read-only) — authenticates to the
+                   Grafana API with cfg.PluginAppClientSecret(). Off Grafana
+                   Cloud the embedded on-behalf-of token exchange returns "", so
+                   this managed SA token is the ONLY identity the chat box's MCP
+                   tools run as; there is no env to inject a hand-minted token
+                   into the embedded server. Grafana mints the token at plugin
+                   boot, scoped by grafana-llm-app's plugin.json `iam` block.
+
+                   SECURITY-OF-RECORD (corrects C7 !4943, for the R8 RBAC review,
+                   ka-0000007430): that iam block is BROADER than dashboards +
+                   folders. As of grafana-llm-app 1.0.8 it grants the managed SA:
+                     dashboards:read/create/write, folders:read/create/write,
+                     alert.rules:read/create/write/DELETE (scope folders:*),
+                     alert.provisioning.provenance:write,
+                     datasources:read/query, orgs:read, teams:read, users:read,
+                     alert.notifications:read, oncall/irm schedules+user-settings
+                     reads, and plugins.app:access (incident/irm apps).
+                   So the managed-SA RBAC does NOT scope the chat box down to
+                   dashboard+folder writes — the SA could mutate (and DELETE)
+                   alert rules if the matching tool were registered. The chat box
+                   is contained to dashboard-create + folder-create writes SOLELY
+                   because the alerting/admin/etc toolset FAMILIES are disabled at
+                   tool registration (layer a = configmap.yaml mcp.toolsets +
+                   the C3 frontend allow-list). The toolset allow-list is the
+                   LOAD-BEARING control; it must NEVER be relaxed for alerting or
+                   admin without a separate RBAC review, because a managed
+                   external SA inherits the plugin's FULL iam and cannot be
+                   narrowed without forking plugin.json. These two env vars are
+                   the PREREQUISITE: without them PluginAppClientSecret() is empty
+                   and EVERY embedded MCP call 302-loops to /login (in-cluster
+                   Grafana runs auth-proxy with anonymous off), breaking BOTH the
+                   read path (C3) and dashboard-create (C7). Requires Grafana
+                   >= 10.3 (we run 11.4) and a single-org deployment (org 1 — our
+                   case). Gated on grafana.llm.enabled so a non-opted-in env
+                   renders byte-identically.
+
+                   featureToggles REPLACES, it does not merge: the template feeds
+                   .Values.grafana.llm.featureToggles VERBATIM to
+                   GF_FEATURE_TOGGLES_ENABLE and the "externalServiceAccounts"
+                   default fires ONLY when the value is empty. So any override
+                   that omits externalServiceAccounts silently strips the managed
+                   SA's identity → the 302-loop above (BOTH read+write paths
+                   down). Replace-with-care: you MUST keep externalServiceAccounts
+                   in the list. See values.yaml grafana.llm.featureToggles. */}}
+            - name: GF_FEATURE_TOGGLES_ENABLE
+              value: {{ .Values.grafana.llm.featureToggles | default "externalServiceAccounts" | quote }}
+            - name: GF_AUTH_MANAGED_SERVICE_ACCOUNTS_ENABLED
+              value: "true"
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: {{ $grafanaProbePrefix }}/api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: {{ $grafanaProbePrefix }}/api/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.grafana.resources | nindent 12 }}
+          volumeMounts:
+            - name: provisioning-datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            {{- if or .Values.grafana.llm.enabled .Values.grafana.assistant.enabled }}
+            {{- /* Plugin app provisioning (ka-0000004453 + C4 ka-0000007568).
+                   Mounts the plugins-provisioning configMap key under
+                   /etc/grafana/provisioning/plugins so Grafana auto-ENABLES the
+                   listed apps at boot — grafana-llm-app when llm.enabled, and
+                   the custom gardenio-assistant-app when assistant.enabled (an
+                   app stays disabled until provisioned, even once discovered on
+                   disk + unsigned-allowed). */}}
+            - name: provisioning-plugins
+              mountPath: /etc/grafana/provisioning/plugins
+            {{- end }}
+            {{- if .Values.grafana.sidecar.enabled }}
+            - name: provisioning-dashboards
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: sidecar-dashboards
+              mountPath: {{ .Values.grafana.sidecar.folder }}
+            {{- end }}
+            {{- if .Values.grafana.persistence.enabled }}
+            - name: data
+              mountPath: /var/lib/grafana
+            {{- else if or .Values.grafana.plugins.install .Values.grafana.llm.prebake.enabled .Values.grafana.victoriaLogsDatasource.enabled }}
+            {{- /* Plugin install needs a writable /var/lib/grafana/plugins under
+                   readOnlyRootFilesystem. With no data PVC (e.g. ephemeral),
+                   back it with an emptyDir so the boot-time install can write
+                   (ka-0000004453) — and so Grafana's own state (grafana.db) is
+                   writable when prebake replaces the catalog install and
+                   plugins.install is empty (ka-0000007541). The seeded
+                   VictoriaLogs datasource plugin (ka-0000007948) needs the same:
+                   its dist mounts at a subdir of this path, and its BACKEND binary
+                   runs from there — the parent must be a real writable dir, not the
+                   read-only rootfs. */}}
+            - name: data
+              mountPath: /var/lib/grafana
+            {{- end }}
+            {{- if .Values.grafana.llm.prebake.enabled }}
+            {{- /* Pre-baked grafana-llm-app plugin dist (C6/prod prereq
+                   ka-0000007541). A dedicated emptyDir, seeded by the
+                   seed-llm-plugin initContainer above, mounted at the plugin's own
+                   subdir under the plugins path. Nested under /var/lib/grafana so
+                   it overlays that one subdir whether the parent is the data PVC
+                   (persistence on) or the plugins emptyDir (ephemeral), and never
+                   collides with the sibling gardenio-assistant-app dir. Grafana
+                   discovers it as an on-disk SIGNED plugin at boot — no catalog
+                   fetch, no unsigned-allow. */}}
+            - name: llm-plugin
+              mountPath: {{ $llmPluginDir }}
+            {{- end }}
+            {{- if .Values.grafana.assistant.enabled }}
+            {{- /* Custom gardenio-assistant-app plugin dist (C4 ka-0000007568).
+                   A dedicated emptyDir, seeded by the seed-assistant-plugin
+                   initContainer below, mounted at the plugin's own subdir under
+                   the plugins path. Nested under /var/lib/grafana so it overlays
+                   that one subdir whether the parent is the data PVC (staging,
+                   persistence on) or the plugins emptyDir (ephemeral) — and
+                   never collides with a sibling grafana-llm-app install dir.
+                   Grafana discovers it as an on-disk plugin at boot. */}}
+            - name: assistant-plugin
+              mountPath: {{ $assistantPluginDir }}
+            {{- end }}
+            {{- if .Values.grafana.victoriaLogsDatasource.enabled }}
+            {{- /* VictoriaLogs datasource plugin dist (Phase-2 forensics
+                   ka-0000007948). A dedicated emptyDir, seeded by the
+                   seed-vl-datasource-plugin initContainer above, mounted at the
+                   plugin's own subdir under the plugins path. Nested under
+                   /var/lib/grafana so it overlays that one subdir whether the
+                   parent is the data PVC (persistence on) or the plugins emptyDir
+                   (ephemeral), and never collides with the sibling
+                   grafana-llm-app / gardenio-assistant-app dirs. Grafana discovers
+                   it as an on-disk SIGNED plugin at boot — no catalog fetch, no
+                   unsigned-allow. */}}
+            - name: vl-datasource-plugin
+              mountPath: {{ $vlDatasourcePluginDir }}
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+        {{- if .Values.grafana.sidecar.enabled }}
+        - name: grafana-sc-dashboard
+          image: "{{ .Values.grafana.sidecar.image.repository }}:{{ .Values.grafana.sidecar.image.tag }}"
+          imagePullPolicy: {{ .Values.grafana.sidecar.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: METHOD
+              value: {{ .Values.grafana.sidecar.watchMethod | quote }}
+            - name: LABEL
+              value: {{ .Values.grafana.sidecar.label | quote }}
+            {{- if .Values.grafana.sidecar.labelValue }}
+            - name: LABEL_VALUE
+              value: {{ .Values.grafana.sidecar.labelValue | quote }}
+            {{- end }}
+            - name: FOLDER
+              value: {{ .Values.grafana.sidecar.folder | quote }}
+            - name: NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: RESOURCE
+              value: configmap
+          resources:
+            {{- toYaml .Values.grafana.sidecar.resources | nindent 12 }}
+          volumeMounts:
+            - name: sidecar-dashboards
+              mountPath: {{ .Values.grafana.sidecar.folder }}
+        {{- end }}
+        {{- if $agentPath.enabled }}
+        {{- /* Header-stripping proxy for agent pods (gd-RUhOpXWwmz). Agents
+               reach Grafana only through this port (edgeBackends
+               grafanaAgentCallers); it blanks every identity header before
+               forwarding to Grafana on loopback, so an agent cannot claim a
+               user. Config: agent-proxy-configmap.yaml. nginx runs with its
+               own config and no entrypoint scripts, which want to rewrite
+               /etc/nginx on a read-only root. */}}
+        - name: grafana-agent-proxy
+          image: "{{ $agentPath.image.repository }}:{{ $agentPath.image.tag }}"
+          imagePullPolicy: {{ $agentPath.image.pullPolicy }}
+          command: ["nginx", "-c", "/etc/nginx/agent-proxy/nginx.conf", "-g", "daemon off;"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http-agent
+              containerPort: {{ $agentPath.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: {{ $grafanaProbePrefix }}/api/health
+              port: http-agent
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml $agentPath.resources | nindent 12 }}
+          volumeMounts:
+            - name: agent-proxy-config
+              mountPath: /etc/nginx/agent-proxy
+              readOnly: true
+            - name: agent-proxy-tmp
+              mountPath: /tmp
+        {{- end }}
+        {{- if .Values.grafana.imageRenderer.enabled }}
+        {{- /* grafana-image-renderer sidecar (bead ka-0000001982). A headless-
+               Chromium HTTP service Grafana calls at GF_RENDERING_SERVER_URL to
+               turn /render requests into real PNGs. Listens on localhost only —
+               not exposed via the Service — so only the co-located Grafana
+               container reaches it. */}}
+        - name: grafana-image-renderer
+          image: "{{ .Values.grafana.imageRenderer.image.repository }}:{{ .Values.grafana.imageRenderer.image.tag }}"
+          imagePullPolicy: {{ .Values.grafana.imageRenderer.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: renderer
+              containerPort: {{ .Values.grafana.imageRenderer.port }}
+              protocol: TCP
+          env:
+            - name: HTTP_HOST
+              value: "127.0.0.1"
+            - name: HTTP_PORT
+              value: {{ .Values.grafana.imageRenderer.port | quote }}
+            {{- /* Full-dashboard render hardening (bug ka-0000006919). The
+                   whole-board /render/d/<uid> route 500'd (or hung to timeout)
+                   on tall multi-panel pages, and the sidecar cascaded 500s under
+                   any concurrency with a ~60-75s recovery, while a single small
+                   d-solo panel rendered fine. "clustered" mode gives each
+                   concurrent render its own isolated browser context behind a
+                   bounded queue (RENDERING_CLUSTERING_MODE + _MAX_CONCURRENCY),
+                   so overflow WAITS instead of colliding on one shared page;
+                   RENDERING_ARGS adds --disable-dev-shm-usage so Chromium's
+                   shared memory lands on the disk-backed /tmp emptyDir instead of
+                   the 64Mi K8s /dev/shm a tall page exhausts. See values.yaml
+                   grafana.imageRenderer for the full rationale. */}}
+            - name: RENDERING_MODE
+              value: {{ .Values.grafana.imageRenderer.mode | quote }}
+            {{- if eq .Values.grafana.imageRenderer.mode "clustered" }}
+            - name: RENDERING_CLUSTERING_MODE
+              value: {{ .Values.grafana.imageRenderer.clusteringMode | quote }}
+            - name: RENDERING_CLUSTERING_MAX_CONCURRENCY
+              value: {{ .Values.grafana.imageRenderer.maxConcurrentRenders | quote }}
+            - name: RENDERING_CLUSTERING_TIMEOUT
+              value: {{ .Values.grafana.imageRenderer.renderTimeoutSeconds | quote }}
+            {{- end }}
+            {{- if .Values.grafana.imageRenderer.renderingArgs }}
+            - name: RENDERING_ARGS
+              value: {{ .Values.grafana.imageRenderer.renderingArgs | quote }}
+            {{- end }}
+            - name: LOG_LEVEL
+              value: {{ .Values.grafana.imageRenderer.logLevel | quote }}
+            # Headless Chromium needs writable temp + home/cache dirs under the
+            # read-only rootfs and non-root user — point them all at the
+            # renderer-tmp emptyDir.
+            - name: TMPDIR
+              value: /tmp
+            - name: HOME
+              value: /tmp
+            - name: XDG_CONFIG_HOME
+              value: /tmp
+            - name: XDG_CACHE_HOME
+              value: /tmp
+          {{- /* The renderer binds loopback-only (HTTP_HOST=127.0.0.1) by
+                 design — it is not exposed via the Service, only the co-located
+                 Grafana container reaches it. A kubelet httpGet probe always
+                 dials the POD IP, never loopback, so against a loopback-only
+                 listener it gets connection-refused forever: the sidecar never
+                 goes Ready, the pod stays 2/3, the Deployment never reaches
+                 minimum availability, and verify-prod red-lines every release
+                 (ka-0000004334). Use an exec probe that hits 127.0.0.1 from
+                 inside the container so the health check sees the same loopback
+                 address the listener actually binds. wget ships in the
+                 grafana-image-renderer image.
+
+                 httpGet:null is REQUIRED, not redundant: this probe was
+                 previously an httpGet handler (ka-0000004334 switched it to
+                 exec). On `helm upgrade` over a live Deployment that predates
+                 the switch, the strategic-merge patch ADDS exec but does not
+                 clear the stale httpGet, leaving two handler types on one probe
+                 — which the apiserver rejects ("may not specify more than 1
+                 handler type", ka-0000005849). The explicit null tombstone
+                 forces the merge to delete the old field. Safe on fresh
+                 installs (null fields are dropped). Remove once no live
+                 Deployment carries the legacy httpGet handler. */}}
+          readinessProbe:
+            httpGet: null
+            exec:
+              command:
+                - /usr/bin/wget
+                - --quiet
+                - --tries=1
+                - --spider
+                - {{ printf "http://127.0.0.1:%d/" (int .Values.grafana.imageRenderer.port) | quote }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.grafana.imageRenderer.resources | nindent 12 }}
+          volumeMounts:
+            - name: renderer-tmp
+              mountPath: /tmp
+        {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.grafana.imageRenderer.enabled }}
+        - name: renderer-tmp
+          emptyDir: {}
+        {{- end }}
+        {{- if $agentPath.enabled }}
+        - name: agent-proxy-config
+          configMap:
+            name: {{ include "gardenio.grafana.fullname" . }}-agent-proxy
+        - name: agent-proxy-tmp
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.grafana.llm.prebake.enabled }}
+        {{- /* Writable home for the pre-baked grafana-llm-app plugin dist,
+               populated by the seed-llm-plugin initContainer and mounted by the
+               main container at its plugins subdir (C6/prod prereq
+               ka-0000007541). */}}
+        - name: llm-plugin
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.grafana.assistant.enabled }}
+        {{- /* Writable home for the custom gardenio-assistant-app plugin dist,
+               populated by the seed-assistant-plugin initContainer and mounted
+               by the main container at its plugins subdir (C4 ka-0000007568). */}}
+        - name: assistant-plugin
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.grafana.victoriaLogsDatasource.enabled }}
+        {{- /* Writable home for the pre-baked victoriametrics-logs-datasource
+               plugin dist, populated by the seed-vl-datasource-plugin
+               initContainer and mounted by the main container at its plugins
+               subdir (Phase-2 forensics ka-0000007948). */}}
+        - name: vl-datasource-plugin
+          emptyDir: {}
+        {{- end }}
+        - name: provisioning-datasources
+          configMap:
+            name: {{ include "gardenio.grafana.fullname" . }}-provisioning
+            items:
+              - key: datasources.yaml
+                path: datasources.yaml
+        {{- if or .Values.grafana.llm.enabled .Values.grafana.assistant.enabled }}
+        - name: provisioning-plugins
+          configMap:
+            name: {{ include "gardenio.grafana.fullname" . }}-provisioning
+            items:
+              - key: plugins.yaml
+                path: gardenio-plugins.yaml
+        {{- end }}
+        {{- if .Values.grafana.sidecar.enabled }}
+        - name: provisioning-dashboards
+          configMap:
+            name: {{ include "gardenio.grafana.fullname" . }}-provisioning
+            items:
+              - key: dashboards.yaml
+                path: dashboards.yaml
+        - name: sidecar-dashboards
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.grafana.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "gardenio.grafana.fullname" . }}
+        {{- else if or .Values.grafana.plugins.install .Values.grafana.llm.prebake.enabled .Values.grafana.victoriaLogsDatasource.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+      {{- include "gardenio.nodeSelector" (dict "local" .Values.grafana.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- with .Values.grafana.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "gardenio.tolerations" (dict "local" .Values.grafana.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+{{- end }}

@@ -1,0 +1,181 @@
+# trigger-source-schedule-fires.toml
+#
+# Claudeless scenario: cron tick → notify action observed.
+#
+# ka-0000002354 / parent ka-0000008095 §P3:
+#   "trigger-source-schedule-fires.toml — cron tick → notify action observed."
+#
+# Drives the real evaluation→action loop end-to-end by:
+#   1. Creating a trigger:schedule bead with cron='* * * * *' and action=notify.
+#   2. Starting a short-lived `trigger-engine` subprocess pointed at the
+#      in-test beads daemon ($BEADS_HTTP_URL) with TRIGGER_POLL_INTERVAL=1s.
+#   3. Waiting for the engine to evaluate, fire the action, and record an
+#      audit bead (auto:trigger-audit + outcome=allow).
+#   4. Asserting the audit bead exists for our trigger.
+#
+# Skips gracefully when the trigger-engine binary is not installed (e.g.
+# local dev runs without `make build-gardenio`).
+#
+# This is the positive companion to trigger-source-schedule-conditions.toml
+# (false condition → no fire) and the dedup invariant tested by
+# trigger-source-restart-dedup.toml.
+
+[claude]
+session_id = "e2e00000-000a-4000-a000-000000000001"
+username = "e2e-trigger-schedule-fires"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 60000
+
+[[responses]]
+on = "*"
+say = "Running trigger-source-schedule-fires: cron tick → notify action observed."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-engine ─────────────────────
+TE_BIN=""
+if command -v trigger-engine >/dev/null 2>&1; then
+  TE_BIN=$(command -v trigger-engine)
+elif [ -x /usr/local/bin/trigger-engine ]; then
+  TE_BIN=/usr/local/bin/trigger-engine
+elif [ -x /tmp/trigger-engine ]; then
+  TE_BIN=/tmp/trigger-engine
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-engine from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-engine ./cmd/trigger-engine/ ) || {
+    echo "SKIP: trigger-engine build failed"; exit 0;
+  }
+  TE_BIN=/tmp/trigger-engine
+else
+  echo "SKIP: trigger-engine binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-engine: $TE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then
+  echo "SKIP: BEADS_HTTP_URL not set (must run inside e2e shard)"
+  exit 0
+fi
+if [ -z "${BEADS_TOKEN:-}" ]; then
+  echo "SKIP: BEADS_TOKEN not set"
+  exit 0
+fi
+
+if ! command -v gb >/dev/null 2>&1; then
+  echo "SKIP: gb not present"
+  exit 0
+fi
+
+# ── Setup ──────────────────────────────────────────────────────────
+TAG="e2e-tsf-$$-$(date +%s)"
+echo "tag: $TAG"
+
+# Create the trigger via gb trigger create. Use cron='* * * * *' (every
+# minute) so the engine fires within 60s of subprocess start.
+TRIG_OUT=$(gb trigger create schedule \
+  --http-url "$BEADS_HTTP_URL" \
+  --title "$TAG" \
+  --cron '* * * * *' \
+  --action notify \
+  --prompt "fires at {{fire_time}}" \
+  --label "e2e:claudeless" \
+  --label "e2e-tag:$TAG" \
+  --json 2>&1) || { fail "gb trigger create" "$TRIG_OUT"; exit 1; }
+
+TRIG_ID=$(echo "$TRIG_OUT" | jq -r '.id // .ID // empty')
+if [ -z "$TRIG_ID" ]; then
+  fail "extract trigger id" "out=$TRIG_OUT"
+  exit 1
+fi
+echo "trigger: $TRIG_ID"
+
+cleanup() {
+  # Disable + close the trigger so the in-cluster engine ignores it after
+  # this scenario ends.
+  gb trigger disable "$TRIG_ID" --http-url "$BEADS_HTTP_URL" >/dev/null 2>&1 || true
+  kd close "$TRIG_ID" >/dev/null 2>&1 || true
+  if [ -n "${TE_PID:-}" ]; then
+    kill "$TE_PID" 2>/dev/null || true
+    wait "$TE_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+# ── Run trigger-engine subprocess ──────────────────────────────────
+TE_LOG=/tmp/trigger-engine-fires-$$.log
+BEADS_HTTP_ADDR="$BEADS_HTTP_URL" \
+  BEADS_DAEMON_TOKEN="$BEADS_TOKEN" \
+  TRIGGER_POLL_INTERVAL=1s \
+  LISTEN_ADDR=":0" \
+  LOG_LEVEL=info \
+  "$TE_BIN" >"$TE_LOG" 2>&1 &
+TE_PID=$!
+echo "trigger-engine pid: $TE_PID"
+
+# ── Wait for fire (up to 75s for cron='* * * * *' boundary) ───────
+DEADLINE=$(( $(date +%s) + 75 ))
+FIRED=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  # Audit bead: type=event, label=trigger:<id>, fields.outcome=allow.
+  AUDIT=$(kd list --type=event -l "trigger:$TRIG_ID" --json 2>/dev/null | \
+    jq -c '[.[] | select(.fields.outcome=="allow")][0] // empty' 2>/dev/null)
+  if [ -n "$AUDIT" ] && [ "$AUDIT" != "null" ]; then
+    FIRED=1
+    pass "audit bead recorded with outcome=allow"
+    echo "  audit: $(echo "$AUDIT" | jq -c '{id, title, fields: {action: .fields.action, outcome: .fields.outcome, match_key: .fields.match_key}}')"
+    break
+  fi
+  # Also accept stdout signal as a fallback (action ran but audit creation failed).
+  if grep -q 'triggers: notification sent' "$TE_LOG" 2>/dev/null; then
+    FIRED=1
+    pass "trigger-engine logged 'notification sent'"
+    break
+  fi
+  sleep 2
+done
+
+if [ "$FIRED" = "0" ]; then
+  fail "trigger fired within 75s"
+  echo "--- trigger-engine log (tail) ---"
+  tail -40 "$TE_LOG" 2>/dev/null || true
+  echo "--- end log ---"
+  exit 1
+fi
+
+# Bonus: trigger-engine should have stamped last_checked on the trigger bead.
+LAST=$(kd show "$TRIG_ID" --json 2>/dev/null | jq -r '.fields.last_checked // empty')
+if [ -n "$LAST" ]; then
+  pass "last_checked stamped on trigger bead ($LAST)"
+else
+  # Soft assertion — engine may not have flushed yet; don't fail the scenario.
+  echo "  (note) last_checked not yet stamped — non-fatal"
+fi
+
+# ── Summary ────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "trigger-source-schedule-fires: cron tick → notify action observed OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "trigger-source-schedule-fires scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

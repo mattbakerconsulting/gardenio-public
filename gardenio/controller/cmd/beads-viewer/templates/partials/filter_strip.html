@@ -1,0 +1,88 @@
+{{/*
+  filter_strip — the ONE canonical page-level filter-strip component
+  (ka-0000005357, audit finding F6). Before this partial every page hand-rolled
+  its own filter-strip <nav>/<div> + chip markup inline (project, project_hub,
+  triggers, agents, inbox), which is what kept regenerating the F1-F4 menu-bar
+  drift as new pages were added. Centralising the markup here makes the
+  wrapper / active-state / aria / count decisions live in exactly one place, so
+  a new page can only pick a documented profile — it can no longer silently
+  diverge by copy-paste.
+
+  Invoke with a dict. Every caller passes a `filterChip` slice as .Chips plus a
+  small set of cosmetic knobs that reproduce that page's existing look:
+
+    {{template "filter_strip" (dict
+        "Chips"       .Chips          // []filterChip (required)
+        "AriaLabel"   "Type filter"   // wrapper aria-label (required)
+        "Wrapper"     "nav"           // "nav" (default) | "div"
+        "Role"        ""              // "" | "tablist" (inbox scope strip)
+        "StripClass"  "chip-strip"    // wrapper class (default "chip-strip")
+        "ChipClass"   "chip"          // per-chip base class: "chip" | "chip chip-type"
+        "Boost"       true            // emit hx-boost + hx-push-url on chips
+        "AriaCurrent" "true"          // aria-current value on the active chip: "true" | "page"
+        "CountMode"   "gated"         // "none" | "gated" (ShowCount && Count>0, a11y label) | "always"
+        "ActiveSpan"  false           // render the active chip as a non-link <span> (triggers/agents)
+        "DataKey"     "")}}           // "" | "source" | "action": emit data-<key>="<chip.DataVal>"
+
+  A `filterChip` (see filter_strip.go) carries: Label, Href, Active, Count,
+  ShowCount, Disabled, Tooltip, DataVal.
+
+  NOTE on html/template: the wrapper tag and the data-attribute NAME are both
+  branched on STATIC literals below rather than interpolated. html/template
+  refuses a dynamic element name (`<{{$w}}>` renders escaped as text) and a
+  dynamic attribute name (`data-{{$k}}=` sanitises to `data-ZgotmplZ`), so the
+  cosmetic knobs select a fixed literal instead of building one.
+*/}}
+
+{{- define "filter_strip" -}}
+{{/* Page-level filter strips carry the distinct `.filter-strip` hook ALONGSIDE
+     `.chip-strip` (ka-0000005049 / audit F5). `.chip-strip` is overloaded — it
+     also dresses per-card attribute badges inside list rows — so page-level
+     menu-bar styling (F1-F4 and any future restyle) must target `.filter-strip`
+     to avoid leaking into every card. Every caller of THIS partial is a
+     page-level filter menu, so the hook is the default StripClass; a caller may
+     still override StripClass explicitly if it ever needs to opt out. */}}
+{{- $stripClass := or .StripClass "chip-strip filter-strip" -}}
+{{- if eq (or .Wrapper "nav") "div" -}}
+<div class="{{$stripClass}}" aria-label="{{.AriaLabel}}"{{if .Role}} role="{{.Role}}"{{end}}>
+  {{- range .Chips}}
+  {{template "filter_chip" (dict "Chip" . "ChipClass" $.ChipClass "Boost" $.Boost "AriaCurrent" $.AriaCurrent "CountMode" $.CountMode "ActiveSpan" $.ActiveSpan "DataKey" $.DataKey)}}
+  {{- end}}
+</div>
+{{- else -}}
+<nav class="{{$stripClass}}" aria-label="{{.AriaLabel}}"{{if .Role}} role="{{.Role}}"{{end}}>
+  {{- range .Chips}}
+  {{template "filter_chip" (dict "Chip" . "ChipClass" $.ChipClass "Boost" $.Boost "AriaCurrent" $.AriaCurrent "CountMode" $.CountMode "ActiveSpan" $.ActiveSpan "DataKey" $.DataKey)}}
+  {{- end}}
+</nav>
+{{- end -}}
+{{- end -}}
+
+{{- define "filter_chip" -}}
+{{- $c := .Chip -}}
+{{- $base := or .ChipClass "chip" -}}
+{{- $ariaCurrent := or .AriaCurrent "page" -}}
+{{- if $c.Disabled -}}
+<span class="{{$base}}{{if $c.Active}} chip-active{{end}}" aria-disabled="true" title="{{$c.Tooltip}}">{{$c.Label}}</span>
+{{- else if and .ActiveSpan $c.Active -}}
+<span class="{{$base}} chip-active"{{template "filter_chip_data" (dict "DataKey" .DataKey "Chip" $c)}} aria-current="{{$ariaCurrent}}">{{$c.Label}}{{template "filter_chip_count" (dict "Chip" $c "CountMode" .CountMode)}}</span>
+{{- else -}}
+<a class="{{$base}}{{if $c.Active}} chip-active{{end}}"{{template "filter_chip_data" (dict "DataKey" .DataKey "Chip" $c)}} href="{{$c.Href}}"{{if .Boost}} hx-boost="true" hx-push-url="true"{{end}}{{if $c.Active}} aria-current="{{$ariaCurrent}}"{{end}}>{{$c.Label}}{{template "filter_chip_count" (dict "Chip" $c "CountMode" .CountMode)}}</a>
+{{- end -}}
+{{- end -}}
+
+{{/* filter_chip_data emits the optional data-<key> attribute. The key must be
+     a static literal (html/template forbids a dynamic attribute name), so the
+     supported keys are branched explicitly. */}}
+{{- define "filter_chip_data" -}}
+{{- if eq .DataKey "source"}} data-source="{{.Chip.DataVal}}"
+{{- else if eq .DataKey "action"}} data-action="{{.Chip.DataVal}}"
+{{- end -}}
+{{- end -}}
+
+{{- define "filter_chip_count" -}}
+{{- $c := .Chip -}}
+{{- if eq .CountMode "always"}} <span class="chip-count">{{$c.Count}}</span>
+{{- else if eq .CountMode "gated"}}{{if and $c.ShowCount (gt $c.Count 0)}} <span class="chip-count" aria-label="{{$c.Count}} active">{{$c.Count}}</span>{{end}}
+{{- end -}}
+{{- end -}}

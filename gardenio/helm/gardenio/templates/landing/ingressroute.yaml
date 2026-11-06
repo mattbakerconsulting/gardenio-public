@@ -1,0 +1,78 @@
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.landing.enabled .Values.landing.ingress.enabled }}
+{{- $fullname := include "gardenio.landing.fullname" . -}}
+{{- $host := .Values.landing.ingress.host -}}
+{{- $port := .Values.landing.service.port | default 80 -}}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.landing.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $host }}`)
+      kind: Rule
+      priority: 10
+      services:
+        - name: {{ $fullname }}
+          port: {{ $port }}
+      {{- if or .Values.landing.ingress.ipWhitelist.enabled .Values.landing.ingress.rateLimit.enabled (and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled (not .Values.landing.public)) .Values.global.securityHeaders.enabled }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ include "gardenio.fullname" . }}-security-headers
+        {{- end }}
+        {{- if .Values.landing.ingress.ipWhitelist.enabled }}
+        - name: {{ $fullname }}-ipwhitelist
+        {{- end }}
+        {{- if and .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled (not .Values.landing.public) }}
+        - name: {{ include "gardenio.fullname" . }}-forwardauth
+        {{- end }}
+        {{- if .Values.landing.ingress.rateLimit.enabled }}
+        - name: {{ $fullname }}-ratelimit
+        {{- end }}
+      {{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+{{- if .Values.landing.ingress.ipWhitelist.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ipwhitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.landing.labels" . | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml .Values.landing.ingress.ipWhitelist.sourceRange | nindent 6 }}
+    ipStrategy:
+      depth: {{ .Values.landing.ingress.ipWhitelist.depth | default 1 }}
+{{- end }}
+{{- if .Values.landing.ingress.rateLimit.enabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-ratelimit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.landing.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ .Values.landing.ingress.rateLimit.average }}
+    burst: {{ .Values.landing.ingress.rateLimit.burst }}
+{{- end }}
+{{- end }}

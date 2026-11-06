@@ -1,0 +1,289 @@
+{{template "layout" .}}
+{{define "title"}}Threads · Beads Viewer{{end}}
+{{define "content"}}
+{{- $base := .BasePath -}}
+{{- $t := .Threads -}}
+<span class="wide-page" hidden></span>
+
+{{/* /threads index — Phase 2, task 2-4 (ka-0000006184), epic ka-0000000679.
+     The polished wish list that replaces 2-3's minimal baseline. One card per
+     user-wish (thread head), most-recently-active first. Each card LEADS with
+     the wish narrative (the WHY) and demotes the agent-work tally to a quiet
+     meta cue — the same conversation-first curation the detail page applies
+     (rubric B11), expressed at list altitude. Empty / error states are
+     first-class so the page never shows a blank white pane (rubric C15). */}}
+<style>
+  .threads-page { width: 100%; max-width: 64rem; }
+  .threads-intro { color: #595959; font-size: 0.9em; margin: 0.2rem 0 1rem; max-width: 60rem; line-height: 1.5; }
+  html[data-skin^="dark"] .threads-intro { color: #9aa7b4; }
+
+  .threads-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }
+  /* The card is a positioned container, not a link — a full-card "stretched"
+     overlay link (.threads-card-link) drives navigation to the thread detail,
+     while interactive children (participant avatars, MR pills) sit ABOVE it
+     with position:relative so they stay independently clickable. Nesting those
+     <a>s inside a card-wide <a> would be invalid HTML. */
+  .threads-card { position: relative; display: block; border: 1px solid rgba(128,128,128,0.25); border-radius: 10px; background: rgba(128,128,128,0.03); padding: 0.7rem 0.9rem; color: inherit; transition: border-color 0.12s ease, background 0.12s ease; }
+  .threads-card:hover, .threads-card:focus-within { border-color: rgba(33,150,243,0.55); background: rgba(33,150,243,0.05); outline: none; }
+  .threads-card.is-fulfilled { background: rgba(46,111,48,0.05); border-color: rgba(46,111,48,0.3); }
+  .threads-card.is-triage { border-color: rgba(214,158,46,0.5); background: rgba(214,158,46,0.07); }
+  /* Stretched overlay link: covers the whole card for the primary navigation.
+     z-index:0 keeps it behind the interactive children (which set z-index:1). */
+  .threads-card-link { position: absolute; inset: 0; z-index: 0; border-radius: inherit; text-indent: -9999px; overflow: hidden; }
+  .threads-card-link:focus-visible { outline: 2px solid rgba(33,150,243,0.7); outline-offset: -2px; }
+  /* Interactive children float above the overlay so their own links win clicks. */
+  .threads-avatars, .threads-mrs { position: relative; z-index: 1; }
+  .threads-avatars .thread-avatar, .threads-mrs .mr-pill { position: relative; z-index: 1; }
+
+  .threads-card-top { display: flex; align-items: baseline; gap: 0.6rem; }
+  .threads-wish { flex: 1 1 auto; min-width: 0; font-weight: 600; font-size: 1.02rem; line-height: 1.35; overflow-wrap: anywhere; }
+  .threads-card.is-fulfilled .threads-wish { opacity: 0.78; }
+  .threads-when { flex: 0 0 auto; color: #6b7280; font-size: 0.8rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  html[data-skin^="dark"] .threads-when { color: #9aa7b4; }
+
+  .threads-card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; margin-top: 0.45rem; }
+  .threads-chip { display: inline-block; font-size: 0.74rem; padding: 0.06rem 0.45rem; border-radius: 999px; border: 1px solid rgba(128,128,128,0.32); color: #4b5563; white-space: nowrap; }
+  html[data-skin^="dark"] .threads-chip { color: #aab4bf; }
+  .threads-chip.is-accent { border-color: rgba(46,111,48,0.45); color: #2c6f30; background: rgba(46,111,48,0.08); }
+  html[data-skin^="dark"] .threads-chip.is-accent { color: #8fd693; }
+  .threads-chip.is-triage { border-color: rgba(214,158,46,0.55); color: #8a6116; background: rgba(214,158,46,0.12); }
+  html[data-skin^="dark"] .threads-chip.is-triage { color: #ecc97a; }
+  /* The herder's verdict on an open wish (gd-RkkGXAz643): dashed, a judgement
+     rather than the wish's state; green when it is about to close it, amber
+     when it woke the agent or asked, plain while the work is in progress. */
+  .threads-chip.herder { border-style: dashed; }
+  .threads-chip.herder-done { border-color: rgba(46,111,48,0.55); color: #2c6f30; }
+  html[data-skin^="dark"] .threads-chip.herder-done { color: #8fd693; }
+  .threads-chip.herder-ask { border-color: rgba(214,158,46,0.65); color: #8a6116; }
+  html[data-skin^="dark"] .threads-chip.herder-ask { color: #ecc97a; }
+  .threads-work { color: #6b7280; font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  html[data-skin^="dark"] .threads-work { color: #9aa7b4; }
+
+  /* Participant avatars + starter line (ka-0000000064). The avatar row leads the
+     meta strip so a glance shows WHO is in the thread; the starter name and the
+     last-message preview add the WHO-started and WHERE-it-stands context Matt
+     asked for. Avatars reuse the shared owner-initials chrome (colored monogram,
+     deterministic per-person hue) so a person reads identically to every other
+     avatar in the viewer. */
+  .threads-people { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap; }
+  .threads-avatars { display: inline-flex; align-items: center; }
+  .threads-avatars .thread-avatar { margin-left: -0.35rem; box-shadow: 0 0 0 2px var(--card-bg, #fff); }
+  .threads-avatars .thread-avatar:first-child { margin-left: 0; }
+  html[data-skin^="dark"] .threads-avatars .thread-avatar { box-shadow: 0 0 0 2px #1a1d21; }
+  .thread-avatar { display: inline-flex; align-items: center; justify-content: center; min-width: 1.7em; height: 1.7em; padding: 0 0.3em; border-radius: 999px; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.02em; line-height: 1; color: #fff; text-decoration: none; vertical-align: middle; box-sizing: border-box; }
+  a.thread-avatar:hover { text-decoration: none; filter: brightness(1.1); }
+  .thread-avatar-overflow { background: rgba(128,128,128,0.35) !important; color: #fff; font-weight: 600; }
+  .threads-starter { color: #6b7280; font-size: 0.8rem; }
+  html[data-skin^="dark"] .threads-starter { color: #9aa7b4; }
+  .threads-starter strong { color: #374151; font-weight: 600; }
+  html[data-skin^="dark"] .threads-starter strong { color: #cbd5e1; }
+
+  /* Last-message preview: a single quiet line echoing where the conversation
+     stands, truncated to one line so a long reply never blows out the card. */
+  .threads-lastmsg { display: flex; align-items: baseline; gap: 0.35rem; margin-top: 0.45rem; color: #6b7280; font-size: 0.82rem; min-width: 0; }
+  html[data-skin^="dark"] .threads-lastmsg { color: #9aa7b4; }
+  .threads-lastmsg-author { flex: 0 0 auto; font-weight: 600; color: #4b5563; }
+  html[data-skin^="dark"] .threads-lastmsg-author { color: #aab4bf; }
+  .threads-lastmsg-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Associated MRs: the concrete code a wish shipped, rendered with the shared
+     mr_pill chrome (same pills the detail rail + /agents rows use). */
+  .threads-mrs { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; margin-top: 0.5rem; }
+  .threads-mrs-label { color: #6b7280; font-size: 0.76rem; font-weight: 600; margin-right: 0.15rem; }
+  html[data-skin^="dark"] .threads-mrs-label { color: #9aa7b4; }
+
+  /* Empty state: a friendly, non-blank panel rather than a bare line on white
+     (rubric C15). */
+  .threads-empty { margin: 1.5rem 0; padding: 1.5rem 1.25rem; border: 1px dashed rgba(128,128,128,0.4); border-radius: 10px; background: rgba(128,128,128,0.03); text-align: center; color: #6b7280; }
+  html[data-skin^="dark"] .threads-empty { color: #9aa7b4; }
+  .threads-empty-title { font-size: 1.05rem; font-weight: 600; margin: 0 0 0.3rem; color: inherit; }
+  .threads-empty-body { margin: 0; font-size: 0.9rem; line-height: 1.5; max-width: 34rem; margin-inline: auto; }
+
+  /* Compose box (ka-0000007860). An operator starts a NEW Slack-bound wish — or
+     adds a message to / reopens an EXISTING one — from the index. The identity
+     is slack-thread:{channel}:{thread_ts}, so the form collects both; POST
+     /threads/compose is resolve-or-mint, so a (channel, ts) that already has a
+     head resolves to it (and reopens it when fulfilled) instead of minting a
+     duplicate. Folded into a <details> so the wish list stays the visual lead
+     (rubric B11 conversation-first) and the composer is one click away. */
+  .threads-compose { margin: 0 0 1.25rem; border: 1px solid rgba(128,128,128,0.28); border-radius: 10px; background: rgba(128,128,128,0.03); }
+  .threads-compose > summary { cursor: pointer; padding: 0.6rem 0.9rem; font-weight: 600; font-size: 0.95rem; list-style: none; user-select: none; }
+  .threads-compose > summary::-webkit-details-marker { display: none; }
+  .threads-compose > summary::before { content: "\002B  "; color: #2196f3; font-weight: 700; }
+  .threads-compose[open] > summary { border-bottom: 1px solid rgba(128,128,128,0.2); }
+  .threads-compose-form { padding: 0.85rem 0.9rem; display: flex; flex-direction: column; gap: 0.7rem; }
+  .threads-compose-row { display: flex; flex-wrap: wrap; gap: 0.7rem; }
+  .threads-compose-field { display: flex; flex-direction: column; gap: 0.25rem; flex: 1 1 12rem; min-width: 0; }
+  .threads-compose-field > span { font-size: 0.8rem; color: #595959; font-weight: 600; }
+  html[data-skin^="dark"] .threads-compose-field > span { color: #9aa7b4; }
+  .threads-compose-field input, .threads-compose-form textarea {
+    width: 100%; box-sizing: border-box; padding: 0.4rem 0.55rem;
+    border: 1px solid rgba(128,128,128,0.4); border-radius: 6px;
+    background: var(--card-bg, #fff); color: inherit; font: inherit;
+  }
+  html[data-skin^="dark"] .threads-compose-field input,
+  html[data-skin^="dark"] .threads-compose-form textarea { background: rgba(255,255,255,0.04); }
+  .threads-compose-form textarea { resize: vertical; min-height: 3.4rem; }
+  .threads-compose-hint { margin: 0; font-size: 0.78rem; color: #6b7280; line-height: 1.45; }
+  html[data-skin^="dark"] .threads-compose-hint { color: #9aa7b4; }
+  .threads-compose-hint code { font-size: 0.92em; }
+  .threads-compose-actions { display: flex; align-items: center; gap: 0.75rem; }
+  .threads-compose-send {
+    padding: 0.4rem 1.1rem; border: 1px solid rgba(33,150,243,0.55); border-radius: 6px;
+    background: rgba(33,150,243,0.12); color: inherit; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  .threads-compose-send:hover { background: rgba(33,150,243,0.2); }
+  .threads-compose-send[disabled] { opacity: 0.55; cursor: progress; }
+  .threads-compose-error { margin: 0; font-size: 0.82rem; color: #c0392b; }
+  html[data-skin^="dark"] .threads-compose-error { color: #f0867a; }
+</style>
+
+<div class="threads-page">
+  <h1>Threads</h1>
+  <p class="threads-intro">
+    Every user <strong>wish</strong> across the fleet — the WHY behind the work.
+    One wish spans many agent plans and tasks; the card leads with the ask, and
+    each wish opens to a conversation-first timeline with the agent work tucked
+    behind a toggle.
+    {{if $t.Project}}Scoped to <code>{{$t.Project}}</code>.{{end}}
+  </p>
+
+  {{/* Compose-new-wish box (ka-0000007860): operator-gated mint/resolve. POSTs
+       to POST /threads/compose (handleThreadCompose), which is resolve-OR-mint
+       and reopens a fulfilled head — so this ONE form starts a new Slack-bound
+       wish AND adds a message to (or reopens) an existing thread, just like a
+       Slack reply. The handler answers 204 + HX-Redirect to the wish detail on
+       success, so the form uses hx-swap="none" and lets htmx follow the
+       redirect; hx-on::response-error surfaces a 4xx/5xx body inline. Gated on
+       CanCompose (operatorOnly parity) so a read-only viewer never sees a lever
+       the POST would 403 — matching the detail-page reply composer. */}}
+  {{if .CanCompose}}
+  <details class="threads-compose">
+    <summary>New thread / message</summary>
+    <form class="threads-compose-form"
+          hx-post="{{$base}}/threads/compose"
+          hx-swap="none"
+          hx-disabled-elt="find button[type=submit]"
+          hx-on::before-request="this.querySelector('.threads-compose-error').hidden = true"
+          hx-on::response-error="var e=this.querySelector('.threads-compose-error'); e.textContent = (event.detail.xhr.responseText || 'Failed to start thread.').trim(); e.hidden = false">
+      <div class="threads-compose-row">
+        <label class="threads-compose-field">
+          <span>Slack channel ID</span>
+          <input type="text" name="channel" required autocomplete="off"
+                 placeholder="C0AHE7C0E1G" pattern="[CDG].+">
+        </label>
+        <label class="threads-compose-field">
+          <span>Thread timestamp</span>
+          <input type="text" name="thread_ts" required autocomplete="off"
+                 placeholder="1700000000.000200" pattern="[0-9]+\.[0-9]+">
+        </label>
+        <label class="threads-compose-field">
+          <span>Project <small>(optional)</small></span>
+          <input type="text" name="project" autocomplete="off"
+                 placeholder="gardenio" value="{{.Project}}">
+        </label>
+      </div>
+      <label class="threads-compose-field">
+        <span>Message</span>
+        <textarea name="text" class="empty-prompt" rows="3" required maxlength="10000"
+                  placeholder="{{emptyPrompt}}"></textarea>
+      </label>
+      <p class="threads-compose-hint">
+        Identity is <code>slack-thread:{channel}:{thread_ts}</code>. A new pair
+        starts a wish; an existing pair adds your message to that thread and
+        reopens it if it was fulfilled — just like replying in Slack. Find the
+        channel ID and thread <code>ts</code> from the Slack thread link
+        (<code>&hellip;/archives/<strong>C&hellip;</strong>/p<strong>1700000000000200</strong></code> →
+        ts <code>1700000000.000200</code>). Sent as <strong>{{.ViewerEmail}}</strong> via the bridge.
+      </p>
+      <div class="threads-compose-actions">
+        <button type="submit" class="threads-compose-send">Send</button>
+        <p class="threads-compose-error" role="alert" aria-live="assertive" hidden></p>
+      </div>
+    </form>
+  </details>
+  {{end}}
+
+  {{if $t.Error}}
+  <div class="banner banner-error" role="alert">{{$t.Error}}</div>
+  {{end}}
+
+  {{if $t.HasThreads}}
+  <ul class="threads-list">
+    {{range $t.Threads}}
+    <li>
+      <div class="threads-card{{if .IsClosed}} is-fulfilled{{else if .IsNeedsTriage}} is-triage{{end}}">
+        {{/* Full-card overlay link drives navigation; interactive children
+             (avatars, MR pills) sit above it so they stay clickable. */}}
+        <a class="threads-card-link" href="{{$base}}/threads/{{.ThreadID}}"
+           aria-label="Open thread: {{.WishText}}">Open thread</a>
+        <div class="threads-card-top">
+          <span class="threads-wish">{{.WishText}}</span>
+          <span class="threads-when">active {{humanizeTime .LastActivity}}</span>
+        </div>
+
+        {{/* Participant avatars + starter (ka-0000000064): WHO is in the thread
+             and WHO opened it. The avatar row shows the initial icons of each
+             participant; the starter line names who started the thread. */}}
+        {{if or .HasParticipants .HasStarter}}
+        <div class="threads-people">
+          {{if .HasParticipants}}
+          <span class="threads-avatars">
+            {{range .Participants}}{{threadParticipantAvatar .}}{{end}}
+            {{if .ParticipantOverflow}}{{threadParticipantOverflow .ParticipantOverflow}}{{end}}
+          </span>
+          {{end}}
+          {{if .HasStarter}}
+          <span class="threads-starter">started by <strong>{{.Starter.Display}}</strong></span>
+          {{end}}
+        </div>
+        {{end}}
+
+        {{/* Last message preview (ka-0000000064): where the conversation stands,
+             one truncated line. */}}
+        {{if .HasLastMessage}}
+        <div class="threads-lastmsg">
+          {{if .LastMessage.Author}}<span class="threads-lastmsg-author">{{.LastMessage.Author}}:</span>{{end}}
+          <span class="threads-lastmsg-text">{{.LastMessage.Text}}</span>
+        </div>
+        {{end}}
+
+        <div class="threads-card-meta">
+          {{if .IsClosed}}
+          <span class="threads-chip is-accent">fulfilled</span>
+          {{else if .IsNeedsTriage}}
+          <span class="threads-chip is-triage">needs triage</span>
+          {{else}}
+          <span class="threads-chip">{{.Status}}</span>
+          {{end}}
+          {{if .Herder.Has}}<span class="threads-chip herder herder-{{.Herder.Tone}}"{{if not .Herder.CheckedAt.IsZero}} title="the herder checked it {{humanizeTime .Herder.CheckedAt}}"{{end}}>herder: {{.Herder.Words}}</span>{{end}}
+          {{if .Project}}<span class="threads-chip">{{.Project}}</span>{{end}}
+          <span class="threads-work">
+            {{if .WorkCount}}{{.WorkCount}} bead{{if ne .WorkCount 1}}s{{end}} of work{{else}}no work yet{{end}}
+          </span>
+        </div>
+
+        {{/* Associated MRs (ka-0000000064): the concrete code this wish shipped,
+             rendered with the shared mr_pill chrome. */}}
+        {{if .HasProducedMRs}}
+        <div class="threads-mrs">
+          <span class="threads-mrs-label">MR{{if ne .ProducedMRCount 1}}s{{end}}</span>
+          {{range .ProducedMRs}}{{template "mr_pill" .}}{{end}}
+        </div>
+        {{end}}
+      </div>
+    </li>
+    {{end}}
+  </ul>
+  {{else if not $t.Error}}
+  <div class="threads-empty">
+    <p class="threads-empty-title">No wishes yet</p>
+    <p class="threads-empty-body">
+      A wish appears here the first time a user opens a Slack thread{{if $t.Project}} in <code>{{$t.Project}}</code>{{end}}.
+      Each wish becomes a thread you can follow — the conversation up front,
+      the agent work one click away.
+    </p>
+  </div>
+  {{end}}
+</div>
+{{end}}

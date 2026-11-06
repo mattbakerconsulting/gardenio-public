@@ -1,0 +1,108 @@
+# Live-namespace e2e lane overlay (gd-WBz2qt9ADZ).
+#
+# Installed by lane.sh into a POOL namespace (gardenio-e2e-0 / gardenio-e2e-1)
+# with release name == namespace name, because run-shard.sh derives every
+# service name from $NAMESPACE (<ns>-beads, <ns>-agents, <ns>-coopmux) and the
+# chart's gardenio.fullname is the release name.
+#
+# INVARIANT: this overlay renders NAMESPACED CORE KINDS ONLY -- no CRDs, no
+# ClusterRole/Binding, no Namespace/PriorityClass/StorageClass/RuntimeClass.
+# The runner holds one Role per pool namespace and nothing cluster-scoped
+# (design: docs/superpowers/specs/2026-10-13-e2e-live-namespace-lane-design.md
+# s4, s6). Check after any chart change:
+#
+#   helm template gardenio-e2e-0 gardenio/helm/gardenio -n gardenio-e2e-0 \
+#     -f gardenio/tests/e2e/lane/values-e2e.yaml \
+#     | grep -E '^kind:' | sort | uniq -c
+#
+# Image tag is NOT set here: lane.sh passes --set global.imageTag=<newest
+# calver tag> (images.yml publishes only on calver tags; Chart.AppVersion is
+# not bumped by release-cut.sh). Pull credentials: the `ecr` Secret is written
+# into the pool namespaces by the ecr-token-refresh CronJob
+# (gardenio/helm/gardenio-ziti/ecr-token-refresh.yaml), same as production.
+
+global:
+  imageRegistry: "360190250083.dkr.ecr.us-east-1.amazonaws.com/gardenio"
+  storageClass: local-path
+  securityHeaders: {enabled: false}
+  # Same as deploy-values/gardenio-k3s.yaml: the gardenio pool carries
+  # gardenio.agent=true:NoSchedule and the control-plane pods do not tolerate
+  # it by default. Without this every lane pod sat Pending with "0/14 nodes are
+  # available: 14 node(s) had untolerated taint(s)" (gd-mS5EZeWhZF, PR #801).
+  # Toleration only, no nodeSelector: untainted nodes are still preferred.
+  tolerations:
+    - {key: gardenio.agent, operator: Equal, value: "true", effect: NoSchedule}
+
+imagePullSecrets:
+  - name: ecr
+
+# ── Off: everything that needs an external system or a cluster-scoped object ──
+tls: {enabled: false, redirect: {enabled: false}}   # cert-manager Certificates
+podSecurityAdmission: {enabled: false}              # ClusterRole + namespace label Job
+keycloak: {enabled: false}                          # Keycloak CRs + forwardauth
+platformPdb: {enabled: false}
+externalSecrets: {enabled: false}
+registrySecrets: {enabled: false}
+landing: {enabled: false}
+slackBridge: {enabled: false}                       # needs Slack creds; slackmock follow-up
+jiraBridge: {enabled: false}
+gitlabBridge: {enabled: false}
+# The operator's ResourceQuota + LimitRange in rbac/namespace-pool.yaml are the
+# only ones in a pool namespace. The runner holds NO verb on either kind, so a
+# chart that rendered its own would 403 at install. (gd-LXD71HHC8n item 1)
+resourceQuota: {enabled: false}
+limitRange: {enabled: false}
+
+# ── On: the stack the NAMESPACE census class exercises ──
+postgres:
+  enabled: true
+  database: beads
+  # passwordSecret left empty: the chart generates <release>-postgres-password
+  # (templates/postgres/credentials.yaml, lookup-then-random, resource-policy
+  # keep). lane.sh deletes it with the other Helm-labelled Secrets on wipe.
+  persistence: {enabled: true, size: 1Gi}
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+
+nats:
+  enabled: true
+  replicas: 1
+  jetstream: {maxMemory: "64M"}
+  persistence: {enabled: false}
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: 200m, memory: 128Mi}
+
+beads:
+  replicaCount: 1
+  # Minted per run by lane.sh (kubectl create secret generic ... key=token).
+  tokenSecret: gardenio-e2e-beads-token
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+
+agents:
+  enabled: true
+  pvGc:
+    # Both are cluster-scoped; neither matters in a disposable namespace.
+    rbac: {enabled: false}
+    admissionPolicy: {enabled: false}
+
+coopmux:
+  enabled: true
+  # lane.sh mints the coop-credential-key Secret (key=key) the deployment reads.
+
+beadsViewer:
+  enabled: true
+  # No Keycloak in the lane. The bypass alone is enough and safe here: the
+  # chart's viewer pod sets automountServiceAccountToken: false, so
+  # dev_auth.go's SA-token prod guard never trips, and the pod binds the pod
+  # network so its httpGet probes reach it. Do NOT add the agent-pod ack env:
+  # it forces LISTEN_ADDR to 127.0.0.1, the probes fail and `helm --wait`
+  # times out (review gd-h3F6SjVL53). Chart test
+  # TestE2ELane_ViewerIsRoutableWithDevAuthBypass pins this.
+  devAuthBypass: true
+
+triggerEngine:
+  enabled: true

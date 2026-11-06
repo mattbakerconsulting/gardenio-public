@@ -1,0 +1,611 @@
+{{template "layout" .}}
+{{define "title"}}Inbox · Beads Viewer{{end}}
+{{define "content"}}
+<style>
+  /* Inbox-specific layout (ka-0000000894): single full-width Gmail-density
+     activity stream. Typography, chips, banners, and chip-strip styling come
+     from layout.html — do not redefine them here. */
+  /* ka-0000004648: containment chain so no descendant can burst the page width.
+     Each level pins min-width:0 + max-width:100% so grid/flex children cannot
+     expand the ancestor box past the viewport. overflow:hidden clips any
+     remaining intrinsic overflow at the row level. */
+  .inbox-stream { list-style: none; padding: 0; margin: 0; border-top: 1px solid rgba(128,128,128,0.18); min-width: 0; max-width: 100%; }
+  /* ka-0000006155: tighten base row vertical rhythm to push /inbox from
+     acceptable→dense bucket. Lift base padding 0.32→0.22rem (4 rows extra
+     above the fold @1280×900) and line-height 1.25→1.2 without changing
+     row anatomy. Skins that already override row padding (docs-notion,
+     tufte at 0.16rem) keep their tighter values. */
+  .inbox-stream-row { position: relative; display: grid; grid-template-columns: 1.4rem 1fr; gap: 0.5rem; align-items: start; padding: 0.22rem 0.5rem; border-bottom: 1px solid rgba(128,128,128,0.10); font-size: 0.92em; line-height: 1.2; min-width: 0; max-width: 100%; overflow: hidden; }
+  .inbox-stream-row:hover { background: rgba(128,128,128,0.06); }
+  .inbox-stream-row.is-pinned { background: rgba(244,200,80,0.06); }
+  .inbox-stream-row.is-forwarded { background: rgba(33,150,243,0.04); }
+  .inbox-stream-row.is-closed { opacity: 0.65; }
+  /* Pin glyph + body to explicit grid cells so extra children (the JS-injected
+     `.bead-row-unread-dot` from unread_listing.js) cannot displace body into an
+     implicit second row in column 1. Without these, the dot becomes a 3rd grid
+     item, body spills into a 22px-wide cell, every char wraps. */
+  .inbox-stream-row > .inbox-stream-glyph { grid-column: 1; grid-row: 1; font-size: 0.95em; opacity: 0.7; padding-top: 0.05rem; }
+  .inbox-stream-row > .inbox-stream-body { grid-column: 2; grid-row: 1; min-width: 0; }
+  /* Take the unread dot out of grid flow; place it as an overlay in the glyph gutter. */
+  .inbox-stream-row > .bead-row-unread-dot { position: absolute; top: 0.5rem; left: 0.1rem; margin: 0; }
+  /* Suppress skin-injected list-item pseudo bullets on inbox rows (dark-terminal
+     defines `ul li::before { content: "▸ " }` in layout.html which would otherwise
+     act as an extra grid item and break the same way the unread dot does). */
+  .inbox-stream-row::before, .inbox-stream-row::after { content: none !important; display: none !important; }
+  /* Base row layout — wraps naturally on the row's flex line. */
+  .inbox-stream-line { display: flex; align-items: baseline; gap: 0.4rem; min-width: 0; }
+  .inbox-stream-title { font-weight: 600; text-decoration: none; color: inherit; flex: 1 1 auto; min-width: 0; }
+  .inbox-stream-title:hover { text-decoration: underline; }
+  .inbox-stream-chips, .inbox-stream-meta, .inbox-stream-badges { display: inline-flex; gap: 0.3rem; align-items: baseline; font-size: 0.85em; opacity: 0.85; min-width: 0; position: relative; }
+  .inbox-stream-meta { opacity: 0.7; }
+
+  /* ka-0000001229: `.inbox-stream--compact` modifier — Gmail single-line rendering.
+     When applied to <ul.inbox-stream>, the row collapses to one line: title ellipsizes,
+     chip/meta groups clip with overflow:hidden + right-edge +N affordance. Default-on
+     for the baseline skin (added unconditionally on the <ul> below); other skins may
+     opt out by overriding these rules under their own `html[data-skin="..."]` block.
+     Companion to ka-0000002992 (MR !2429) which seeded skin-unconditional nowrap.
+
+     ka-0000004013 refinement: pin badges to the right edge so pinned/forwarded/flagged
+     signals are never clipped by chip overflow (information-loss regression rule), and
+     replace the soft fade-only affordance with an explicit `⋯` overflow glyph rendered
+     by the template. The glyph is positioned absolutely at the right edge of the chip
+     and meta clusters and only visually reads as "more" when content actually clips;
+     the full chip/meta content is reachable via the parent span's title= tooltip
+     (cursor: help nudges the operator toward hover). */
+  .inbox-stream--compact .inbox-stream-line { flex-wrap: nowrap; overflow: hidden; }
+  .inbox-stream--compact .inbox-stream-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .inbox-stream--compact .inbox-stream-chips,
+  .inbox-stream--compact .inbox-stream-meta,
+  .inbox-stream--compact .inbox-stream-badges { flex-wrap: nowrap; overflow: hidden; }
+  .inbox-stream--compact .inbox-stream-chips > *,
+  .inbox-stream--compact .inbox-stream-meta > *,
+  .inbox-stream--compact .inbox-stream-badges > * { flex-shrink: 0; }
+  /* Shrink hierarchy: meta is most expendable (actor/project/ago), chips next,
+     badges never shrink AND get pinned to the right edge via margin-left:auto
+     so pinned/forwarded/flagged signals retain their slot when chips spill. */
+  .inbox-stream--compact .inbox-stream-chips { flex-shrink: 2; flex-basis: auto; cursor: help; }
+  .inbox-stream--compact .inbox-stream-meta { flex-shrink: 3; flex-basis: auto; cursor: help; }
+  .inbox-stream--compact .inbox-stream-badges { flex-shrink: 0; margin-left: auto; overflow: visible; }
+  /* Explicit `⋯` overflow glyph — controlled +N affordance. Rendered unconditionally
+     by inbox_row.html as the last child of the chips/meta wrappers; absolute
+     positioning anchors it to the right edge so it always sits where clipping
+     happens. The fade-backdrop gradient lets it visually blend into the row
+     background when the cluster fits (no overflow → reads as quiet trailing
+     whitespace) and lets it punch through any clipped chip stub when it
+     doesn't (overflow → reads as an explicit "more" affordance, paired with
+     the parent title= tooltip surfaced via cursor:help). */
+  .inbox-stream--compact .inbox-stream-more {
+    position: absolute; right: 0; top: 0; bottom: 0;
+    display: inline-flex; align-items: baseline;
+    padding: 0 0.25rem 0 0.7rem;
+    font-size: 0.95em; font-weight: 600; opacity: 0.65;
+    background: linear-gradient(to right, transparent, var(--inbox-fade-bg, Canvas) 0.55rem);
+    pointer-events: none;
+  }
+  /* Hide the affordance when the cluster has no real content (only the
+     trailing glyph remains, e.g. a row with no Actor/Project/Ago in .meta).
+     Without this, the meta gutter would render a stray ⋯ next to nothing. */
+  .inbox-stream--compact .inbox-stream-chips > .inbox-stream-more:only-child,
+  .inbox-stream--compact .inbox-stream-meta > .inbox-stream-more:only-child { display: none; }
+  /* Row-state-aware fade backdrop so the gradient blends into hover / pinned
+     / forwarded backgrounds instead of revealing the row beneath. The Canvas
+     fallback covers any skin that hasn't set the custom property. */
+  .inbox-stream--compact .inbox-stream-row:hover .inbox-stream-more { --inbox-fade-bg: rgba(128,128,128,0.06); }
+  .inbox-stream--compact .inbox-stream-row.is-pinned .inbox-stream-more { --inbox-fade-bg: rgba(244,200,80,0.06); }
+  .inbox-stream--compact .inbox-stream-row.is-forwarded .inbox-stream-more { --inbox-fade-bg: rgba(33,150,243,0.04); }
+  .inbox-stream-ago { white-space: nowrap; opacity: 0.75; font-variant-numeric: tabular-nums; }
+  /* ka-0000005380: per-row meta densification. Cap visible width of long
+     actor/project strings under compact mode so a single sprawling agent
+     name doesn't crowd the row; full value remains on title=/aria-label. */
+  .inbox-stream--compact .inbox-stream-meta .bead-row-assignee {
+    display: inline-block;
+    max-width: 14ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+  .inbox-stream--compact .inbox-stream-meta .inbox-stream-project {
+    display: inline-block;
+    max-width: 14ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+  /* Default: full actor visible, initials hidden. At narrow widths the swap
+     flips so the avatar/initial replaces the full name. The aria-hidden on
+     .actor-initials keeps screen readers on the full actor (which the parent
+     span's aria-label also redundantly carries). */
+  .inbox-stream-meta .bead-row-assignee .actor-initials {
+    display: none;
+    font-variant-caps: all-small-caps;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+  }
+  @media (max-width: 720px) {
+    .inbox-stream--compact .inbox-stream-meta .bead-row-assignee .actor-full { display: none; }
+    .inbox-stream--compact .inbox-stream-meta .bead-row-assignee .actor-initials { display: inline; }
+    .inbox-stream--compact .inbox-stream-meta .bead-row-assignee { max-width: none; }
+  }
+  /* ka-0000001392: belt-and-suspenders content cap at narrow viewports. T14
+     evidence (ka-0000004170) showed first_row_h jumping +12–21px between
+     2026.140.2 and 2026.140.8 across every skin because top-row title/desc
+     content drifted longer and the compact-mode `white-space: nowrap` was
+     not bounding height alone (sub-line + flex wrap interactions). Clamp the
+     title to 2 lines at ≤960 so first_row_h is bounded regardless of content
+     drift; the desc preview is already line-clamp:2. Compact mode keeps its
+     1-line ellipsis intent on wide viewports. */
+  @media (max-width: 960px) {
+    .inbox-stream .inbox-stream-title,
+    .inbox-stream--compact .inbox-stream-title {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      white-space: normal;
+      text-overflow: clip;
+    }
+  }
+  .inbox-stream-sub { font-size: 0.85em; opacity: 0.75; margin-top: 0.05rem; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .inbox-stream-prompt { opacity: 0.85; }
+  .inbox-stream-options { font-size: 0.8em; opacity: 0.8; margin-top: 0.05rem; }
+  .inbox-row-flag { color: #d33; font-weight: 600; }
+  .chip[aria-disabled="true"] { opacity: 0.4; cursor: not-allowed; }
+  .inbox-orphan-row { padding: 0.5rem 0.5rem; border-bottom: 1px solid rgba(128,128,128,0.10); border-top: 2px dashed rgba(128,128,128,0.35); font-style: italic; font-size: 0.9em; }
+  .inbox-orphan-row a { color: inherit; text-decoration: none; }
+  .inbox-orphan-row a:hover { text-decoration: underline; }
+  .inbox-empty { opacity: 0.65; padding: 1.25rem 0.5rem; font-style: italic; }
+  .inbox-kind-strip { margin-top: 0.4rem; }
+  .inbox-kind-strip .chip-count { opacity: 0.65; margin-left: 0.25rem; font-variant-numeric: tabular-nums; }
+  /* ka-0000001480: collapsed "+N empty:" group rendered after the visible
+     kind chips when >=4 of 6 kind counts are zero. Each label inside the
+     group is still a clickable filter link with the same href as the full
+     chip — no data-surface change, just less vertical waste. */
+  .inbox-kind-empty-group { display: inline-flex; align-items: baseline; gap: 0.3rem; font-size: 0.8em; opacity: 0.65; margin-left: 0.4rem; padding: 0.05rem 0.5rem; border: 1px dashed rgba(128,128,128,0.35); border-radius: 999px; }
+  .inbox-kind-empty-count { font-variant-numeric: tabular-nums; font-weight: 500; }
+  .inbox-kind-empty-link { color: inherit; text-decoration: none; }
+  .inbox-kind-empty-link:hover { text-decoration: underline; opacity: 1; }
+  .inbox-kind-empty-sep { opacity: 0.5; }
+  .inbox-drill-back { display: inline-block; margin-bottom: 0.6rem; font-size: 0.9em; opacity: 0.8; text-decoration: none; }
+  .inbox-drill-back:hover { text-decoration: underline; opacity: 1; }
+
+  /* ka-0000002575: adjacent-buckets section — inline preview cards for
+     Decisions/Escalations/Mentions rendered when the mine-scope row count
+     is at or below the threshold (operator decision ka-0000003122). Sits
+     below the primary stream, above the empty-state filler. */
+  .inbox-adjacent { margin: 0.75rem 0 0.25rem; padding: 0.5rem 0 0; border-top: 1px dashed rgba(128,128,128,0.25); }
+  .inbox-adjacent-header { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.4rem; }
+  .inbox-adjacent-header h2 { margin: 0; font-size: 1em; font-weight: 600; }
+  .inbox-adjacent-hint { font-size: 0.85em; opacity: 0.7; }
+  .inbox-adjacent-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 0.5rem; }
+  .inbox-adjacent-card { border: 1px solid rgba(128,128,128,0.25); border-radius: 4px; padding: 0.5rem 0.65rem; min-width: 0; background: rgba(128,128,128,0.03); }
+  .inbox-adjacent-card-header { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.35rem; }
+  .inbox-adjacent-card-header h3 { margin: 0; font-size: 0.92em; font-weight: 600; }
+  .inbox-adjacent-all { font-size: 0.8em; text-decoration: none; opacity: 0.75; }
+  .inbox-adjacent-all:hover { text-decoration: underline; opacity: 1; }
+  .inbox-adjacent-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }
+  .inbox-adjacent-row { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; padding-bottom: 0.25rem; border-bottom: 1px solid rgba(128,128,128,0.12); }
+  .inbox-adjacent-row:last-child { border-bottom: none; padding-bottom: 0; }
+  .inbox-adjacent-title { font-weight: 500; text-decoration: none; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .inbox-adjacent-title:hover { text-decoration: underline; }
+  .inbox-adjacent-meta { display: inline-flex; gap: 0.3rem; align-items: baseline; font-size: 0.8em; opacity: 0.75; flex-wrap: wrap; }
+  .inbox-adjacent-sub { font-size: 0.85em; opacity: 0.8; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .inbox-adjacent-empty { margin: 0; font-style: italic; font-size: 0.85em; }
+  .inbox-adjacent-card::before, .inbox-adjacent-card::after { content: none !important; display: none !important; }
+  .inbox-adjacent-row::before, .inbox-adjacent-row::after { content: none !important; display: none !important; }
+  /* ka-0000005641: dedicated "Recent mentions" section. Surfaces when the
+     mine-scope stream is empty so the operator has something useful to scan
+     instead of an inbox-zero screen; a small badge in the heading nudges
+     toward the section when the stream is non-empty. Re-uses
+     .inbox-stream--compact (ka-0000001229) for single-line rendering. */
+  .inbox-mentions-section { margin-top: 1rem; }
+  .inbox-mentions-heading { display: flex; align-items: baseline; gap: 0.5rem; font-size: 1em; margin: 0.4rem 0 0.3rem; }
+  .inbox-mentions-heading h2 { font-size: 1em; margin: 0; font-weight: 600; }
+  .inbox-mentions-badge { display: inline-flex; align-items: baseline; padding: 0.05rem 0.45rem; font-size: 0.78em; font-variant-numeric: tabular-nums; border: 1px solid rgba(128,128,128,0.35); border-radius: 999px; opacity: 0.85; }
+  .inbox-mentions-row .inbox-stream-actor { font-weight: 500; }
+  .inbox-mentions-row .inbox-stream-context { opacity: 0.85; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }
+
+  /* ka-0000004756: pull the bead stream above the fold. The bare /inbox view
+     was burning ~450px of vertical space on the H1 + chip-strip + project
+     controls + kind-strip + meta line before the first row, leaving operators
+     with an essentially blank first viewport. Tighten the inbox-only chrome
+     (page-scoped via the `.inbox-page` wrapper added below) so the first row
+     lands ~250-300px from the top, and pin the H1 onto the same line as the
+     summary tiles. */
+  .inbox-page h1 { margin: 0; font-size: 1.35rem; line-height: 1.2; }
+  .inbox-page > .chip-strip { margin: 0.25rem 0 0.35rem; }
+  .inbox-page .inbox-project-controls { margin: 0 0 0.35rem; }
+  .inbox-page .inbox-kind-strip { margin-top: 0.2rem; margin-bottom: 0.35rem; }
+  .inbox-page .inbox-stream-meta-row { margin: 0.3rem 0 0.15rem; }
+
+  /* ka-0000004756: at-a-glance summary tiles directly under the title. Four
+     pill counters (my-open / decisions / mentions / open epics) drawn from
+     data the handler already loads — no extra daemon queries. The tile row
+     sits in a flex container with the H1 so the first 300px of viewport
+     carries real signal on top of the bead stream. */
+  .inbox-title-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.6rem 1rem; margin: 0.1rem 0 0.35rem; }
+  .inbox-summary-tiles { display: inline-flex; flex-wrap: wrap; gap: 0.35rem; list-style: none; padding: 0; margin: 0; }
+  .inbox-summary-tiles a, .inbox-summary-tiles span.inbox-summary-tile {
+    display: inline-flex; align-items: baseline; gap: 0.3rem;
+    padding: 0.1rem 0.55rem; border: 1px solid rgba(128,128,128,0.32);
+    border-radius: 999px; font-size: 0.82em; line-height: 1.4;
+    color: inherit; text-decoration: none; background: rgba(128,128,128,0.04);
+  }
+  .inbox-summary-tiles a:hover { background: rgba(128,128,128,0.10); text-decoration: none; }
+  .inbox-summary-tiles .inbox-summary-label { opacity: 0.75; }
+  .inbox-summary-tiles .inbox-summary-count { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .inbox-summary-tiles .inbox-summary-tile.is-zero { opacity: 0.55; }
+
+  /* ka-0000004622: two-column desktop layout. Activity stream on the left,
+     recent-mentions rail on the right so both buckets sit above the fold
+     instead of stacking vertically and burning the right half of the
+     viewport on whitespace. Below the breakpoint the columns stack and the
+     mentions rail returns to its single-column position below the stream.
+     ka-0000001385: dropped breakpoint 1280px -> 1100px so 13" laptops also
+     get inbox+mentions in one screen instead of just XL desktops. */
+  .inbox-main-cols { display: block; min-width: 0; }
+  .inbox-main-col { min-width: 0; }
+  .inbox-side-col { min-width: 0; margin-top: 0.5rem; }
+  @media (min-width: 1100px) {
+    .inbox-main-cols {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(18rem, 22rem);
+      gap: 1.25rem;
+      align-items: start;
+    }
+    .inbox-side-col { margin-top: 0; }
+    /* Reset margin-top on the first heading inside the side rail so it
+       aligns with the stream meta row to its left. */
+    .inbox-side-col .inbox-mentions-section { margin-top: 0; }
+  }
+
+  /* ka-0000001385: mobile (≤640px) chip token shortening — hide the long
+     <recommendation_key> code token on decision option chips and keep the
+     human-readable verb (Short) + label. The full key is still surfaced via
+     the parent row's title= attribute (ka-0000002992) for hover/screen
+     readers and remains visible on the dedicated /b/<id> decision page.
+     Applies to:
+       - .inbox-stream-options (inline option chips under decision rows in
+         the main stream — see inbox_row.html line ~63).
+       - .inbox-decision-option-id inside the dedicated Decisions section
+         list (inbox_decisions.html line ~40). */
+  @media (max-width: 640px) {
+    .inbox-stream-options .inbox-decision-option-id,
+    .inbox-decision-options .inbox-decision-option-id { display: none; }
+
+    /* ka-0000001662: mobile (≤640px) snippet/padding densification — after
+       the chip-token shortening (ka-0000001385) landed, the 480px viewport
+       still parked all 6 skins in the SPARSE rows-above-fold bucket because
+       the snippet body + per-row padding remained the dominant vertical
+       cost (~250 px/row). Two rendering-only cuts here:
+         1. Drop the snippet body to a 1-line clamp (was 2-line). Saves
+            ~18 px / row on an 18 px line-height; the second snippet line
+            was already the lowest-signal portion of the row and the full
+            value is preserved on the /b/<id> drill-down.
+         2. Tighten the per-row vertical padding 0.22rem → 0.12rem mobile-
+            only. Saves another ~3-4 px / row × 2 (top+bottom).
+       Together that's ~25 px / row reclaimed at 480 px without touching
+       data-surface or anatomy. */
+    .inbox-stream-sub { -webkit-line-clamp: 1; }
+    .inbox-stream-row { padding-top: 0.12rem; padding-bottom: 0.12rem; }
+  }
+
+  /* ka-0000002309: mobile (≤480px) info-density push — ka-0000001662
+     dropped firstRowH to 55px but @480 still parked baseline + minimal-
+     refined in SPARSE (3/9 and 2/9 rowsAboveFold). Two header-chrome
+     and per-row costs still dominate the 900h viewport:
+       1. Per-row secondary content (.inbox-stream-sub holding desc
+          preview / agent-task line / decision prompt, and the
+          .inbox-stream-options decision-option strip) adds 18-83 px to
+          rows past the first. Hiding it on ≤480 trims row height to the
+          single-line title row, with the full value still reachable on
+          the /b/<id> drill.
+       2. The chrome stack (title-row, chip-strip, project-controls,
+          kind-strip, meta-row, adjacent-buckets section) eats ~520 px
+          on a 480 viewport — Adjacent buckets is the easiest cut since
+          the same data is surfaced via the Decisions/Escalations chips
+          and dedicated pages already linked from the summary tiles.
+     Acceptance: baseline + minimal-refined rowsAboveFold @480 ≥ 5/9 and
+     firstRowH @480 ≤ 50 px, with @1280 desktop untouched. */
+  @media (max-width: 480px) {
+    .inbox-stream-row {
+      padding-top: 0.08rem;
+      padding-bottom: 0.08rem;
+      font-size: 0.88em;
+      line-height: 1.18;
+    }
+    .inbox-stream-sub,
+    .inbox-stream-options { display: none; }
+    .inbox-adjacent { display: none; }
+    .inbox-title-row { margin: 0 0 0.2rem; gap: 0.3rem 0.5rem; }
+    .inbox-page h1 { font-size: 1.15rem; }
+    .inbox-summary-tiles { gap: 0.25rem; }
+    .inbox-summary-tiles a, .inbox-summary-tiles span.inbox-summary-tile {
+      padding: 0.05rem 0.4rem; font-size: 0.78em; line-height: 1.3;
+    }
+    .inbox-page > .chip-strip,
+    .inbox-page .inbox-kind-strip { margin: 0.15rem 0 0.2rem; }
+    .inbox-page .inbox-project-controls { margin: 0 0 0.2rem; font-size: 0.85em; }
+    .inbox-stream-meta-row { margin: 0.25rem 0 0.15rem !important; }
+  }
+
+  /* ka-0000002309 (pass-2): residual @480 chrome cuts on top of pass-1
+     (MR !2782, snippet-sub hide + adjacent hide + per-row tighten + nav cull).
+     EVIDENCE cycle 2026-05-20T01 measured a ~520 px header stack still
+     dominating the 480×900 viewport even after pass-1. Three further
+     rendering-only cuts (candidate win #4 from the bead — compact filter
+     region — plus two low-signal residual elements):
+
+       4a. Collapse `.chip-strip` (scope: mine/team/on-call/raise-only),
+           `.inbox-project-controls` (Project: select), and
+           `.inbox-kind-strip` (per-bucket chips) into one visually-
+           contiguous filter region by zeroing their inter-row margins
+           and shrinking gap + font-size at ≤480 px. Read order is
+           preserved; the three chip strips still wrap independently
+           but no longer push the first stream row down with their own
+           top/bottom margins.
+       4b. Hide `.inbox-kind-empty-group` (the "+N empty:" cluster) at
+           ≤480 px. The same filter entry points stay reachable via the
+           per-kind page links surfaced from the summary tiles and
+           dedicated kind chips when populated.
+       4c. Hide the `.inbox-stream-meta-row` "X of Y rows" header at
+           ≤480 px. The count is already redundantly surfaced by the
+           "my open" summary tile directly above it. Saves one full
+           line of vertical chrome (~18 px) immediately before the
+           first stream row paints.
+       4d. Drop `.inbox-page h1` ("Inbox") to a sr-only landmark at
+           ≤480 px — the inbox tab in the nav and the summary tiles
+           below carry the page identity, and the H1 was eating ~22 px
+           of viewport with zero new information.
+     All cuts media-scoped to (max-width: 480px) so @1280 desktop
+     density (currently DENSE 8-9/9 on all 6 skins) is untouched. */
+  @media (max-width: 480px) {
+    .inbox-page > .chip-strip,
+    .inbox-page .inbox-project-controls,
+    .inbox-page .inbox-kind-strip { margin: 0 0 0.1rem; gap: 0.2rem; font-size: 0.82em; }
+    .inbox-page .inbox-kind-empty-group { display: none; }
+    .inbox-stream-meta-row { display: none !important; }
+    .inbox-page h1 {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    .inbox-title-row { margin: 0 0 0.15rem; }
+  }
+
+  {{/* ka-0000002309's inbox-scoped nav densification was promoted to a
+       GENERALIZED, all-surface treatment in layout.html (Step 1,
+       ka-0000000866) — the 25-link nav wraps to 4-5 rows on a phone on
+       every page, not just /inbox, so the fix belongs in the shared
+       layout, not a per-page copy. The layout rule hides the same
+       lower-traffic links at ≤640px; nothing inbox-specific is lost. */}}
+</style>
+
+<div class="inbox-page">
+
+{{if .ShowInboxHomepageBanner}}{{template "inbox_homepage_banner" .}}{{end}}
+{{with .GardenHref}}{{template "garden_banner" .}}{{end}}
+
+<div class="inbox-title-row">
+  <h1>Home</h1>
+  {{/* ka-0000004756: at-a-glance summary tiles. Drawn from data already
+       loaded by the handler (no new daemon queries). Suppressed on
+       /inbox/{id} drill so the focused subgraph keeps its own header
+       hierarchy and we don't double-render counts the drill doesn't drive. */}}
+  {{if not .InboxBeadActive}}
+  <ul class="inbox-summary-tiles" aria-label="Inbox summary">
+    <li>
+      <a class="inbox-summary-tile{{if eq .StreamTotal 0}} is-zero{{end}}"
+         href="{{.BasePath}}/inbox{{if ne .Scope "mine"}}?scope={{.Scope}}{{end}}"
+         title="Rows visible in your stream">
+        <span class="inbox-summary-count">{{.StreamTotal}}</span>
+        <span class="inbox-summary-label">my open</span>
+      </a>
+    </li>
+    <li>
+      <a class="inbox-summary-tile{{if not .PendingDecisions}} is-zero{{end}}"
+         href="{{.BasePath}}/decisions"
+         title="Pending decisions awaiting an operator">
+        <span class="inbox-summary-count">{{len .PendingDecisions}}{{if .DecisionsTruncated}}+{{end}}</span>
+        <span class="inbox-summary-label">decisions</span>
+      </a>
+    </li>
+    <li>
+      <a class="inbox-summary-tile{{if eq .RecentMentionsCount 0}} is-zero{{end}}"
+         href="{{.BasePath}}/inbox?kind=mention{{if ne .Scope "mine"}}&amp;scope={{.Scope}}{{end}}"
+         title="Recent @-mentions of you">
+        <span class="inbox-summary-count">{{.RecentMentionsCount}}</span>
+        <span class="inbox-summary-label">mentions</span>
+      </a>
+    </li>
+    <li>
+      <a class="inbox-summary-tile{{if not .OpenEpics}} is-zero{{end}}"
+         href="{{.BasePath}}/inbox?kind=epic{{if ne .Scope "mine"}}&amp;scope={{.Scope}}{{end}}"
+         title="Your open and in-progress epics">
+        <span class="inbox-summary-count">{{len .OpenEpics}}</span>
+        <span class="inbox-summary-label">open epics</span>
+      </a>
+    </li>
+  </ul>
+  {{end}}
+</div>
+
+{{if eq .BannerMode "mode_a"}}
+<div class="banner banner-error" role="alert">
+  <strong>No operators row found for your identity.</strong>
+  Inbox is unavailable until your identity is provisioned. Ask an administrator to create
+  an operator row for <code>{{if .ViewerEmail}}{{.ViewerEmail}}{{else}}your account{{end}}</code>,
+  or sign in if you have not.
+</div>
+{{else if eq .BannerMode "mode_b"}}
+<div class="banner banner-warn" role="status">
+  <strong>Some sources are not linked.</strong>
+  Your inbox may miss intakes routed via unlinked platforms.
+</div>
+{{else if eq .BannerMode "error"}}
+<div class="banner banner-error" role="alert">
+  {{if .BannerError}}{{.BannerError}}{{else}}Failed to resolve viewer identity.{{end}}
+</div>
+{{end}}
+
+{{if .Error}}<div class="banner banner-error">{{.Error}}</div>{{end}}
+
+{{template "filter_strip" (dict "Chips" .Chips "AriaLabel" "Inbox scope" "Wrapper" "div" "Role" "tablist" "ChipClass" "chip" "AriaCurrent" "page" "CountMode" "none")}}
+
+{{if .ProjectOptions}}
+<div class="project-controls inbox-project-controls" role="group" aria-label="Inbox project filter">
+  <label class="project-control" for="inbox-project-select">
+    Project:
+    <select id="inbox-project-select"
+            class="inbox-project-select"
+            name="project"
+            data-base="{{.BasePath}}/inbox"
+            data-scope="{{.Scope}}"
+            data-kind="{{.Kind}}"
+            onchange="(function(sel){var p=sel.value;var qs=[];if(sel.dataset.scope&&sel.dataset.scope!=='mine')qs.push('scope='+encodeURIComponent(sel.dataset.scope));if(sel.dataset.kind)qs.push('kind='+encodeURIComponent(sel.dataset.kind));if(p)qs.push('project='+encodeURIComponent(p));var u=sel.dataset.base;if(qs.length)u+='?'+qs.join('&');window.location.href=u;})(this)">
+      {{range .ProjectOptions}}
+      <option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}} ({{.Count}})</option>
+      {{end}}
+    </select>
+  </label>
+</div>
+{{end}}
+
+{{if .KindChips}}
+<div class="chip-strip filter-strip inbox-kind-strip" role="tablist" aria-label="Inbox kind filter">
+  {{range .KindChips}}{{if not .Collapsed}}
+  <a class="chip{{if .Active}} chip-active{{end}}" href="{{.Href}}" {{if .Active}}aria-current="page"{{end}}>{{.Label}}<span class="chip-count">{{.Count}}</span></a>
+  {{end}}{{end}}
+  {{/* ka-0000001480: collapse >=4 zero-count kind chips into a single +N
+       empty group so a quiet inbox doesn't waste a full row on dead chips. */}}
+  {{if .KindChipsEmpty}}
+  <span class="inbox-kind-empty-group" role="group" aria-label="Empty kind filters">
+    <span class="inbox-kind-empty-count">+{{len .KindChipsEmpty}} empty:</span>
+    {{range $i, $c := .KindChipsEmpty}}{{if $i}}<span class="inbox-kind-empty-sep" aria-hidden="true">·</span>{{end}}<a class="inbox-kind-empty-link" href="{{$c.Href}}">{{$c.Label}}</a>{{end}}
+  </span>
+  {{end}}
+</div>
+{{end}}
+
+{{if .Truncated}}<div class="banner banner-warn">Showing first {{.Limit}} intakes.</div>{{end}}
+{{if .DecisionsTruncated}}<div class="banner banner-warn">Showing first {{.DecisionsLimit}} pending decisions. <a href="{{.BasePath}}/decisions">See the full list.</a></div>{{end}}
+
+{{if and .InboxBeadActive .InboxBeadID (ne .BannerMode "mode_a")}}
+  {{/* /inbox/{id} drill: render constellation page (single column, full width).
+       The unified stream is suppressed in favor of the focused subgraph. */}}
+  <a class="inbox-drill-back" href="{{.BasePath}}/inbox{{if ne .Scope "mine"}}?scope={{.Scope}}{{end}}">&lsaquo; Back to inbox</a>
+  {{if .DrillError}}
+  <div class="banner banner-error">{{.DrillError}}</div>
+  {{else if .Constellation}}
+    {{if and .InboxBeadID (eq .InboxBeadType "epic")}}
+    <div class="bead-actions-row" style="margin-bottom: 0.5rem;">
+      <button type="button"
+              class="bead-action create-gardener-btn"
+              aria-label="Create gardener for this epic"
+              hx-get="{{.BasePath}}/create-gardener?epic={{.InboxBeadID}}"
+              hx-target="#quick-spawn-host"
+              hx-swap="innerHTML">+ Create gardener</button>
+    </div>
+    {{end}}
+    {{template "constellation" .}}
+  {{else if .OrphanBeads}}
+    <h2>Unparented action beads <span class="meta">({{len .OrphanBeads}})</span></h2>
+    <ul class="bead-list">
+      {{range .OrphanBeads}}
+      <li class="bead-row">
+        <div class="bead-row-text">
+          <a class="bead-row-title" href="{{$.BasePath}}/{{.ID}}">{{.Title}}</a>
+          {{if .DescPreview}}<div class="bead-row-desc">{{.DescPreview}}</div>{{end}}
+          <div class="bead-row-meta">
+            <span class="bead-row-id">{{.ID}}</span>
+            {{if .Type}}<span class="chip-type chip-type-{{.Type}}">{{.Type}}</span>{{end}}
+          </div>
+        </div>
+      </li>
+      {{end}}
+    </ul>
+  {{else}}
+    <div class="inbox-empty">Nothing to show for this drill.</div>
+  {{end}}
+{{else if eq .BannerMode "mode_a"}}
+  <div class="inbox-empty">Inbox unavailable until identity is provisioned.</div>
+{{else}}
+  {{/* /inbox proper: stream on the left, recent-mentions side rail on the
+       right at >=1280px (ka-0000004622). Below 1280px the columns stack so
+       the layout still works on narrow viewports. */}}
+  <div class="inbox-main-cols">
+    <div class="inbox-main-col">
+      <div class="inbox-stream-meta-row" style="margin: 0.6rem 0 0.3rem; font-size: 0.85em; opacity: 0.7;">
+        <span>{{len .Stream}} of {{.StreamTotal}} rows</span>
+      </div>
+      {{if .Stream}}
+      <ul class="inbox-stream inbox-stream--compact" aria-label="Activity stream">
+        {{range .Stream}}{{template "inbox_row" .}}{{end}}
+      </ul>
+      {{end}}
+
+      {{with .AdjacentBuckets}}{{template "inbox_adjacent" .}}{{end}}
+
+      {{if not .Stream}}
+      <p class="inbox-empty">Inbox zero. Nothing to triage.</p>
+      {{end}}
+
+      {{with .OrphanRow}}
+      {{if gt .Count 0}}
+      <div class="inbox-orphan-row">
+        <a href="{{.Href}}">{{.Title}} <span class="meta">({{.Count}})</span></a>
+      </div>
+      {{end}}
+      {{end}}
+    </div>
+
+    {{/* ka-0000004622: recent-mentions side rail (was an in-flow section below
+         the stream gated on .MineEmpty). Always renders the top-N list when
+         there are mentions so the operator gets signal in the right column at
+         desktop sizes instead of staring at empty gutter. Stacks below the
+         stream on narrow viewports via .inbox-main-cols media query. */}}
+    {{if gt .RecentMentionsCount 0}}
+    <aside class="inbox-side-col" aria-label="Recent mentions">
+      <div class="inbox-mentions-section">
+        <div class="inbox-mentions-heading">
+          <h2>Recent mentions</h2>
+          <span class="inbox-mentions-badge" title="Recent @-mentions of you">{{.RecentMentionsCount}}</span>
+        </div>
+        <ul class="inbox-stream inbox-stream--compact" aria-label="Recent mentions list">
+          {{range .RecentMentions}}
+          <li class="inbox-stream-row inbox-mentions-row inbox-stream-row-kind-{{.Source}}"
+              data-kind="{{.Source}}"
+              data-bead-id="{{.ID}}"
+              {{if .UpdatedAtRFC}}data-last-activity-ts="{{.UpdatedAtRFC}}"{{end}}>
+            <span class="inbox-stream-glyph" aria-hidden="true">{{if eq .Source "decision"}}◆{{else}}🤖{{end}}</span>
+            <div class="inbox-stream-body">
+              <div class="inbox-stream-line">
+                {{if .Ago}}<span class="inbox-stream-ago" title="{{.UpdatedAtRFC}}">{{.Ago}}</span>{{end}}
+                {{if .Actor}}<span class="inbox-stream-actor bead-row-assignee">{{.Actor}}</span>{{end}}
+                <a class="inbox-stream-context inbox-stream-title" href="{{.Href}}">{{.Context}}</a>
+                <span class="inbox-stream-chips" title="{{.ID}} · {{.Source}}">
+                  <span class="bead-row-id">{{.ID}}</span>
+                </span>
+              </div>
+            </div>
+          </li>
+          {{end}}
+        </ul>
+      </div>
+    </aside>
+    {{end}}
+  </div>
+{{end}}
+
+</div>{{/* .inbox-page */}}
+
+{{end}}

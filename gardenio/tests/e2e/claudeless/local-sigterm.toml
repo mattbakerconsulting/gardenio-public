@@ -1,0 +1,79 @@
+# local-sigterm.toml
+#
+# Claudeless scenario: Local-mode SIGTERM → graceful deregistration
+#
+# The `gb agent start --local` runner must react to SIGTERM (e.g. operator
+# Ctrl-C or supervisor shutdown) by:
+#
+#   1. Forwarding the signal to the child coop/claudeless process
+#   2. Waiting for the child to exit (bounded grace period)
+#   3. Deregistering the agent bead with the kbeads daemon
+#   4. Removing the local registry entry (~/.gardenio/local/<name>.json)
+#
+# This scenario's role is to provide a long-lived claudeless child that the
+# runner can signal. The scenario itself stays in a sleep loop until SIGTERM
+# arrives (or the runner's grace timer fires). On signal it exits 0 so the
+# runner sees a clean shutdown — the "graceful" assertions then run
+# outside claudeless (see test-local-mode.sh in A4).
+#
+# Run via:
+#   gb agent start --local --test-scenario=local-sigterm &
+#   PID=$!
+#   # ... wait for registration, then:
+#   kill -TERM $PID
+#   wait $PID           # runner should exit cleanly
+
+# Local-mode startup prompt for `gb agent start --local` lives in the
+# sidecar local-sigterm.startup-prompt.txt next to this file
+# (claudeless rejects unknown TOML keys).
+
+[claude]
+session_id = "e2e00000-0004-4000-a000-000000000004"
+username = "e2e-local-sigterm"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 30000
+
+# ── Single response: sleep until signalled ────────────────────────
+# The scenario turns into a controlled idle loop. When the runner receives
+# SIGTERM and propagates it, this sleep is interrupted and the Bash
+# wrapper exits — closing the claudeless session cleanly. A trap on TERM
+# writes a marker to a side-channel file the runner can poll to confirm
+# propagation.
+#
+# Markers go to /tmp/local-sigterm-marker (side-channel) rather than
+# stdout because `gb agent start --local` is invoked with stdin redirected
+# from /dev/null in CI. `coop attach` cannot enter raw mode on a non-TTY
+# stdin (tcgetattr fails with ENOTTY), so PTY-rendered Bash tool output
+# never reaches the runner's log. The same side-channel pattern is used
+# by local-yield-close (/tmp/local-yield-decision-id) and
+# local-escalation-roundtrip (/tmp/local-escalation-handled).
+[[responses]]
+on = "*"
+say = "Local agent idling — awaiting SIGTERM for graceful-shutdown check."
+tools = [
+  { call = "Bash", input = { command = """MARKER=/tmp/local-sigterm-marker
+trap 'echo LOCAL_SIGTERM_RECEIVED >> "$MARKER"; exit 0' TERM INT
+echo LOCAL_AGENT_READY > "$MARKER"
+# Bounded max duration so the scenario never wedges CI if the runner
+# forgets to signal. 60s is far longer than any realistic handoff.
+for _ in $(seq 1 60); do
+  sleep 1
+done
+echo LOCAL_SIGTERM_TIMED_OUT >> "$MARKER"
+exit 0""" } }
+]
+
+# ── Fallback ──────────────────────────────────────────────────────
+[default]
+say = "Idle — awaiting signal."
+
+# ── Tool config ───────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

@@ -1,0 +1,118 @@
+# onboarding-add-local-agent.toml
+#
+# Claudeless scenario: a local agent works a poured add-local-agent molecule
+# (gardenio/formulas/onboarding/add-local-agent.json) up to its first gate.
+#
+#   1. the runner, as the person, has closed the sign-in manual gate
+#   2. claim doctor and list-roles, run what each names, close them
+#   3. stop at the pick-role decision gate without touching it
+#
+# Driven by test-onboarding-formulas.sh, which pours the molecule, exports
+# ONBOARD_MOLECULE / ONBOARD_STATE_DIR / ONBOARD_AGENT_STEP, runs
+# `gb agent start --local --test-scenario=onboarding-add-local-agent`, and then
+# checks from the outside which steps this agent closed and that the gate is
+# the molecule's whole ready frontier. Each tool call goes through
+# scripts/onboarding-agent-step.sh, which refuses to claim a gate or a step
+# outside the ready set and records the scenario verdict.
+#
+# The startup prompt and follow-up nudges live in the sidecars
+# onboarding-add-local-agent.startup-prompt.txt and .nudges.txt. claudeless picks
+# the first [[responses]] whose `contains` matches, so every nudge carries
+# exactly one phase keyword.
+
+[claude]
+session_id = "e2e00000-0005-4000-a000-000000000002"
+username = "e2e-onboarding-add-local-agent"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+# ── Startup: find the molecule's ready steps ────────────────────────
+[[responses]]
+on = { contains = "gb ready" }
+say = "Checking the onboarding molecule for ready steps."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" ready'
+
+# ── doctor and list-roles: claim, run, close ────────────────────────
+[[responses]]
+on = { contains = "Claim doctor" }
+say = "Claiming the doctor step."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" claim doctor'
+
+[[responses]]
+on = { contains = "Run doctor" }
+say = "Checking this machine can run a local agent."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '''"$ONBOARD_AGENT_STEP" run doctor "kd --version && gb --version && gb ping && gb agent roster && git rev-parse --show-toplevel && command -v coop"'''
+
+[[responses]]
+on = { contains = "Close doctor" }
+say = "Closing the doctor step."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" close doctor'
+
+[[responses]]
+on = { contains = "Claim list-roles" }
+say = "Claiming the list-roles step."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" claim list-roles'
+
+[[responses]]
+on = { contains = "Run list-roles" }
+say = "Listing the roles."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '''"$ONBOARD_AGENT_STEP" run list-roles "gb role list"'''
+
+[[responses]]
+on = { contains = "Close list-roles" }
+say = "Closing the list-roles step."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" close list-roles'
+
+# ── Gate ────────────────────────────────────────────────────────────
+[[responses]]
+on = { contains = "the gate" }
+say = "Only the pick-role decision is left; that is the person's call."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" gate'
+
+# ── Stop ────────────────────────────────────────────────────────────
+[[responses]]
+on = { contains = "stop" }
+say = "Stopping at the gate."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" verdict; gb stop 2>&1 || true'
+
+# ── Fallback ────────────────────────────────────────────────────────
+[default]
+say = "Onboarding add-local-agent scenario idle. Ready for the next step."
+
+# ── Tool config ─────────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

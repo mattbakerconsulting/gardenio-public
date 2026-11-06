@@ -1,0 +1,49 @@
+{{/*
+Orphaned-Pending-PVC observability ClusterRole + ClusterRoleBinding (ka-0000002737).
+
+Grants the controller SA cluster-wide READ (list) on persistentvolumeclaims and
+pods so the pvcobs collector can classify PVCs stuck Pending for months with no
+consuming pod and publish the gardenio_orphaned_pending_pvcs gauges backing the
+OrphanedPendingPVCs cost-leak alert. The orphans live in FOREIGN namespaces
+(observability/, dolt/) the controller SA cannot otherwise read PVCs in, and the
+pvcgc GC path deliberately sweeps only gardenio-labeled workspace PVCs — so this
+narrow list-only grant is provisioned in lockstep with the collector.
+
+Read-only by design: the collector NEVER deletes (the cost-gardener has survey
+authority, not delete rights), so no create/delete/patch verbs are granted.
+
+Gated behind agents.pvcObs.enabled (requires agents.enabled too). When off,
+neither the RBAC nor the PVC_OBS_INTERVAL env (deployment.yaml) render, so the
+collector never starts and needs no permission.
+*/}}
+{{- if and .Values.agents.enabled .Values.agents.pvcObs.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-pvc-obs
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  # Read-only cluster-wide PVC + pod listing for the orphaned-Pending-PVC
+  # observability gauges. list is sufficient (the collector reads phase, age,
+  # requested storage, and pod volume claim refs from the list); get/watch and
+  # every mutating verb are deliberately omitted to keep the grant minimal.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-pvc-obs
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gardenio.agents.fullname" . }}-pvc-obs
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.agents.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -1,0 +1,762 @@
+{{- /*
+  Stage 3 / W-E-5: unified-host IngressRoute.
+
+  Single host (unifiedHost.host) that fans out by path prefix to every
+  enabled gardenio web surface — beads-viewer (/beads), kbeads HTTP API
+  (/kd), coopmux (/mux), jira-bridge (/jira). Each path is stripped at
+  Traefik before being forwarded to the upstream Service; upstreams are
+  expected to honor a BASE_PATH-equivalent env so generated outbound
+  URLs match the public-facing prefix (already wired by W-E-1..W-E-3).
+
+  Parent epic: ka-0000003384. Plan: gardenio/plans/stage3-ava-cli-eb-rollout.md.
+
+  Per W-E-2 (ka-0000006216) discovery, "/mezmo" is intentionally dropped
+  from the fanout — mezmo widgets are served by beads-viewer under /beads.
+
+  Companion redirect IngressRoutes (rendered when
+  unifiedHost.legacyRedirects.enabled is true) sit at priority 1000 on
+  each app's legacy host so old links 301 to the unified host without
+  touching the existing per-app IngressRoute templates.
+*/}}
+{{- if and (eq (include "gardenio.traefik.ingressRoutesEnabled" .) "true") .Values.unifiedHost .Values.unifiedHost.enabled }}
+{{- if not .Values.unifiedHost.host }}
+{{- fail "unifiedHost.enabled is true but unifiedHost.host is empty: set the unified hostname (e.g. gardenio.example.com) or set unifiedHost.enabled=false." }}
+{{- end }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- $unifiedHost := .Values.unifiedHost.host -}}
+{{- $paths := .Values.unifiedHost.paths | default dict -}}
+
+{{- /* Resolve each per-app participation. An app is included when:
+       - It is .enabled
+       - The corresponding path under unifiedHost.paths is non-empty
+*/ -}}
+{{- $beadsViewerPath := $paths.beads | default "" -}}
+{{- $beadsViewerEnabled := and .Values.beadsViewer.enabled (ne $beadsViewerPath "") -}}
+{{- $kdPath := $paths.kd | default "" -}}
+{{- $kdEnabled := ne $kdPath "" -}}{{- /* beads daemon always present alongside the chart */ -}}
+{{- $muxPath := $paths.mux | default "" -}}
+{{- $muxEnabled := and .Values.coopmux.enabled (ne $muxPath "") -}}
+{{- $natsPath := $paths.nats | default "" -}}
+{{- $natsEnabled := and (ne $natsPath "") .Values.beads.ingress.natsWebsocketRoute.enabled -}}
+{{- $jiraPath := $paths.jira | default "" -}}
+{{- $jiraEnabled := and .Values.jiraBridge.enabled (ne $jiraPath "") -}}
+{{- $grafanaPath := $paths.grafana | default "" -}}
+{{- $grafanaEnabled := and .Values.grafana.enabled (ne $grafanaPath "") -}}
+{{- /* Optional ForwardAuth middleware applied to EVERY unified-host route. */ -}}
+{{- $forwardAuthEnabled := and .Values.unifiedHost.forwardAuth .Values.unifiedHost.forwardAuth.enabled -}}
+{{- $forwardAuthMiddleware := printf "%s-unified-host-forwardauth" $fullname -}}
+{{- /* Beads-ONLY oauth2-proxy forwardauth gate (ka-0000005900). Attaches the
+       interactive-login middleware <fullname>-forwardauth (templates/forwardauth/
+       middleware.yaml — the same gate landing/coopmux/roles ride) to the /beads
+       route alone, so the beads-viewer can run in devAuthBypass mode (pod trusts
+       the edge-stamped X-Auth-Request-Email) without exposing an un-authed route.
+       The middleware only exists when keycloak.enabled && keycloak.forwardAuth
+       .enabled, so gate on both. Independent of the AVA $forwardAuthEnabled above. */ -}}
+{{- $beadsEdgeForwardAuth := and .Values.unifiedHost.beadsForwardAuth .Values.unifiedHost.beadsForwardAuth.enabled .Values.keycloak.enabled .Values.keycloak.forwardAuth.enabled -}}
+{{- /* Fail fast: the beads route cannot carry BOTH the AVA verifier and the
+       oauth2-proxy login gate — they set overlapping X-Auth-Request-* headers
+       from two different verifiers, so stacking them is a config error, not
+       defense-in-depth. Pick one. */ -}}
+{{- if and $forwardAuthEnabled $beadsEdgeForwardAuth -}}
+{{- fail "unifiedHost.forwardAuth.enabled and unifiedHost.beadsForwardAuth.enabled are BOTH true: the /beads route would carry both the AVA verifier and the oauth2-proxy login gate, which set overlapping X-Auth-Request-* headers. Enable exactly one." -}}
+{{- end }}
+{{- /* Fail fast: a beadsForwardAuth request with the middleware absent renders a
+       route referencing a non-existent Middleware — Traefik 500s every /beads
+       request. Surface at install time. */ -}}
+{{- if and .Values.unifiedHost.beadsForwardAuth .Values.unifiedHost.beadsForwardAuth.enabled (not $beadsEdgeForwardAuth) -}}
+{{- fail "unifiedHost.beadsForwardAuth.enabled is true but the oauth2-proxy forwardauth middleware is not rendered: it requires keycloak.enabled AND keycloak.forwardAuth.enabled (that block is what stands up <release>-forwardauth; on the GitLab-flipped edge it points oauth2-proxy at gitlab.com). Enable forwardauth or clear unifiedHost.beadsForwardAuth.enabled." -}}
+{{- end }}
+
+{{- /*
+  viaShim: paths listed in unifiedHost.viaShim route through the
+  gardenio-edge-auth shim's Service (the shim's proxy mode handles AVA
+  verify + HMAC envelope stamping + upstream dispatch internally) instead
+  of going to the app Service directly via forwardauth + strip-prefix.
+
+  Coupled with the proxy.go patch that lets proxyEnabled() return true
+  in AVA-only deployments. The two pieces ship together because the
+  forwardauth path emits X-Auth-Request-* headers that coopmux/kbeads do
+  not consume; only the HMAC envelope (X-Operator + X-Edge-Auth-Sig)
+  satisfies their daemon-side validator (ka-0000001678).
+
+  Background: coopmux returns 401 on every /mux/* request under the
+  current forwardauth wiring because oauth2-proxy-shape headers carry no
+  access-token JWT. Routing /mux through the shim restores the envelope
+  the daemon validates today.
+
+  Routes listed here:
+    - do NOT get the forwardauth middleware (shim handles auth)
+    - do NOT get the strip-prefix middleware (shim handles prefix)
+    - DO get the security-headers middleware (cross-cutting, unrelated)
+
+  Default empty so legacy callers see no behaviour change.
+*/ -}}
+{{- $viaShim := .Values.unifiedHost.viaShim | default list -}}
+{{- /*
+  Per-host opt-out of the legacy 301 redirect. A host listed here keeps
+  serving on its own legacy hostname instead of redirecting to the unified
+  host — used to stage deprecation: flip legacyRedirects.enabled=true for the
+  browser surfaces (beads-viewer, mux) while holding back hosts that have
+  non-browser callers needing migration first. As of the unified cutover:
+    - "kd"   excluded until CI/automation move off the daemon token to the
+             edge-auth shim (cli.gardenio.<env>/kd + GitLab PAT); a 301 of the
+             daemon host to the AVA-gated unified host 303s token callers.
+    - "jira" excluded until Jira's outbound webhook target is repointed; a
+             301 on POST drops the webhook body.
+  Keys: beads (viewer), kd (daemon HTTP API), mux (coopmux), jira (jira-bridge).
+*/}}
+{{- $excludeRedirects := (.Values.unifiedHost.legacyRedirects | default dict).exclude | default list -}}
+{{- $beadsViaShim := has "beads" $viaShim -}}
+{{- $kdViaShim := has "kd" $viaShim -}}
+{{- $muxViaShim := has "mux" $viaShim -}}
+{{- $natsViaShim := has "nats" $viaShim -}}
+{{- $jiraViaShim := has "jira" $viaShim -}}
+{{- $grafanaViaShim := has "grafana" $viaShim -}}
+{{- /*
+  Grafana subpath mode (bug ka-0000001440). When grafana.serveFromSubPath is
+  true, Grafana OWNS the /grafana prefix end-to-end (GF_SERVER_SERVE_FROM_SUB_PATH
+  =true) and expects /grafana/* to arrive INTACT. So the unified-host route must
+  NOT strip the prefix — stripping would feed the pod /api/... while it serves
+  everything under /grafana/..., 404ing every route. When it is false (legacy
+  "proxy strips the prefix" mode), we keep the stripPrefix middleware so the pod,
+  serving at root, sees the prefix removed. This flag flips the strip on/off so
+  the ingress and the deployment's GF_SERVER_SERVE_FROM_SUB_PATH always agree.
+*/ -}}
+{{- $grafanaServeFromSubPath := and .Values.grafana .Values.grafana.serveFromSubPath -}}
+{{- $edgeAuthService := include "gardenio.edgeAuth.fullname" . -}}
+{{- $edgeAuthPort := .Values.edgeAuth.service.port | default 8096 -}}
+{{- /*
+  Explicit router priority for EVERY unified-host per-path route. The
+  landing IngressRoute is a Host(`unifiedHost`) CATCH-ALL pinned at
+  priority 10 with the oauth2-proxy forwardauth middleware. A per-path
+  route whose priority is left unset falls back to Traefik's rule-length
+  ordering, which is NOT guaranteed to outrank that explicit 10 — the
+  shim routes (/kd,/mux) shadow-303'd to oauth2-proxy under exactly this
+  gap (BUG#1, ka-0000004502), and only viaShim routes were bumped then.
+
+  Now every per-path route (/beads,/kd,/mux,/nats,/jira,/grafana) is
+  stamped the same explicit priority so ordering is deterministic-by-
+  design rather than rule-length luck (ka-0000005784). Today the longer
+  Host()&&PathPrefix() rules HAPPEN to beat the Host() catch-all, so
+  these paths already reach edge-auth — but a future longer or higher-
+  priority landing rule would silently shadow the browser surfaces back
+  to oauth2-proxy. This change is defense-in-depth: it makes explicit the
+  routing that already holds at runtime — no per-path route changes which
+  Service or auth middleware it carries, so behaviour is unchanged today.
+  The forwardauth redesign that re-gates the browser surfaces is separate
+  (ka-0000000080).
+
+  The per-path prefixes are mutually exclusive, so an equal priority
+  across them causes no inter-route shadowing. $routePriority (100) sits
+  above landing (10) and below the legacy-redirect routes (1000, which
+  live on the legacy hosts anyway, so they never compete here).
+*/ -}}
+{{- $routePriority := .Values.unifiedHost.routePriority | default 100 -}}
+{{- /*
+  Root ("/") redirect. When unifiedHost.rootRedirect.enabled is true, a
+  Host(`unifiedHost`) && Path(`/`) route redirects the bare root to
+  rootRedirect.target (default: the beads path) so the apex is not a dead-end.
+  Mirrors the coopmux "/" → "/mux" root redirect (templates/coopmux/ingress.yaml).
+  Its priority defaults to $routePriority so it deterministically outranks the
+  landing Host()-catch-all (priority 10). Path(`/`) is more specific than a bare
+  PathPrefix, so it never shadows the per-path fanout routes.
+*/ -}}
+{{- $rootRedirect := .Values.unifiedHost.rootRedirect | default dict -}}
+{{- $rootRedirectEnabled := $rootRedirect.enabled -}}
+{{- $rootRedirectTarget := $rootRedirect.target | default $beadsViewerPath -}}
+{{- $rootRedirectPriority := $rootRedirect.priority | default $routePriority -}}
+{{- if and $rootRedirectEnabled (eq $rootRedirectTarget "") -}}
+{{- fail "unifiedHost.rootRedirect.enabled is true but no redirect target resolved: set unifiedHost.rootRedirect.target (e.g. \"/beads\") or unifiedHost.paths.beads." -}}
+{{- end }}
+{{- /* Fail fast: viaShim implies the shim is deployed. Operators that
+       list a path under viaShim but leave edgeAuth.enabled=false would
+       render IngressRoute rules pointing at a non-existent Service.
+       Surface that at install time, not at first 503. */ -}}
+{{- if and (gt (len $viaShim) 0) (not .Values.edgeAuth.enabled) -}}
+{{- fail "unifiedHost.viaShim is non-empty but edgeAuth.enabled is false — viaShim routes point at the gardenio-edge-auth Service which is only rendered when edgeAuth.enabled=true. Either set edgeAuth.enabled=true or clear unifiedHost.viaShim." -}}
+{{- end }}
+
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-unified-host
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+{{- if $rootRedirectEnabled }}
+    - match: Host(`{{ $unifiedHost }}`) && Path(`/`)
+      kind: Rule
+      priority: {{ $rootRedirectPriority }}
+      services:
+        {{- /* redirectRegex short-circuits with a 30x before the request reaches
+               the Service, so this backing Service is a required placeholder
+               only. Point it at beads-viewer (the redirect's own destination)
+               to keep the reference valid regardless of viaShim wiring. */}}
+        - name: {{ $fullname }}-beads-viewer
+          port: {{ .Values.beadsViewer.service.port | default 8095 }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ $fullname }}-security-headers
+        {{- end }}
+        - name: {{ $fullname }}-unified-host-root-redirect
+{{- end }}
+{{- if $beadsViewerEnabled }}
+    - match: Host(`{{ $unifiedHost }}`) && PathPrefix(`{{ $beadsViewerPath }}`)
+      kind: Rule
+      priority: {{ $routePriority }}
+      services:
+        {{- if $beadsViaShim }}
+        - name: {{ $edgeAuthService }}
+          port: {{ $edgeAuthPort }}
+        {{- else }}
+        - name: {{ $fullname }}-beads-viewer
+          port: {{ .Values.beadsViewer.service.port | default 8095 }}
+        {{- end }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        {{- /* beads-viewer serves server-rendered htmx pages whose hx-on /
+               hx-trigger [filter] / hx-vals='js:' attributes htmx compiles via
+               new Function(); those need script-src 'unsafe-eval'. Use the
+               htmx-eval CSP variant here ONLY (ka-0000006016) — every other
+               unified-host route keeps the strict no-eval -security-headers. */}}
+        - name: {{ $fullname }}-security-headers-htmx-eval
+        {{- end }}
+        {{- if not $beadsViaShim }}
+        {{- if $forwardAuthEnabled }}
+        - name: {{ $forwardAuthMiddleware }}
+        {{- end }}
+        {{- if $beadsEdgeForwardAuth }}
+        {{- /* oauth2-proxy interactive login gate (ka-0000005900): unauthenticated
+               → 302 to the provider (gitlab.com on the flipped edge); authenticated
+               → overwrites X-Auth-Request-* from the verified session, which the
+               devAuthBypass viewer then trusts. Mirrors the standalone legacy-host
+               route (beads-viewer/forwardauth-ingressroute.yaml). */}}
+        - name: {{ $fullname }}-forwardauth
+        {{- if .Values.keycloak.forwardAuth.forceLogoutOn403.enabled }}
+        - name: {{ $fullname }}-forwardauth-errors
+        {{- end }}
+        {{- end }}
+        - name: {{ $fullname }}-unified-host-beads-stripprefix
+        {{- end }}
+{{- end }}
+{{- if $kdEnabled }}
+    - match: Host(`{{ $unifiedHost }}`) && PathPrefix(`{{ $kdPath }}`)
+      kind: Rule
+      priority: {{ $routePriority }}
+      services:
+        {{- if $kdViaShim }}
+        - name: {{ $edgeAuthService }}
+          port: {{ $edgeAuthPort }}
+        {{- else }}
+        - name: {{ include "gardenio.beads.fullname" . }}
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+        {{- end }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ $fullname }}-security-headers
+        {{- end }}
+        {{- if not $kdViaShim }}
+        {{- if $forwardAuthEnabled }}
+        - name: {{ $forwardAuthMiddleware }}
+        {{- end }}
+        - name: {{ $fullname }}-unified-host-kd-stripprefix
+        {{- end }}
+{{- end }}
+{{- if $muxEnabled }}
+    - match: Host(`{{ $unifiedHost }}`) && PathPrefix(`{{ $muxPath }}`)
+      kind: Rule
+      priority: {{ $routePriority }}
+      services:
+        {{- if $muxViaShim }}
+        - name: {{ $edgeAuthService }}
+          port: {{ $edgeAuthPort }}
+        {{- else }}
+        - name: {{ include "gardenio.coopmux.fullname" . }}
+          port: {{ .Values.coopmux.service.port }}
+        {{- end }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ $fullname }}-security-headers
+        {{- end }}
+        {{- if not $muxViaShim }}
+        {{- if $forwardAuthEnabled }}
+        - name: {{ $forwardAuthMiddleware }}
+        {{- end }}
+        - name: {{ $fullname }}-unified-host-mux-stripprefix
+        {{- end }}
+{{- end }}
+{{- if $natsEnabled }}
+{{- $natsFullname := include "gardenio.nats.fullname" . -}}
+{{- $natsWsPort := .Values.beads.ingress.natsWebsocketRoute.servicePort | default 8443 }}
+    - match: Host(`{{ $unifiedHost }}`) && PathPrefix(`{{ $natsPath }}`)
+      kind: Rule
+      priority: {{ $routePriority }}
+      services:
+        {{- if $natsViaShim }}
+        - name: {{ $edgeAuthService }}
+          port: {{ $edgeAuthPort }}
+        {{- else }}
+        - name: {{ $natsFullname }}
+          port: {{ $natsWsPort }}
+        {{- end }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ $fullname }}-security-headers
+        {{- end }}
+        {{- if not $natsViaShim }}
+        {{- if $forwardAuthEnabled }}
+        - name: {{ $forwardAuthMiddleware }}
+        {{- end }}
+        - name: {{ $fullname }}-unified-host-nats-stripprefix
+        {{- end }}
+{{- end }}
+{{- if $jiraEnabled }}
+    - match: Host(`{{ $unifiedHost }}`) && PathPrefix(`{{ $jiraPath }}`)
+      kind: Rule
+      priority: {{ $routePriority }}
+      services:
+        {{- if $jiraViaShim }}
+        - name: {{ $edgeAuthService }}
+          port: {{ $edgeAuthPort }}
+        {{- else }}
+        - name: {{ $fullname }}-jira-bridge
+          port: {{ .Values.jiraBridge.service.port | default 8091 }}
+        {{- end }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        - name: {{ $fullname }}-security-headers
+        {{- end }}
+        {{- if not $jiraViaShim }}
+        {{- if $forwardAuthEnabled }}
+        - name: {{ $forwardAuthMiddleware }}
+        {{- end }}
+        - name: {{ $fullname }}-unified-host-jira-stripprefix
+        {{- end }}
+{{- end }}
+{{- if $grafanaEnabled }}
+    - match: Host(`{{ $unifiedHost }}`) && PathPrefix(`{{ $grafanaPath }}`)
+      kind: Rule
+      priority: {{ $routePriority }}
+      services:
+        {{- if $grafanaViaShim }}
+        - name: {{ $edgeAuthService }}
+          port: {{ $edgeAuthPort }}
+        {{- else }}
+        - name: {{ include "gardenio.grafana.fullname" . }}
+          port: {{ .Values.grafana.service.port | default 3000 }}
+        {{- end }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        {{- if .Values.global.securityHeaders.enabled }}
+        {{- /* Grafana is FRAMED into the beads-viewer dashboard-bead page
+               (same-origin <iframe src="/grafana/d/<uid>?kiosk">, built in
+               beads-viewer dashboard_view.go). The strict `security-headers`
+               middleware emits `X-Frame-Options: DENY` + CSP
+               `frame-ancestors 'none'` at the edge, which refuses ALL framing
+               — re-introducing the operator-reported "refused to connect"
+               (ka-0000001147) even after Grafana itself stopped sending
+               X-Frame-Options (GF_SECURITY_ALLOW_EMBEDDING, ka-0000003842).
+               The edge header was the missed second blocker: the prior fix
+               was "verified" via port-forward, which bypasses Traefik. Use the
+               iframe-allowed variant (SAMEORIGIN + `frame-ancestors 'self'`)
+               so the same-origin embed loads while cross-origin framing stays
+               blocked. (ka-0000006153) */}}
+        - name: {{ $fullname }}-security-headers-iframe
+        {{- end }}
+        {{- if not $grafanaViaShim }}
+        {{- if $forwardAuthEnabled }}
+        - name: {{ $forwardAuthMiddleware }}
+        {{- end }}
+        {{- /* Strip /grafana ONLY in non-subpath mode. With serveFromSubPath
+               on, Grafana owns the prefix and the strip would break it
+               (ka-0000001440). */}}
+        {{- if not $grafanaServeFromSubPath }}
+        - name: {{ $fullname }}-unified-host-grafana-stripprefix
+        {{- end }}
+        {{- end }}
+{{- end }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+
+{{- /* Root ("/") redirect middleware. A redirectRegex that matches the bare
+       root on the unified host and re-issues it at the resolved target path.
+       Anchored on the exact root ("/?" then optional "?query") so it fires ONLY
+       for the bare host — never for the per-path routes, which carry their own
+       longer prefixes — while still redirecting a root hit that trails a query
+       string (e.g. /?utm=...). */ -}}
+{{- if $rootRedirectEnabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-unified-host-root-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  redirectRegex:
+    regex: {{ printf "^https?://%s/?(\\?.*)?$" $unifiedHost | quote }}
+    replacement: {{ printf "https://%s%s" $unifiedHost $rootRedirectTarget | quote }}
+    permanent: {{ $rootRedirect.permanent | default false }}
+{{- end }}
+
+{{- /* Per-path stripPrefix middlewares — one per fanned-out app that
+       is NOT via shim. Shim-routed paths are stripped inside the shim's
+       reverse-proxy (proxyUpstream.Rewrite in cmd/edge-auth/proxy.go) so
+       rendering a Traefik stripPrefix in front would double-strip and
+       send `//foo` to the shim. */ -}}
+{{- if and $beadsViewerEnabled (not $beadsViaShim) }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-unified-host-beads-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $beadsViewerPath }}
+{{- end }}
+{{- if and $kdEnabled (not $kdViaShim) }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-unified-host-kd-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $kdPath }}
+{{- end }}
+{{- if and $muxEnabled (not $muxViaShim) }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-unified-host-mux-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $muxPath }}
+{{- end }}
+{{- if and $natsEnabled (not $natsViaShim) }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-unified-host-nats-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $natsPath }}
+{{- end }}
+{{- if $forwardAuthEnabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $forwardAuthMiddleware }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  forwardAuth:
+    address: {{ .Values.unifiedHost.forwardAuth.address | quote }}
+    {{- /* Direct reference (NOT `| default true`): Helm's `default` treats a
+           boolean false as empty and would force it back to true, silently
+           discarding an operator's `trustForwardHeader: false`. When Traefik is
+           internet-facing with no trusted front proxy, X-Forwarded-* is
+           attacker-controlled and must NOT feed the auth decision — see the
+           identical guard in forwardauth/middleware.yaml (audit F9). The key
+           always ships in values.yaml (default true), so reference it. */}}
+    trustForwardHeader: {{ .Values.unifiedHost.forwardAuth.trustForwardHeader }}
+    authResponseHeaders:
+      {{- range .Values.unifiedHost.forwardAuth.authResponseHeaders }}
+      - {{ . | quote }}
+      {{- end }}
+{{- end }}
+{{- if and $jiraEnabled (not $jiraViaShim) }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-unified-host-jira-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $jiraPath }}
+{{- end }}
+{{- if and $grafanaEnabled (not $grafanaViaShim) (not $grafanaServeFromSubPath) }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-unified-host-grafana-stripprefix
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  stripPrefix:
+    prefixes:
+      - {{ $grafanaPath }}
+{{- end }}
+
+{{- /*
+  Per-app legacy-host redirect IngressRoutes. Priority 1000 so they win
+  against the existing per-app IngressRoute on the same host. Uses a Traefik
+  RedirectRegex middleware (the pattern the retired beads-viewer legacy host
+  once used before it was sunset in ka-0000004107).
+  Each redirect captures the path+query suffix on the legacy host and
+  re-issues it under https://<unifiedHost>/<unifiedPath>${1}. Operators that
+  want both legacy and unified hosts to serve traffic in parallel for the
+  POC window can set unifiedHost.legacyRedirects.enabled=false.
+*/ -}}
+{{- if and .Values.unifiedHost.legacyRedirects .Values.unifiedHost.legacyRedirects.enabled }}
+
+{{- if and $beadsViewerEnabled (not (has "beads" $excludeRedirects)) .Values.beadsViewer.avaIngress .Values.beadsViewer.avaIngress.enabled .Values.beadsViewer.avaIngress.host }}
+{{- $legacyHost := .Values.beadsViewer.avaIngress.host }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-beads-viewer-unified-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+    app.kubernetes.io/gate: redirect-to-unified
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $legacyHost }}`)
+      kind: Rule
+      priority: 1000
+      services:
+        - name: {{ $fullname }}-beads-viewer
+          port: {{ .Values.beadsViewer.service.port | default 8095 }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        - name: {{ $fullname }}-beads-viewer-unified-redirect
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-beads-viewer-unified-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  redirectRegex:
+    regex: {{ printf "^https?://%s(/.*)?$" $legacyHost | quote }}
+    replacement: {{ printf "https://%s%s${1}" $unifiedHost $beadsViewerPath | quote }}
+    permanent: true
+{{- end }}
+
+{{- if and $kdEnabled (not (has "kd" $excludeRedirects)) .Values.beads.ingress.enabled .Values.beads.ingress.host }}
+{{- $legacyHost := .Values.beads.ingress.host }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}-unified-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+    app.kubernetes.io/gate: redirect-to-unified
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $legacyHost }}`)
+      kind: Rule
+      priority: 1000
+      services:
+        - name: {{ include "gardenio.beads.fullname" . }}
+          port: {{ .Values.beads.service.httpPort | default 8080 }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        - name: {{ include "gardenio.beads.fullname" . }}-unified-redirect
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "gardenio.beads.fullname" . }}-unified-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  redirectRegex:
+    regex: {{ printf "^https?://%s(/.*)?$" $legacyHost | quote }}
+    replacement: {{ printf "https://%s%s${1}" $unifiedHost $kdPath | quote }}
+    permanent: true
+{{- end }}
+
+{{- if and $muxEnabled (not (has "mux" $excludeRedirects)) .Values.coopmux.ingress.enabled .Values.coopmux.ingress.host }}
+{{- $legacyHost := .Values.coopmux.ingress.host }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ include "gardenio.coopmux.fullname" . }}-unified-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+    app.kubernetes.io/gate: redirect-to-unified
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $legacyHost }}`)
+      kind: Rule
+      priority: 1000
+      services:
+        - name: {{ include "gardenio.coopmux.fullname" . }}
+          port: {{ .Values.coopmux.service.port }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        - name: {{ include "gardenio.coopmux.fullname" . }}-unified-redirect
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "gardenio.coopmux.fullname" . }}-unified-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  redirectRegex:
+    regex: {{ printf "^https?://%s(/.*)?$" $legacyHost | quote }}
+    replacement: {{ printf "https://%s%s${1}" $unifiedHost $muxPath | quote }}
+    permanent: true
+{{- end }}
+
+{{- if and $jiraEnabled (not (has "jira" $excludeRedirects)) .Values.jiraBridge.webhook.enabled .Values.jiraBridge.webhook.host }}
+{{- $legacyHost := .Values.jiraBridge.webhook.host }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ $fullname }}-jira-bridge-unified-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+    app.kubernetes.io/gate: redirect-to-unified
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`{{ $legacyHost }}`)
+      kind: Rule
+      priority: 1000
+      services:
+        - name: {{ $fullname }}-jira-bridge
+          port: {{ .Values.jiraBridge.service.port | default 8091 }}
+      middlewares:
+        {{- include "gardenio.edgeMiddlewares" . | nindent 8 }}
+        - name: {{ $fullname }}-jira-bridge-unified-redirect
+  {{- if .Values.tls.enabled }}
+  tls:
+    secretName: {{ include "gardenio.tls.secretName" . }}
+    {{- if .Values.tls.optionName }}
+    options:
+      name: {{ .Values.tls.optionName }}
+      namespace: {{ .Release.Namespace }}
+    {{- end }}
+  {{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-jira-bridge-unified-redirect
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: unified-host
+spec:
+  redirectRegex:
+    regex: {{ printf "^https?://%s(/.*)?$" $legacyHost | quote }}
+    replacement: {{ printf "https://%s%s${1}" $unifiedHost $jiraPath | quote }}
+    permanent: true
+{{- end }}
+
+{{- end }}{{- /* end legacyRedirects */ -}}
+{{- end }}{{- /* end traefik.ingressRoutes.enabled && unifiedHost.enabled */ -}}

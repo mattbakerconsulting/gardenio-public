@@ -1,0 +1,182 @@
+{{- if .Values.monitoring.podStateMetrics.enabled }}
+{{- $cfg := .Values.monitoring.podStateMetrics }}
+{{- $name := printf "%s-pod-state-metrics" (include "gardenio.fullname" .) }}
+{{- /* The postgres S3 backup alerts (vmalert gapAlerts.postgresS3Backup,
+       gd-Li0fBnupv2) and the Keycloak role-drift alerts (gapAlerts.keycloakRoleDrift,
+       gd-L2MyfEe9lL) read kube_cronjob_status_last_successful_time, so the
+       exporter also watches cronjobs whenever either CronJob renders. */ -}}
+{{- $resources := $cfg.resourceScope | default (list) }}
+{{- $allowlist := $cfg.metricAllowlist }}
+{{- if or (and .Values.postgres.enabled .Values.postgres.s3Backup.enabled) (include "gardenio.keycloakRuntime.roleDriftProbe.on" .) }}
+{{- $resources = append $resources "cronjobs" | uniq }}
+{{- if $allowlist }}
+{{- $allowlist = append $allowlist "kube_cronjob_status_last_successful_time" | uniq }}
+{{- end }}
+{{- end }}
+{{- if not $resources }}
+{{- fail "monitoring.podStateMetrics.resourceScope is empty and postgres.s3Backup is off: the exporter would watch nothing" }}
+{{- end }}
+{{- $batch := list }}
+{{- range $resources }}{{ if has . (list "cronjobs" "jobs") }}{{ $batch = append $batch . }}{{ end }}{{ end }}
+# Namespace-scoped pod-state exporter (vpa-right-sizing board ka-0000000341).
+#
+# A kube-state-metrics instance restricted to this release's namespace and
+# resourceScope (pods by default, plus cronjobs when postgres.s3Backup is on),
+# emitting the kube_pod_container_* families the VPA
+# right-sizing dashboard and the CrewOOMKilled/CrewMemoryNearLimit guardrails
+# read. prod-gardenio-eks runs NO cluster kube-state-metrics (there is no
+# observability kube-prometheus stack on that cluster — verified 2026-07-19),
+# so these series exist nowhere without this exporter.
+#
+# Scrape path: the dedicated `pod-state-metrics` vmagent job (endpoints SD +
+# honor_labels: true — see vmagent/configmap.yaml). NOT the annotation job:
+# KSM series carry their own namespace/pod labels identifying the SUBJECT pod,
+# which the default job's target relabels would clobber with the exporter's
+# identity. For the same reason the pod deliberately carries NO scrape
+# annotation. No prometheus-operator dependency — fresh prod ships
+# the monitoring.coreos.com CRDs only, with no controller to reconcile a
+# ServiceMonitor.
+#
+# Isolation mirrors the vpa-guardrails recommendationExporter: --namespaces
+# scoping means it can never read product workloads on a shared cluster, and
+# the metric allow-list bounds emission at the source.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pod-state-metrics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pod-state-metrics
+rules:
+  {{- if has "pods" $resources }}
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+  {{- end }}
+  {{- if $batch }}
+  - apiGroups: ["batch"]
+    resources: {{ $batch | toJson }}
+    verbs: ["list", "watch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pod-state-metrics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pod-state-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gardenio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pod-state-metrics
+  template:
+    metadata:
+      labels:
+        {{- include "gardenio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: pod-state-metrics
+    spec:
+      serviceAccountName: {{ $name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if $.Values.global.systemPriorityClass.create }}
+      priorityClassName: {{ $.Values.global.systemPriorityClass.infra.name }}
+      {{- end }}
+      {{- /* Scheduling like every other chart pod (global + per-component).
+             Without these the exporter has no toleration for the tainted
+             gardenio nodes and sits Pending: the 2026.299.2 roll failed on
+             exactly that (Progress deadline exceeded, 2026-10-26 04:54Z). */}}
+      {{- include "gardenio.nodeSelector" (dict "local" $cfg.nodeSelector "global" .Values.global.nodeSelector) | nindent 6 }}
+      {{- include "gardenio.tolerations" (dict "local" $cfg.tolerations "global" .Values.global.tolerations) | nindent 6 }}
+      {{- with $cfg.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: kube-state-metrics
+          image: "{{ $cfg.image.repository }}:{{ $cfg.image.tag }}"
+          imagePullPolicy: {{ $cfg.image.pullPolicy }}
+          args:
+            - "--resources={{ join "," $resources }}"
+            - "--namespaces={{ .Release.Namespace }}"
+            {{- with $allowlist }}
+            - "--metric-allowlist={{ join "," . }}"
+            {{- end }}
+            - "--port=8080"
+            - "--telemetry-port=8081"
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: telemetry
+              containerPort: 8081
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml $cfg.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pod-state-metrics
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "gardenio.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: pod-state-metrics
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+{{- end }}

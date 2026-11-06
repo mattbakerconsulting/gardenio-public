@@ -1,0 +1,125 @@
+{{/*
+ValidatingAdmissionPolicy that constrains the controller SA's fleet-manager
+verbs (namespace create/delete + serviceaccount/role/rolebinding/secret/
+externalsecret create) to namespaces stamped with
+`app.kubernetes.io/managed-by: gardenio-fleet` — the label that
+`gb fleet create` (gardenio/controller/cmd/gb/fleet.go fleetNamespaceLabels)
+applies to every fleet namespace it provisions.
+
+Mitigates F6 from gardenio/docs/audits/namespace-isolation-static.md
+(ka-0000003687). The fleet-manager ClusterRole still grants cluster-wide
+verbs (required because Namespaces are cluster-scoped), but a compromised
+controller pod can no longer delete `kube-system`, create RBAC in arbitrary
+tenants, or read/create secrets outside fleet namespaces — the VAP rejects
+those requests at admission time.
+
+Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA). Operators on
+older clusters can disable via `agents.fleetManager.admissionPolicy.enabled`.
+*/}}
+{{- if and .Values.agents.enabled .Values.agents.fleetManager.enabled .Values.agents.fleetManager.admissionPolicy.enabled }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-fleet-manager
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "DELETE"]
+        resources: ["namespaces"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["serviceaccounts", "secrets"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["roles", "rolebindings"]
+      - apiGroups: ["external-secrets.io"]
+        apiVersions: ["v1beta1"]
+        operations: ["CREATE"]
+        resources: ["externalsecrets"]
+  matchConditions:
+    # Only apply this policy to the controller SA. Other SAs (including the
+    # cluster-admin agent SA, which carries the built-in cluster-admin
+    # binding separately — F8) are unaffected.
+    - name: only-fleet-manager-controller-sa
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:{{ .Release.Namespace }}:{{ include "gardenio.agents.serviceAccountName" . }}'
+    # Exempt CREATE of namespaced resources (SA / Secret / RBAC /
+    # ExternalSecret) inside controller-managed substrate namespaces:
+    #   - the controller's own release namespace (project ExternalSecrets,
+    #     etc.); without this exemption a transient cache wipe leaves
+    #     home-namespace ExternalSecrets unrecoverable because the VAP then
+    #     refuses every recreate. See ka-0000008048.
+    #   - the gVisor freeze/thaw substrate namespace (when configured). The
+    #     secretreconciler mirrors every project/account ExternalSecret into
+    #     this namespace via extraNamespaces so a runsc agent routed to
+    #     gardenio-gvisor finds its credentials pre-synced (ka-0000007922).
+    #     That namespace is created by Helm (gvisor-namespace.yaml), not by
+    #     `gb fleet create`, so it carries managed-by=Helm — without this
+    #     exemption every mirror CREATE 403s (~8-41 denials/cycle of pure
+    #     log-spam), and any runsc-routed agent defers forever on "secret(s)
+    #     not yet synced", i.e. fails to spawn (ka-0000000416).
+    #
+    # Namespace CREATE/DELETE is *not* exempted — those still require the
+    # gardenio-fleet label. Helm owns these substrate namespaces itself, so
+    # the controller never needs to create or delete them.
+    - name: not-controller-home-namespace-create
+      expression: >-
+        request.resource.resource == 'namespaces' ||
+        (request.namespace != '{{ .Release.Namespace }}'
+        {{- if .Values.gvisor.namespace.name }}
+        && request.namespace != '{{ .Values.gvisor.namespace.name }}'
+        {{- end }}
+        )
+  validations:
+    # Namespace CREATE: the new namespace itself must carry the
+    # managed-by=gardenio-fleet label.
+    - expression: >-
+        request.resource.resource != 'namespaces' ||
+        request.operation != 'CREATE' ||
+        (has(object.metadata.labels) &&
+         'app.kubernetes.io/managed-by' in object.metadata.labels &&
+         object.metadata.labels['app.kubernetes.io/managed-by'] == 'gardenio-fleet')
+      message: >-
+        fleet-manager SA may only create namespaces stamped with
+        app.kubernetes.io/managed-by=gardenio-fleet
+    # Namespace DELETE: the existing namespace must carry the label.
+    # This is the F6 kube-system-deletion guard.
+    - expression: >-
+        request.resource.resource != 'namespaces' ||
+        request.operation != 'DELETE' ||
+        (has(oldObject.metadata.labels) &&
+         'app.kubernetes.io/managed-by' in oldObject.metadata.labels &&
+         oldObject.metadata.labels['app.kubernetes.io/managed-by'] == 'gardenio-fleet')
+      message: >-
+        fleet-manager SA may only delete namespaces stamped with
+        app.kubernetes.io/managed-by=gardenio-fleet
+    # Namespace-scoped resources (SA, Role, RoleBinding, Secret,
+    # ExternalSecret) — the target namespace must carry the label.
+    - expression: >-
+        request.resource.resource == 'namespaces' ||
+        (namespaceObject != null &&
+         has(namespaceObject.metadata.labels) &&
+         'app.kubernetes.io/managed-by' in namespaceObject.metadata.labels &&
+         namespaceObject.metadata.labels['app.kubernetes.io/managed-by'] == 'gardenio-fleet')
+      message: >-
+        fleet-manager SA may only create RBAC/secret resources in namespaces
+        stamped with app.kubernetes.io/managed-by=gardenio-fleet
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-fleet-manager
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "gardenio.agents.fullname" . }}-fleet-manager
+  validationActions: ["Deny"]
+{{- end }}

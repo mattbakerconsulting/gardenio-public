@@ -1,0 +1,177 @@
+{{- if .Values.agents.metrics.prometheusRule.vpaGuardrails.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.vpaGuardrails }}
+{{- $ns := $cfg.namespace | default .Release.Namespace }}
+# PrometheusRule — VPA crew right-sizing guardrails
+# (epic ka-0000005189 "Right-size gardenio crew pods via VPA",
+#  task ka-0000004597 "Guardrails & observability").
+#
+# These alerts are the safety net for the recommendation-only → enforce
+# rollout: they make sure the right-sizing cannot silently start killing agent
+# runs. They evaluate in the SHARED `observability` kube-prometheus Prometheus,
+# where cadvisor + kube-state-metrics series live — gardenio's own in-chart
+# vmsingle scrapes only annotated gardenio pods and carries none of these. That
+# Prometheus discovers PrometheusRule CRs cluster-wide (empty ruleSelector /
+# ruleNamespaceSelector on america-e2e-eks, confirmed against the existing
+# {{ include "gardenio.agents.fullname" . }}-resume-latency rule), so this CR in
+# the {{ .Release.Namespace }} namespace is picked up automatically.
+#
+# Crew (agent) pods are BARE pods (no ownerRef) named `crew-*` and labelled
+# gardenio.io/mode=crew (spike ka-0000006358). cadvisor series do not carry the
+# gardenio.io/* labels (the kube_pod_labels collector is disabled on the cluster
+# KSM), so the crew-pod expressions select on namespace + the `crew-` pod-name
+# prefix — the stable identifier present on every cadvisor/KSM series.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-vpa-guardrails
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.vpa_guardrails
+      interval: 30s
+      rules:
+        - alert: CrewOOMKilled
+          # The HARD GATE: agent-run OOMKill rate must NOT rise under
+          # right-sizing. Any crew container whose last termination was
+          # OOMKilled in the window is a killed agent run — page immediately
+          # (for: 0m). Scoped to namespace + the `crew-` pod prefix so product
+          # pods on the shared cluster never trip it. The `increase(...) > 0`
+          # on the restarts counter requires a *new* OOM in the window, so a
+          # single historical OOM does not page forever.
+          expr: |
+            max by (namespace, pod, container) (
+              kube_pod_container_status_last_terminated_reason{namespace="{{ $ns }}",pod=~"crew-.*",reason="OOMKilled"} == 1
+            )
+            and on (namespace, pod, container)
+            (
+              increase(kube_pod_container_status_restarts_total{namespace="{{ $ns }}",pod=~"crew-.*"}[15m]) > 0
+            )
+          for: 0m
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: agents
+            subsystem: vpa_guardrails
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "crew pod OOMKilled (VPA under-provisioning)"
+            description: |
+              A crew/agent container in {{ $ns }} was OOMKilled — a killed agent
+              run. This is the under-provisioning failure the VPA right-sizing
+              rollout must never cause (epic ka-0000005189 success metric: zero
+              increase in agent-run OOM failures). If this fires after a VPA
+              enforce flip, ROLL BACK per docs/vpa-guardrails.md#rollback (flip
+              updateMode to Off / restore the flat request) before debugging.
+              Offending pods:
+              {{`{{ with printf "kube_pod_container_status_last_terminated_reason{namespace=\"%s\",pod=~\"crew-.*\",reason=\"OOMKilled\"} == 1" "`}}{{ $ns }}{{`" | query }}{{ range . }}  - {{ .Labels.pod }}/{{ .Labels.container }}
+              {{ end }}{{ end }}`}}
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/vpa-guardrails.md#rollback"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: CrewMemoryNearLimit
+          # OOM precursor: a crew container's working set is sustained above
+          # nearLimitFraction of its memory LIMIT. The OOMKiller enforces the
+          # LIMIT (not the request), so under VPA — which shrinks the request —
+          # the limit stays the kill threshold. Gives lead time to widen bounds
+          # before CrewOOMKilled fires. The `> 0` limit guard drops pods with no
+          # memory limit (division would be +Inf).
+          expr: |
+            (
+              container_memory_working_set_bytes{namespace="{{ $ns }}",pod=~"crew-.*",container="agent"}
+              /
+              (kube_pod_container_resource_limits{namespace="{{ $ns }}",pod=~"crew-.*",container="agent",resource="memory"} > 0)
+            ) > {{ $cfg.nearLimitFraction }}
+          for: {{ $cfg.for | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: agents
+            subsystem: vpa_guardrails
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "crew pod memory > {{ $cfg.nearLimitFraction }} of limit (OOM precursor)"
+            description: |
+              A crew/agent container in {{ $ns }} has held working-set memory
+              above {{ $cfg.nearLimitFraction }} of its memory limit for
+              {{ $cfg.for }} — an OOM precursor. Under VPA right-sizing this is
+              the early-warning that the recommended/applied bound is too tight
+              for the live workload. Widen the VPA minAllowed (or the limit)
+              before the run is OOMKilled. Compare recommended vs actual vs
+              request on the "VPA right-sizing" dashboard.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/vpa-guardrails.md#rollback"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: VPARecommenderDown
+          # The recommender Deployment has no ready replica. Recommendations go
+          # stale silently — a recommendation-only rollback signal, and a hard
+          # blocker for any enforce flip. up{} from the recommender
+          # ServiceMonitor; absent() catches the scrape target disappearing
+          # entirely (pod gone), not just up==0.
+          expr: |
+            absent(up{job=~".*vpa-recommender.*",namespace="{{ $ns }}"} == 1)
+          for: {{ $cfg.for | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: agents
+            subsystem: vpa_guardrails
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "vpa-recommender is down (recommendations going stale)"
+            description: |
+              No ready vpa-recommender scrape target in {{ $ns }} for
+              {{ $cfg.for }}. VPA recommendations stop updating silently. In
+              recommendation-only mode this only stales the dashboard; if the
+              updater is enabled, in-place resizes stop and the cluster drifts.
+              Check `kubectl get deploy -n {{ $ns }} vpa-recommender` and the
+              recommender ServiceMonitor. Requires
+              recommenderServiceMonitor.enabled=true to populate the up{} series.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/vpa-guardrails.md#recommender-health"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: VPARecommenderNoRecommendation
+          # The recommender is up but not producing: VPA objects that match live
+          # pods yet carry no recommendation. Distinct from Down — the loop runs
+          # but errs (bad metrics-server, unsupported config). Counts the
+          # recommender's own self-report; gated on there being matching pods so
+          # an env with zero gardenio VPAs does not page.
+          expr: |
+            sum(vpa_recommender_vpa_objects_count{namespace="{{ $ns }}",matches_pods="true",has_recommendation="false"}) > 0
+            and
+            sum(vpa_recommender_vpa_objects_count{namespace="{{ $ns }}",matches_pods="true"}) > 0
+          for: {{ $cfg.for | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: agents
+            subsystem: vpa_guardrails
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "vpa-recommender producing no recommendation for matched VPAs"
+            description: |
+              The recommender is running but {{ $cfg.for }}+ of VPA objects in
+              {{ $ns }} that match live pods carry no recommendation
+              (has_recommendation="false"). The loop is erroring — check the
+              recommender's metrics-server source (vpa_recommender_metric_server_
+              responses) and the recommender logs (--v=4). Recommendations the
+              dashboard and any enforce flip depend on are missing.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/docs/vpa-guardrails.md#recommender-health"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

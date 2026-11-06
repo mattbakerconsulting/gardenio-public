@@ -1,0 +1,444 @@
+{{- if .Values.vmagent.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.vmagent.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.vmagent.labels" . | nindent 4 }}
+data:
+  scrape.yaml: |
+    global:
+      scrape_interval: 30s
+      scrape_timeout: 10s
+      {{- /*
+        external_labels stamp env + cluster on every series before
+        remote_write so the same metric does not alias across
+        prod / gardenio-next / gardenio-e2e on cross-environment dashboards
+        (E2.2, epic ka-0000002391). `env` must match global.env, which the
+        controller also surfaces as GARDENIO_ENV onto its per-account gauges,
+        so scrape-stamped and emitter-stamped series agree. Empty values are
+        omitted so single-env installs stay label-free.
+      */}}
+      {{- if or .Values.global.env .Values.global.cluster }}
+      external_labels:
+        {{- if .Values.global.env }}
+        env: {{ .Values.global.env | quote }}
+        {{- end }}
+        {{- if .Values.global.cluster }}
+        cluster: {{ .Values.global.cluster | quote }}
+        {{- end }}
+      {{- end }}
+    scrape_configs:
+      # Discover pods with prometheus.io/scrape=true annotation.
+      # Gardenio controller, coopmux, and agent pods use this annotation.
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - {{ .Release.Namespace }}
+        relabel_configs:
+          # Only scrape pods with prometheus.io/scrape=true
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # Dedupe multi-port pods to a single scrape target (ka-0000002518).
+          # The `pod` role emits one target per declared containerPort. Agent
+          # pods declare 4 ports (api 8080 / health / metrics 9093 / channel)
+          # and the infra deployments declare 2+, so without this filter every
+          # target on a pod gets its __address__ rewritten below to the single
+          # annotated metrics port, yielding N identical-label targets per pod.
+          # vmagent then logs "skipping duplicate scrape target with identical
+          # labels" and the churn drove the prod OOMKill crashloop. keep_if_equal
+          # (a VictoriaMetrics-native action) keeps only the target whose
+          # declared container port already equals the annotated scrape port —
+          # exactly one per pod. Every pod we scrape declares its annotated port
+          # as a real containerPort, so nothing stops being scraped. Runs before
+          # the __address__ rewrite so it filters on the original SD metadata.
+          - source_labels:
+              - __meta_kubernetes_pod_container_port_number
+              - __meta_kubernetes_pod_annotation_prometheus_io_port
+            action: keep_if_equal
+          # Use custom metrics path if annotated
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          # Use custom port if annotated
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          # Standard metadata labels
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            target_label: component
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_instance]
+            target_label: instance_name
+        # ---------------------------------------------------------------------
+        # PII allow-list backstop (ka-0000007286, W2 §6 defense-in-depth).
+        #
+        # Drop any forbidden, person-identifying label from operator-keyed and
+        # security series before remote_write to vmsingle. metric labels are the
+        # worst place to leak PII (they explode cardinality and persist for the
+        # full retention window — obs-centralization-w2-pii.md §3.6). This is the
+        # scrape-side mirror of the pii-gateway catalog rule and the gb
+        # producer-side sanitiser; none trusts the others to have done its job.
+        #
+        # `labeldrop` removes the label from the series (it does not drop the
+        # sample), so a clean aggregate survives even if an emitter regresses.
+        # Keep the deny-list regex in sync with
+        # gardenio/controller/internal/obspii.ForbiddenOperatorLabels.
+        metric_relabel_configs:
+          # 1. Strip the always-forbidden, person-identifying labels from every
+          #    series. `labeldrop` removes the label (not the sample), so a clean
+          #    aggregate survives even if an emitter regresses and stamps one.
+          #    Keep this regex in sync with obspii.ForbiddenOperatorLabels.
+          - regex: "oidc_email|slack_user_id|display|display_name|raw_url|url|viewer_email|email"
+            action: labeldrop
+          # 2. session_id is legitimate on the per-session push metrics
+          #    (gardenio_session_*) but must never key an operator/security
+          #    counter. If one ever carries it, drop the whole sample — it is a
+          #    cardinality-blowup error condition, not a label to silently keep.
+          - source_labels: [__name__, session_id]
+            separator: ";"
+            regex: "gardenio_(operator_.*|decisions_lifecycle_total|escalations_total|user_request_latency_seconds);.+"
+            action: drop
+      {{- /*
+        Karpenter controller scrape (GAP-2 prereq ka-0000006900, epic
+        ka-0000000770). Cross-namespace endpoints SD against the Karpenter
+        controller in .Values.vmagent.karpenterScrape.namespace so vmsingle
+        carries the karpenter_nodepools_{usage,limit} series the GAP-2
+        AgentPoolMemoryNearLimit alert needs. Disabled by default.
+
+        endpoints (NOT service ClusterIP) role: Karpenter runs 2 HA replicas
+        behind one Service and ONLY the elected leader emits the
+        karpenter_nodepools_* gauges, so a ClusterIP scrape round-robins and
+        the series flap every interval (fatal for a `for:15m` alert).
+        Scraping each Endpoint keeps the leader's series continuously present.
+        Cross-namespace SD needs the ClusterRole in vmagent/rbac.yaml and the
+        vmagent→karpenter egress allowance in networkpolicies.yaml — both
+        gated on the same karpenterScrape.enabled knob.
+      */}}
+      {{- if .Values.vmagent.karpenterScrape.enabled }}
+      {{- $ks := .Values.vmagent.karpenterScrape }}
+      - job_name: karpenter
+        scrape_interval: {{ $ks.scrapeInterval | default "30s" }}
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - {{ $ks.namespace | quote }}
+        relabel_configs:
+          # Keep only the Karpenter controller Endpoints object (its Service
+          # is named after $ks.serviceName; the upstream chart names both the
+          # Service and its Endpoints `karpenter`).
+          - source_labels: [__meta_kubernetes_endpoints_name]
+            action: keep
+            regex: {{ $ks.serviceName | quote }}
+          # Keep only the metrics-port target. The endpoints role emits one
+          # target per (address, port) in the Endpoints subsets, so if the
+          # Karpenter Service ever exposes more than one port (webhook/health
+          # on older builds) each pod yields several targets and only the
+          # metrics one must be scraped. Filter on the scrape __address__ port
+          # suffix rather than a named/number port label: __address__ is always
+          # populated for the endpoints role and its port is the ACTUAL scrape
+          # port, so this needs no dependency on the upstream Service naming its
+          # port and cannot silently drop every target the way concatenating
+          # two SD labels under the default `;` separator would (a bare
+          # `name|number` regex never matches the joined `name;number` string).
+          - source_labels: [__address__]
+            action: keep
+            regex: ".+:{{ $ks.metricsPort }}"
+          # Stamp standard identity labels so the series are attributable.
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - target_label: job
+            replacement: karpenter
+        {{- /*
+          Guard the keep-filter on a NON-EMPTY keepMetrics. Relabel regexes are
+          fully anchored, so an empty list would render `regex: "()"` == `^()$`,
+          which matches only the empty string and a `keep` action then DROPS
+          EVERY karpenter series — a silent zero-series failure. If an operator
+          deliberately empties the list, omit the keep rule entirely (scrape all
+          families) rather than dropping all. The chart default is a populated
+          14-family list, so prod always renders the bounded keep.
+        */}}
+        {{- if $ks.keepMetrics }}
+        metric_relabel_configs:
+          # Karpenter's /metrics is ~45k samples / ~7MB (controller-runtime +
+          # client-go + per-instance-type pricing histograms). Keep ONLY the
+          # capacity-signal families GAP-2 and its symptom fallbacks need
+          # (~1.6% of raw volume, ~700 samples) so vmsingle's 1y retention
+          # does not balloon.
+          - source_labels: [__name__]
+            action: keep
+            regex: "({{ join "|" $ks.keepMetrics }})"
+        {{- end }}
+      {{- end }}
+      {{- /*
+        Kubelet resource-metrics scrape (vpa-right-sizing board ka-0000000341).
+        node SD role against every kubelet's /metrics/resource — the small
+        metrics-server endpoint (container/namespace/pod labels only), NOT the
+        ~10x-larger /metrics/cadvisor — so vmsingle carries
+        container_memory_working_set_bytes for the board's "actual" line.
+        HTTPS + SA bearer token: the kubelet serves :10250 with a self-signed
+        cert (no cluster-CA SAN for node addresses on EKS) and authorizes via
+        Webhook (nodes/metrics subresource — granted by the kubelet-scrape
+        ClusterRole in rbac.yaml, gated on the same knob). The metric_relabel
+        keeps pin the copied series to the configured namespaces (default: this
+        release) and keepMetrics families, so whole-cluster product pods never
+        reach vmsingle. Disabled by default.
+      */}}
+      {{- if .Values.vmagent.kubeletScrape.enabled }}
+      {{- $kls := .Values.vmagent.kubeletScrape }}
+      - job_name: kubelet-resources
+        scheme: https
+        scrape_interval: {{ $kls.scrapeInterval | default "30s" }}
+        tls_config:
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        metrics_path: /metrics/resource
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          # Stamp the node identity; the per-container labels (namespace, pod,
+          # container) come from the kubelet's own series labels.
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+          - target_label: job
+            replacement: kubelet-resources
+        metric_relabel_configs:
+          # 1. Keep ONLY containers in the configured namespaces (default: this
+          #    release's). Node-level series carry no namespace label and fall
+          #    out here too — the board is pod-scoped, so that is intended.
+          - source_labels: [namespace]
+            action: keep
+            regex: "({{ join "|" (default (list .Release.Namespace) $kls.namespaces) }})"
+          {{- /*
+            2. Family allow-list. Same empty-list guard as karpenterScrape
+            keepMetrics: relabel regexes are fully anchored, so an empty list
+            would render `regex: "()"` and a keep action would DROP EVERY
+            series. An operator who empties the list gets an unbounded (but
+            still namespace-scoped) scrape instead.
+          */}}
+          {{- if $kls.keepMetrics }}
+          - source_labels: [__name__]
+            action: keep
+            regex: "({{ join "|" $kls.keepMetrics }})"
+          {{- end }}
+      {{- /*
+        cAdvisor OOM-events scrape (ka-0000004184 — Matt: "detect OOMs and alert
+        in Slack"). The DIRECT agent-OOM signal AgentOOMKilled reads
+        (gardenio_agent_lifecycle_events_total{event="oom_killed"}) is derived
+        from the kubelet's per-CONTAINER reason=OOMKilled status, which the
+        kubelet sets only when the container's PID1 is the OOM victim. Agents run
+        coop as PID1 and claude + workflow fan-out (node/playwright/subagents) as
+        CHILDREN, so a cgroup OOM-kill of a workflow CHILD leaves coop alive → the
+        container is never flagged OOMKilled → oom_killed never increments → no
+        alert (the death is mislabeled stop_gate_*_involuntary). That is the
+        "lots of deaths on workflows" blind spot.
+
+        container_oom_events_total is the cadvisor counter for the cgroup's OWN
+        memory.oom_control/memory.events oom_kill count — it increments for ANY
+        process in the container cgroup the OOM-killer reaps, child or PID1. It
+        also fires under gVisor (runtime_class=runsc): the K8s memory limit is
+        enforced at the HOST pod cgroup, so the host kubelet's cadvisor sees the
+        kill regardless of what the sandbox exposes internally.
+
+        Same node-SD target + RBAC (nodes/metrics) + :10250 egress as
+        kubelet-resources above — this is just the OTHER metrics_path on the same
+        kubelet, so it renders under the SAME kubeletScrape.enabled gate with no
+        new grant. Kept OFF by an inner cadvisorOOM toggle so the extra target is
+        opt-in and the chart stays byte-identical where it is not wanted. The
+        cadvisor endpoint is ~10x larger than /metrics/resource, so the family
+        allow-list keep below pins vmsingle to ONLY container_oom_events_total
+        (namespace-scoped to the agent namespaces) — no id/image cardinality.
+      */}}
+      {{- if $kls.cadvisorOOM.enabled }}
+      - job_name: kubelet-cadvisor-oom
+        scheme: https
+        scrape_interval: {{ $kls.cadvisorOOM.scrapeInterval | default $kls.scrapeInterval | default "30s" }}
+        tls_config:
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        metrics_path: /metrics/cadvisor
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+          - target_label: job
+            replacement: kubelet-cadvisor-oom
+        metric_relabel_configs:
+          # 1. Keep ONLY containers in the configured namespaces (default: the
+          #    kubeletScrape namespaces, else this release's). cadvisor stamps a
+          #    `namespace` label per container; node-level series carry none and
+          #    fall out here — intended, this is a pod-scoped OOM signal.
+          - source_labels: [namespace]
+            action: keep
+            regex: "({{ join "|" (default (default (list .Release.Namespace) $kls.namespaces) $kls.cadvisorOOM.namespaces) }})"
+          # 2. Pin to the single OOM-events family. Anchored keep — the list is
+          #    hard-coded (not operator-emptied) so no empty-regex footgun.
+          - source_labels: [__name__]
+            action: keep
+            regex: "(container_oom_events_total)"
+      {{- end }}
+      {{- end }}
+      {{- /*
+        Pod-state exporter scrape (vpa-right-sizing board ka-0000000341). The
+        monitoring.podStateMetrics KSM pod is ALSO discovered by the annotation
+        job above, but kube-state-metrics emits series whose OWN namespace/pod
+        labels identify the *subject* pod — the default kubernetes-pods job
+        target-relabels namespace/pod to the *exporter* pod, which would
+        clobber them (honor_labels defaults to false). This dedicated job
+        scrapes the exporter Service with honor_labels: true so the subject
+        labels survive, and drops the annotation-job duplicate via the
+        exporter's missing prometheus.io/scrape annotation (the exporter pod is
+        deliberately NOT annotated — this job is its only scraper).
+      */}}
+      {{- if .Values.monitoring.podStateMetrics.enabled }}
+      - job_name: pod-state-metrics
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - {{ .Release.Namespace }}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_endpoints_name]
+            action: keep
+            regex: {{ printf "%s-pod-state-metrics" (include "gardenio.fullname" .) | quote }}
+          # Keep only the metrics port target (8080); the telemetry port (8081)
+          # would otherwise yield a duplicate near-empty target per pod.
+          - source_labels: [__address__]
+            action: keep
+            regex: ".+:8080"
+          - target_label: job
+            replacement: pod-state-metrics
+      {{- end }}
+      {{- /*
+        VPA recommendation-value exporter scrape (vpa-right-sizing board
+        ka-0000000525, follow-up to ka-0000000341). The vpa-guardrails
+        recommendationExporter is a kube-state-metrics Custom-Resource-State
+        pod that emits kube_customresource_vpa_status_recommendation_{target,
+        lowerbound,uncappedtarget} — the ONLY source of the board's
+        "recommended" line. It ships a ServiceMonitor, but this in-chart vmagent
+        runs a STATIC -promscrape.config (no prometheus-operator, no
+        ServiceMonitor discovery — see deployment.yaml), and prod-gardenio-eks
+        has no observability Prometheus to honor that ServiceMonitor, so without
+        this static job the series reach NO scraper. Same shape as the
+        pod-state-metrics job above: endpoints SD + honor_labels so the CRS
+        series keep their OWN namespace/verticalpodautoscaler/container labels
+        (the default kubernetes-pods job would clobber them). The exporter pod
+        carries no prometheus.io/scrape annotation, so this is its only scraper.
+        Gated on the same knobs that render the exporter Deployment.
+      */}}
+      {{- if and .Values.agents.metrics.prometheusRule.vpaGuardrails.enabled .Values.agents.metrics.prometheusRule.vpaGuardrails.recommendationExporter.enabled }}
+      - job_name: vpa-reco-exporter
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - {{ .Release.Namespace }}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_endpoints_name]
+            action: keep
+            regex: {{ printf "%s-vpa-reco-exporter" (include "gardenio.agents.fullname" .) | quote }}
+          # Keep only the metrics port target (8080); the telemetry port (8081)
+          # would otherwise yield a duplicate near-empty target per pod.
+          - source_labels: [__address__]
+            action: keep
+            regex: ".+:8080"
+          - target_label: job
+            replacement: vpa-reco-exporter
+      {{- end }}
+      {{- /*
+        VPA recommender operational-metrics scrape (vpa-right-sizing board
+        ka-0000000525). The recommenderServiceMonitor renders a headless Service
+        selecting the vpa-recommender pods on :8942 plus a ServiceMonitor for
+        vpa_recommender_vpa_objects_count / _aggregate_container_states_count /
+        _execution_latency_seconds. As above, the static vmagent never consumes
+        that ServiceMonitor, so this static endpoints-SD job is what actually
+        puts the series (and the up{job=~".*vpa-recommender.*"} health signal
+        the board's "VPA recommender up" panel + VPARecommenderDown alert read)
+        into vmsingle. namespace is stamped from SD meta because the recommender
+        series carry no subject-namespace label of their own; job is pinned to
+        vpa-recommender so the up{} selector matches deterministically. Gated on
+        the same knobs that render the recommender Service + ServiceMonitor.
+      */}}
+      {{- if and .Values.agents.metrics.prometheusRule.vpaGuardrails.enabled .Values.agents.metrics.prometheusRule.vpaGuardrails.recommenderServiceMonitor.enabled }}
+      - job_name: vpa-recommender
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - {{ .Release.Namespace }}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_endpoints_name]
+            action: keep
+            regex: {{ printf "%s-vpa-recommender-metrics" (include "gardenio.agents.fullname" .) | quote }}
+          # Keep only the :8942 metrics-port target so a multi-port recommender
+          # pod does not yield duplicate near-empty targets.
+          - source_labels: [__address__]
+            action: keep
+            regex: ".+:8942"
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - target_label: job
+            replacement: vpa-recommender
+      {{- end }}
+      {{- /*
+        Off-cluster availability prober (Lands Track B §5.8, gd-rqtbyqCMZJ):
+        the status bucket's public metrics file, one static target. The file
+        carries its own `target` label (the probed surface), so honor_labels.
+      */}}
+      {{- with .Values.vmagent.uptimeProbeScrape }}
+      {{- if .enabled }}
+      {{- if not (hasPrefix "https://" (.url | default "")) }}
+      {{- fail "vmagent.uptimeProbeScrape.url must be the https URL of the status bucket's metrics file (edge-probes output uptime_metrics_url)" }}
+      {{- end }}
+      {{- $u := urlParse .url }}
+      - job_name: uptime-probe
+        scrape_interval: {{ .scrapeInterval | quote }}
+        scheme: https
+        metrics_path: {{ $u.path | quote }}
+        honor_labels: true
+        static_configs:
+          - targets: [{{ $u.host | quote }}]
+            labels:
+              component: uptime-probe
+      {{- end }}
+      {{- end }}
+      {{- /*
+        Extra scrape jobs appended verbatim (default empty). Used to federate an
+        external VictoriaMetrics into the in-chart vmsingle — e.g. the perf VM
+        (epic ka-0000004560). Each job carries its own relabel/write_relabel so
+        per-source cardinality drops and a source label stay with the job.
+      */}}
+      {{- /*
+        Render-time guard (ka-0000000566, follow-up to ka-0000007382). A
+        write_relabel_configs key is valid only under remote_write, never on a
+        scrape_configs entry. Such an entry renders cleanly through helm but
+        crashloops vmagent at boot via its strict parser — exactly the prod
+        CrashLoopBackOff in ka-0000007382. Fail fast at template time instead.
+      */}}
+      {{- range .Values.vmagent.extraScrapeConfigs }}
+      {{- if hasKey . "write_relabel_configs" }}
+      {{- fail "vmagent.extraScrapeConfigs: write_relabel_configs is only valid under remote_write, not on a scrape_configs entry (ka-0000007382)" }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.vmagent.extraScrapeConfigs }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+{{- end }}

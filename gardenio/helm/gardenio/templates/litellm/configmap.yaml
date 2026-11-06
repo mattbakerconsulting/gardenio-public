@@ -1,0 +1,334 @@
+{{- if .Values.litellm.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.litellm.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.litellm.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    model_list:
+      {{- if .Values.litellm.models }}
+      {{- toYaml .Values.litellm.models | nindent 6 }}
+      {{- else }}
+      # Default model definitions matching litellm_aliases.go
+      # OAuth-forwarding models (forward_client_headers_to_llm_api)
+      - model_name: claude-opus-5-5-oauth
+        litellm_params:
+          model: anthropic/claude-opus-5-5
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Opus 5.5 via OAuth token forwarding"
+
+      - model_name: claude-opus-5-oauth
+        litellm_params:
+          model: anthropic/claude-opus-5
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Opus 5 via OAuth token forwarding"
+
+      - model_name: claude-opus-4-8-oauth
+        litellm_params:
+          model: anthropic/claude-opus-4-8
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Opus 4.8 via OAuth token forwarding"
+
+      - model_name: claude-opus-4-7-oauth
+        litellm_params:
+          model: anthropic/claude-opus-4-7
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Opus 4.7 via OAuth token forwarding"
+
+      - model_name: claude-opus-4-6-oauth
+        litellm_params:
+          model: anthropic/claude-opus-4-6
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Opus 4.6 via OAuth token forwarding"
+
+      - model_name: claude-sonnet-4-6-oauth
+        litellm_params:
+          model: anthropic/claude-sonnet-4-6
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Sonnet 4.6 via OAuth token forwarding"
+
+      # Claude Sonnet 5 (claude-sonnet-5). Claude Code >= 2.1.257 resolves its
+      # `sonnet` alias (Agent-tool model:"sonnet", subagents) to this bare id,
+      # and the 2.1.257 Fable consent dialog offers "Switch to Sonnet 5" — so
+      # without this group + the claude-sonnet-5 alias every such request 401s
+      # at the key ACL ("Tried to access claude-sonnet-5"; ka-0000001501,
+      # ka-0000004084). Operator directive 2026-09-02 (Matt): give Sonnet 5 an
+      # alias. claude-sonnet-4-6-oauth stays defined for beads pinning it.
+      - model_name: claude-sonnet-5-oauth
+        litellm_params:
+          model: anthropic/claude-sonnet-5
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Sonnet 5 via OAuth token forwarding"
+
+      # Claude Sonnet 5.5 (claude-sonnet-5-5, launched 2026-09-28; dateless
+      # pinned snapshot, same scheme as claude-opus-5-5 above). Operator
+      # directive (gd-rKWmvwW908, gd-l98jAxY5x3, 2026-10-10 -- initially
+      # mis-verified as non-existent, corrected same day against
+      # platform.claude.com/docs) to register it and make it the fleet
+      # default. claude-sonnet-5-oauth stays defined for beads pinning it.
+      - model_name: claude-sonnet-5-5-oauth
+        litellm_params:
+          model: anthropic/claude-sonnet-5-5
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Sonnet 5.5 via OAuth token forwarding"
+
+      # Claude Fable 5.1 (claude-fable-5-1, launched 2026-09-01). Alias-only
+      # model ID — 1M ctx / 128K out, adaptive thinking always-on. The fleet's
+      # high-intelligence tier: every `fable` selector (Slack --model=fable, the
+      # harness fable-alias pin, fable-pinned role beads) resolves here
+      # (ka-0000002744).
+      - model_name: claude-fable-5-1-oauth
+        litellm_params:
+          model: anthropic/claude-fable-5-1
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Fable 5.1 via OAuth token forwarding"
+
+      # Claude Fable 5 (claude-fable-5, launched 2026-06-09). Alias-only model
+      # ID — 1M ctx / 128K out, thinking always-on. Superseded by fable-5-1 as
+      # the fable tier (ka-0000002744); the group stays defined so the
+      # claude-fable-5 alias (and any bead still pinning it) keeps routing, and
+      # so a rollback is a values flip rather than a chart change.
+      - model_name: claude-fable-5-oauth
+        litellm_params:
+          model: anthropic/claude-fable-5
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Fable 5 via OAuth token forwarding"
+
+      # Pass-through models (direct Anthropic API)
+      - model_name: anthropic/claude-haiku-4-5
+        litellm_params:
+          model: anthropic/claude-haiku-4-5-20251001
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Haiku 4.5 via Anthropic API"
+
+      - model_name: anthropic/claude-haiku-4-5-20251001
+        litellm_params:
+          model: anthropic/claude-haiku-4-5-20251001
+          api_base: https://api.anthropic.com
+        model_info:
+          description: "Claude Haiku 4.5 (dated) via Anthropic API"
+      {{- end }}
+      {{- if .Values.litellm.embedding.enabled }}
+
+      # Bedrock Titan embedding model (ka-0000007591, epic ka-0000000560).
+      # Mirrors the external devops litellm so kbeads semantic-search
+      # embeddings resolve in-cluster. 1024-dim output matches the pgvector
+      # column width (kbeads migration 005_bead_embeddings). Credentials reach
+      # the upstream bedrock:InvokeModel call via the proxy pod's AWS default
+      # credential chain — wired by litellm.embedding.{irsaRoleArn,staticCredsSecret}
+      # (see deployment.yaml + serviceaccount.yaml).
+      - model_name: {{ .Values.litellm.embedding.modelName | quote }}
+        litellm_params:
+          model: bedrock/{{ .Values.litellm.embedding.bedrockModel }}
+          aws_region_name: {{ .Values.litellm.embedding.region | quote }}
+        model_info:
+          mode: embedding
+          description: "AWS Bedrock Titan Text Embeddings V2 (1024-dim)"
+      {{- end }}
+      {{- if .Values.litellm.bedrock.enabled }}
+
+      # Bedrock CHAT model groups (litellm Stage-3, ka-0000002573, epic
+      # ka-0000000560). Mirrors the external devops litellm's bedrock-* groups
+      # so accounts (e.g. litellm-bedrock ka-0000003488) can flip base_url to
+      # the in-cluster proxy with no model rename. Credentials reach the
+      # upstream bedrock:InvokeModel call via the SAME AWS path as the Titan
+      # embedder (litellm.embedding.{irsaRoleArn,staticCredsSecret} — one pod,
+      # one SA/role). PURELY ADDITIVE: gated on litellm.bedrock.enabled.
+      {{- range .Values.litellm.bedrock.models }}
+      - model_name: {{ .modelName | quote }}
+        litellm_params:
+          model: bedrock/{{ .bedrockModel }}
+          aws_region_name: {{ .region | default $.Values.litellm.bedrock.region | quote }}
+        model_info:
+          description: "AWS Bedrock chat model {{ .bedrockModel }}"
+      {{- end }}
+      {{- end }}
+      {{- if .Values.litellm.imageGeneration.enabled }}
+
+      # Bedrock IMAGE-GENERATION model (ka-0000008102, plan ka-0000005980 Phase 5
+      # — optional raster plan-badges). Appends an image model so the in-cluster
+      # proxy can serve POST /v1/images/generations {model: <modelName>} (the
+      # mount 401s today, it has no image model in model_list). mode:
+      # image_generation tells LiteLLM to route to the images endpoint.
+      # Credentials reach the upstream bedrock:InvokeModel call via the SAME AWS
+      # path as the Titan embedder and bedrock-chat groups
+      # (litellm.embedding.{irsaRoleArn,staticCredsSecret} — one pod, one
+      # SA/role). PURELY ADDITIVE: gated on litellm.imageGeneration.enabled.
+      - model_name: {{ .Values.litellm.imageGeneration.modelName | quote }}
+        litellm_params:
+          model: bedrock/{{ .Values.litellm.imageGeneration.bedrockModel }}
+          aws_region_name: {{ .Values.litellm.imageGeneration.region | quote }}
+        model_info:
+          mode: image_generation
+          description: "AWS Bedrock image-generation model {{ .Values.litellm.imageGeneration.bedrockModel }}"
+      {{- end }}
+
+    # model_group_alias MUST live under router_settings — LiteLLM (v1.84.8)
+    # only honors model_group_alias nested under router_settings; a top-level
+    # block is silently ignored (verified live: the master key 400s "Invalid
+    # model name" on a top-level-only alias, and the live router map stays {}).
+    # This is also exactly where the controller's runtime alias-sync reads and
+    # writes (litellm_aliases.go fetch/update via router_settings.model_group_alias),
+    # so the chart's boot-time aliases and the controller's runtime union-merge
+    # compose in ONE namespace rather than a top-level-vs-router_settings split
+    # brain. (ka-0000005911 — relocated from the former top-level placement.)
+    #
+    # Agents never send the bare alias names (the controller bakes
+    # ANTHROPIC_MODEL = the account's literal "-oauth" model-group name), so the
+    # claude-* base set is functionally a no-op for the fleet today; it stays
+    # to mirror litellm_aliases.go (and to make the controller's startup sync a
+    # no-op when already present). The grafana OSS-chat OpenAI->Bedrock aliases
+    # are layered on via litellm.modelGroupAlias in the non-prod overlay
+    # (the RWX-era staging overlay) — see epic ka-0000002011 Phase 0.
+    #
+    # SINGLE SOURCE OF TRUTH (ka-0000003830): the claude-*/glm-5 BASE alias map
+    # below ALWAYS renders. litellm.modelGroupAlias no longer REPLACES it — it is
+    # MERGED on top, so an overlay declares ONLY its env-specific ADDITIONS (e.g.
+    # the grafana gpt-*->Bedrock aliases) instead of re-copying the whole base
+    # map. This removes the former quadruplication of the base map across the
+    # deploy-values overlays + values-inbox.yaml + grafana-assistant-values.yaml
+    # (kept in sync only by drift tests). The controller Go map
+    # (cmd/controller/litellm_aliases.go) and the Slack bridge allowlist
+    # (internal/bridge/bot_mentions_model.go) remain drift-guarded SUBSETS of
+    # this block (TestBridgeAllowlistMatchesAliasMap).
+    router_settings:
+      model_group_alias:
+        # Base model_group_alias (single source of truth) matching
+        # litellm_aliases.go. Overlays MERGE additions on top via
+        # litellm.modelGroupAlias (see the `with` block below).
+        claude-opus-5-5: claude-opus-5-5-oauth
+        claude-opus-5: claude-opus-5-oauth
+        claude-opus-4-8: claude-opus-4-8-oauth
+        claude-opus-4-7: claude-opus-4-7-oauth
+        claude-sonnet-4-6: claude-sonnet-4-6-oauth
+        claude-sonnet-4-6-20250514: claude-sonnet-4-6-oauth
+        claude-sonnet-5: claude-sonnet-5-oauth
+        claude-sonnet-5-5: claude-sonnet-5-5-oauth
+        claude-haiku-4-5: anthropic/claude-haiku-4-5
+        claude-haiku-4-5-20251001: anthropic/claude-haiku-4-5-20251001
+        claude-opus-4-6: claude-opus-4-6-oauth
+        claude-opus-4-6-20260205: claude-opus-4-6-oauth
+        claude-fable-5-1: claude-fable-5-1-oauth
+        claude-fable-5: claude-fable-5-oauth
+        {{- if .Values.litellm.bedrock.enabled }}
+        # GLM 5 selector alias (epic ka-0000002312; Matt decision ka-0000003230).
+        # Maps the Slack `--model=glm` alias-KEY (glm-5, from
+        # bot_mentions_model.go shortModelAliases) and the glm-bedrock account's
+        # model onto the bedrock-glm-5 model group. GUARDED on
+        # litellm.bedrock.enabled because bedrock-glm-5 only exists in model_list
+        # when bedrock chat is on — aliasing to an undefined group 400s the
+        # router "no healthy deployments" (same dangling-target rule as the
+        # fallbacks/modelGroupAlias comments). glm-5 is a subset of the bridge's
+        # selectable targets; the drift guard TestBridgeAllowlistMatchesAliasMap
+        # asserts this key stays in sync with litellm_aliases.go. Now that this
+        # base block ALWAYS renders (rather than being replaced by an overlay's
+        # modelGroupAlias), every bedrock-enabled env gets the glm-5 selector —
+        # fixing the former per-env drift where prod had it but staging/poc did not.
+        glm-5: bedrock-glm-5
+        {{- end }}
+        {{- with .Values.litellm.modelGroupAlias }}
+        # Overlay additions, merged on top of the base map above. Keys here that
+        # collide with a base key override it (last-wins in the rendered YAML).
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      # Router-level fallbacks (ka-0000008144). LiteLLM v1.84.8 maps a 429
+      # rate_limit_error (incl. Anthropic "monthly spend limit") to
+      # RateLimitError, which the generic `fallbacks` chain retries on — and
+      # this path IS reached by the /v1/messages anthropic_messages passthrough
+      # every gardenio agent uses. Default fable/opus-4-8 -> opus-5.5 (the
+      # fleet's default Opus, plan:opus55-release) so a usage-limit 429 on the
+      # fleet-default account model auto-retries on opus-5.5. A pinned opus-5
+      # key that exhausts its own budget also fails over to opus-5.5. Every
+      # group referenced here is always in model_list; set litellm.fallbacks=[]
+      # in an overlay to disable. MUST live under router_settings (like
+      # model_group_alias) — a top-level fallbacks block is silently ignored.
+      {{- with .Values.litellm.fallbacks }}
+      fallbacks:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.litellm.redis.enabled }}
+      # Redis for multi-replica router coordination (H4, ka-0000003463, epic
+      # ka-0000005228). These redis_* keys flip LiteLLM's Router onto a SHARED
+      # backend for rate-limit counters, model cooldowns, and the router cache —
+      # the per-process state that otherwise diverges across replicaCount>=2 (H2,
+      # ka-0000007221). MUST live under router_settings (like model_group_alias /
+      # fallbacks — a top-level block is silently ignored, ka-0000005911). The
+      # AUTH password (when set) is referenced via os.environ so it never lands
+      # in this ConfigMap — the env is injected from litellm.redis.passwordSecret
+      # (deployment.yaml). host defaults to the in-chart Redis Service.
+      redis_host: {{ include "gardenio.litellm.redis.host" . | quote }}
+      redis_port: {{ .Values.litellm.redis.port | default 6379 }}
+      {{- if .Values.litellm.redis.passwordSecret }}
+      redis_password: os.environ/LITELLM_REDIS_PASSWORD
+      {{- end }}
+      {{- end }}
+      {{- with .Values.litellm.extraRouterSettings }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+
+    litellm_settings:
+      drop_params: true
+      {{- if .Values.litellm.forwardClientHeaders }}
+      forward_client_headers_to_llm_api: true
+      {{- end }}
+      {{- $callbacks := list }}
+      {{- if .Values.litellm.thinkingCapture.enabled }}
+      {{- $callbacks = append $callbacks "litellm_thinking_callback.instance" }}
+      {{- end }}
+      {{- if .Values.litellm.cacheTTL.enabled }}
+      {{- $callbacks = append $callbacks "litellm_cache_ttl_callback.instance" }}
+      {{- end }}
+      {{- if $callbacks }}
+      # LiteLLM custom callbacks. Each entry resolves to the `instance` object in
+      # its module, which litellm loads as a file relative to this config dir
+      # (/app) — every module is mounted at /app/<module>.py via subPath
+      # (bug ka-0000004812).
+      #   - litellm_thinking_callback.instance: thinking-capture telepathy
+      #     producer (ka-0000002697).
+      #   - litellm_cache_ttl_callback.instance: 1h prompt-cache TTL upgrade
+      #     (ka-0000003469 / ka-0000004405) — rewrites ephemeral cache_control
+      #     breakpoints to ttl:"1h" on the /v1/messages pre-call hook.
+      callbacks: {{ $callbacks | toJson }}
+      {{- end }}
+      {{- with .Values.litellm.extraSettings }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+
+    general_settings:
+      master_key: os.environ/LITELLM_MASTER_KEY
+      {{- if .Values.postgres.enabled }}
+      database_url: os.environ/DATABASE_URL
+      {{- end }}
+      {{- with .Values.litellm.spendLogsRetention }}
+      {{- if .period }}
+      {{- if hasKey ($.Values.litellm.extraGeneralSettings | default dict) "maximum_spend_logs_retention_period" }}
+      {{- fail "set spend-log retention in litellm.spendLogsRetention or in litellm.extraGeneralSettings, not both" }}
+      {{- end }}
+      # Spend-log retention (gd-oih6JxjJMM): LiteLLM deletes LiteLLM_SpendLogs
+      # rows older than the period, in 1000-row batches, on the cron schedule
+      # when one is set, else every interval.
+      maximum_spend_logs_retention_period: {{ .period | quote }}
+      maximum_spend_logs_retention_interval: {{ .interval | default "1d" | quote }}
+      {{- if .cron }}
+      maximum_spend_logs_cleanup_cron: {{ .cron | quote }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.litellm.extraGeneralSettings }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+{{- end }}

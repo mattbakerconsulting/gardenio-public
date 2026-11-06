@@ -1,0 +1,344 @@
+# gardener-chain-heir-preflight-flip.toml
+#
+# Claudeless scenario (task ka-0000004018, parent ka-0000000958): the ENGINE
+# half of C3 card-graph authoring (merge 38df7ce07) — the chain-heir spawn path
+# TRANSLATES a predecessor's `chain.to.join_parent` / `.branch_decision_key`
+# into the heir gardener's PREFLIGHT, end-to-end against a live daemon + the real
+# trigger-engine.
+#
+# ── The gap this closes ────────────────────────────────────────────────────
+# gardener_successor.spec.js:280 proves join_parent/branch_decision_key PERSIST
+# on chain.to. The unit tests (TestBuildHeirBeadSpec_JoinParent / _BranchDecision
+# in gardener_chain_fanout_test.go) prove the PURE builder flips the preflight
+# against a fakeDaemon. NOTHING drove the LIVE spawn path (gardenerTerminate ->
+# maybeSpawnChainHeir -> CreateBead) and read the flip off a genuinely-minted
+# heir bead. Persistence != behavior: if the translation regresses, the "ship"
+# heir inherits the DEFAULT preflight (">0 open under its own epic") and fires
+# IMMEDIATELY against an unfinished subtree — while the authoring bead still
+# looks correct, because only the field-persistence was ever asserted.
+#
+# ── What would have to break for this to go red ────────────────────────────
+#   * gardener_chain_spawn.go:311-316 — the join_parent flip
+#       (preflightParent=jp; preflightOp="==") stops firing -> the ship heir's
+#       persisted `conditions` reads op=">" / parent=<own epic> and the JOIN
+#       assertions below fail. THIS is the "heir fires immediately against an
+#       unfinished subtree" regression the bead names. NOTE the ship heir's OWN
+#       epic ($SHIP_EPIC) is DISTINCT from its join_parent ($UMBRELLA), so the
+#       parent assertion is non-vacuous: only a real flip yields parent==UMBRELLA.
+#   * gardener_chain_spawn.go:349-358 — branch_decision_key stops authoring a
+#       decision_resolved triggers[] entry -> the BRANCH assertions fail.
+#   * gardenerTerminate no longer calls maybeSpawnChainHeir before CloseBead, or
+#       stopKindIsGoalAchievement drops specific_bead_closed -> NO heir is minted
+#       and every heir assertion fails (0 heirs found).
+#
+# ── Why an engine subprocess, not the fleet engine ─────────────────────────
+# maybeSpawnChainHeir runs from gardenerTerminate, reached only via the stop
+# gate inside evalOne's gardenerPreFireCheck. That gate runs BEFORE the bootstrap
+# guard (triggers.go:2214 vs :2239), so a `specific_bead_closed` stop whose
+# target is already closed terminates the gardener on the FIRST poll — no cron
+# boundary, no ProgressState, no real agent spawn. We drive exactly this with a
+# short-lived `trigger-engine` subprocess pointed at the in-test daemon (the
+# same harness trigger-source-schedule-fires.toml uses), then read the two
+# heirs' persisted `conditions` / `triggers` fields.
+#
+# NOTE: we deliberately do NOT label the predecessor `fixture:e2e:` — that
+# prefix makes LoadTriggers (isE2EFixture) skip the bead, and LoadTriggers is
+# SHARED by our own subprocess, so a fixture label would skip our predecessor
+# and mint nothing. Instead we bound blast radius with a never-firing cron
+# (0 0 1 1 *) + immediate disable/close in cleanup, and we drive it ourselves
+# on a 1s poll so it terminates before any other evaluator matters.
+#
+# ── Fan-out: two heirs, both flips, one run ─────────────────────────────────
+# The predecessor declares a chain.to ARRAY (fan-out, C3 §3.3): a JOIN "ship"
+# heir (join_parent=umbrella, own epic distinct) AND a BRANCH heir
+# (branch_decision_key). One engine run exercises both translations plus the
+# fan-out loop.
+#
+# Skips gracefully when trigger-engine / gb / daemon env are unavailable.
+
+[claude]
+session_id = "e2e00000-000c-4000-a000-00000000000e"
+username = "e2e-gardener-chain-heir-flip"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 120000
+
+[[responses]]
+on = "*"
+say = "Running gardener-chain-heir-preflight-flip: predecessor goal handoff -> live engine mints JOIN + BRANCH heirs -> assert the persisted preflight flip."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: locate or build trigger-engine ─────────────────────
+TE_BIN=""
+if command -v trigger-engine >/dev/null 2>&1; then
+  TE_BIN=$(command -v trigger-engine)
+elif [ -x /usr/local/bin/trigger-engine ]; then
+  TE_BIN=/usr/local/bin/trigger-engine
+elif [ -x /tmp/trigger-engine ]; then
+  TE_BIN=/tmp/trigger-engine
+elif command -v go >/dev/null 2>&1 && [ -d gardenio/controller ]; then
+  echo "Building trigger-engine from source..."
+  ( cd gardenio/controller && CGO_ENABLED=0 go build -o /tmp/trigger-engine ./cmd/trigger-engine/ ) || {
+    echo "SKIP: trigger-engine build failed"; exit 0;
+  }
+  TE_BIN=/tmp/trigger-engine
+else
+  echo "SKIP: trigger-engine binary not found and cannot be built"
+  exit 0
+fi
+echo "trigger-engine: $TE_BIN"
+
+if [ -z "${BEADS_HTTP_URL:-}" ]; then echo "SKIP: BEADS_HTTP_URL not set (must run inside e2e shard)"; exit 0; fi
+if [ -z "${BEADS_TOKEN:-}" ]; then echo "SKIP: BEADS_TOKEN not set"; exit 0; fi
+if ! command -v kd >/dev/null 2>&1; then echo "SKIP: kd not present"; exit 0; fi
+if ! command -v jq >/dev/null 2>&1; then echo "SKIP: jq not present"; exit 0; fi
+
+TAG="e2e-cchf-$$-$(date +%s)"
+echo "tag: $TAG"
+
+# ── Setup ──────────────────────────────────────────────────────────
+# Predecessor's own epic — the DEFAULT preflight parent when no join_parent.
+PRED_EPIC=$(kd create "chain-heir-pred-epic-$TAG" --type=epic \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$PRED_EPIC" ]; then fail "create predecessor epic"; exit 1; fi
+
+# The ship heir's OWN epic — DISTINCT from its join_parent below, so the JOIN
+# parent assertion is non-vacuous (default flip would parent on THIS, the join
+# flip parents on the umbrella).
+SHIP_EPIC=$(kd create "chain-heir-ship-epic-$TAG" --type=epic \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$SHIP_EPIC" ]; then fail "create ship epic"; exit 1; fi
+
+# Umbrella epic the JOIN heir must wait on (the fan-in parent). The whole point
+# of a join is the ship heir waits for {impl-A,impl-B,...} under THIS umbrella,
+# NOT its own epic.
+UMBRELLA=$(kd create "chain-heir-umbrella-$TAG" --type=epic \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$UMBRELLA" ]; then fail "create umbrella epic"; exit 1; fi
+
+# The BRANCH heir wakes on THIS decision's resolution.
+DECISION_KEY="gd-fa3bgn38qk-$TAG"
+
+# Sentinel bead the predecessor's stop watches. Closing it = goal handoff.
+GOAL_BEAD=$(kd create "chain-heir-goal-$TAG" --type=task \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$GOAL_BEAD" ]; then fail "create goal sentinel bead"; exit 1; fi
+echo "pred-epic: $PRED_EPIC  ship-epic: $SHIP_EPIC  umbrella: $UMBRELLA  goal: $GOAL_BEAD"
+
+# Predecessor gardener block: goal-achievement stop on the sentinel bead closing.
+# specific_bead_closed is terminal (stopKindIsTerminal), so it routes to
+# gardenerTerminate -> maybeSpawnChainHeir, NOT resume-or-escalate. run_budget=10
+# with runs_spawned unset (0) keeps the run_budget gate from firing so the
+# pre-fire check reaches the stop gate.
+CAP_BLOB=$(cat <<JSON
+{"terminal_goal":"drive $GOAL_BEAD to closed then hand off","assign_bead":"$PRED_EPIC","run_budget":10,"stop":{"loop_end":{"any":[{"kind":"specific_bead_closed","bead_id":"$GOAL_BEAD"}]}}}
+JSON
+)
+
+# Fan-out chain.to ARRAY: a JOIN "ship" heir + a BRANCH heir.
+#   - ship: epic=$SHIP_EPIC, join_parent=$UMBRELLA
+#       -> preflight MUST flip to op="==", parent=$UMBRELLA (NOT $SHIP_EPIC)
+#   - branch: epic=$PRED_EPIC, branch_decision_key=$DECISION_KEY
+#       -> heir MUST carry a decision_resolved triggers[] keyed on $DECISION_KEY
+# on=goal_satisfied, mode=spawn are the v1 engine-handoff arming values.
+CHAIN_BLOB=$(cat <<JSON
+{"on":"goal_satisfied","mode":"spawn","to":[{"phase":"ship","terminal_goal":"all impls merged","epic":"$SHIP_EPIC","join_parent":"$UMBRELLA"},{"phase":"branch-a","terminal_goal":"branch A shipped","epic":"$PRED_EPIC","branch_decision_key":"$DECISION_KEY"}]}
+JSON
+)
+
+# operated_by is a HUMAN shape (slack:U…): the heir spawn's human-operator gate
+# (warn by default, enforce-safe) allows the handoff, AND the daemon derives the
+# heir's created_by/operated_by from THIS via the engine's X-Operated-By stamp
+# (ctxWithTriggerOperator). We do NOT label it fixture:e2e: (see header note).
+PRED_ID=$(kd create "chain-heir-pred-trig-$TAG" --type=trigger --kind=data \
+  -l "trigger:schedule" -l "role:gardener" -l "gardener-epic:$PRED_EPIC" \
+  -l "e2e:claudeless" -l "e2e-tag:$TAG" -l "project:gardenio" \
+  -f "source=schedule" -f "enabled=true" -f "role=gardener" -f "assign_bead=$PRED_EPIC" \
+  -f "project=gardenio" -f "action=spawn_agent" -f "prompt=chain-heir predecessor" \
+  -f "operated_by=slack:U0OPERATOR1" \
+  -f "cron=0 0 1 1 *" -f "timezone=UTC" \
+  -f "gardener=$CAP_BLOB" -f "chain=$CHAIN_BLOB" --json 2>&1 | jq -r '.id // empty')
+if [ -z "$PRED_ID" ]; then fail "create predecessor gardener trigger"; exit 1; fi
+echo "predecessor: $PRED_ID"
+
+# Track heirs the engine mints so cleanup always reaches them.
+HEIR_IDS=""
+
+cleanup() {
+  if [ -n "${TE_PID:-}" ]; then kill "$TE_PID" 2>/dev/null || true; wait "$TE_PID" 2>/dev/null || true; fi
+  kd update "$PRED_ID" -f "enabled=false" >/dev/null 2>&1 || true
+  kd close "$PRED_ID" >/dev/null 2>&1 || true
+  for h in $HEIR_IDS; do
+    kd update "$h" -f "enabled=false" >/dev/null 2>&1 || true
+    kd close "$h" >/dev/null 2>&1 || true
+  done
+  kd close "$GOAL_BEAD" >/dev/null 2>&1 || true
+  kd close "$UMBRELLA" >/dev/null 2>&1 || true
+  kd close "$SHIP_EPIC" >/dev/null 2>&1 || true
+  kd close "$PRED_EPIC" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ── Drive the goal handoff: close the sentinel BEFORE the engine polls ──────
+# specific_bead_closed matches immediately; the first poll terminates the
+# predecessor and mints the heirs.
+kd close "$GOAL_BEAD" >/dev/null 2>&1 || { fail "close goal sentinel bead"; exit 1; }
+echo "closed goal sentinel $GOAL_BEAD"
+
+# ── Run trigger-engine subprocess (1s poll) ─────────────────────────────────
+TE_LOG=/tmp/trigger-engine-chain-heir-$$.log
+BEADS_HTTP_ADDR="$BEADS_HTTP_URL" \
+  BEADS_DAEMON_TOKEN="$BEADS_TOKEN" \
+  TRIGGER_POLL_INTERVAL=1s \
+  LISTEN_ADDR=":0" \
+  METRICS_LISTEN_ADDR=":0" \
+  LOG_LEVEL=info \
+  "$TE_BIN" >"$TE_LOG" 2>&1 &
+TE_PID=$!
+echo "trigger-engine pid: $TE_PID"
+
+# ── Wait for the predecessor to terminate (proves the stop gate fired) ──────
+DEADLINE=$(( $(date +%s) + 75 ))
+TERMINATED=0
+STATUS=""
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  STATUS=$(kd show "$PRED_ID" --json 2>/dev/null | jq -r '.status // empty')
+  if [ "$STATUS" = "closed" ]; then TERMINATED=1; break; fi
+  if ! kill -0 "$TE_PID" 2>/dev/null; then break; fi
+  sleep 2
+done
+if [ "$TERMINATED" = "1" ]; then
+  pass "predecessor gardener terminated on specific_bead_closed (status=closed)"
+else
+  fail "predecessor did not terminate within 75s" "status=$STATUS"
+  echo "--- trigger-engine log (tail) ---"; tail -40 "$TE_LOG" 2>/dev/null || true
+  exit 1
+fi
+
+# ── Discover the minted heirs ───────────────────────────────────────────────
+# Heirs are type=trigger carrying `succeeds: <PRED_ID>` in their description
+# (composeHeirDescription). We match on that — created_by is server-derived from
+# X-Operated-By (NOT the request's CreatedBy), so we cannot filter by it. Poll
+# briefly: CreateBead runs just before CloseBead, and the terminate we already
+# observed guarantees it ran.
+# --limit 500 defeats the 20-row default page so the two heirs are never
+# stranded on a later page of a busy daemon; the succeeds:<PRED_ID> filter is
+# unique per run so the projection stays exact regardless of other gardeners.
+find_heirs() {
+  kd list --type=trigger --limit 500 --json 2>/dev/null \
+    | jq -c --arg p "$PRED_ID" '[.[] | select((.description // "") | contains("succeeds: " + $p))]' 2>/dev/null
+}
+HDEADLINE=$(( $(date +%s) + 30 ))
+HEIRS="[]"
+CNT=0
+while [ "$(date +%s)" -lt "$HDEADLINE" ]; do
+  HEIRS=$(find_heirs)
+  CNT=$(echo "$HEIRS" | jq 'length' 2>/dev/null || echo 0)
+  if [ "${CNT:-0}" -ge 2 ]; then break; fi
+  sleep 2
+done
+CNT=$(echo "$HEIRS" | jq 'length' 2>/dev/null || echo 0)
+HEIR_IDS=$(echo "$HEIRS" | jq -r '.[].id' 2>/dev/null | tr '\\n' ' ')
+echo "heirs found: $CNT  ids: $HEIR_IDS"
+
+if [ "${CNT:-0}" -ge 2 ]; then
+  pass "fan-out minted 2 heirs (succeeds: $PRED_ID)"
+else
+  fail "fan-out heir count" "found ${CNT:-0}, want 2 — heirs=$HEIRS"
+  echo "--- trigger-engine log (tail) ---"; tail -60 "$TE_LOG" 2>/dev/null || true
+  exit 1
+fi
+
+# Resolve each heir's id from the discovery projection, then RE-FETCH its full
+# body with `kd show <id> --json` — the guaranteed-hydration path the sibling
+# gardener scenarios use (gardener-mode-flip / gardener-resume). We do NOT trust
+# the list projection for the field/label reads below.
+SHIP_ID=$(echo "$HEIRS" | jq -r '[.[] | select((.title // "") | test("ship"))][0].id // empty')
+BRANCH_ID=$(echo "$HEIRS" | jq -r '[.[] | select((.title // "") | test("branch-a"))][0].id // empty')
+
+# ── JOIN heir: preflight flipped to op="==" parent=<umbrella> ───────────────
+# THE assertion the bead is buying: the ship heir waits for the umbrella subtree
+# to DRAIN, not its own epic. A regression reads op=">" / parent=$SHIP_EPIC and
+# the heir would fire immediately against unfinished work.
+SHIP_COND=""
+if [ -z "$SHIP_ID" ]; then
+  fail "locate JOIN (ship) heir by phase-derived title" "heirs=$HEIRS"
+else
+  SHIP_JSON=$(kd show "$SHIP_ID" --json 2>/dev/null)
+  SHIP_COND=$(echo "$SHIP_JSON" | jq -r '.fields.conditions // empty')
+  SHIP_OP=$(echo "$SHIP_COND" | jq -r '.[0].op // empty' 2>/dev/null)
+  SHIP_PARENT=$(echo "$SHIP_COND" | jq -r '.[0].parent // empty' 2>/dev/null)
+  if [ "$SHIP_OP" = "==" ]; then
+    pass "JOIN heir preflight op flipped to == (default is >)"
+  else
+    fail "JOIN heir preflight op" "got op=[$SHIP_OP], want == ; conditions=$SHIP_COND"
+  fi
+  if [ "$SHIP_PARENT" = "$UMBRELLA" ]; then
+    pass "JOIN heir preflight parent = join_parent umbrella ($UMBRELLA), NOT own epic"
+  else
+    fail "JOIN heir preflight parent" "got [$SHIP_PARENT], want umbrella $UMBRELLA (own epic is $SHIP_EPIC)"
+  fi
+fi
+
+# Negative control: the JOIN heir must NOT carry ANY preflight on its own epic —
+# guards a regression that leaves the flip AND a stray default both in place.
+if [ -n "$SHIP_COND" ] && echo "$SHIP_COND" | jq -e --arg e "$SHIP_EPIC" '.[] | select(.parent==$e)' >/dev/null 2>&1; then
+  fail "JOIN heir carries a stray default preflight on its own epic $SHIP_EPIC" "conditions=$SHIP_COND"
+else
+  pass "JOIN heir has NO default own-epic (>0) preflight — only the join gate"
+fi
+
+# ── BRANCH heir: authored with a decision_resolved triggers[] entry ─────────
+if [ -z "$BRANCH_ID" ]; then
+  fail "locate BRANCH heir by phase-derived title" "heirs=$HEIRS"
+else
+  BRANCH_JSON=$(kd show "$BRANCH_ID" --json 2>/dev/null)
+  BR_TRIGS=$(echo "$BRANCH_JSON" | jq -r '.fields.triggers // empty')
+  BR_KIND=$(echo "$BR_TRIGS" | jq -r '.[0].kind // empty' 2>/dev/null)
+  BR_KEY=$(echo "$BR_TRIGS" | jq -r '.[0].decision_key // empty' 2>/dev/null)
+  if [ "$BR_KIND" = "decision_resolved" ]; then
+    pass "BRANCH heir authored a decision_resolved triggers[] entry"
+  else
+    fail "BRANCH heir triggers kind" "got kind=[$BR_KIND], want decision_resolved ; triggers=$BR_TRIGS"
+  fi
+  if [ "$BR_KEY" = "$DECISION_KEY" ]; then
+    pass "BRANCH heir decision_key = branch_decision_key ($DECISION_KEY)"
+  else
+    fail "BRANCH heir decision_key" "got [$BR_KEY], want $DECISION_KEY"
+  fi
+  # A triggers[] array must flip the heir's source label to trigger:multi
+  # (mislabel guardrail ka-0000001688) — otherwise a schedule-source gardener
+  # would silently never fire its decision wake.
+  if echo "$BRANCH_JSON" | jq -e '(.labels // []) | index("trigger:multi")' >/dev/null 2>&1; then
+    pass "BRANCH heir labelled trigger:multi (carries triggers[])"
+  else
+    LBLS=$(echo "$BRANCH_JSON" | jq -c '.labels // []')
+    fail "BRANCH heir trigger:multi label" "labels=$LBLS"
+  fi
+fi
+
+# ── Summary ─────────────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then printf "Failures:%b\\n" "$ERRORS"; exit 1; fi
+echo "gardener-chain-heir-preflight-flip: live engine translated join_parent + branch_decision_key OK."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-chain-heir-preflight-flip scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

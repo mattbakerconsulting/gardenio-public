@@ -1,0 +1,209 @@
+{{template "layout" .}}
+{{define "title"}}Formulas · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+
+<style>
+  /* /formulas catalog — scoped styles (formula-legibility plan ka-0000007376,
+     step S1 ka-0000000872). Deliberately minimal: reuse shared chip/bead-list
+     classes where they exist, add only the formula-specific badges + pip strip. */
+  .formula-catalog-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.75rem 1rem; margin: 0.75rem 0 1rem; }
+  .formula-catalog-filters label { display: flex; flex-direction: column; font-size: 0.8em; gap: 0.2rem; }
+  .formula-catalog-filters .ff-check { flex-direction: row; align-items: center; gap: 0.4rem; }
+  .formula-catalog-filters input[type="text"], .formula-catalog-filters select { padding: 0.25rem 0.4rem; font: inherit; }
+  .formula-catalog-filters button { padding: 0.3rem 0.85rem; font: inherit; cursor: pointer; }
+  .formula-catalog-filters .ff-clear { align-self: center; font-size: 0.85em; }
+
+  /* One recipe = one dense line (ka-0000003457): title + badges + step/var
+     counts cluster on the left, the live-molecule status (N live + pip strip)
+     is pulled to the right beside the View → / Pour… actions. This replaces the
+     old flex-COLUMN layout that stacked a separate live/pip line UNDER every
+     row — doubling each recipe's vertical height and sprawling the catalog to
+     ~7383px. Info-density is this loop's stated first-class goal. */
+  .formula-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.3rem 0.8rem; }
+  .formula-row-title { font-weight: 600; }
+  .formula-badges { display: inline-flex; flex-wrap: wrap; gap: 0.3rem; }
+  .fbadge { font-size: 0.72em; padding: 0.05rem 0.4rem; border-radius: 0.75rem; border: 1px solid var(--border, #ccc); letter-spacing: 0.02em; white-space: nowrap; }
+  .fbadge-workflow { background: rgba(25,118,210,0.12); border-color: rgba(25,118,210,0.4); }
+  .fbadge-expansion { background: rgba(123,31,162,0.12); border-color: rgba(123,31,162,0.4); }
+  .fbadge-aspect { background: rgba(0,121,107,0.12); border-color: rgba(0,121,107,0.4); }
+  .fbadge-vapor { background: rgba(2,136,209,0.10); border-color: rgba(2,136,209,0.35); }
+  .fbadge-liquid { background: rgba(56,142,60,0.12); border-color: rgba(56,142,60,0.4); }
+  .formula-counts { font-size: 0.82em; color: var(--text-subtle, #666); display: inline-flex; gap: 0.7rem; }
+
+  /* margin-left:auto pulls the live-status cluster (and the actions after it) to
+     the right edge of the row, so the recipe fills the row width instead of
+     huddling in the left ~640px with a dead right band. */
+  .formula-live { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.6rem; font-size: 0.85em; margin-left: auto; }
+  .formula-live-count { font-weight: 600; }
+  .formula-live-none { color: var(--text-subtle, #999); font-style: italic; }
+  .formula-pips { display: inline-flex; flex-wrap: wrap; gap: 0.15rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .fpip { text-decoration: none; line-height: 1; font-size: 1.05em; }
+  .fpip-in_progress { color: #f9a825; }
+  .fpip-open { color: #1976d2; }
+  .fpip-deferred { color: #9e9e9e; }
+  .fpip-closed { color: #43a047; }
+  .fpip-overflow { color: var(--text-subtle, #777); font-size: 0.8em; align-self: center; }
+  .formula-frontier { color: var(--text-subtle, #666); }
+  .formula-row-actions { display: inline-flex; gap: 0.6rem; font-size: 0.85em; white-space: nowrap; }
+
+  /* Desktop two-column catalog (ka-0000003457): even after collapsing each
+     recipe to one line, a single-column list still packs every row's content
+     into the left ~640px of a 1280px viewport and leaves the middle-right ~40%
+     near-white (measured 96-99% white in x[640-1152]). Lay the catalog out as a
+     two-column grid at >=1024px so the empty right band carries a SECOND column
+     of recipes and the 105-row list scrolls ~half as far. Scoped to
+     .formula-catalog-list so the shared .bead-list on every other page is
+     untouched; the row separators come from each cell's own .bead-row border. */
+  @media (min-width: 1024px) {
+    .formula-catalog-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 2rem; }
+  }
+
+  /* Narrow viewports (ka-0000003920): the shared .stats-banner stacks its three
+     figures into ~200px of full-width chrome (each .stats-banner-item is min-width
+     8rem + column layout, so three of them wrap on a ~375px phone), pushing the
+     first recipe row below the fold on the most-scanned viewport. Collapse the
+     catalog banner to a compact 3-up grid so the recipes start within the first
+     viewport height. Scoped to .stats-banner-formulas — desktop and every other
+     page's shared .stats-banner are left untouched. */
+  @media (max-width: 480px) {
+    .stats-banner-formulas { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.4rem 0.6rem; padding: 0.5rem 0.6rem; margin: 0.5rem 0 0.75rem; }
+    .stats-banner-formulas .stats-banner-item { min-width: 0; }
+    .stats-banner-formulas .stats-banner-num { font-size: 1.15rem; }
+    .stats-banner-formulas .stats-banner-label { font-size: 0.6em; margin-top: 0.05rem; }
+  }
+
+  /* Desktop / tablet (ka-0000004426): the shared .stats-banner is a block-level
+     flex container, so on /formulas it stretched to the full content width — at
+     1280px its three KPIs huddled in the left ~40%, leaving a ~746px (61%)
+     near-white band to their right (the single lowest-density chrome element
+     above the fold). Make the banner hug its content instead (width:max-content,
+     mirroring the .formula-dag-scroll pane-hug idiom) so it stops being a
+     full-width card with an empty right half; the border/background now wrap
+     only the figures. Scoped to >=481px so the narrow compact-grid rule above
+     (ka-0000003920) is left untouched; max-width:100% keeps it bounded. */
+  @media (min-width: 481px) {
+    .stats-banner-formulas { width: max-content; max-width: 100%; }
+  }
+
+  /* Dense header (ka-0000000836): the >=481px hug rule above (ka-0000004426)
+     shrank the banner CARD to hug its three KPIs, but that left the ~768px STRIP
+     to the banner's right (x[512-1280] at 1280px) as dead page-background
+     whitespace — the one remaining low-density spot above the fold on /formulas.
+     Lay the KPI banner and the filter form out as ONE flex row (the audit's
+     highest-density recommendation) so the filters — previously their own sparse
+     strip stacked BELOW the banner — fill that right band instead: two sparse
+     strips collapse into a single dense header. The banner still hugs at the left
+     edge; the filter form is pushed to the right edge (margin-left:auto) and
+     aligned to the banner's bottom, so content anchors BOTH ends of the strip
+     rather than huddling left. Scoped to >=768px so narrow/tablet viewports keep
+     the stacked layout (the banner's own narrow rules are untouched). */
+  @media (min-width: 768px) {
+    .formula-catalog-header { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.5rem 1.5rem; }
+    .formula-catalog-header .stats-banner-formulas { margin-bottom: 0; }
+    .formula-catalog-header .formula-catalog-filters { margin-left: auto; margin-top: 0; margin-bottom: 0; }
+  }
+</style>
+
+<h1>Formulas{{if .ProjectFilter}} · {{.ProjectFilter}}{{end}}</h1>
+
+{{if .Error}}
+<div class="banner banner-error">{{.Error}}</div>
+{{end}}
+
+{{if .Truncated}}
+<div class="banner banner-warn">Showing first {{.Limit}} formulas.</div>
+{{end}}
+
+{{/* Dense header (ka-0000000836): banner KPIs + filter form share one flex row
+     on desktop so the filters fill the ~768px band the hugged banner leaves to
+     its right, instead of stacking as a second sparse strip below. See the
+     .formula-catalog-header rules above. */}}
+<div class="formula-catalog-header">
+  <div class="stats-banner stats-banner-formulas" aria-label="Formula catalog summary">
+    <div class="stats-banner-item">
+      <span class="stats-banner-num">{{.Summary.Formulas}}</span>
+      <span class="stats-banner-label">Formulas</span>
+    </div>
+    <div class="stats-banner-item">
+      <span class="stats-banner-num">{{.Summary.WithLive}}</span>
+      <span class="stats-banner-label">With live molecules</span>
+    </div>
+    <div class="stats-banner-item">
+      <span class="stats-banner-num">{{.Summary.LiveMolecules}}</span>
+      <span class="stats-banner-label">Live molecules</span>
+    </div>
+  </div>
+
+  <form class="formula-catalog-filters" method="GET" action="{{.BasePath}}/formulas" aria-label="Filter formulas">
+    <label>Project
+      <input type="text" name="project" value="{{.ProjectFilter}}" placeholder="e.g. gardenio">
+    </label>
+    <label>Type
+      <select name="formula_type">
+        {{range .TypeOptions}}
+        <option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>
+        {{end}}
+      </select>
+    </label>
+    <label class="ff-check">
+      <input type="checkbox" name="has_live" value="1"{{if .HasLiveOnly}} checked{{end}}>
+      Has live molecules
+    </label>
+    <button type="submit">Filter</button>
+    {{if or .ProjectFilter .FormulaType .HasLiveOnly}}
+    <a class="ff-clear" href="{{.BasePath}}/formulas">× clear</a>
+    {{end}}
+  </form>
+</div>
+
+{{if .Rows}}
+<ul class="bead-list formula-catalog-list">
+  {{range .Rows}}
+  {{/* Single dense line per recipe (ka-0000003457): title + badges + counts on
+       the left, live-molecule status + actions pulled right via .formula-live's
+       margin-left:auto — no more separate stacked live/pip line. */}}
+  <li class="bead-row formula-row" data-formula-type="{{.FormulaType}}">
+    <a class="formula-row-title" href="{{$.BasePath}}/{{.ID}}">{{.Title}}</a>
+    <span class="formula-badges">
+      <span class="fbadge fbadge-{{.FormulaType}}" title="Formula type">{{.FormulaType}}</span>
+      {{if .Phase}}<span class="fbadge fbadge-{{.Phase}}" title="Recommended instantiation phase">{{.Phase}}</span>{{end}}
+      {{if .Project}}<span class="fbadge" title="Project">{{.Project}}</span>{{end}}
+    </span>
+    <span class="formula-counts">
+      <span title="Steps in this recipe">{{.StepCount}} step{{if ne .StepCount 1}}s{{end}}</span>
+      <span title="Variables declared">{{.VarCount}} var{{if ne .VarCount 1}}s{{end}}</span>
+    </span>
+    <span class="formula-live">
+      {{if .LiveCount}}
+        <span class="formula-live-count">{{.LiveCount}} live</span>
+        <span class="formula-pips" aria-label="Live molecule statuses">
+          {{range .Pips}}
+          <a class="fpip fpip-{{.Status}}" href="{{$.BasePath}}/{{.MoleculeID}}" title="{{.MoleculeID}} · {{.Status}}">{{.Symbol}}</a>
+          {{end}}
+          {{if .PipOverflow}}<span class="fpip-overflow" title="{{.PipOverflow}} more live molecule(s)">+{{.PipOverflow}}</span>{{end}}
+        </span>
+        {{/* The pips already encode each live molecule's status (glyph + colour),
+             so the tally is only rendered when the strip is truncated — there it
+             accounts for the +N molecules the pips can't show. */}}
+        {{if .Frontier}}<span class="formula-frontier" title="Status of all {{.LiveCount}} live molecules, including the {{.PipOverflow}} not shown above">{{.Frontier}}</span>{{end}}
+      {{else}}
+        <span class="formula-live-none">no live molecules</span>
+      {{end}}
+    </span>
+    <span class="formula-row-actions">
+      <a href="{{$.BasePath}}/{{.ID}}" title="View this formula's structure">View →</a>
+      {{/* Pour is operator-only and workflow-only — expansion/aspect
+           formulas compose into others and cannot be instantiated
+           directly (ka-0000000251). */}}
+      {{if and $.IsOperator (eq .FormulaType "workflow")}}
+      <a href="{{$.BasePath}}/formulas/{{.ID}}/pour" title="Instantiate this formula as a molecule">Pour…</a>
+      {{end}}
+    </span>
+  </li>
+  {{end}}
+</ul>
+{{else if not .Error}}
+<p class="empty">No formulas match &mdash; {{if or .ProjectFilter .FormulaType .HasLiveOnly}}try clearing the filters above.{{else}}no <code>type=formula</code> recipes found.{{end}}</p>
+{{end}}
+{{end}}

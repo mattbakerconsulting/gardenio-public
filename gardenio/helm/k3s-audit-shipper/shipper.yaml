@@ -1,0 +1,157 @@
+# k3s API audit-log shipper (task gd-ZrPUxj8wyU, follow-up to gd-HXRD9yizAE;
+# decision gd-bNVBdrmIo5).
+#
+# One pod per control-plane node. It tails the kube-apiserver audit log that k3s
+# writes at /var/log/k3s-audit/audit.log through a read-only hostPath mount, drops
+# or redacts each event (internal/k3sauditshipper.Transform: no Secret/ConfigMap/
+# HelmChart bodies, sensitive keys masked, credential shapes scrubbed, output
+# re-validated) and POSTs it to the in-chart vlsingle /insert/jsonline in its OWN
+# VictoriaLogs tenant (AccountID 9), so a default-tenant query never sees it. It
+# keeps a checkpoint on a second hostPath so a restart neither re-ships nor skips.
+#
+# OPERATOR-APPLIED (kubectl apply -f namespace.yaml -f shipper.yaml), not part of
+# the gardenio Helm release: the release deployer must never hold DaemonSet rights
+# in a PSA-privileged namespace (root on the control plane). See README.md.
+#
+# Before applying: set the image tag (the `image:` line below is a placeholder you
+# edit to the released calver) and make sure vlsingle is on.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k3s-audit-shipper
+  namespace: gardenio-audit
+  labels:
+    app.kubernetes.io/name: gardenio
+    app.kubernetes.io/component: k3s-audit-shipper
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: k3s-audit-shipper
+  namespace: gardenio-audit
+  labels:
+    app.kubernetes.io/name: gardenio
+    app.kubernetes.io/component: k3s-audit-shipper
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gardenio
+      app.kubernetes.io/component: k3s-audit-shipper
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One node at a time: a restart re-reads from the checkpoint, and the
+      # control plane is three servers.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gardenio
+        app.kubernetes.io/component: k3s-audit-shipper
+    spec:
+      serviceAccountName: k3s-audit-shipper
+      # Never calls the Kubernetes API: no token.
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: ecr
+        - name: ghcr
+      securityContext:
+        # The apiserver writes the log 0600 root. Capabilities are all dropped and
+        # the root filesystem is read-only; owning the file needs none.
+        runAsUser: 0
+        runAsGroup: 0
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: k3s-audit-shipper
+          # EDIT ME to the released calver (same tag as the gardenio release).
+          image: 360190250083.dkr.ecr.us-east-1.amazonaws.com/ghcr/mattbakerconsulting/gardenio/k3s-audit-shipper:REPLACE_WITH_CALVER
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            # Cross-namespace Service name: the bare name only resolves from the
+            # release namespace.
+            - name: K3S_AUDIT_VICTORIALOGS_ENDPOINT
+              value: "http://gardenio-victoria-logs.gardenio.svc:9428"
+            # The audit log's own VictoriaLogs tenant. Never 0: the shipper refuses
+            # the default tenant, which every agent-facing reader queries.
+            - name: K3S_AUDIT_VICTORIALOGS_ACCOUNT_ID
+              value: "9"
+            - name: K3S_AUDIT_VICTORIALOGS_PROJECT_ID
+              value: "0"
+            - name: K3S_AUDIT_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K3S_AUDIT_LOG_PATH
+              value: "/var/log/k3s-audit/audit.log"
+            - name: K3S_AUDIT_STATE_PATH
+              value: "/var/lib/k3s-audit-shipper/state.json"
+            # Back-fill up to one rotation (~100 MB) when there is no checkpoint.
+            - name: K3S_AUDIT_FROM_START
+              value: "true"
+            # redacted: bodies of non-sensitive kinds with keys masked; none:
+            # metadata only. Secrets/ConfigMaps/HelmCharts/token calls never ship a
+            # body in either mode.
+            - name: K3S_AUDIT_BODIES
+              value: "redacted"
+            - name: K3S_AUDIT_MAX_BODY_BYTES
+              value: "32768"
+            # Volume valve: true ships only writes plus reads by KEEP_READS_USERS.
+            - name: K3S_AUDIT_DROP_READS
+              value: "false"
+            - name: K3S_AUDIT_KEEP_READS_USERS
+              value: "system:serviceaccount:gardenio:gardenio-infra-admin"
+            - name: K3S_AUDIT_POLL_INTERVAL
+              value: "1s"
+            - name: K3S_AUDIT_FLUSH_INTERVAL
+              value: "2s"
+            - name: K3S_AUDIT_MAX_BATCH_LINES
+              value: "500"
+            - name: K3S_AUDIT_RETRY_BACKOFF
+              value: "5s"
+          # No containerPort: the shipper dials OUT to VictoriaLogs only.
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: audit
+              mountPath: /var/log/k3s-audit
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/k3s-audit-shipper
+      volumes:
+        - name: audit
+          hostPath:
+            path: /var/log/k3s-audit
+            # Directory, not DirectoryOrCreate: a server that has not taken the
+            # audit policy has no such directory, and inventing an empty one would
+            # hide that the shipper is watching nothing. The pod stays in
+            # ContainerCreating with a FailedMount instead.
+            type: Directory
+        - name: state
+          hostPath:
+            path: /var/lib/k3s-audit-shipper
+            type: DirectoryOrCreate
+      # Control-plane pinning. k3s taints servers node-role.kubernetes.io/
+      # control-plane:NoSchedule and labels them control-plane.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists

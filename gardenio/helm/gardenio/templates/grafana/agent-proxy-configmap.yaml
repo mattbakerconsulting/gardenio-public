@@ -1,0 +1,59 @@
+{{- if and .Values.grafana.enabled .Values.grafana.auth.proxy.agentPath.enabled }}
+{{- /* nginx config for the grafana-agent-proxy sidecar (gd-RUhOpXWwmz). Agent
+       pods reach Grafana only on this port; every identity header Grafana or
+       an edge could trust is blanked (an empty proxy_set_header drops the
+       header), so a request arrives as anonymous no matter what the agent
+       sends. Authorization passes through for a future service-account token. */ -}}
+{{- $agentPath := .Values.grafana.auth.proxy.agentPath -}}
+{{- $strip := list -}}
+{{- range (list .Values.grafana.auth.proxy.headerName "X-Auth-Request-Email" "X-Auth-Request-User" "X-Auth-Request-Groups" "X-Auth-Request-Preferred-Username" "X-WEBAUTH-USER" "X-WEBAUTH-GROUPS" "X-Forwarded-Email" "X-Forwarded-User" "X-Forwarded-Groups" "X-Forwarded-Preferred-Username" "X-Grafana-User") -}}
+{{- if . -}}
+{{- $strip = append $strip (lower .) -}}
+{{- end -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gardenio.grafana.fullname" . }}-agent-proxy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.grafana.labels" . | nindent 4 }}
+data:
+  nginx.conf: |
+    worker_processes 1;
+    pid /tmp/nginx.pid;
+    error_log /dev/stderr warn;
+    events {
+      worker_connections 256;
+    }
+    http {
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path /tmp/proxy_temp;
+      fastcgi_temp_path /tmp/fastcgi_temp;
+      uwsgi_temp_path /tmp/uwsgi_temp;
+      scgi_temp_path /tmp/scgi_temp;
+      access_log off;
+      server_tokens off;
+      map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+      }
+      server {
+        listen {{ $agentPath.port }};
+        client_max_body_size 10m;
+        location / {
+          proxy_pass http://127.0.0.1:3000;
+          proxy_http_version 1.1;
+          proxy_set_header Host $http_host;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          # Identity headers, blanked so Grafana never sees a client copy.
+          {{- range uniq $strip }}
+          proxy_set_header {{ . }} "";
+          {{- end }}
+          # Panel renders wait on the image renderer.
+          proxy_read_timeout 300s;
+        }
+      }
+    }
+{{- end }}

@@ -1,0 +1,100 @@
+{{- if .Values.keycloak.enabled }}
+{{- $fullname := include "gardenio.fullname" . -}}
+{{- range .Values.keycloak.clients }}
+{{- if .directGrantRole }}
+{{- if not (regexMatch "^[a-z][a-z0-9-]{0,62}$" (.directGrantRole | toString)) -}}
+{{- fail (printf "keycloak.clients %s: directGrantRole %q must be a lowercase role name (letters, digits, '-')" .clientId .directGrantRole) -}}
+{{- end -}}
+{{- $alias := printf "%s-direct-grant" .clientId -}}
+{{- $gate := printf "%s-role-gate" $alias }}
+# ── KeycloakAuthFlow: {{ .clientId }} password grant, {{ .directGrantRole }} only
+# keycloak.clients[].directGrantRole (gd-Hq1PnUVOUC). The client's direct grant
+# is bound to this flow (clients.yaml, authenticationFlowBindingOverrides), so
+# the password grant signs in only users holding the realm role
+# {{ .directGrantRole }}. Keycloak's default direct grant flow runs no passkey,
+# so without it any realm user's password, an admin's included, would mint
+# this client's token.
+#
+#   {{ $alias }} (topLevel)
+#     1 direct-grant-validate-username  REQUIRED (sets the user)
+#     2 {{ $gate }}  CONDITIONAL subflow
+#         conditional-user-role  condUserRole={{ .directGrantRole }}, negate
+#         deny-access-authenticator  REQUIRED
+#     3 direct-grant-validate-password  REQUIRED
+#
+# The gate sits before the password check, so this client never tells anyone
+# else whether their password is right. The parent lists the gate as an
+# authenticatorFlow entry: the operator then pins its priority between the two
+# checks (adjustChildFlowsPriority) and adds the parent's own executions only
+# once the gate exists. Until then the flow sets no user and every grant fails.
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakAuthFlow
+metadata:
+  name: {{ printf "%s-direct-grant-%s" $fullname .clientId | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: {{ $alias | quote }}
+  description: {{ printf "Password grant for %s, %s only (managed by gardenio helm chart)" .clientId .directGrantRole | quote }}
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: basic-flow
+  topLevel: true
+  builtIn: false
+  authenticationExecutions:
+    - authenticator: direct-grant-validate-username
+      requirement: REQUIRED
+      priority: 10
+    - authenticatorFlow: true
+      alias: {{ $gate | quote }}
+      requirement: CONDITIONAL
+      priority: 20
+    - authenticator: direct-grant-validate-password
+      requirement: REQUIRED
+      priority: 30
+---
+apiVersion: v1.edp.epam.com/v1
+kind: KeycloakAuthFlow
+metadata:
+  name: {{ printf "%s-direct-grant-gate-%s" $fullname .clientId | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+  annotations:
+    edp.epam.com/preserve-resources-on-deletion: "true"
+spec:
+  alias: {{ $gate | quote }}
+  description: {{ printf "Deny the %s password grant to users without %s" .clientId .directGrantRole | quote }}
+  realmRef:
+    name: {{ $fullname }}-realm
+    kind: KeycloakRealm
+  providerId: basic-flow
+  topLevel: false
+  builtIn: false
+  parentName: {{ $alias | quote }}
+  childType: basic-flow
+  childRequirement: CONDITIONAL
+  authenticationExecutions:
+    - authenticator: conditional-user-role
+      requirement: REQUIRED
+      priority: 10
+      authenticatorConfig:
+        alias: {{ printf "%s-cond-not-role" $alias | quote }}
+        config:
+          condUserRole: {{ .directGrantRole | quote }}
+          negate: "true"
+    - authenticator: deny-access-authenticator
+      requirement: REQUIRED
+      priority: 20
+      authenticatorConfig:
+        alias: {{ printf "%s-deny" $alias | quote }}
+        config:
+          denyErrorMessage: "This client signs in only its own test identity."
+---
+{{- end }}
+{{- end }}
+{{- end }}

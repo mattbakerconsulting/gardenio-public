@@ -1,0 +1,96 @@
+{{- /*
+Tiered PriorityClasses for gardenio pods (gd-Vtnt5lAGeQ, gd-2qjxTVMBkC).
+
+Crew/batch agent pods sit at priority 0. Before the tiers, so did every
+operator service outside the data plane: on 2026-10-20 a crew burst filled the
+agent nodes and left sign-in, grafana, the backups and the release deployer
+Pending, with nothing able to preempt. The tiers, highest first:
+
+  - system-critical: the data plane, the sign-in path and the backups.
+  - infra: every other non-agent workload in this chart.
+  - interactive: thread/dm/gardener agent pods (INTERACTIVE_PRIORITY_CLASS).
+    Above crews so a human-waiting pod can preempt one, below infra so no
+    agent pod can evict a platform pod.
+  - scheduled: a gardener run a schedule or fire-now started
+    (SCHEDULED_PRIORITY_CLASS). The interactive value, so it goes ahead of
+    crews in the queue, with preemptionPolicy Never: nobody is waiting on it,
+    so it waits for room rather than killing a working crew (gd-Y2KaNE233g).
+  - agent: crew/reviewer/batch agent pods (AGENT_PRIORITY_CLASS). Value 0 and
+    preemptionPolicy Never: a crew waits for room and never evicts anything.
+
+The first three keep the default preemptionPolicy (PreemptLowerPriority).
+Values sit well below the reserved built-ins (system-cluster-critical =
+2000000000). tests/priority_class_coverage_test.go fails if a non-agent
+workload renders without one of the first two.
+
+DEFAULT OFF: values ships systemPriorityClass.create=false, so this renders
+nothing, the controller leaves INTERACTIVE_PRIORITY_CLASS,
+SCHEDULED_PRIORITY_CLASS and AGENT_PRIORITY_CLASS unset, and every consuming template's priorityClassName
+conditional is skipped.
+*/}}
+{{- if .Values.global.systemPriorityClass.create }}
+{{- $pc := .Values.global.systemPriorityClass }}
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ $pc.name }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+value: {{ $pc.value }}
+globalDefault: false
+description: >-
+  gardenio data plane, sign-in path and backups. Outranks infra and every
+  agent pod (gd-Vtnt5lAGeQ, gd-2qjxTVMBkC).
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ $pc.infra.name }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+value: {{ $pc.infra.value }}
+globalDefault: false
+description: >-
+  gardenio operator services and jobs. Outranks every agent pod so a crew
+  burst cannot leave them Pending (gd-2qjxTVMBkC).
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ $pc.interactive.name }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+value: {{ $pc.interactive.value }}
+globalDefault: false
+description: >-
+  gardenio thread/dm/gardener agent pods. May preempt crew pods, never
+  infra (gd-Vtnt5lAGeQ, gd-2qjxTVMBkC).
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ $pc.scheduled.name }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+value: {{ $pc.interactive.value }}
+# Ahead of crews in the queue, but a scheduled gardener never evicts one.
+preemptionPolicy: Never
+globalDefault: false
+description: >-
+  gardenio gardener pods a schedule or fire-now started. Queued ahead of
+  crews; never preempts (gd-Y2KaNE233g).
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ $pc.agent.name }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+value: {{ $pc.agent.value }}
+# Crews wait for room rather than evicting anything.
+preemptionPolicy: Never
+globalDefault: false
+description: >-
+  gardenio crew/reviewer/batch agent pods. Lowest tier; never preempts
+  (gd-2qjxTVMBkC).
+{{- end }}

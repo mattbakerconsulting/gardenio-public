@@ -1,0 +1,194 @@
+# gardener-gardener-start-idempotent.toml
+#
+# Claudeless scenario: `gb gardener start` is idempotent.
+#
+# Plan §T9 (gardenio/plans/epic-mention-looping-gardener.md):
+#   "gardener-gardener-start-idempotent: second gb gardener start returns existing."
+#
+# Verifies the §T6 contract that creating a gardener for an epic twice does
+# NOT create two schedule beads — the second invocation must exit non-zero
+# and surface the existing schedule's id so an operator can adopt it.
+#
+# Test outline:
+#   0. `gb gardener start <epic>` with NO ack flag — exits non-zero, names
+#      --i-read-the-gardener-instructions, echoes the guide inline, and
+#      creates NO schedule (the ack-gate REFUSAL leg, ka-0000000438).
+#   1. Create a fresh `epic` bead.
+#   2. `gb gardener start <epic>` — succeeds, captures schedule id S1.
+#   3. `gb gardener start <epic>` again — exits non-zero, mentions "already".
+#   4. List schedule beads filtered by assign_bead=<epic> — exactly one
+#      enabled gardener schedule remains.
+#   5. Cleanup: `gb gardener stop <epic>` (or kd close fallback), close epic.
+#
+# The §0 refusal leg (ka-0000000438): every other e2e call site passes
+# --i-read-the-gardener-instructions, so the read-the-instructions gate's
+# NEGATIVE path was e2e-uncovered — a weakening refactor (flag stays
+# registered but the refusal at gardener.go degrades to a warning/no-op)
+# would keep every scenario green while the gate silently stopped gating.
+# This leg is the only thing that goes red for that regression. It asserts
+# the flag NAME appears AND that no schedule bead was written, because an
+# exit-code-only check passes against a gate that errors AFTER creating the
+# trigger — the exact half-broken state a weakening produces.
+#
+# `gb gardener` is gated behind the §T6 merge (gd-ARm8tM6lA6). When the
+# binary is older than T6 the scenario emits SKIP and exits 0 so it can
+# ship before the agent image rebuilds — same convention used by
+# local-orphan-cleanup.toml for the §A8 reaper.
+
+[claude]
+session_id = "e2e00000-0009-4000-a000-000000000001"
+username = "e2e-gardener-idempotent"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 30000
+
+[[responses]]
+on = "*"
+say = "Running gardener-start-idempotent: create epic, start gardener twice, assert second is no-op, cleanup."
+tools = [
+  { call = "Bash", input = { command = """set -u
+PASS=0; FAIL=0; ERRORS=""
+
+pass() { PASS=$((PASS + 1)); echo "PASS: $1"; }
+fail() { FAIL=$((FAIL + 1)); ERRORS="$ERRORS\\n  - $1${2:+ — $2}"; echo "FAIL: $1${2:+ — $2}"; }
+
+# ── Pre-flight: gb gardener present? ────────────────────────────────
+if ! gb gardener --help >/dev/null 2>&1; then
+  echo "SKIP: gb gardener not present in this binary (pre-T6)"
+  exit 0
+fi
+
+# ── Setup: create a fresh epic ─────────────────────────────────────
+EPIC_TITLE="e2e-gardener-idempotent-$$-$(date +%s)"
+EPIC_ID=$(kd create "$EPIC_TITLE" --type=epic --json 2>/dev/null | jq -r '.id // empty')
+if [ -z "$EPIC_ID" ]; then
+  fail "create epic" "kd create returned no id"
+  exit 1
+fi
+echo "epic: $EPIC_ID"
+
+cleanup() {
+  # Tear down any gardener schedule we may have created, then close the epic.
+  if gb gardener status "$EPIC_ID" --json >/dev/null 2>&1; then
+    gb gardener stop "$EPIC_ID" --reason "e2e cleanup" >/dev/null 2>&1 || true
+  fi
+  kd close "$EPIC_ID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ── Test 0: bare start (no ack flag) REFUSES and writes nothing ─────
+# ka-0000000438: the read-the-instructions gate's negative leg. Every
+# other e2e passes --i-read-the-gardener-instructions, so a weakening of
+# the refusal (gardener.go: gate degrades to a warning after still
+# creating the schedule) would leave every scenario green. This is the
+# only leg that reds for it — so a bare non-zero exit is not enough
+# (it is satisfiable by any failure). We ALSO pin the flag NAME in the
+# error, assert the guide echo fired, and prove NO schedule bead exists.
+echo "--- Test 0: bare start refuses (ack-gate) ---"
+BARE_OUT=$(gb gardener start "$EPIC_ID" 2>&1)
+BARE_RC=$?
+if [ $BARE_RC -ne 0 ]; then
+  pass "bare start exit non-zero"
+else
+  fail "bare start exit non-zero" "rc=0 (expected refusal), out=$BARE_OUT"
+fi
+if echo "$BARE_OUT" | grep -q -- "--i-read-the-gardener-instructions"; then
+  pass "bare start names --i-read-the-gardener-instructions"
+else
+  fail "bare start names --i-read-the-gardener-instructions" "out=$BARE_OUT"
+fi
+# The inline guide echo is the reason the gate is tolerable (ka-0000004752):
+# the refusal echoes the canonical gardener-authoring guide so the author
+# loads it into context before re-running. Assert the echo actually fired.
+# Key on the guide-echo header literal (a source constant in echoGardenerGuide),
+# not the daemon-fetched advice prose, so this stays stable across advice edits.
+if echo "$BARE_OUT" | grep -qi "canonical gardener-authoring guide"; then
+  pass "bare start echoes the gardener-authoring guide inline"
+else
+  fail "bare start echoes the gardener-authoring guide inline" "out=$BARE_OUT"
+fi
+# Load-bearing half: the refusal must happen BEFORE any schedule is
+# written. `gb gardener status` resolves the epic's gardener and exits
+# non-zero with "no gardener schedule found" when none exists — so a
+# non-zero status here proves the bare start created nothing.
+BARE_STATUS_OUT=$(gb gardener status "$EPIC_ID" 2>&1)
+BARE_STATUS_RC=$?
+if [ $BARE_STATUS_RC -ne 0 ]; then
+  pass "bare start created NO gardener schedule (status resolves none)"
+else
+  fail "bare start created NO gardener schedule" "status rc=0, out=$BARE_STATUS_OUT"
+fi
+
+# ── Test 1: first gb gardener start succeeds ────────────────────────
+echo "--- Test 1: first start ---"
+START1_OUT=$(gb gardener start "$EPIC_ID" --i-read-the-gardener-instructions --json 2>&1)
+START1_RC=$?
+if [ $START1_RC -eq 0 ]; then
+  pass "first start exit 0"
+else
+  fail "first start exit 0" "rc=$START1_RC out=$START1_OUT"
+fi
+SCHED_ID=$(echo "$START1_OUT" | jq -r '.id // empty' 2>/dev/null || true)
+if [ -n "$SCHED_ID" ]; then
+  pass "first start returned schedule id ($SCHED_ID)"
+else
+  fail "first start returned schedule id" "out=$START1_OUT"
+fi
+
+# ── Test 2: second gb gardener start is a no-op (non-zero, "already") ─
+echo "--- Test 2: second start ---"
+START2_OUT=$(gb gardener start "$EPIC_ID" --i-read-the-gardener-instructions 2>&1)
+START2_RC=$?
+if [ $START2_RC -ne 0 ]; then
+  pass "second start exit non-zero"
+else
+  fail "second start exit non-zero" "rc=0 (expected non-zero), out=$START2_OUT"
+fi
+if echo "$START2_OUT" | grep -qi "already"; then
+  pass "second start mentions 'already'"
+else
+  fail "second start mentions 'already'" "out=$START2_OUT"
+fi
+
+# ── Test 3: only one enabled gardener schedule for this epic ─────────
+# Count via the SERVER (kd count with label + field filters), not a
+# client-side jq scan. The prior `kd list --type=schedule --json | jq
+# '.beads[]?'` had rotted two ways: (a) kd list --json is a BARE ARRAY,
+# so `.beads[]?` hard-errors "Cannot index array with string beads"
+# (advice ka-0000003286), yielding a permanent count=ERR; and (b) modern
+# gardeners are `type=trigger` pinned by a `gardener-epic:<epic>` LABEL with
+# `assign_bead=null` (Phase 3b/D10 migration, bug ka-0000005960), so the
+# old `assign_bead==$e` field selector could never match one. `kd count`
+# does the filtering server-side and prints a bare integer — no array
+# indexing, robust across the trigger/schedule shapes.
+echo "--- Test 3: single schedule for epic ---"
+COUNT=$(kd count --all-types -l "gardener-epic:$EPIC_ID" -f enabled=true 2>/dev/null || echo "ERR")
+if [ "$COUNT" = "1" ]; then
+  pass "exactly one enabled gardener schedule for $EPIC_ID"
+else
+  fail "exactly one enabled gardener schedule" "count=$COUNT"
+fi
+
+# ── Summary ─────────────────────────────────────────────────────────
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+  printf "Failures:%b\\n" "$ERRORS"
+  exit 1
+fi
+echo "gardener-start-idempotent: all assertions passed."
+exit 0
+""" } }
+]
+
+[default]
+say = "gardener-start-idempotent scenario complete."
+
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true

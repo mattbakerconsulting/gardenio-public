@@ -1,0 +1,784 @@
+# =============================================================================
+# values-inbox.yaml — Gardenio-in-a-Box single-EC2 profile (storage + secrets half)
+# =============================================================================
+# This is ONE OF TWO in-box overlays. By itself it gives you local-path storage,
+# in-box secrets, and air-gap pulls — but NOT the public-safe edge. For the full
+# box profile, layer BOTH overlays on top of the base values, in this order:
+#
+#   helm upgrade --install gardenio gardenio/helm/gardenio \
+#       -f gardenio/helm/gardenio/values.yaml \           # 1. base defaults
+#       -f gardenio/helm/gardenio/values-inbox.yaml \      # 2. THIS file (storage+secrets)
+#       -f deploy-values/gardenio-inbox.yaml              # 3. edge + in-box Keycloak
+#
+# Canonical layering order + the combined render test:
+#   gardenio/docs/inbox-overlay-layering.md
+#   gardenio/helm/gardenio/tests/inbox_overlay_layering_test.go
+#
+# This overlay is OFF by default — the base chart and the AWS-POC/EKS path are
+# untouched unless an operator explicitly passes this file. Every block below
+# flips an AWS-coupled storage default to its in-box (k3s + local-path) variant.
+#
+# Scope of THIS file:
+#   - storage  (Phase 1, ka-0000000657): local-path StorageClass, no EBS/EFS CSI,
+#                    no CSI VolumeSnapshotClass, reclaimPolicy:Retain for the
+#                    crown-jewels stores, in-cluster pg_dumpall DR backup.
+#   - secrets  (Phase 1, ka-0000002047): in-box-seeded k8s Secrets, no ESO/IRSA;
+#                    fail-fast on a missing coop credential key (no plaintext).
+#   - DNS/TLS  (Phase 3, ka-0000002443 + ka-0000005963): sslip.io + per-host
+#                    Let's Encrypt HTTP-01, in-cluster HTTP-01 ClusterIssuer,
+#                    no Route53/ACM/external-dns/DNS credential.
+#
+# The COMPLEMENTARY edge half (Phase 3 P3.1/P3.3/P3.4/P3.6 + in-box Keycloak)
+# lives in deploy-values/gardenio-inbox.yaml. A few keys (postgres,
+# storageClassRetain, backup, keycloak.runtime.persistence) appear in BOTH files
+# with identical values so each is independently coherent; they deep-merge
+# cleanly. See the layering doc above.
+#
+# Sources: gardenio/docs/research/inbox-storage-localpv.md §8 (ka-0000005525),
+#          gardenio/docs/research/inbox-dns-tls-replace-route53-acm.md (ka-0000004570),
+#          gardenio/docs/gardenio-in-a-box-synthesis.md §3,
+#          restore runbook gardenio/docs/gardenio-in-a-box-restore.md.
+# =============================================================================
+
+global:
+  # In-box profile marker. Later epic axes (secrets, ingress, DNS/TLS, object
+  # store) branch on this single documented flag. Informational for the storage
+  # axis; load-bearing for the rest of the box.
+  inBox: true
+
+  # (G) Air-gap image distribution (Phase 4). The box pulls ZERO images from
+  # any external registry at runtime — the in-box zot registry + containerd
+  # mirror serve every pull (scripts/inbox/*, bootstrap --airgap). Setting this
+  # hard-disables latestMode everywhere (so digest pins survive), flips the
+  # agent pull policy to IfNotPresent, and neutralizes imagePullSecrets.
+  # See gardenio/docs/research/inbox-image-distribution.md (P4.3, ka-0000007177).
+  airgap: true
+
+  # (E) EBS/EFS CSI -> k3s built-in `local-path` StorageClass.
+  # The one required storage change: every PVC inherits this via
+  # `persistence.storageClass: "" | default .Values.global.storageClass`,
+  # and the controller's runtime ensurePVC falls back to it when
+  # agents.agentStorageClass is empty. The k3s default SC is named `local-path`.
+  storageClass: "local-path"
+
+  # (E) coverage requires ReadWriteMany, which node-local local-path cannot
+  # satisfy — the PVC would wedge Pending forever. Keep it explicitly off in-box.
+  coverage:
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# (PSA) Release-namespace PodSecurity must admit the privileged DinD sidecar.
+# In-box, agents run *in the release namespace* (agents.namespace defaults to
+# .Release.Namespace) and per-project Docker enables a privileged `docker:dind`
+# sidecar. The chart's default psa-labels hook stamps enforce=baseline on the
+# release namespace, which REJECTS that sidecar at admission — the controller
+# then retries pod-create forever and every Slack-mention spawn is marked
+# crashed (~2h later) with no agent ever running. The controller's own dind
+# preflight (podmanager/dind.go checkDindAdmittable) flags exactly this.
+#
+# Prod sidesteps it by running agents in a dedicated PSA-privileged fleet
+# namespace; in-box there is no separate fleet namespace, so the release ns
+# itself must enforce `privileged`. audit/warn stay `restricted` so the chart's
+# own non-privileged workloads still get flagged if they regress.
+# Bug: ka-0000007454.
+# -----------------------------------------------------------------------------
+podSecurityAdmission:
+  enabled: true
+  enforceProfile: "privileged"
+  profile: "restricted"
+  version: "latest"
+
+# -----------------------------------------------------------------------------
+# (CPU) Per-namespace LimitRange — box-sized so agent pods actually SCHEDULE.
+# Bug ka-0000006038.
+#
+# The default LimitRange (values.yaml) mirrors the podmanager prod defaults:
+# defaultRequest cpu=2 / mem=16Gi. On a Karpenter fleet that is fine — each
+# agent gets its own large node. On the single ~8-vCPU in-a-box k3s node it is
+# fatal: the privileged DinD sidecar carries NO explicit resources in code
+# (podmanager/dind.go), so it inherits the namespace defaultRequest = cpu 2.
+# Combined with the agent container's own 2-core request that is 4 cores per
+# agent pod; after the ~5.7 cores the core gardenio services already request,
+# the node has ~2.3 cores free and NOT ONE agent pod can ever schedule — every
+# Slack-mention spawn sits Pending/Insufficient cpu forever and the box "goes
+# silent." (Memory is the same story: a 16Gi defaultRequest means one pod fills
+# the box.)
+#
+# Trim the defaultRequest to what an idle agent/dind actually uses so several
+# agents fit on the box. The agent CONTAINER's own request is trimmed
+# separately via per-project cpu_request/memory_request on the gasbox/gardenio
+# project beads (controller beadsapi/projects.go), which the in-box bootstrap
+# seeds. `max` stays at the prod 4-core / 16Gi ceiling so a bursty agent can
+# still spike to a full limit.
+# -----------------------------------------------------------------------------
+limitRange:
+  enabled: true
+  default:
+    cpu: "2"
+    memory: "4Gi"
+  defaultRequest:
+    cpu: "250m"
+    memory: "512Mi"
+  max:
+    cpu: "4"
+    memory: "16Gi"
+
+# -----------------------------------------------------------------------------
+# (E) StorageClass object: do NOT create the EBS-specific StorageClass in-box.
+# k3s ships `local-path` as the cluster default SC for free, so the chart
+# renders no StorageClass of its own. (Already create:false in base; pinned
+# here for unambiguous intent.)
+# -----------------------------------------------------------------------------
+storageClass:
+  create: false
+
+# -----------------------------------------------------------------------------
+# (E) VolumeSnapshotClass: local-path is NOT a CSI driver, so CSI
+# VolumeSnapshots are unsupported (`snapshotting non-CSI volumes is not
+# supported`). Nothing in the chart or controller creates or consumes a
+# VolumeSnapshot CR. Keep it off; the in-box DR story is pg_dumpall + an
+# out-of-band EC2-host EBS snapshot of the data volume (an ops action, not a
+# runtime AWS dependency). (Already create:false in base; pinned for intent.)
+# -----------------------------------------------------------------------------
+volumeSnapshotClass:
+  create: false
+
+# -----------------------------------------------------------------------------
+# (E) Agent workspace PVCs (runtime ensurePVC): be explicit about local-path.
+# Empty would fall back to the cluster-default SC (which IS local-path on k3s),
+# but pin it so a stray project-bead `storage_class` label is the only override.
+# -----------------------------------------------------------------------------
+#
+# (C) No AWS-account IRSA on a single EC2 box: neither the controller SA nor the
+# agent-pod SA may carry an eks.amazonaws.com/role-arn annotation (there is no
+# OIDC provider / role to assume). Plain in-cluster RBAC only. Both default to
+# {} in base; pinned here so a stray base-overlay IRSA annotation can't leak in.
+agents:
+  agentStorageClass: "local-path"
+  serviceAccount:
+    annotations: {}
+  agentServiceAccount:
+    annotations: {}
+  # IN-BOX inference routing (epic ka-0000007994). Point the controller + agent
+  # pods at the in-cluster LiteLLM Service instead of the corp proxy / direct
+  # Anthropic. This is the controller-level LITELLM_URL and the ANTHROPIC_BASE_URL
+  # fallback applyAccountConfig bakes onto agent pods whose account bead carries
+  # no explicit base_url. See the IN-BOX LiteLLM axis section at the bottom of
+  # this file for the full rationale + the account-bead seeding recipe.
+  litellmURL: "http://gardenio-litellm.gardenio.svc.cluster.local:4000"
+  # Default model for agent pods when no account model is resolved. Matches the
+  # in-box litellm model_group_alias.
+  claudeModel: "claude-opus-5-5"
+  # (G) Reuse a seeded image with no registry round-trip on every spawn. The
+  # controller default is PullAlways (hot-path round-trip to the registry on
+  # each agent spawn); in-box that registry is the loopback zot, but
+  # IfNotPresent avoids the round-trip entirely. global.airgap also defaults
+  # this, but pin it for unambiguous intent.
+  agentPullPolicy: "IfNotPresent"
+  # OBJECT-STORE axis (ka-0000004955): point coop/controller/beads-viewer/agents
+  # at the in-cluster MinIO (objectStore block below) instead of AWS S3. The
+  # endpoint override flips both SDKs to path-style addressing (forced in code).
+  # The bucket here MUST match objectStore.bucket. region is cosmetic for MinIO
+  # but the SDK still signs with it, so keep it set.
+  s3:
+    bucket: "gardenio-sessions"
+    prefix: "coop/sessions"
+    region: "us-east-1"
+    endpoint: "http://gardenio-minio:9000"
+
+  # (G) First-party digest pins — see the "Air-gap first-party image digest
+  # pins" section below for the full rationale, refresh procedure, and why
+  # these live in the overlay (NOT base values.yaml). controller + agent.
+  image:
+    digest: "sha256:34a5260e861f88bfd3071b138d0ce692d9cea2589b09ac0e86a7d3daa8e3ee4d"
+  agentImage:
+    digest: "sha256:1b5e07d40029440955f29fd34c201dd9f33183bb302803c3d0d6b6f9a86b187a"
+
+# -----------------------------------------------------------------------------
+# reclaimPolicy:Retain for the crown-jewels stores.
+# k3s's default `local-path` SC is reclaimPolicy:Delete — a deleted PVC (or
+# `helm uninstall`) erases the on-disk directory. For postgres / nats / keycloak
+# that is unrecoverable data loss. Render the sibling Retain StorageClass
+# (shipped by P1.2, ka-0000008198) and point the critical stores at it.
+# NOTE: a StorageClass's reclaimPolicy is immutable and applies only to PVs
+# provisioned AFTER the store is (re)created against it — see the restore
+# runbook for migrating an already-bound PVC.
+# -----------------------------------------------------------------------------
+storageClassRetain:
+  create: true
+  name: "local-path-retain"
+
+# postgres — the one MUST-backup store (beads + controller + keycloak DBs).
+# In-box runs the in-cluster StatefulSet (NOT external RDS); enabling it is what
+# makes the pg_dumpall DR CronJob (below) have something to dump.
+postgres:
+  enabled: true
+  persistence:
+    storageClass: "local-path-retain"
+
+# nats — JetStream durable state; mostly re-derivable, but cheap to retain.
+nats:
+  persistence:
+    storageClass: "local-path-retain"
+
+# keycloak — runtime users/sessions (realm itself is declarative EDP CRDs).
+# enabled: true is explicit here (gd-85rqxsPPoM flipped the chart default to
+# false — safe for the gardenio-k3s profile, where db.autoWire=true means
+# /opt/keycloak/data holds no state Postgres doesn't already have — but this
+# box's own comment below relies on the admin bootstrap surviving on a
+# retained PV across upgrades, so keep it a real PVC here).
+keycloak:
+  runtime:
+    persistence:
+      enabled: true
+      storageClass: "local-path-retain"
+    # The box is long-lived: the realm admin is bootstrapped once on first
+    # install and survives across upgrades on the retained PV. After that the
+    # first-admin Job is a pure idempotent re-ensure. Make it best-effort so a
+    # cosmetic re-ensure miss (e.g. the operator API briefly slow, or a
+    # master-admin credential drift on an already-provisioned box) does NOT trip
+    # the Helm post-upgrade hook timeout and report every `helm upgrade` as
+    # failed (ka-0000006886). The Job still logs full kcadm diagnostics so a real
+    # regression is visible; it just no longer fails the release on the box.
+    firstAdmin:
+      failOnError: false
+
+# -----------------------------------------------------------------------------
+# In-cluster DR backups (shipped by P1.2, ka-0000008198; turned ON here).
+# pg_dumpall captures EVERY database (beads, controller, keycloak) plus global
+# roles in one portable, app-consistent stream — the artifact a fresh box needs
+# to rehydrate. Written to a dedicated Retain PVC so the dumps survive both a
+# corrupt data PV and a `helm uninstall`, and ride along on a host EBS snapshot.
+# -----------------------------------------------------------------------------
+backup:
+  postgres:
+    enabled: true
+    schedule: "17 */6 * * *"
+    retentionDays: 7
+    storage:
+      size: 5Gi
+      storageClass: "local-path-retain"
+  nats:
+    # nice-to-have: zero JetStream event-loss across a restore. Off by default;
+    # flip on if event durability across a box rebuild matters.
+    enabled: false
+
+# =============================================================================
+# SECRETS axis (P1.3, ka-0000002047)
+# =============================================================================
+# In-box has no AWS Secrets Manager and no External Secrets Operator. Secrets
+# are seeded directly as k8s Secrets at install time by scripts/deploy-byo.sh
+# (`ensure_secret` — `openssl rand`, create-if-missing so re-runs are
+# idempotent and never clobber an operator-chosen value). This overlay flips
+# the chart off the ESO/IRSA path and onto those pre-seeded Secrets, and closes
+# the plaintext-credential foot-gun.
+#
+# Source: gardenio/docs/research/secrets-story-synthesis.md §4 (ka-0000004337),
+#         gardenio/docs/gardenio-in-a-box-synthesis.md §3 (block C).
+
+# (C) No External Secrets Operator in-box — the chart must NOT render
+# ExternalSecret CRs (the ESO CRDs are not installed on a stock k3s box, and
+# there is no AWS SM backing store). The three core Secrets
+# (<release>-postgres-password, kd-beads-token, coop-credential-key) are seeded
+# at install by deploy-byo.sh instead. Already false in base; pinned for intent.
+externalSecrets:
+  enabled: false
+
+# (C/T1) Fail-fast on a missing credential-encryption key — NO plaintext
+# fallback. coopmux reads COOP_CREDENTIAL_KEY from the in-box-seeded
+# `coop-credential-key` Secret (key `key`, 32-byte hex from `openssl rand`).
+# allowPlaintextBootstrap stays false so coopmux refuses to start rather than
+# silently persisting Anthropic OAuth tokens as plaintext on disk
+# (coop/crates/mux/src/credential/persist.rs::resolve_key_policy fail-closed).
+coopmux:
+  credentialKey:
+    secretName: "coop-credential-key"
+    secretKey: "key"
+    allowPlaintextBootstrap: false
+  # (G) First-party digest pin — see the air-gap digest section below.
+  image:
+    digest: "sha256:ced9506a89c07b5f0b377506201f1f5563ab32443eca9742fbaa3a589f80ba50"
+
+# =============================================================================
+# (G) Air-gap first-party image digest pins (P4 follow-up, ka-0000006693)
+# =============================================================================
+# WHY THIS LIVES IN THE OVERLAY AND NOT BASE values.yaml
+# ------------------------------------------------------
+# The air-gap bundle is a frozen, point-in-time snapshot: scripts/inbox/* seed
+# the in-box zot registry with exactly the images a single chart version ships,
+# and the containerd mirror serves every pull from there. Pinning each
+# first-party image by content digest closes the last supply-chain gap — a
+# "latest" rotation in the source GitLab registry cannot swap the bytes that
+# land in the air-gapped bundle.
+#
+# These pins MUST NOT go in base values.yaml. All first-party image blocks use
+# `tag: ""`, which the gardenio.imageTag helper floats to Chart.AppVersion, and
+# gardenio.imageRef renders "<repo>:<tag>@<digest>" with the DIGEST winning at
+# pull time. The release pipeline floats the tag per deploy — release-deploy.sh
+# passes `--set global.imageTag=<calver>`, and the RWX-era staging deploys used
+# `main-<sha7>`. A static digest in base values.yaml
+# would therefore pin every floating tag to ONE frozen build: staging would
+# pull stale content under each new commit's tag (poisoned, false-green E2E —
+# cf. advice ka-0000003330) and prod would silently roll back to the pinned
+# build on the next appVersion bump. latestMode is NOT set in any deploy path
+# (only referenced in stale comments), so it does not save us. The overlay is
+# the only consumer where a frozen digest is correct, and global.airgap:true
+# above already forces the digest to bind (latestMode hard-disabled).
+#
+# REFRESH PROCEDURE — NOW AUTOMATED (ka-0000004971)
+# --------------------------------------------------------------------------
+# These pins are NO LONGER hand-refreshed. The tarboat bundle cut auto-rewrites
+# them from THIS release's <calver> registry digests before baking the tarball
+# (scripts/inbox/refresh-airgap-pins.py --write; the RWX-era bundle job ran it
+# and no workflow runs the tarboat cut today),
+# so the chart shipped to a box is correct-by-construction. Before automation
+# they silently rotted between releases — ka-0000000443 shipped a June daemon on
+# an August chart (~2.5mo drift) → CrashLoop on the box.
+#
+# The values checked in here are a snapshot at the last release's appVersion;
+# they need not equal the CURRENT Chart.AppVersion (the new-calver images do not
+# exist until the tag pipeline promotes them), which is why the drift check runs
+# at bundle-cut against $CALVER, not on every MR.
+#
+# Refresh / check by hand (crane needs `crane auth login` to the registry):
+#   scripts/inbox/refresh-airgap-pins.py --write            # rewrite pins to Chart.AppVersion
+#   scripts/inbox/refresh-airgap-pins.py --check            # verify (exit 1 on drift)
+#   scripts/inbox/refresh-airgap-pins.py --write --tag 2026.238.7   # pin a specific calver
+# It resolves the bare "<appVersion>" tag; golden promotion is digest-preserving
+# (bare == "<appVersion>-rc"), so that is the value the release ships. The parser
+# maps each first-party block below to its registry component; a NEW first-party
+# image block needs a PARENT_TO_COMPONENT row in the script (the tool fails loud
+# on an unmapped pin). push-bridge publishes no image (enabled:false,
+# never built) — no digest to pin. Validate the render with:
+#   helm template -f values.yaml -f values-inbox.yaml
+# and confirm every gardenio/* image renders "<repo>:<tag>@sha256:…".
+# =============================================================================
+# The beads daemon image is the kbeads repo (templates read .Values.beads.image).
+beads:
+  image:
+    digest: "sha256:1a4cbe545e542de2a55fdf2e544a9bdeab3f7764748cc75af2fc8e238e25943f"
+
+beadsViewer:
+  image:
+    digest: "sha256:64e9e45e6ebfbde3406f37105e7e3116a8884eff81db3977eef64dd9b35ff658"
+
+slackBridge:
+  image:
+    digest: "sha256:ac3d997b5d46ead9e676e9a02d47d66239b0de2f9aa3b795b38edf6999e7f6ee"
+
+jiraBridge:
+  image:
+    digest: "sha256:89508d16fb3bb95ba93fb57d7f02deb942af80be3614108b42be19bba75e1e5f"
+
+gitlabBridge:
+  image:
+    digest: "sha256:63c7fb1682985f627e6f8f3edcd29d2726b1dfc305cd6eb4dd4282b76828a181"
+
+triggerEngine:
+  image:
+    digest: "sha256:fdf2772aedea86e7f60d7c8c0c8009f95a8c2484c540c1b6855c3a530e44b28b"
+
+edgeAuth:
+  image:
+    digest: "sha256:20f7841433dcd1a1c551cf5913ee0f66f1da302ed59b1aafe3bb750fb1419c7f"
+
+# =============================================================================
+# DNS / TLS axis (P3.6, ka-0000002443 + follow-up ka-0000005963)
+# =============================================================================
+# In-box has no Route53, no ACM, no external-dns, and no DNS-provider
+# credential. The box gets PUBLICLY-TRUSTED TLS with ZERO DNS records and no
+# domain owned via sslip.io magic DNS + per-host Let's Encrypt HTTP-01:
+#
+#   - sslip.io resolves `<anything>.<dashed-public-ip>.sslip.io` -> that IP on
+#     public nameservers, so every gardenio subdomain resolves with no records.
+#   - HTTP-01 cannot issue a wildcard, but the box serves <15 single-label
+#     subdomains, so ONE multi-SAN Certificate enumerating tls.hosts covers
+#     every SNI (sniStrict holds) — issued over the :80 ACME challenge with no
+#     DNS credential.
+#   - cert-manager renders the HTTP-01 ClusterIssuer in-cluster (clusterIssuer
+#     .create:true) because there is no terraform to create it.
+#   - external-dns DNSEndpoint is never rendered (mode=perHost gates it off).
+#
+# Source: gardenio/docs/research/inbox-dns-tls-replace-route53-acm.md §3.1, §5
+#         (ACME gotchas), §6 (acceptance), ka-0000004570;
+#         gardenio/docs/gardenio-in-a-box-synthesis.md §2.D.
+#
+# PREREQUISITES (operator):
+#   1. cert-manager + its CRDs installed on the box before this chart applies
+#      (DNS/TLS doc §4 — the Certificate/ClusterIssuer CRs need the CRDs first).
+#   2. An Elastic IP pinned to the instance (DNS/TLS doc §5 gotcha #2) — every
+#      hostname and cert embeds the public IP, so a re-IP reissues all certs.
+#   3. tls.domainName + tls.hosts set to the box's actual dashed-IP sslip.io
+#      apex and per-service hostnames (commented below — uncomment + fill the
+#      real IP at install; they cannot be hardcoded in a tracked file).
+tls:
+  enabled: true
+  # perHost: enumerate every served hostname on one HTTP-01 cert; NO wildcard,
+  # NO external-dns DNSEndpoint. (Base default is `wildcard` for the cloud path.)
+  mode: "perHost"
+  # HTTP-01 ClusterIssuer (solves over :80, no DNS-provider credential). The
+  # chart renders this issuer because clusterIssuer.create is true below.
+  issuer: "letsencrypt-http01"
+  clusterIssuer:
+    create: true
+    # Switch to the LE STAGING endpoint while iterating to avoid burning the
+    # strict production rate limits, then flip back for the real cert:
+    #   acmeServer: "https://acme-staging-v02.api.letsencrypt.org/directory"
+    acmeServer: "https://acme-v02.api.letsencrypt.org/directory"
+    # email: "ops@example.com"   # recommended: ACME expiry-warning contact
+    solverIngressClass: "traefik"
+  # external-dns is never used in-box; perHost already gates the DNSEndpoint
+  # off, but keep the target empty for unambiguous intent.
+  dns:
+    target: ""
+  # ---- Fill these at install with the box's Elastic-IP-derived hostnames ----
+  # `<dashed-ip>` is the public IP with dots->dashes, e.g. 203.0.113.7 ->
+  # "203-0-113-7". domainName is the shared apex; hosts enumerates each
+  # single-label service subdomain (one label only, so sniStrict's single
+  # served cert covers every SNI). Keep this list in sync with the IngressRoute
+  # hosts the chart actually serves.
+  # domainName: "<dashed-ip>.sslip.io"
+  # hosts:
+  #   - "auth.<dashed-ip>.sslip.io"
+  #   - "beads.<dashed-ip>.sslip.io"
+  #   - "beads-viewer.<dashed-ip>.sslip.io"
+  #   - "coopmux.<dashed-ip>.sslip.io"
+  #   - "grafana.<dashed-ip>.sslip.io"
+  #   - "landing.<dashed-ip>.sslip.io"
+  #   - "<dashed-ip>.sslip.io"   # apex — ForwardAuth callback host
+  #
+  # ---- ALT: operator-owned real domain (DNS/TLS doc §3.2) ----
+  # Same overlay, but point domainName/hosts at a real domain whose A records
+  # you created at any registrar (not Route53). HTTP-01 per-host as above, OR
+  # switch to a DNS-01 wildcard issuer (smaller cert count, but cert-manager
+  # then holds a DNS-provider API credential in-cluster).
+  #
+  # ---- ALT: TRUE air-gap — local-CA, chart-minted (Tarboat G1.4 ka-0000003591) ----
+  # HTTP-01 needs Let's Encrypt to reach :80, so it is unusable on a box with NO
+  # inbound/outbound internet (operator Q2 = true air-gap). Rather than hand-craft
+  # a static cert secret, set tls.mode=localCA and the chart mints the whole chain
+  # IN-CLUSTER via cert-manager: a SelfSigned issuer -> a 10y CA -> a CA
+  # ClusterIssuer that signs the leaf enumerating tls.hosts. No ACME, no DNS, no
+  # internet. Cost: the CA is not publicly trusted, so each client imports it once
+  # (runbook: gardenio/docs/tarboat-local-ca-tls.md). To use, layer THIS over the
+  # perHost block above (mode + issuer + clusterIssuer.create win on merge):
+  #   tls:
+  #     mode: localCA
+  #     issuer: gardenio-local-ca-issuer     # name of the CA ClusterIssuer the chart renders
+  #     clusterIssuer:
+  #       create: false                      # do NOT render the ACME/HTTP-01 issuer
+  #     hosts:                               # every served hostname (sniStrict: one cert)
+  #       - "auth.<dashed-ip>.box.local"
+  #       - "beads-viewer.<dashed-ip>.box.local"
+  #       - "<dashed-ip>.box.local"          # apex — ForwardAuth callback host
+  # (This is the TLS half of the true-air-gap profile TARBOAT-SETUP.md §2 assumes.)
+  #
+  # ---- ALT: static cert provided out-of-band ----
+  # If you already hold a cert (corp CA, etc.), skip cert-manager entirely:
+  #   existingSecretName: "gardenio-wildcard-tls"   # pre-created via kubectl
+
+# =============================================================================
+# OBJECT-STORE axis (ka-0000004955) — in-box MinIO replaces AWS S3
+# =============================================================================
+# In-box has no AWS S3 and no IRSA. Run MinIO single-node single-drive in
+# cluster on a local-path PVC; the agents.s3.endpoint override above points coop,
+# the controller, and beads-viewer at it (path-style, forced in code). The
+# endpoint plumbing (coop Rust + controller Go + chart env) is already merged —
+# this overlay only flips the server on.
+#
+# License (decision ka-0000004293, chosen: minio): the MinIO server is AGPL-v3,
+# shipped OFF by default, in-cluster, operator-self-hosted (not offered as a
+# network service to third parties). The plumbing is store-agnostic, so swapping
+# to the Apache-2.0 fallback (SeaweedFS) would touch only the server template.
+#
+# Source: gardenio/docs/research/inbox-replace-s3-object-store.md §6/§8.
+objectStore:
+  enabled: true
+  bucket: "gardenio-sessions"   # MUST match agents.s3.bucket above
+  # Root creds: seed <release>-minio-credentials (keys accesskey/secretkey) via
+  # scripts/deploy-byo.sh (`ensure_secret` → openssl rand, create-if-missing).
+  # existingSecret empty → chart default name "<release>-minio-credentials".
+  existingSecret: ""
+  persistence:
+    size: 20Gi
+    storageClass: "local-path"
+  # Single-disk session archive is sacrificial vs postgres; ILM keeps it bounded
+  # so it never crowds postgres on the shared host disk. Tune per the runbook.
+  ilmExpiryDays: 30
+# NOTE: agents.s3.endpoint above is "http://<release>-minio:9000"; the default
+# assumes release name "gardenio". If you install under a different release name,
+# override agents.s3.endpoint to match "<release>-minio".
+#
+# AGENT pods get the least-privilege MinIO user automatically (gd-urSiLLwPIz):
+# the controller projects <release>-minio-agent-credentials (seeded by
+# deploy-byo.sh, turned into a MinIO user by the bootstrap Job) as files coop
+# and gb read via COOP_S3_*_FILE. Never declare the root
+# <release>-minio-credentials Secret in a project or role bead's secrets[]: the
+# controller refuses any Secret name containing "minio-credentials".
+
+# =============================================================================
+# IN-BOX LiteLLM axis (epic ka-0000007994) — first-class in-cluster inference
+# =============================================================================
+# Operator directive (Matt Baker): "we MUST make an in-cluster litellm part of
+# the gasbox." The base chart already ships a complete bundled LiteLLM
+# (templates/litellm/*); this overlay turns it ON for the box and configures it
+# for a self-sufficient, single-egress inference path.
+#
+# WHY in-cluster: one inference chokepoint, one provider secret, and ONLY the
+# LiteLLM pod egresses to the upstream provider (one allowlist target instead of
+# per-agent). Agent pods stay default-deny to the internet and reach inference
+# cluster-internally at http://gardenio-litellm.<ns>.svc.cluster.local:4000.
+#
+# UPSTREAM-CREDENTIAL CHOICE (ka-0000004450, revised under ka-0000007708):
+# the original plan held a real Anthropic API key (sk-ant-api…, x-api-key) in
+# the LiteLLM pod to dodge a suspected OAuth-IP throttle on fresh EC2 egress
+# IPs. That plan is DEAD: this org has no sk-ant-api… key anywhere — every
+# Anthropic credential is a Claude OAuth token (sk-ant-oat01…). So the in-box
+# proxy now FORWARDS the on-box agent's OAuth bearer token to api.anthropic.com
+# (forwardClientHeaders: true), the same mechanism the shared devops LiteLLM
+# uses for the whole fleet. A direct OAuth /v1/messages round-trip from the box
+# EIP was verified working (HTTP 200) under ka-0000007708, so the throttle fear
+# did not materialize for a single call. KNOWN RISK: the ka-0000004450 throttle
+# observation may still bite under sustained load or with a Max-subscription
+# token; if /v1/messages starts returning rate_limit_error, the mitigation is an
+# allowlist request for the box EIP with Anthropic, NOT a static key (none exist).
+litellm:
+  enabled: true
+
+  # No HPA in-box (H5, epic ka-0000005228). Gardenio-in-a-Box is a single EC2
+  # instance with in-box k3s — there is nowhere to scale OUT to, and letting the
+  # autoscaler try would only strand surplus 2Gi-request replicas Pending. Keep
+  # the proxy at the static replicaCount inherited from base values.yaml (the
+  # `replicas` field renders normally when autoscaling is off), which is the
+  # exact behaviour the box ran before H5.
+  autoscaling:
+    enabled: false
+
+  # Upstream litellm image (third-party, ghcr.io/berriai/litellm). NOT a
+  # first-party gardenio image, so it is NOT in the GitLab mirror and carries no
+  # air-gap digest pin in this overlay. On a genuinely air-gapped box it must be
+  # pre-seeded into the in-box zot registry (scripts/inbox/*) like every other
+  # pull; on the connected-pull box (global.airgap:false in the per-box env
+  # overlay) it pulls from ghcr.io directly. Pull policy IfNotPresent so a
+  # seeded image is reused with no registry round-trip on pod restart.
+  image:
+    pullPolicy: IfNotPresent
+
+  # Forward the agent's client OAuth header upstream? YES in-box. This org has
+  # NO sk-ant-api… provider key anywhere — every Anthropic credential is a Claude
+  # OAuth token (sk-ant-oat01…). So the in-box proxy authenticates by FORWARDING
+  # the on-box agent's OAuth bearer token to api.anthropic.com, exactly like the
+  # shared devops LiteLLM does for the rest of the fleet. The earlier "box IP is
+  # OAuth-throttled, hold a static provider key" design was abandoned: it required
+  # an sk-ant-api… key that does not exist, and a direct OAuth round-trip from the
+  # box EIP was verified working (HTTP 200) under ka-0000007708. The `models`
+  # block below therefore carries NO api_key and relies on the forwarded header.
+  forwardClientHeaders: true
+
+  # db-init targets the in-cluster postgres StatefulSet (postgres.enabled:true
+  # above). It is idempotent (CREATE DATABASE only when absent), so it is safe
+  # across redeploys. No external RDS — confirmed: postgresExternal stays off.
+  dbInit:
+    enabled: true
+
+  # Resources sane for an r7i.2xlarge (8 vCPU / 64 GiB) shared single node.
+  # LiteLLM is a thin async proxy at steady state, BUT its startup runs
+  # `prisma migrate deploy` (the bundled prisma engine + node toolchain), whose
+  # peak working set exceeds 1 GiB — a 1Gi limit OOMKills the pod mid-migration
+  # before it ever serves (observed on the box: exit 137 in seed/migrate, chart
+  # 2026.164.x; ka-0000005575). Match the base chart default (2Gi) so the box
+  # comes up clean. The node has 64 GiB, so 2Gi is comfortable headroom.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+  # No provider-key Secret and no ANTHROPIC_API_KEY env: the in-box proxy holds
+  # no upstream credential. Inference is authenticated by the on-box agent's
+  # forwarded OAuth bearer token (forwardClientHeaders: true, above). The agent
+  # carries its Claude OAuth token (sk-ant-oat01…, e.g. from a
+  # gardenio-claude-oauth-<handle> secret) as CLAUDE_CODE_OAUTH_TOKEN; Claude Code
+  # sends it as `Authorization: Bearer …` plus the `anthropic-beta:
+  # oauth-2025-04-20` header, both of which LiteLLM forwards upstream.
+
+  # In-box model routing. Each model points at api.anthropic.com with NO api_key
+  # so the forwarded client OAuth header is the sole upstream credential.
+  #
+  # CRITICAL: the model_name values MUST include the "-oauth"-suffixed groups
+  # that the controller's litellm_aliases.go targets. That sync hard-codes
+  # claude-opus-5 -> claude-opus-5-oauth (etc.) and patches it onto the live
+  # proxy at runtime. If the model_list only defines the bare (non-oauth) groups,
+  # the synced alias points at a group that does not exist and EVERY agent model
+  # call 400s with "no healthy deployments for model=claude-opus-5-oauth" — the
+  # agent boots, gets the mention, and goes silent. This mirrors the chart's own
+  # default model_list in templates/litellm/configmap.yaml. (ka-0000000385)
+  models:
+    - model_name: claude-opus-5-5
+      litellm_params:
+        model: anthropic/claude-opus-5-5
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Opus 5.5 via forwarded OAuth bearer token"
+    - model_name: claude-opus-5-5-oauth
+      litellm_params:
+        model: anthropic/claude-opus-5-5
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Opus 5.5 via OAuth token forwarding"
+    - model_name: claude-opus-5
+      litellm_params:
+        model: anthropic/claude-opus-5
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Opus 5 via forwarded OAuth bearer token"
+    - model_name: claude-opus-4-8
+      litellm_params:
+        model: anthropic/claude-opus-4-8
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Opus 4.8 via forwarded OAuth bearer token"
+    - model_name: claude-opus-4-8-oauth
+      litellm_params:
+        model: anthropic/claude-opus-4-8
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Opus 4.8 via OAuth token forwarding"
+    - model_name: claude-opus-5-oauth
+      litellm_params:
+        model: anthropic/claude-opus-5
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Opus 5 via OAuth token forwarding"
+    - model_name: claude-opus-4-7-oauth
+      litellm_params:
+        model: anthropic/claude-opus-4-7
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Opus 4.7 via OAuth token forwarding"
+    - model_name: claude-opus-4-6-oauth
+      litellm_params:
+        model: anthropic/claude-opus-4-6
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Opus 4.6 via OAuth token forwarding"
+    - model_name: claude-sonnet-4-6
+      litellm_params:
+        model: anthropic/claude-sonnet-4-6
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Sonnet 4.6 via forwarded OAuth bearer token"
+    - model_name: claude-sonnet-4-6-oauth
+      litellm_params:
+        model: anthropic/claude-sonnet-4-6
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Sonnet 4.6 via OAuth token forwarding"
+    # claude-sonnet-5 is in the chart's single-source model_group_alias base and
+    # the controller alias map (ka-0000004084), so its target group MUST be
+    # defined here too or the alias would dangle.
+    - model_name: claude-sonnet-5-oauth
+      litellm_params:
+        model: anthropic/claude-sonnet-5
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Sonnet 5 via OAuth token forwarding"
+    - model_name: anthropic/claude-haiku-4-5
+      litellm_params:
+        model: anthropic/claude-haiku-4-5-20251001
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Haiku 4.5 via forwarded OAuth bearer token"
+    - model_name: anthropic/claude-haiku-4-5-20251001
+      litellm_params:
+        model: anthropic/claude-haiku-4-5-20251001
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Haiku 4.5 (dated) via Anthropic API"
+    # Both fable groups are in the chart's single-source model_group_alias base
+    # (claude-fable-5-1 -> claude-fable-5-1-oauth, claude-fable-5 ->
+    # claude-fable-5-oauth) AND the controller's runtime alias-sync
+    # (litellm_aliases.go), so they MUST be defined here too or those aliases
+    # would dangle. (ka-0000003830 — closes the former latent gap where this
+    # custom model_list omitted the fable group the controller targets;
+    # ka-0000002744 added the 5.1 tier.)
+    - model_name: claude-fable-5-1-oauth
+      litellm_params:
+        model: anthropic/claude-fable-5-1
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Fable 5.1 via OAuth token forwarding"
+    - model_name: claude-fable-5-oauth
+      litellm_params:
+        model: anthropic/claude-fable-5
+        api_base: https://api.anthropic.com
+      model_info:
+        description: "Claude Fable 5 via OAuth token forwarding"
+
+  # model_group_alias is now the chart's single source of truth (ka-0000003830):
+  # the claude-* base map (matching litellm_aliases.go) ALWAYS renders and is
+  # merged with any litellm.modelGroupAlias additions. This in-box deployment has
+  # no env-specific alias additions (bedrock off -> no glm-5/gpt-*), so it sets
+  # nothing here — the chart base covers every group defined in model_list above,
+  # keeping the controller's runtime alias-sync a no-op.
+
+# -----------------------------------------------------------------------------
+# Routing: point agents/coop/controller at the in-cluster LiteLLM endpoint.
+# -----------------------------------------------------------------------------
+# agents.litellmURL is the controller-level fallback inference base (env
+# LITELLM_URL on the controller, and the ANTHROPIC_BASE_URL applyAccountConfig
+# bakes onto an agent pod when its account bead has no explicit base_url). The
+# controller deployment ALSO auto-derives LITELLM_URL + LITELLM_ADMIN_SECRET
+# from litellm.enabled, but pinning it here makes the in-cluster Service the
+# unambiguous default and keeps `gb spawn` resolving a model end-to-end against
+# the in-box proxy with NO corp-proxy / direct-Anthropic dependency.
+#
+# An in-box ACCOUNT BEAD (type=account) wires the actual spawn path; seed it
+# once the chart is up (documented in gardenio/docs/gardenio-in-a-box-install.md
+# and scripts/inbox/seed-litellm-account.sh):
+#   kd create --type account --title claude-inbox-litellm \
+#     --field base_url=http://gardenio-litellm.gardenio.svc.cluster.local:4000 \
+#     --field model=claude-opus-5 \
+#     --field litellm_key=<master-key from gardenio-litellm-master-key/token> \
+#     --label project:<your-project>
+# applyAccountConfig then bakes ANTHROPIC_BASE_URL + ANTHROPIC_MODEL +
+# ANTHROPIC_CUSTOM_HEADERS(x-litellm-api-key) onto every agent pod for that
+# project (gardenio/controller/cmd/controller/podspec.go::applyAccountConfig).
+#
+# NOTE: agents.litellmURL is set on the SINGLE `agents:` block near the top of
+# this file (alongside agentStorageClass/s3) — YAML forbids a second top-level
+# `agents:` key in one document (last wins, silently dropping the first), so the
+# routing keys live there. See that block for litellmURL + claudeModel.
+
+# -----------------------------------------------------------------------------
+# (R) Report this box's release to the home daemon (plan gd-UZKZ9H25UD step 4d,
+# gardenio/docs/releases-design.md §4.3 item 5). Off here: every box has its own
+# name and home client, so set these in the box's own deploy-values, not in
+# this shared overlay:
+#
+#   releases:
+#     box:
+#       name: <box>                       # home target box-<box>
+#       homeAddr: https://<home daemon HTTP address>
+#       homeTokenURL: https://<home Keycloak>/auth/realms/<realm>/protocol/openid-connect/token
+#       # homeClientID defaults to gardenio-box-<box>
+#
+# and seed the client secret on the box (never commit the value):
+#   kubectl -n gardenio create secret generic gardenio-release-home-client \
+#     --from-literal=clientSecret=<the home client's secret>
+#
+# Home side, per box (an admin write, not this chart): the confidential client
+# gardenio-box-<box> whose service account holds gardenio-machine-release-deploy,
+# registered in the home daemon's beads.machineClients, and
+# {"name": "box-<box>", "kind": "box"} appended to the home project's
+# release_targets. The box's controller already has internet 443 egress.
+# -----------------------------------------------------------------------------
+releases:
+  box:
+    name: ""
+    homeProject: gardenio
+    homeClientSecret:
+      name: gardenio-release-home-client
+      key: clientSecret

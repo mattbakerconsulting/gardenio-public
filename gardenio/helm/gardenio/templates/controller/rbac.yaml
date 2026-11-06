@@ -1,0 +1,119 @@
+{{- if .Values.agents.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+rules:
+  # Pod lifecycle: podmanager (create/delete), statusreporter+pvcgc (list).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "create", "delete"]
+  # PVC lifecycle: podmanager (create/get/update for helm-adoption), pvcgc (list/delete).
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "create", "update", "delete"]
+  # Secret reads: credential materialisation for ratelimit probe, litellm aliases, subscribe path.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    {{- if or .Values.agents.perAgentTokens .Values.agents.githubApp.enabled }}
+  # Per-agent token provisioning (agents.perAgentTokens=true or
+  # agents.githubApp.enabled=true). `update` lets the controller rewrite a
+  # per-agent token Secret in place (GitHub installation tokens last 1h and are
+  # re-minted at ~40min; plan §4.2 step 5). `list` is the label-selector scan
+  # behind the GitHub sweep (tokens to refresh / revoke) and the token janitor
+  # (orphaned agent-token-* Secrets), so both flags need it. With the App on,
+  # create/update also write release-deployer-github-token (gd-q48ldwLspl).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "update", "delete", "list"]
+    {{- end }}
+    {{- if and .Values.agents.bridgeTokenRotation .Values.agents.bridgeTokenRotation.enabled }}
+  # Bridge-token rotator (ka-0000002353): patches per-bridge keys in the
+  # bridge-token Secret, then stamps a rotation annotation on each bridge
+  # Deployment to trigger a rolling restart.
+  #
+  # fleet→bridge rename compat (ka-0000005788): scope the Update verb to BOTH
+  # the configured secretName AND the legacy "bridge-fleet-tokens" name so a
+  # deploy mid-migration — whichever name its operator pre-seeded the Secret
+  # under — keeps working through the window. The configured name mirrors the
+  # deployment's BRIDGE_TOKEN_ROTATION_SECRET resolution (ka-0000004295): an
+  # explicit agents.bridgeTokenRotation.secretName wins, else the daemon's
+  # resolved bridge-token secret, so RBAC always covers the Secret the rotator
+  # actually writes.
+  {{- $rotSecret := .Values.agents.bridgeTokenRotation.secretName | default (include "gardenio.beads.bridgeTokenSecretName" .) }}
+  {{- $rotSecretNames := list $rotSecret }}
+  {{- if ne $rotSecret "bridge-fleet-tokens" }}
+  {{- $rotSecretNames = append $rotSecretNames "bridge-fleet-tokens" }}
+  {{- end }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ range $i, $n := $rotSecretNames }}{{ if $i }}, {{ end }}{{ $n | quote }}{{ end }}]
+    verbs: ["update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    {{- with .Values.agents.bridgeTokenRotation.fleets }}
+    resourceNames:
+      {{- range . }}
+      - {{ . | quote }}
+      {{- end }}
+    {{- end }}
+    verbs: ["get", "update"]
+    {{- end }}
+    {{- if .Values.gvisor.freezeThaw.enabled }}
+  # Durable freeze/thaw snapshot store (ka-0000001694): the ConfigMapSnapshotStore
+  # persists one ConfigMap per snapshot (name prefix "gardenio-ftsnap-") in this
+  # namespace so the snapshot record HasSnapshot()/shouldThaw() consult survives a
+  # controller pod restart between freeze and thaw. Only granted when freeze/thaw
+  # is enabled.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update", "delete"]
+    {{- if .Values.gvisor.freezeThaw.postThawTokenRefresh.enabled }}
+  # Post-thaw credential refresher (bug ka-0000000518): a thawed agent's SA/IRSA
+  # token warm copy is a static snapshot outside kubelet rotation (thaw step [4]
+  # runsc-deletes Pod B so the kubelet stops rotating), so it expires ~1h post-thaw
+  # and the agent's k8s/AWS calls 401. The refresher re-mints each live thawed
+  # agent's tokens via the k8s TokenRequest API (serviceaccounts/token create) and
+  # re-overlays them into the warm copy. Granted ONLY when the refresher is enabled
+  # (default-off) so the token-mint privilege is not held unless the feature is on.
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+    {{- end }}
+    {{- end }}
+  # Leader election (coordination.k8s.io/v1 LeaseLock).
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  # ExternalSecret CRDs: secretreconciler creates, reaps orphaned, and updates
+  # in place when a managed ExternalSecret drifts from its desired spec
+  # (reconciler.reconcileNamespace -> client.Update on the drift branch).
+  # Without `update` every drift-correction 403s as log-spam (bug ka-0000002732;
+  # the gVisor-namespace twin Role in gvisor-namespace.yaml mirrors this set).
+  - apiGroups: ["external-secrets.io"]
+    resources: ["externalsecrets"]
+    verbs: ["get", "list", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "gardenio.agents.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gardenio.agents.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+  {{- /* gd-Hk4RBE2MC7 / gd-P84rleirJ4: the aux SA (beads-viewer)
+       is deliberately NOT a subject here: this Role grants get on
+       every Secret and pods create, which that workload does not need. */}}
+{{- end }}

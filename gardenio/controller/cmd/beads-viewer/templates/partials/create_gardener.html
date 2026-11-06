@@ -1,0 +1,252 @@
+{{define "create_gardener_sheet"}}
+<div class="quick-spawn-sheet" id="quick-spawn-sheet" role="dialog" aria-modal="true" aria-labelledby="create-gardener-title">
+  <div class="quick-spawn-backdrop" onclick="document.getElementById('quick-spawn-host').innerHTML=''"></div>
+  <div class="quick-spawn-card">
+    <header class="quick-spawn-header">
+      <h2 id="create-gardener-title">Create gardener</h2>
+      <button type="button"
+              class="quick-spawn-close"
+              aria-label="Close"
+              onclick="document.getElementById('quick-spawn-host').innerHTML=''">×</button>
+    </header>
+    <form class="quick-spawn-form"
+          hx-post="{{.BasePath}}/create-gardener"
+          hx-target="#quick-spawn-sheet"
+          hx-swap="outerHTML"
+          hx-disabled-elt="find button[type=submit]">
+      {{with .Sheet}}
+      <input type="hidden" name="epic_id" value="{{.EpicID}}">
+      <p class="quick-spawn-multi-note">
+        Gardener will drive epic
+        <a href="{{$.BasePath}}/{{.EpicID}}"><code>{{.EpicID}}</code></a>{{if .EpicTitle}} — {{.EpicTitle}}{{end}}.
+        It is authored as a real <code>type=trigger</code> loop that wakes on a schedule
+        while the epic has open children, and self-blocks (run budget + wall-clock + stop spec).
+      </p>
+
+      {{/* ── Preset picker: seeds the knobs below. ── */}}
+      <label class="quick-spawn-field">
+        <span>Preset — a behavior template that seeds the knobs</span>
+        <select name="preset" id="cc-preset" data-testid="cc-preset">
+          {{range .Presets}}
+          <option value="{{.Key}}"
+                  data-cron="{{.Cron}}"
+                  data-max-runs="{{.MaxRuns}}"
+                  data-cooldown="{{.Cooldown}}"
+                  data-loop-wall-clock="{{.LoopWallClock}}"
+                  data-standing="{{if .Standing}}1{{else}}0{{end}}"
+                  data-desc="{{.Description}}"
+                  data-goal="{{.GoalTemplate}}">{{.Label}}</option>
+          {{end}}
+        </select>
+      </label>
+      <p class="quick-spawn-hint" id="cc-preset-desc" data-testid="cc-preset-desc">{{(index .Presets 0).Description}}</p>
+
+      <label class="quick-spawn-field">
+        <span>Project</span>
+        <input type="text" name="project" value="{{.Project}}" required
+               placeholder="gardenio" autocomplete="off">
+      </label>
+
+      <label class="quick-spawn-field">
+        <span>Mentor (optional) — pick an existing gardener to learn from</span>
+        <select name="mentor_id">
+          <option value="">— no mentor —</option>
+          {{range .Mentors}}
+          <option value="{{.BeadID}}">
+            {{.AgentName}}{{if .TaskID}} · {{.TaskID}}{{if .TaskTitle}} ({{.TaskTitle}}){{end}}{{end}} · {{.Status}}
+          </option>
+          {{end}}
+        </select>
+      </label>
+
+      <label class="quick-spawn-field">
+        <span>What should this gardener drive?</span>
+        <textarea name="prompt" rows="5" required autofocus
+                  placeholder="Describe the gardener's mission in plain English.">{{.PromptDefault}}</textarea>
+      </label>
+
+      <label class="quick-spawn-field">
+        <span>Terminal goal — the human-legible "done" the engine tracks</span>
+        <textarea name="terminal_goal" id="cc-terminal-goal" data-testid="cc-terminal-goal" rows="2"
+                  placeholder="All children of the epic are closed.">{{.TerminalGoalDefault}}</textarea>
+      </label>
+
+      {{/* ── Schedule: preset cadence + custom cron. ── */}}
+      <fieldset class="quick-spawn-fieldset">
+        <legend>Schedule (when the gardener wakes)</legend>
+        <label class="quick-spawn-field">
+          <span>Cadence</span>
+          <select id="cc-schedule" data-testid="cc-schedule">
+            {{range .Schedules}}
+            <option value="{{.Key}}" data-cron="{{.Cron}}">{{.Label}}</option>
+            {{end}}
+          </select>
+        </label>
+        <label class="quick-spawn-field">
+          <span>Cron expression <span class="quick-spawn-hint-inline">(5-field; staggered from the epic id by default)</span></span>
+          <input type="text" name="cron" id="cc-cron" data-testid="cc-cron"
+                 value="{{.CronDefault}}" placeholder="{{.CronDefault}}" autocomplete="off">
+        </label>
+        <label class="quick-spawn-field">
+          <span>Timezone</span>
+          <input type="text" name="timezone" value="{{.TimezoneDefault}}" autocomplete="off">
+        </label>
+        <label class="quick-spawn-field">
+          <span>Cooldown (minutes between firings)</span>
+          <input type="number" name="cooldown_minutes" id="cc-cooldown" data-testid="cc-cooldown"
+                 value="{{.CooldownDefault}}" min="0" step="1">
+        </label>
+      </fieldset>
+
+      {{/* ── Budget + bounds (progressive disclosure). ── */}}
+      <details class="quick-spawn-details">
+        <summary>Budget &amp; bounds</summary>
+        <label class="quick-spawn-field">
+          <span>Run budget / max runs — the self-block run cap</span>
+          <input type="number" name="max_runs" id="cc-max-runs" data-testid="cc-max-runs"
+                 value="{{.MaxRunsDefault}}" min="1" step="1">
+        </label>
+        <label class="quick-spawn-field">
+          <span>Loop wall-clock — absolute ceiling (Go duration, e.g. 168h)</span>
+          <input type="text" name="loop_wall_clock" id="cc-loop-wall-clock" data-testid="cc-loop-wall-clock"
+                 value="{{.LoopWallClockDefault}}" autocomplete="off">
+        </label>
+        <label class="quick-spawn-field">
+          <span>Per-run timeout (Go duration, e.g. 30m)</span>
+          <input type="text" name="run_timeout" value="{{.RunTimeoutDefault}}" autocomplete="off">
+        </label>
+        <label class="quick-spawn-field">
+          <span>Max concurrent live runs</span>
+          <input type="number" name="max_concurrent" value="1" min="0" step="1">
+        </label>
+        <label class="quick-spawn-check">
+          <input type="checkbox" name="one_spawn_at_a_time" value="1" checked>
+          <span>One spawn at a time — serialize iterations (no two crew racing)</span>
+        </label>
+        <label class="quick-spawn-check">
+          <input type="checkbox" name="retry_on_failure" value="1">
+          <span>Retry a failed run</span>
+        </label>
+        <label class="quick-spawn-field">
+          <span>Max retries (when retry-on-failure is on)</span>
+          <input type="number" name="max_retries" value="0" min="0" step="1">
+        </label>
+      </details>
+
+      {{/* ── Exit + standing (advanced). ── */}}
+      <details class="quick-spawn-details">
+        <summary>Exit &amp; advanced</summary>
+        <label class="quick-spawn-field">
+          <span>Exit condition (optional free-text guidance for the engine's exit)</span>
+          <input type="text" name="exit_condition" autocomplete="off"
+                 placeholder="e.g. the target MR is merged">
+        </label>
+        <label class="quick-spawn-field">
+          <span>On exit (optional — what to do when the loop ends)</span>
+          <input type="text" name="on_exit" autocomplete="off"
+                 placeholder="e.g. close, escalate">
+        </label>
+        <label class="quick-spawn-check">
+          <input type="checkbox" name="standing" id="cc-standing" data-testid="cc-standing" value="1">
+          <span>Standing (perpetual) — never self-completes; adds the <code>perpetual:true</code> marker</span>
+        </label>
+      </details>
+      {{end}}
+
+      <div class="quick-spawn-actions">
+        <button type="button"
+                class="quick-spawn-cancel"
+                onclick="document.getElementById('quick-spawn-host').innerHTML=''">Cancel</button>
+        <button type="submit" class="quick-spawn-submit">Author gardener</button>
+      </div>
+    </form>
+    <script>
+    (function () {
+      var host = document.getElementById('quick-spawn-sheet');
+      if (!host) return;
+      var presetSel = host.querySelector('#cc-preset');
+      var presetDesc = host.querySelector('#cc-preset-desc');
+      var scheduleSel = host.querySelector('#cc-schedule');
+      var cron = host.querySelector('#cc-cron');
+      var maxRuns = host.querySelector('#cc-max-runs');
+      var cooldown = host.querySelector('#cc-cooldown');
+      var loopWall = host.querySelector('#cc-loop-wall-clock');
+      var goal = host.querySelector('#cc-terminal-goal');
+      var standing = host.querySelector('#cc-standing');
+      var epicId = (host.querySelector('input[name=epic_id]') || {}).value || '';
+      function applyPreset() {
+        if (!presetSel) return;
+        var o = presetSel.options[presetSel.selectedIndex];
+        if (!o) return;
+        var c = o.getAttribute('data-cron');
+        // Empty cron => staggered default; leave whatever is in the box.
+        if (c) { if (cron) cron.value = c; if (scheduleSel) scheduleSel.value = 'custom'; }
+        if (maxRuns) maxRuns.value = o.getAttribute('data-max-runs') || maxRuns.value;
+        if (cooldown) cooldown.value = o.getAttribute('data-cooldown') || cooldown.value;
+        if (loopWall) loopWall.value = o.getAttribute('data-loop-wall-clock') || loopWall.value;
+        if (standing) standing.checked = o.getAttribute('data-standing') === '1';
+        if (goal) {
+          var g = o.getAttribute('data-goal') || '';
+          goal.value = g.replace(/\{epic\}/g, epicId);
+        }
+        if (presetDesc) presetDesc.textContent = o.getAttribute('data-desc') || '';
+      }
+      function applySchedule() {
+        if (!scheduleSel || !cron) return;
+        var o = scheduleSel.options[scheduleSel.selectedIndex];
+        if (!o) return;
+        var c = o.getAttribute('data-cron');
+        if (o.value === 'custom') return;      // leave the box for hand-editing
+        if (c) { cron.value = c; }
+        // 'staggered' has empty cron; keep the server-seeded staggered default.
+      }
+      if (presetSel) presetSel.addEventListener('change', applyPreset);
+      if (scheduleSel) scheduleSel.addEventListener('change', applySchedule);
+    })();
+    </script>
+  </div>
+</div>
+{{end}}
+
+{{define "create_gardener_result"}}
+<div class="quick-spawn-sheet" id="quick-spawn-sheet" role="dialog" aria-modal="true" aria-labelledby="create-gardener-result-title">
+  <div class="quick-spawn-backdrop" onclick="document.getElementById('quick-spawn-host').innerHTML=''"></div>
+  <div class="quick-spawn-card">
+    <header class="quick-spawn-header">
+      <h2 id="create-gardener-result-title">{{with .Result}}{{if .Error}}Authoring failed{{else}}Gardener authored{{end}}{{end}}</h2>
+      <button type="button"
+              class="quick-spawn-close"
+              aria-label="Close"
+              onclick="document.getElementById('quick-spawn-host').innerHTML=''">×</button>
+    </header>
+    <div class="quick-spawn-body">
+      {{with .Result}}
+        {{if .Error}}
+          <p class="quick-spawn-error" role="alert">{{.Error}}</p>
+          <div class="quick-spawn-actions">
+            <button type="button"
+                    class="quick-spawn-cancel"
+                    onclick="document.getElementById('quick-spawn-host').innerHTML=''">Close</button>
+          </div>
+        {{else}}
+          <p class="quick-spawn-success">
+            Authored gardener
+            <a href="{{$.BasePath}}/{{.BeadID}}" class="quick-spawn-link">{{.BeadID}}</a>
+            (<code>{{.AgentName}}</code>) on epic
+            <a href="{{$.BasePath}}/{{.EpicID}}" class="quick-spawn-link">{{.EpicID}}</a>
+            in project <strong>{{.Project}}</strong>.
+            {{if .Cron}} Wakes on <code>{{.Cron}}</code>.{{end}}
+            {{if .MentorID}} Mentor: <a href="{{$.BasePath}}/{{.MentorID}}" class="quick-spawn-link">{{.MentorID}}</a>.{{end}}
+          </p>
+          <div class="quick-spawn-actions">
+            <a class="quick-spawn-submit" href="{{$.BasePath}}/{{.BeadID}}">Open gardener bead</a>
+            <button type="button"
+                    class="quick-spawn-cancel"
+                    onclick="document.getElementById('quick-spawn-host').innerHTML=''">Close</button>
+          </div>
+        {{end}}
+      {{end}}
+    </div>
+  </div>
+</div>
+{{end}}

@@ -1,0 +1,38 @@
+{{- /*
+Low-priority class for prewarmed/standby agent pods + warm placeholders
+(ka-0000000722).
+
+Prewarmed pool pods are real running pods that hold node CPU/mem requests while
+parked in standby. Without a priority they compete for nodes on equal footing
+with real (assigned) agents, so an idle pool can starve a cold non-pool spawn
+under node pressure. Real agents carry no PriorityClass (cluster-default
+priority 0); this class is NEGATIVE so they outrank pool pods.
+
+  - value < 0: a cold real agent (priority 0) outranks an idle pool pod, so the
+    scheduler can preempt the pool pod to admit the real agent when nodes are
+    tight. The pool refills once capacity frees up.
+  - preemptionPolicy: Never: pool pods themselves NEVER evict anything when they
+    warm up — they simply wait for room. This keeps the pool from disrupting
+    live work just to stay full.
+
+DEFAULT OFF: values ships prewarmedPriorityClass.create=false, so this renders
+nothing and the controller leaves PREWARMED_PRIORITY_CLASS unset (pool pods stay
+at default priority). The controller env is wired only when create=true, so it
+never references a PriorityClass that does not exist.
+*/}}
+{{- if .Values.agents.prewarmedPriorityClass.create }}
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .Values.agents.prewarmedPriorityClass.name }}
+  labels:
+    {{- include "gardenio.labels" . | nindent 4 }}
+value: {{ .Values.agents.prewarmedPriorityClass.value }}
+# Pool pods wait for room rather than evicting live work to warm up.
+preemptionPolicy: Never
+globalDefault: false
+description: >-
+  Low-priority class for gardenio prewarmed/standby agent pods and warm
+  placeholders. Negative value so real (assigned) agents preempt idle pool
+  members under node pressure (ka-0000000722).
+{{- end }}

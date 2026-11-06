@@ -1,0 +1,107 @@
+{{- if .Values.agents.metrics.prometheusRule.restartChurn.enabled }}
+{{- $cfg := .Values.agents.metrics.prometheusRule.restartChurn }}
+# PrometheusRule for agent restart churn and runtime-ceiling detection
+# (gd-5MTDWjwNjm, parent epic gd-aGiTndCXA4: bound agent restart churn).
+#
+# Source metrics, both GaugeVecs on the poller Collector with labels
+# {agent,project,role} (gardenio/controller/internal/metrics/metrics.go):
+#   - gardenio_agent_sessions_current: total coop sessions for an open agent.
+#   - gardenio_agent_age_seconds: now - created_at for an open agent. Uses
+#     created_at rather than updated_at so a wedged-but-churning agent (whose
+#     updated_at keeps refreshing via SyncAll) cannot mask its true age.
+#
+# Two alerts:
+#   - AgentRestartChurn: an agent has racked up more than sessionsThreshold
+#     coop sessions while still older than minAgeSeconds — restarting in a
+#     loop rather than running one long session.
+#   - AgentRuntimeCeiling: an agent has been open longer than maxAgeSeconds
+#     regardless of restart count — flags a stuck-open agent of any role.
+#
+# The task spec for gd-5MTDWjwNjm also called for a CrewOOMKilled alert on
+# kube_pod_container_status_last_terminated_reason{reason="OOMKilled"},
+# framed as step 4 of gd-FyClrfTYbK ("still unowned"). It is not unowned:
+# that exact alert (name AND metric) already exists at
+# templates/vpa-guardrails/alerts.yaml ($cfg.vpaGuardrails, evaluated in the
+# shared observability Prometheus where cadvisor/KSM series live — this
+# chart's own vmalert only sees gardenio_* series, so it could not evaluate
+# that expr anyway). A role=crew-scoped view of the gardenio-native signal
+# also already exists and already routes to Slack: AgentOOMKilled
+# (templates/vmalert/configmap.yaml, sum by (project, role) over
+# gardenio_agent_lifecycle_events_total{event="oom_killed"}). Adding a third
+# OOM-kill alert here — under the same "CrewOOMKilled" name as the first,
+# duplicating the metric of the second — would only add Slack-routing
+# confusion, so it is deliberately omitted; enable the existing two instead.
+#
+# Thresholds are a STARTING POINT, not a result — tune against a week of
+# real fleet data before Phase C (per the task's own framing). Off by
+# default; per-env overlays opt in. Requires the monitoring.coreos.com/v1
+# PrometheusRule CRD.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardenio.agents.fullname" . }}-restart-churn
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardenio.agents.labels" . | nindent 4 }}
+    {{- with $cfg.prometheusRuleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: gardenio.restart_churn
+      interval: 30s
+      rules:
+        - alert: AgentRestartChurn
+          # Both source gauges share the {agent,project,role} label set, so a
+          # bare `and` vector-matches them on those labels automatically.
+          expr: |
+            gardenio_agent_sessions_current > {{ $cfg.sessionsThreshold }}
+            and
+            gardenio_agent_age_seconds > {{ $cfg.minAgeSeconds }}
+          for: {{ $cfg.churnFor | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: controller
+            subsystem: restart_churn
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "agent {{`{{ $labels.agent }}`}} (role {{`{{ $labels.role }}`}}) is restart-churning"
+            description: |
+              Agent {{`{{ $labels.agent }}`}} (project {{`{{ $labels.project }}`}}, role
+              {{`{{ $labels.role }}`}}) has run more than {{ $cfg.sessionsThreshold }}
+              coop sessions while still open for over {{ $cfg.minAgeSeconds }}s
+              ({{`{{ $value }}`}} sessions) — it is restarting in a loop instead of
+              making progress in one long session. Check the agent's recent
+              session exit codes (gardenio_session_exit_code_total) and
+              restart_cause on its session beads for the failure pattern.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/plans/restart-churn.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        - alert: AgentRuntimeCeiling
+          expr: |
+            gardenio_agent_age_seconds > {{ $cfg.maxAgeSeconds }}
+          for: {{ $cfg.ceilingFor | quote }}
+          labels:
+            severity: {{ $cfg.severity | quote }}
+            component: controller
+            subsystem: restart_churn
+            {{- with $cfg.labels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          annotations:
+            summary: "agent {{`{{ $labels.agent }}`}} (role {{`{{ $labels.role }}`}}) exceeded the runtime ceiling"
+            description: |
+              Agent {{`{{ $labels.agent }}`}} (project {{`{{ $labels.project }}`}}, role
+              {{`{{ $labels.role }}`}}) has been open for {{`{{ $value }}`}}s, above the
+              {{ $cfg.maxAgeSeconds }}s ceiling — it has never been recycled.
+              Applies to every role, not just crew. Check whether the agent is
+              making progress or is stuck.
+            runbook_url: "{{ $.Values.global.docsBaseURL }}/gardenio/plans/restart-churn.md"
+            {{- with $cfg.annotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

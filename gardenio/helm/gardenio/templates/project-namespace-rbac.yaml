@@ -1,0 +1,115 @@
+{{- /*
+Per-project namespace RBAC (task ka-0000007869, epic ka-0000005677).
+
+WHY THIS FILE EXISTS
+Every per-project namespace grant on prod-gardenio-eks was hand-applied with
+`kubectl apply` and owned by nothing — no chart, no terraform, no manifest in
+any repo. Swept live 2026-08-25, all of them carried only
+`kubectl.kubernetes.io/last-applied-configuration`. They are load-bearing (they
+are what lets a project's agent pods do anything in their own namespace) and
+they were unreviewable: nobody had ever read them in a diff, which is how
+glm-lab held `verbs: ["*"]` on `resources: ["*"]` for 45 days unnoticed
+(revoked 2026-08-25, see values.yaml). This template puts them in a diff.
+
+DESIGN — mirrors gvisor-namespace.yaml:
+  - The whole file is gated on `projectNamespaceRbac.enabled` AND a non-empty
+    `projectNamespaceRbac.grants`, and values.yaml ships BOTH off/empty, so the
+    chart's default render is byte-identical to before this file existed.
+  - Each grant has its own `enabled` flag plus per-object `role.create` /
+    `roleBinding.create` flags, so an operator can adopt one pre-existing object
+    without an upgrade collision on the other.
+
+Namespace creation is deliberately NOT in scope. `namespace` must already
+exist; these are grants inside somebody else's namespace, and the two live
+namespaces disagree about their own labels/annotations (crab-science has
+neither, glm-lab has both). Unifying that is a separate question.
+
+ADOPTION. A grant flipped on for an object that ALREADY exists live needs Helm
+ownership metadata stamped on it first, or the atomic upgrade fails with
+"invalid ownership metadata": stamp app.kubernetes.io/managed-by=Helm and
+meta.helm.sh/release-{name,namespace} on it by hand before the upgrade.
+
+GUARDS. An enabled grant with no namespace, a created Role with no rules, or a
+created RoleBinding with no subjects is a `fail` at render time, not a silently
+empty object. That is deliberate: the glm-lab entry in values.yaml ships with
+`rules: []` on purpose, so whoever re-enables it is forced to state the
+resources and verbs glm-lab actually needs rather than restoring the wildcard.
+*/ -}}
+{{- if and .Values.projectNamespaceRbac.enabled .Values.projectNamespaceRbac.grants }}
+{{- range $key, $g := .Values.projectNamespaceRbac.grants }}
+{{- if $g.enabled }}
+{{- $ns := $g.namespace | default "" }}
+{{- if not $ns }}
+{{- fail (printf "projectNamespaceRbac.grants.%s is enabled but has no `namespace`. These are grants inside a pre-existing namespace; namespace creation is not in scope for this template." $key) }}
+{{- end }}
+{{- $base := $g.name | default $key }}
+{{- $roleName := (($g.role | default dict).name | default $base) }}
+{{- $bindingName := (($g.roleBinding | default dict).name | default $base) }}
+{{- /* Per-object create flags default TRUE: a grant you bothered to enable
+       renders both halves unless you explicitly opt one out (because you are
+       managing that half elsewhere). Same shape as gvisor.namespace.create /
+       gvisor.probe.create, which likewise default to the useful value. */ -}}
+{{- $createRole := true }}
+{{- if and $g.role (hasKey $g.role "create") }}{{ $createRole = $g.role.create }}{{ end }}
+{{- $createBinding := true }}
+{{- if and $g.roleBinding (hasKey $g.roleBinding "create") }}{{ $createBinding = $g.roleBinding.create }}{{ end }}
+{{- if $createRole }}
+{{- if not $g.rules }}
+{{- fail (printf "projectNamespaceRbac.grants.%s renders a Role but declares no `rules`. State the resources and verbs the project actually needs — an empty rules list here is a placeholder, not a default (see the glm-lab entry in values.yaml)." $key) }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $roleName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    {{- with $g.project }}
+    {{- /* The inventory label. `kubectl get roles,rolebindings -A -l
+           gardenio.io/project` is how these objects are found at all; dropping it
+           makes a grant invisible to the sweep that surfaced them. */}}
+    gardenio.io/project: {{ . | quote }}
+    {{- end }}
+    {{- with $g.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $g.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  {{- toYaml $g.rules | nindent 2 }}
+{{- end }}{{/* end if createRole */}}
+{{- if $createBinding }}
+{{- if not $g.subjects }}
+{{- fail (printf "projectNamespaceRbac.grants.%s renders a RoleBinding but declares no `subjects`. Name the ServiceAccount or Group the grant is for." $key) }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $bindingName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "gardenio.labels" $ | nindent 4 }}
+    {{- with $g.project }}
+    gardenio.io/project: {{ . | quote }}
+    {{- end }}
+    {{- with $g.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $g.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $roleName }}
+subjects:
+  {{- toYaml $g.subjects | nindent 2 }}
+{{- end }}{{/* end if createBinding */}}
+{{- end }}{{/* end if grant enabled */}}
+{{- end }}{{/* end range grants */}}
+{{- end }}{{/* end if projectNamespaceRbac.enabled and grants */}}

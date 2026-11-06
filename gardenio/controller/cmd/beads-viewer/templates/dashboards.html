@@ -1,0 +1,335 @@
+{{template "layout" .}}
+{{define "title"}}Dashboards · Beads Viewer{{end}}
+{{define "content"}}
+<span class="wide-page" hidden></span>
+
+{{/* dashboards.html — the operator-engagement + security dashboards
+     (task ka-0000004892). A thin shell: the panels are drawn client-side by
+     dashboards.js from the daemon's engagement/security/uniqueness chart
+     endpoints via the read-only viewer proxy. Every operator identity is
+     resolved SERVER-SIDE — this page never resolves an operator_id and never
+     receives an email / slack_user_id in a metric label. A forgotten operator
+     row (forgotten=true) is badged as redacted by the driver. */}}
+
+<h1>Dashboards
+  <span class="bead-row-spacer"></span>
+  <a class="meta" href="{{.BasePath}}/dashboards">refresh ↻</a>
+</h1>
+
+<p class="meta dash-blurb">
+  Operator-engagement and security telemetry, drawn live from the in-house chart
+  backend. Operator identities are resolved server-side; this surface shows only
+  pre-resolved display names and never a raw id or email. A
+  <span class="dash-forgotten-badge" aria-hidden="true">redacted</span> badge
+  marks an operator who exercised the right to be forgotten.
+</p>
+
+{{/* Controls: dashboard section tabs + a shared look-back window selector. Both
+     are client-side — no navigation, no re-render. The window applies to every
+     panel that accepts one (activity, sessions, authz, decisions, token-slo);
+     spend + uniqueness ignore it (spend is lifetime-to-date; uniqueness pins its
+     own 1d/7d/30d windows). */}}
+<div class="dash-controls">
+  <nav class="section-tabs dash-tabs" aria-label="Dashboard sections">
+    <button type="button" class="section-tab is-active" data-dash-tab="engagement" aria-current="page">Engagement</button>
+    <button type="button" class="section-tab" data-dash-tab="security">Security</button>
+  </nav>
+  <div class="dash-window" role="group" aria-label="Look-back window">
+    <span class="meta dash-window-label">Window</span>
+    <button type="button" class="dash-window-chip" data-window="1d" aria-pressed="false">1d</button>
+    <button type="button" class="dash-window-chip is-active" data-window="7d" aria-pressed="true">7d</button>
+    <button type="button" class="dash-window-chip" data-window="30d" aria-pressed="false">30d</button>
+  </div>
+</div>
+
+{{/* ── Engagement dashboard ─────────────────────────────────────────────── */}}
+<section class="dash-section" data-dash-panel="engagement" aria-label="Operator engagement">
+
+  {{/* DAU/WAU/MAU headline tiles — distinct active-operator counts. */}}
+  <div class="dash-kpi-row" id="dash-uniqueness" aria-label="Distinct active operators">
+    <div class="dash-kpi" data-uniq-key="dau">
+      <span class="dash-kpi-value">–</span>
+      <span class="dash-kpi-label">DAU <span class="meta">(1d)</span></span>
+    </div>
+    <div class="dash-kpi" data-uniq-key="wau">
+      <span class="dash-kpi-value">–</span>
+      <span class="dash-kpi-label">WAU <span class="meta">(7d)</span></span>
+    </div>
+    <div class="dash-kpi" data-uniq-key="mau">
+      <span class="dash-kpi-value">–</span>
+      <span class="dash-kpi-label">MAU <span class="meta">(30d)</span></span>
+    </div>
+  </div>
+
+  <div class="dash-grid">
+    <div class="dash-card">
+      <div class="dash-card-head">
+        <h2 class="dash-card-title">Activity by surface</h2>
+        <p class="meta dash-card-sub">Activity samples per surface over the window.</p>
+      </div>
+      <div class="dash-chart" data-dash-chart="activity-surface" role="img" aria-label="Activity by surface bar chart"></div>
+    </div>
+
+    <div class="dash-card">
+      <div class="dash-card-head">
+        <h2 class="dash-card-title">Most active operators</h2>
+        <p class="meta dash-card-sub">Top operators by activity over the window.</p>
+      </div>
+      <div class="dash-chart" data-dash-chart="activity-operators" role="img" aria-label="Top operators by activity bar chart"></div>
+    </div>
+
+    <div class="dash-card">
+      <div class="dash-card-head">
+        <h2 class="dash-card-title">Spend by operator</h2>
+        <p class="meta dash-card-sub">Cumulative spend (USD), lifetime-to-date. <span data-dash-spend-others></span></p>
+      </div>
+      <div class="dash-chart" data-dash-chart="spend-operators" role="img" aria-label="Per-operator spend bar chart"></div>
+    </div>
+
+    <div class="dash-card dash-card--wide">
+      <div class="dash-card-head">
+        <h2 class="dash-card-title">Session duration</h2>
+        <p class="meta dash-card-sub">Per-operator session length (p50 / p90 / p99) over the window.</p>
+      </div>
+      <div class="dash-table-wrap">
+        <table class="dash-table" data-dash-table="sessions">
+          <thead>
+            <tr>
+              <th scope="col">Operator</th>
+              <th scope="col" class="dash-num">p50</th>
+              <th scope="col" class="dash-num">p90</th>
+              <th scope="col" class="dash-num">p99</th>
+              <th scope="col" class="dash-num">Sessions</th>
+            </tr>
+          </thead>
+          <tbody><tr><td colspan="5" class="meta dash-state">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+{{/* ── Security dashboard ───────────────────────────────────────────────── */}}
+<section class="dash-section" data-dash-panel="security" aria-label="Security overview" hidden>
+  <div class="dash-grid">
+    <div class="dash-card">
+      <div class="dash-card-head">
+        <h2 class="dash-card-title">Authorization denials
+          <span class="dash-headline" data-dash-headline="authz-total"></span>
+        </h2>
+        <p class="meta dash-card-sub">Write-authorization rejections by reason over the window.</p>
+      </div>
+      <div class="dash-chart" data-dash-chart="authz" role="img" aria-label="Authorization denials by reason bar chart"></div>
+    </div>
+
+    <div class="dash-card">
+      <div class="dash-card-head">
+        <h2 class="dash-card-title">Decision lifecycle</h2>
+        <p class="meta dash-card-sub">Decision lifecycle events by type over the window.</p>
+      </div>
+      <div class="dash-chart" data-dash-chart="decisions-lifecycle" role="img" aria-label="Decision lifecycle events bar chart"></div>
+    </div>
+
+    <div class="dash-card">
+      <div class="dash-card-head">
+        <h2 class="dash-card-title">Escalations</h2>
+        <p class="meta dash-card-sub">Decision escalations by outcome over the window.</p>
+      </div>
+      <div class="dash-chart" data-dash-chart="escalations" role="img" aria-label="Escalations by outcome bar chart"></div>
+    </div>
+
+    <div class="dash-card dash-card--wide">
+      <div class="dash-card-head">
+        <h2 class="dash-card-title">Token-revocation SLO
+          <span class="dash-slo-badge" data-dash-slo-badge hidden></span>
+        </h2>
+        <p class="meta dash-card-sub" data-dash-slo-sub>Agent token-revocation latency against the approved SLO target.</p>
+      </div>
+      <div class="dash-table-wrap">
+        <table class="dash-table" data-dash-table="token-slo">
+          <thead>
+            <tr>
+              <th scope="col">Objective</th>
+              <th scope="col" class="dash-num">Budget</th>
+              <th scope="col" class="dash-num">Observed</th>
+              <th scope="col" class="dash-num">Within budget</th>
+              <th scope="col">Status</th>
+            </tr>
+          </thead>
+          <tbody><tr><td colspan="5" class="meta dash-state">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .dash-blurb { max-width: 62rem; }
+  .dash-forgotten-badge, .dash-forgotten-inline {
+    display: inline-block;
+    font-size: 0.72em;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    padding: 0.05rem 0.4rem;
+    border-radius: 999px;
+    border: 1px solid rgba(214, 108, 108, 0.55);
+    background: rgba(214, 108, 108, 0.14);
+    color: #9c2019;
+    vertical-align: 0.05rem;
+    white-space: nowrap;
+  }
+  html[data-skin^="dark"] .dash-forgotten-badge,
+  html[data-skin^="dark"] .dash-forgotten-inline { color: #ee9a9a; }
+
+  /* Controls row: section tabs + window selector on one line. */
+  .dash-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem 1rem;
+    margin: 1rem 0 0.5rem;
+  }
+  .dash-tabs { margin: 0; border-bottom: none; }
+  .dash-tabs .section-tab {
+    background: none;
+    border: none;
+    font: inherit;
+    cursor: pointer;
+  }
+  .dash-window { display: inline-flex; align-items: center; gap: 0.3rem; }
+  .dash-window-label { margin-right: 0.15rem; }
+  .dash-window-chip {
+    font: inherit;
+    font-size: 0.8em;
+    padding: 0.18rem 0.6rem;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    border-radius: 999px;
+    background: rgba(128, 128, 128, 0.06);
+    color: inherit;
+    cursor: pointer;
+  }
+  .dash-window-chip:hover { border-color: rgb(25, 118, 210); }
+  .dash-window-chip.is-active {
+    border-color: rgb(25, 118, 210);
+    background: rgba(25, 118, 210, 0.14);
+    font-weight: 600;
+  }
+  html[data-skin^="dark"] .dash-window-chip:hover,
+  html[data-skin^="dark"] .dash-window-chip.is-active { border-color: rgb(56, 178, 255); }
+  html[data-skin^="dark"] .dash-window-chip.is-active { background: rgba(56, 178, 255, 0.16); }
+
+  /* DAU/WAU/MAU KPI tiles. */
+  .dash-kpi-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.75rem;
+    margin: 0.75rem 0 1rem;
+  }
+  .dash-kpi {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    padding: 0.75rem 1rem;
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    border-radius: 8px;
+    background: rgba(128, 128, 128, 0.05);
+  }
+  .dash-kpi-value {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 2rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+  }
+  .dash-kpi-label { font-size: 0.9em; color: var(--text-muted, #595959); }
+
+  /* Panel grid — one column on narrow, two on wide; a wide card spans both. */
+  .dash-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1rem;
+    margin-top: 0.6rem;
+  }
+  @media (min-width: 60rem) {
+    .dash-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .dash-card--wide { grid-column: 1 / -1; }
+  }
+  .dash-card {
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    border-radius: 8px;
+    padding: 0.7rem 0.9rem 0.9rem;
+    background: rgba(128, 128, 128, 0.04);
+    min-width: 0;
+  }
+  .dash-card-head { margin-bottom: 0.5rem; }
+  .dash-card-title { font-size: 1rem; margin: 0; display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
+  .dash-card-sub { margin: 0.15rem 0 0; }
+  .dash-headline {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Chart container — ECharts needs an explicit height. */
+  .dash-chart {
+    width: 100%;
+    height: 240px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .dash-chart .dash-state,
+  .dash-state { color: var(--text-muted, #595959); font-size: 0.9em; }
+  .dash-chart-error { color: #9c2019; }
+  html[data-skin^="dark"] .dash-chart-error { color: #ee9a9a; }
+
+  /* Tables (session duration + token SLO). */
+  .dash-table-wrap { overflow-x: auto; }
+  .dash-table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+  .dash-table th, .dash-table td {
+    text-align: left;
+    padding: 0.35rem 0.5rem;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.18);
+  }
+  .dash-table th {
+    font-weight: 600;
+    color: var(--text-muted, #595959);
+    border-bottom-color: rgba(128, 128, 128, 0.3);
+  }
+  .dash-table td.dash-num, .dash-table th.dash-num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .dash-table tbody tr:last-child td { border-bottom: none; }
+  .dash-op-name { font-weight: 500; }
+
+  /* SLO status pills + the "awaiting data" badge. */
+  .dash-slo-badge, .dash-slo-pill {
+    display: inline-block;
+    font-size: 0.72em;
+    font-weight: 600;
+    padding: 0.05rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .dash-slo-badge {
+    border-color: rgba(214, 158, 46, 0.5);
+    background: rgba(214, 158, 46, 0.16);
+    color: #6f4e11;
+  }
+  html[data-skin^="dark"] .dash-slo-badge { color: #e0b25a; }
+  .dash-slo-pill--met { border-color: rgba(67, 160, 71, 0.5); background: rgba(67, 160, 71, 0.15); color: #1c5220; }
+  .dash-slo-pill--miss { border-color: rgba(214, 69, 69, 0.5); background: rgba(214, 69, 69, 0.16); color: #9c2019; }
+  .dash-slo-pill--na { border-color: rgba(128, 128, 128, 0.4); background: rgba(128, 128, 128, 0.14); color: var(--text-muted, #5c5c5c); }
+  html[data-skin^="dark"] .dash-slo-pill--met { color: #7ddb82; }
+  html[data-skin^="dark"] .dash-slo-pill--miss { color: #ee7e7e; }
+</style>
+
+<script src="{{.BasePath}}/assets/static/echarts.min.js" defer></script>
+<script src="{{.BasePath}}/assets/static/echarts_catalog.js" defer></script>
+<script src="{{.BasePath}}/assets/static/dashboards.js" defer></script>
+{{end}}

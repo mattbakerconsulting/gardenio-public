@@ -1,0 +1,12 @@
+output "api_endpoint" { value = "https://${var.api_fqdn}:6443" }
+output "kubeconfig_ssm_parameter" { value = aws_ssm_parameter.kubeconfig.name }
+output "token_ssm_parameter" { value = aws_ssm_parameter.token.name }
+output "server_asg_name" { value = aws_autoscaling_group.servers.name }
+output "agent_asg_name" { value = aws_autoscaling_group.agents.name }
+output "agent_spot_asg_name" { value = aws_autoscaling_group.agents_spot.name }
+output "security_group_id" { value = aws_security_group.nodes.id }
+output "node_role_arn" { value = aws_iam_role.node.arn }
+output "join_endpoint" { value = "https://${var.join_fqdn}:6443" }
+output "ci_asg_name" { value = aws_autoscaling_group.ci.name }
+output "ziti_edge_public_ip" { value = try(aws_eip.ziti_edge[0].public_ip, null) }
+output "ziti_edge_instance_id" { value = try(aws_instance.ziti_edge[0].id, null) }

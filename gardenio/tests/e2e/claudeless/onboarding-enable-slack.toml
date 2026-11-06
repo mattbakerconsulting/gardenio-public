@@ -1,0 +1,94 @@
+# onboarding-enable-slack.toml
+#
+# Claudeless scenario: a local agent works a poured enable-slack molecule
+# (gardenio/formulas/onboarding/enable-slack.json) up to its first gate.
+#
+#   1. gb ready --plan shows find-project and the install-app manual gate
+#   2. claim find-project, run the command it names, close it
+#   3. stop at install-app (a Slack admin installs the app) without touching it
+#
+# Driven by test-onboarding-formulas.sh, which pours the molecule, exports
+# ONBOARD_MOLECULE / ONBOARD_STATE_DIR / ONBOARD_AGENT_STEP, runs
+# `gb agent start --local --test-scenario=onboarding-enable-slack`, and then
+# checks from the outside which steps this agent closed and that the gate is
+# the molecule's whole ready frontier. Each tool call goes through
+# scripts/onboarding-agent-step.sh, which refuses to claim a gate or a step
+# outside the ready set and records the scenario verdict.
+#
+# The startup prompt and follow-up nudges live in the sidecars
+# onboarding-enable-slack.startup-prompt.txt and .nudges.txt. claudeless picks
+# the first [[responses]] whose `contains` matches, so every nudge carries
+# exactly one phase keyword.
+
+[claude]
+session_id = "e2e00000-0005-4000-a000-000000000004"
+username = "e2e-onboarding-enable-slack"
+permission_mode = "accept-edits"
+trusted = true
+logged_in = true
+
+[claude.timeouts]
+hook_timeout_ms = 15000
+
+# ── Startup: find the molecule's ready steps ────────────────────────
+[[responses]]
+on = { contains = "gb ready" }
+say = "Checking the onboarding molecule for ready steps."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" ready'
+
+# ── find-project: claim, run, close ─────────────────────────────────
+[[responses]]
+on = { contains = "Claim find-project" }
+say = "Claiming the find-project step."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" claim find-project'
+
+[[responses]]
+on = { contains = "Run find-project" }
+say = "Looking for the project bead."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '''"$ONBOARD_AGENT_STEP" run find-project "kd list --type project"'''
+
+[[responses]]
+on = { contains = "Close find-project" }
+say = "Closing the find-project step."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" close find-project'
+
+# ── Gate ────────────────────────────────────────────────────────────
+[[responses]]
+on = { contains = "the gate" }
+say = "Only the install-app manual gate is left; a Slack admin does that."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" gate'
+
+# ── Stop ────────────────────────────────────────────────────────────
+[[responses]]
+on = { contains = "stop" }
+say = "Stopping at the gate."
+[[responses.tools]]
+call = "Bash"
+[responses.tools.input]
+command = '"$ONBOARD_AGENT_STEP" verdict; gb stop 2>&1 || true'
+
+# ── Fallback ────────────────────────────────────────────────────────
+[default]
+say = "Onboarding enable-slack scenario idle. Ready for the next step."
+
+# ── Tool config ─────────────────────────────────────────────────────
+[tools]
+mode = "live"
+
+[tools.Bash]
+approve = true
